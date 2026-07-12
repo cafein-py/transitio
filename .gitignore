@@ -1,0 +1,29 @@
+# Rust
+/target/
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+build/
+dist/
+*.egg-info/
+.venv/
+.coverage
+.coverage.*
+htmlcov/
+
+# Test data and caches
+tests/data/
+cache/
+
+# Local planning and assistant files (not part of the library)
+plans/
+.claude/
+CLAUDE.md
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
