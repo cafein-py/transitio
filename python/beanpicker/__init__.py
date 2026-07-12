@@ -1,6 +1,14 @@
 """AOI-driven OSM and GTFS acquisition, validation and repair."""
 
-__all__ = ["Dataset", "Feed", "MobilityDatabase", "exceptions", "__version__"]
+__all__ = [
+    "Dataset",
+    "Feed",
+    "MobilityDatabase",
+    "exceptions",
+    "fetch_pbf",
+    "osm",
+    "__version__",
+]
 
 
 def __getattr__(name):
@@ -8,10 +16,14 @@ def __getattr__(name):
         from beanpicker import catalog
 
         return getattr(catalog, name)
-    if name == "exceptions":
-        from beanpicker import exceptions
+    if name == "fetch_pbf":
+        from beanpicker.osm import fetch_pbf
 
-        return exceptions
+        return fetch_pbf
+    if name in ("exceptions", "osm"):
+        import importlib
+
+        return importlib.import_module(f"beanpicker.{name}")
     if name == "__version__":
         from beanpicker._core import __version__
 

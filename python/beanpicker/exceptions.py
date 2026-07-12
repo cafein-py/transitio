@@ -11,3 +11,7 @@ class MissingTokenError(BeanpickerError):
 
 class DownloadError(BeanpickerError):
     """A dataset cannot be downloaded or fails checksum verification."""
+
+
+class ExtractNotFoundError(BeanpickerError):
+    """No OSM extract covers the requested area."""

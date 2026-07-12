@@ -12,7 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Repository scaffold: maturin build with a stub ``beanpicker._core`` Rust
   crate, CI for lint/tests and release wheels.
 - ``beanpicker.exceptions`` module with ``BeanpickerError``,
-  ``MissingTokenError`` and ``DownloadError``.
+  ``MissingTokenError``, ``DownloadError`` and ``ExtractNotFoundError``.
+- OSM module (``beanpicker.fetch_pbf``): AOI-driven extract acquisition on
+  top of pyrosm — smallest-covering-extract resolution from pyrosm's bundled
+  Geofabrik index, cached download, polygon-true cropping via
+  ``pyrosm.OSM(...).to_pbf``, place-name AOIs via Nominatim geocoding, and a
+  provenance sidecar per file.
 - Mobility Database catalog client (``beanpicker.MobilityDatabase``):
   token-refresh authentication, feed search by AOI bounding box, country,
   subdivision and municipality, historical dataset listing with
