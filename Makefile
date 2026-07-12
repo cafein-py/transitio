@@ -1,7 +1,7 @@
 .PHONY: develop test lint fmt
 
 develop:
-	pip install -e . --no-build-isolation
+	pip install -e .
 
 test:
 	cargo test --workspace

@@ -44,6 +44,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
-      - run: pip install maturin pytest pytest-cov
-      - run: pip install -e . --no-build-isolation
+      - run: pip install pytest pytest-cov
+      - run: pip install -e .
       - run: pytest --cov=beanpicker --cov-report=term-missing
