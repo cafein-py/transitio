@@ -8,7 +8,7 @@ from shapely.geometry import box
 
 from beanpicker.catalog import TOKEN_ENV_VAR, MobilityDatabase
 from beanpicker.catalog._client import _bounds
-from beanpicker.catalog._models import Dataset
+from beanpicker.catalog._models import Dataset, Feed
 from beanpicker.exceptions import DownloadError, MissingTokenError
 
 FEED_RECORD = {
@@ -20,8 +20,33 @@ FEED_RECORD = {
         "producer_url": "https://example.com/gtfs.zip",
         "license_url": "https://example.com/license",
     },
+    "latest_dataset": {"hosted_url": "https://files.example.com/mdb-1/latest.zip"},
     "locations": [{"country_code": "FI", "municipality": "Helsinki"}],
 }
+
+CSV_HEADER = (
+    "id,data_type,status,is_official,provider,"
+    "location.country_code,location.subdivision_name,location.municipality,"
+    "location.bounding_box.minimum_latitude,"
+    "location.bounding_box.maximum_latitude,"
+    "location.bounding_box.minimum_longitude,"
+    "location.bounding_box.maximum_longitude,"
+    "urls.direct_download,urls.latest,urls.license"
+)
+
+CSV_ROWS = [
+    "mdb-10,gtfs,active,True,HSL,FI,Uusimaa,Helsinki,59.9,60.6,24.2,25.6,"
+    "https://example.com/hsl.zip,https://files.example.com/mdb-10/latest.zip,"
+    "https://example.com/license",
+    "mdb-11,gtfs,deprecated,False,Old Operator,FI,Uusimaa,Helsinki,"
+    "59.9,60.6,24.2,25.6,https://example.com/old.zip,,",
+    "mdb-12,gtfs_rt,active,True,HSL RT,FI,Uusimaa,Helsinki,"
+    "59.9,60.6,24.2,25.6,https://example.com/rt,,",
+    "mdb-13,gtfs,active,True,Skanetrafiken,SE,,,55.3,56.5,12.5,14.6,"
+    "https://example.com/skane.zip,,",
+]
+
+CSV_BODY = "\n".join([CSV_HEADER, *CSV_ROWS]) + "\n"
 
 DATASET_RECORD = {
     "id": "mdb-1-202606",
@@ -138,8 +163,30 @@ def test_pagination(tmp_path):
     pages = api_requests(requests, "/v1/gtfs_feeds")
     assert [(p.url.params["offset"], p.url.params["limit"]) for p in pages] == [
         ("0", "100"),
-        ("100", "50"),
+        ("100", "100"),
     ]
+
+
+def test_search_feeds_status_filter_spans_pages(tmp_path):
+    deprecated = [
+        dict(FEED_RECORD, id=f"mdb-{i}", status="deprecated") for i in range(100)
+    ]
+    active = [dict(FEED_RECORD, id=f"mdb-{100 + i}") for i in range(3)]
+    records = deprecated + active
+    requests = []
+
+    def feeds_endpoint(request):
+        offset = int(request.url.params["offset"])
+        limit = int(request.url.params["limit"])
+        return httpx.Response(200, json=records[offset : offset + limit])
+
+    routes = {"/v1/gtfs_feeds": feeds_endpoint}
+    with make_db(routes, tmp_path, requests) as db:
+        feeds = db.search_feeds(country_code="FI", limit=2)
+
+    # All page-1 records are deprecated; pagination must continue to page 2.
+    assert [f.id for f in feeds] == ["mdb-100", "mdb-101"]
+    assert len(api_requests(requests, "/v1/gtfs_feeds")) == 2
 
 
 def test_datasets_sorted_newest_first(tmp_path):
@@ -162,6 +209,23 @@ def test_dataset_for_rejects_non_dates(tmp_path):
     with make_db({}, tmp_path) as db:
         with pytest.raises(TypeError):
             db.dataset_for("mdb-1", 20260901)
+
+
+def test_as_date_accepts_zulu_datetime_strings():
+    from beanpicker.catalog._models import as_date
+
+    assert as_date("2026-09-01T08:00:00Z") == datetime.date(2026, 9, 1)
+    assert as_date("2026-09-01") == datetime.date(2026, 9, 1)
+
+
+def test_download_rejects_unsafe_ids(tmp_path):
+    with make_db({}, tmp_path) as db:
+        bad_dataset = Dataset.from_api(dict(DATASET_RECORD, id="../evil"))
+        with pytest.raises(DownloadError, match="not safe"):
+            db.download(bad_dataset)
+        bad_feed = Feed.from_api(dict(FEED_RECORD, id="../evil"))
+        with pytest.raises(DownloadError, match="not safe"):
+            db.download_latest(bad_feed)
 
 
 def test_download_verifies_checksum_and_caches(tmp_path):
@@ -205,11 +269,11 @@ def test_validation_report(tmp_path):
         assert db.validation_report(Dataset.from_api(OLD_DATASET_RECORD)) is None
 
 
-def test_missing_token_raises(tmp_path, monkeypatch):
+def test_missing_token_raises_for_api_methods(tmp_path, monkeypatch):
     monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
     with make_db({}, tmp_path, token=None) as db:
         with pytest.raises(MissingTokenError, match="refresh token"):
-            db.search_feeds(country_code="FI")
+            db.datasets("mdb-1")
 
 
 def test_token_from_environment(tmp_path, monkeypatch):
@@ -236,6 +300,137 @@ def test_retry_on_transient_errors(tmp_path):
         feeds = db.search_feeds(country_code="FI")
     assert len(feeds) == 1
     assert len(attempts) == 3
+
+
+def test_csv_fallback_without_token(tmp_path, monkeypatch):
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+    requests = []
+    routes = {"/feeds_v2.csv": lambda request: httpx.Response(200, text=CSV_BODY)}
+    with make_db(routes, tmp_path, requests, token=None) as db:
+        with pytest.warns(UserWarning, match="CSV catalogue"):
+            feeds = db.search_feeds(aoi=box(24.6, 60.1, 25.2, 60.4))
+
+    # gtfs_rt, deprecated and out-of-bbox rows are filtered out.
+    assert [f.id for f in feeds] == ["mdb-10"]
+    feed = feeds[0]
+    assert feed.provider == "HSL"
+    assert feed.official is True
+    assert feed.license_url == "https://example.com/license"
+    assert feed.latest_dataset_url == "https://files.example.com/mdb-10/latest.zip"
+    assert feed.locations[0]["country_code"] == "FI"
+
+    (request,) = requests
+    assert request.url.host == "files.mobilitydatabase.org"
+    assert "Authorization" not in request.headers
+
+
+def test_csv_fallback_filters_and_cache(tmp_path, monkeypatch):
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+    requests = []
+    routes = {"/feeds_v2.csv": lambda request: httpx.Response(200, text=CSV_BODY)}
+    with make_db(routes, tmp_path, requests, token=None) as db:
+        with pytest.warns(UserWarning):
+            swedish = db.search_feeds(country_code="SE")
+            both_statuses = db.search_feeds(country_code="FI", status=None)
+
+    assert [f.id for f in swedish] == ["mdb-13"]
+    assert [f.id for f in both_statuses] == ["mdb-10", "mdb-11"]
+    # The CSV itself is fetched once and cached.
+    assert len(requests) == 1
+
+
+def test_csv_fallback_tolerates_alternate_headers(tmp_path, monkeypatch):
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+    header = (
+        "id,data_type,status,official,provider,"
+        "country_code,subdivision_name,municipality,"
+        "minimum_latitude,maximum_latitude,minimum_longitude,maximum_longitude,"
+        "urls.direct_download_url,urls.latest_url,urls.license_url"
+    )
+    row = (
+        "mdb-20,gtfs,active,True,HSL,FI,Uusimaa,Helsinki,59.9,60.6,24.2,25.6,"
+        "https://example.com/hsl.zip,https://files.example.com/mdb-20/latest.zip,"
+        "https://example.com/license"
+    )
+    body = f"{header}\n{row}\n"
+    routes = {"/feeds_v2.csv": lambda request: httpx.Response(200, text=body)}
+    with make_db(routes, tmp_path, token=None) as db:
+        with pytest.warns(UserWarning):
+            feeds = db.search_feeds(aoi=box(24.6, 60.1, 25.2, 60.4), country_code="FI")
+
+    (feed,) = feeds
+    assert feed.id == "mdb-20"
+    assert feed.official is True
+    assert feed.latest_dataset_url == "https://files.example.com/mdb-20/latest.zip"
+    assert feed.locations[0]["municipality"] == "Helsinki"
+
+
+def test_dataset_for_scans_all_versions(tmp_path):
+    filler = [
+        dict(
+            DATASET_RECORD,
+            id=f"mdb-1-filler-{i}",
+            service_date_range_start="2026-06-15",
+            service_date_range_end="2026-12-13",
+        )
+        for i in range(120)
+    ]
+    records = filler + [OLD_DATASET_RECORD]
+    requests = []
+
+    def datasets_endpoint(request):
+        offset = int(request.url.params["offset"])
+        limit = int(request.url.params["limit"])
+        return httpx.Response(200, json=records[offset : offset + limit])
+
+    routes = {"/v1/gtfs_feeds/mdb-1/datasets": datasets_endpoint}
+    with make_db(routes, tmp_path, requests) as db:
+        # The only dataset covering early 2025 sits past the first page.
+        assert db.dataset_for("mdb-1", "2025-03-01").id == "mdb-1-202501"
+    assert len(api_requests(requests, "/v1/gtfs_feeds/mdb-1/datasets")) == 2
+
+
+def test_token_present_skips_csv(tmp_path):
+    requests = []
+    routes = {"/v1/gtfs_feeds": [FEED_RECORD]}
+    with make_db(routes, tmp_path, requests) as db:
+        feeds = db.search_feeds(country_code="FI")
+    assert [f.id for f in feeds] == ["mdb-1"]
+    assert feeds[0].latest_dataset_url == "https://files.example.com/mdb-1/latest.zip"
+    assert not [r for r in requests if r.url.path == "/feeds_v2.csv"]
+
+
+def test_download_latest(tmp_path, monkeypatch):
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+    payload = b"PK\x03\x04 latest zip"
+    requests = []
+    routes = {
+        "/feeds_v2.csv": lambda request: httpx.Response(200, text=CSV_BODY),
+        "/mdb-10/latest.zip": lambda request: httpx.Response(200, content=payload),
+    }
+    with make_db(routes, tmp_path, requests, token=None) as db:
+        with pytest.warns(UserWarning):
+            (feed,) = db.search_feeds(country_code="FI")
+        path = db.download_latest(feed)
+
+    assert path.name == "latest.zip"
+    assert path.read_bytes() == payload
+    provenance = json.loads(path.with_suffix(".provenance.json").read_text())
+    assert provenance["feed_id"] == "mdb-10"
+    assert provenance["source_url"] == feed.latest_dataset_url
+    (download,) = [r for r in requests if r.url.path == "/mdb-10/latest.zip"]
+    assert "Authorization" not in download.headers
+
+
+def test_download_latest_without_url(tmp_path, monkeypatch):
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+    routes = {"/feeds_v2.csv": lambda request: httpx.Response(200, text=CSV_BODY)}
+    with make_db(routes, tmp_path, token=None) as db:
+        with pytest.warns(UserWarning):
+            feeds = db.search_feeds(country_code="FI", status=None)
+        old = [f for f in feeds if f.id == "mdb-11"][0]
+        with pytest.raises(DownloadError, match="latest-dataset url"):
+            db.download_latest(old)
 
 
 def test_expired_access_token_is_refreshed_once(tmp_path):

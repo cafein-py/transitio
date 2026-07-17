@@ -29,7 +29,10 @@ def as_date(value):
     if isinstance(value, datetime.date):
         return value
     if isinstance(value, str):
-        return datetime.datetime.fromisoformat(value).date()
+        try:
+            return datetime.date.fromisoformat(value[:10])
+        except ValueError:
+            return datetime.datetime.fromisoformat(value).date()
     raise TypeError(f"cannot interpret {value!r} as a date")
 
 
@@ -47,12 +50,14 @@ class Feed:
     official: bool | None
     producer_url: str | None
     license_url: str | None
+    latest_dataset_url: str | None
     locations: tuple
     raw: dict = dataclasses.field(repr=False, default_factory=dict)
 
     @classmethod
     def from_api(cls, record):
         source = record.get("source_info") or {}
+        latest = record.get("latest_dataset") or {}
         return cls(
             id=record["id"],
             provider=record.get("provider"),
@@ -60,6 +65,7 @@ class Feed:
             official=record.get("official", record.get("is_official")),
             producer_url=source.get("producer_url"),
             license_url=source.get("license_url"),
+            latest_dataset_url=latest.get("hosted_url"),
             locations=tuple(record.get("locations") or ()),
             raw=record,
         )

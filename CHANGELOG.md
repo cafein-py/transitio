@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   crate, CI for lint/tests and release wheels.
 - ``beanpicker.exceptions`` module with ``BeanpickerError``,
   ``MissingTokenError``, ``DownloadError`` and ``ExtractNotFoundError``.
+- No-token fallback for the catalog: without a refresh token,
+  ``search_feeds`` now searches the Mobility Database CSV catalogue export
+  (with a ``UserWarning``) instead of failing; ``Feed`` carries
+  ``latest_dataset_url`` and ``download_latest`` fetches the hosted latest
+  dataset zip in both modes.
 - OSM module (``beanpicker.fetch_pbf``): AOI-driven extract acquisition on
   top of pyrosm — smallest-covering-extract resolution from pyrosm's bundled
   Geofabrik index, cached download, polygon-true cropping via

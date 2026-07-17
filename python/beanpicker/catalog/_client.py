@@ -6,12 +6,15 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import time
+import warnings
 from pathlib import Path
 
 import httpx
 import platformdirs
 
+from beanpicker.catalog._csv import fetch_catalog_csv, search_csv
 from beanpicker.catalog._models import Dataset, Feed, as_date
 from beanpicker.exceptions import DownloadError, MissingTokenError
 
@@ -21,6 +24,14 @@ TOKEN_ENV_VAR = "MOBILITY_API_REFRESH_TOKEN"
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 _PAGE_SIZE = 100
 _EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _safe_id(value):
+    """Validate a catalog ID before it is used as a path component."""
+    if not value or not _SAFE_ID.match(value):
+        raise DownloadError(f"catalog id {value!r} is not safe for filesystem use")
+    return value
 
 
 def _bounds(aoi):
@@ -47,6 +58,21 @@ def _sha256(path):
     with open(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _stream_download(client, url, path):
+    """Stream a URL to ``path`` via a partial file; return the SHA-256 hex."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    partial = path.parent / (path.name + ".part")
+    with client.stream("GET", url) as response:
+        response.raise_for_status()
+        with open(partial, "wb") as handle:
+            for chunk in response.iter_bytes():
+                digest.update(chunk)
+                handle.write(chunk)
+    partial.replace(path)
     return digest.hexdigest()
 
 
@@ -128,21 +154,30 @@ class MobilityDatabase:
             response.raise_for_status()
             return response.json()
 
-    def _paginated(self, path, params, limit):
+    def _paginated(self, path, params, limit, predicate=None):
+        """Collect up to ``limit`` records matching ``predicate``, paginating
+        past non-matching records until the API is exhausted. ``limit=None``
+        fetches every record."""
         results = []
         offset = 0
-        while len(results) < limit:
+        while limit is None or len(results) < limit:
             page = dict(params)
-            page["limit"] = min(_PAGE_SIZE, limit - len(results))
+            page["limit"] = (
+                _PAGE_SIZE
+                if predicate or limit is None
+                else min(_PAGE_SIZE, limit - len(results))
+            )
             page["offset"] = offset
             batch = self._get_json(path, params=page)
             if not batch:
                 break
-            results.extend(batch)
+            results.extend(
+                record for record in batch if predicate is None or predicate(record)
+            )
             if len(batch) < page["limit"]:
                 break
             offset += len(batch)
-        return results[:limit]
+        return results if limit is None else results[:limit]
 
     def search_feeds(
         self,
@@ -178,19 +213,47 @@ class MobilityDatabase:
         enclosure : {"partially_enclosed", "completely_enclosed"}
             How feed extents must relate to the AOI bounding box.
         limit : int, default 100
-            Maximum number of feeds to return (before status filtering).
+            Maximum number of matching feeds to return.
 
         Returns
         -------
         list of Feed
+
+        Notes
+        -----
+        Without a refresh token this method falls back to the Mobility
+        Database CSV catalogue export (with a ``UserWarning``): feed
+        discovery still works, but historical dataset versions and hosted
+        validation reports need the API and therefore a token.
         """
         if enclosure not in ("partially_enclosed", "completely_enclosed"):
             raise ValueError(
                 "enclosure must be 'partially_enclosed' or 'completely_enclosed'"
             )
+        bounds = _bounds(aoi) if aoi is not None else None
+        if not self._refresh_token:
+            warnings.warn(
+                "no Mobility Database refresh token configured; falling back "
+                "to the CSV catalogue export (no historical datasets or "
+                "hosted validation reports)",
+                UserWarning,
+                stacklevel=2,
+            )
+            path = fetch_catalog_csv(self._cache_dir, self._http)
+            return search_csv(
+                path,
+                bounds=bounds,
+                country_code=country_code,
+                subdivision=subdivision,
+                municipality=municipality,
+                status=status,
+                official_only=official_only,
+                enclosure=enclosure,
+                limit=limit,
+            )
         params = {}
-        if aoi is not None:
-            minx, miny, maxx, maxy = _bounds(aoi)
+        if bounds is not None:
+            minx, miny, maxx, maxy = bounds
             params["dataset_latitudes"] = f"{miny},{maxy}"
             params["dataset_longitudes"] = f"{minx},{maxx}"
             params["bounding_filter_method"] = enclosure
@@ -202,11 +265,15 @@ class MobilityDatabase:
             params["municipality"] = municipality
         if official_only:
             params["is_official"] = True
-        records = self._paginated("/gtfs_feeds", params, limit)
-        feeds = [Feed.from_api(record) for record in records]
-        if status is not None:
-            feeds = [feed for feed in feeds if feed.status == status]
-        return feeds
+        if status is None:
+            predicate = None
+        else:
+
+            def predicate(record):
+                return record.get("status") == status
+
+        records = self._paginated("/gtfs_feeds", params, limit, predicate)
+        return [Feed.from_api(record) for record in records]
 
     def feed(self, feed_id):
         """Fetch a single feed by its catalog ID.
@@ -224,8 +291,9 @@ class MobilityDatabase:
         ----------
         feed : Feed or str
             The feed, or its catalog ID.
-        limit : int, default 100
-            Maximum number of datasets to return.
+        limit : int or None, default 100
+            Maximum number of datasets to return; ``None`` fetches every
+            catalogued version.
 
         Returns
         -------
@@ -257,7 +325,7 @@ class MobilityDatabase:
         Dataset or None
         """
         when = as_date(when)
-        for dataset in self.datasets(feed):
+        for dataset in self.datasets(feed, limit=None):
             if dataset.covers(when):
                 return dataset
         return None
@@ -284,37 +352,72 @@ class MobilityDatabase:
         if not dataset.hosted_url:
             raise DownloadError(f"dataset {dataset.id} has no hosted download url")
         target_dir = (
-            Path(directory) if directory else self._cache_dir / "gtfs" / dataset.feed_id
+            Path(directory)
+            if directory
+            else self._cache_dir / "gtfs" / _safe_id(dataset.feed_id)
         )
         target_dir.mkdir(parents=True, exist_ok=True)
-        path = target_dir / f"{dataset.id}.zip"
+        path = target_dir / f"{_safe_id(dataset.id)}.zip"
         if path.exists() and dataset.hash and _sha256(path) == dataset.hash:
             return path
-        digest = hashlib.sha256()
-        partial = path.parent / (path.name + ".part")
         # The catalog token is never sent to download hosts.
-        with self._http.stream("GET", dataset.hosted_url) as response:
-            response.raise_for_status()
-            with open(partial, "wb") as handle:
-                for chunk in response.iter_bytes():
-                    digest.update(chunk)
-                    handle.write(chunk)
-        if dataset.hash and digest.hexdigest() != dataset.hash:
-            partial.unlink()
+        digest = _stream_download(self._http, dataset.hosted_url, path)
+        if dataset.hash and digest != dataset.hash:
+            path.unlink()
             raise DownloadError(
                 f"checksum mismatch for dataset {dataset.id}: "
-                f"expected {dataset.hash}, got {digest.hexdigest()}"
+                f"expected {dataset.hash}, got {digest}"
             )
-        partial.replace(path)
         provenance = {
             "feed_id": dataset.feed_id,
             "dataset_id": dataset.id,
             "source_url": dataset.hosted_url,
-            "sha256": digest.hexdigest(),
+            "sha256": digest,
             "service_date_range": [
                 str(dataset.service_start) if dataset.service_start else None,
                 str(dataset.service_end) if dataset.service_end else None,
             ],
+            "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        path.with_suffix(".provenance.json").write_text(
+            json.dumps(provenance, indent=2)
+        )
+        return path
+
+    def download_latest(self, feed, directory=None):
+        """Download the latest hosted dataset zip of a feed.
+
+        Works without an API token: the URL comes from the catalogue entry.
+        The latest dataset is a moving target, so the file is re-downloaded
+        on every call; no upstream checksum is available, and the provenance
+        sidecar records the computed SHA-256 only. With a token,
+        :meth:`dataset_for` plus :meth:`download` give checksum-verified,
+        version-pinned downloads instead.
+
+        Parameters
+        ----------
+        feed : Feed
+        directory : str or pathlib.Path, optional
+            Target directory; defaults to the beanpicker cache.
+
+        Returns
+        -------
+        pathlib.Path
+            Path of the downloaded zip.
+        """
+        if not feed.latest_dataset_url:
+            raise DownloadError(f"feed {feed.id} has no hosted latest-dataset url")
+        target_dir = (
+            Path(directory)
+            if directory
+            else self._cache_dir / "gtfs" / _safe_id(feed.id)
+        )
+        path = target_dir / "latest.zip"
+        digest = _stream_download(self._http, feed.latest_dataset_url, path)
+        provenance = {
+            "feed_id": feed.id,
+            "source_url": feed.latest_dataset_url,
+            "sha256": digest,
             "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         path.with_suffix(".provenance.json").write_text(
