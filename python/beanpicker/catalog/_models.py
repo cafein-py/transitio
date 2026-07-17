@@ -29,7 +29,10 @@ def as_date(value):
     if isinstance(value, datetime.date):
         return value
     if isinstance(value, str):
-        return datetime.datetime.fromisoformat(value).date()
+        try:
+            return datetime.date.fromisoformat(value[:10])
+        except ValueError:
+            return datetime.datetime.fromisoformat(value).date()
     raise TypeError(f"cannot interpret {value!r} as a date")
 
 

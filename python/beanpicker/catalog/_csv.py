@@ -14,6 +14,18 @@ CSV_CATALOG_URL = "https://files.mobilitydatabase.org/feeds_v2.csv"
 
 _MAX_AGE_SECONDS = 24 * 3600
 
+# The live export schema is not verifiable from every environment, so every
+# field lookup tolerates naming variants through these alias tuples.
+_ALIASES = {
+    "country_code": ("location.country_code", "country_code"),
+    "subdivision": ("location.subdivision_name", "subdivision_name"),
+    "municipality": ("location.municipality", "municipality"),
+    "min_lat": ("location.bounding_box.minimum_latitude", "minimum_latitude"),
+    "max_lat": ("location.bounding_box.maximum_latitude", "maximum_latitude"),
+    "min_lon": ("location.bounding_box.minimum_longitude", "minimum_longitude"),
+    "max_lon": ("location.bounding_box.maximum_longitude", "maximum_longitude"),
+}
+
 
 def _first(row, *names):
     for name in names:
@@ -26,9 +38,9 @@ def _first(row, *names):
 def _feed_from_row(row):
     official = _first(row, "is_official", "official")
     location = {
-        "country_code": _first(row, "location.country_code"),
-        "subdivision_name": _first(row, "location.subdivision_name"),
-        "municipality": _first(row, "location.municipality"),
+        "country_code": _first(row, *_ALIASES["country_code"]),
+        "subdivision_name": _first(row, *_ALIASES["subdivision"]),
+        "municipality": _first(row, *_ALIASES["municipality"]),
     }
     return Feed(
         id=row["id"],
@@ -48,14 +60,16 @@ def _feed_from_row(row):
 
 
 def _row_box(row):
-    try:
-        min_lat = float(row["location.bounding_box.minimum_latitude"])
-        max_lat = float(row["location.bounding_box.maximum_latitude"])
-        min_lon = float(row["location.bounding_box.minimum_longitude"])
-        max_lon = float(row["location.bounding_box.maximum_longitude"])
-    except (KeyError, TypeError, ValueError):
-        return None
-    return box(min_lon, min_lat, max_lon, max_lat)
+    values = []
+    for key in ("min_lon", "min_lat", "max_lon", "max_lat"):
+        raw = _first(row, *_ALIASES[key])
+        if raw is None:
+            return None
+        try:
+            values.append(float(raw))
+        except ValueError:
+            return None
+    return box(*values)
 
 
 def fetch_catalog_csv(cache_dir, client, *, update=False):
@@ -87,19 +101,19 @@ def search_csv(
     feeds = []
     with open(path, newline="", encoding="utf-8-sig") as handle:
         for row in csv.DictReader(handle):
-            if row.get("data_type") != "gtfs":
+            if _first(row, "data_type") != "gtfs":
                 continue
             if country_code:
-                value = (row.get("location.country_code") or "").upper()
-                if value != country_code.upper():
+                value = _first(row, *_ALIASES["country_code"]) or ""
+                if value.upper() != country_code.upper():
                     continue
             if subdivision:
-                value = (row.get("location.subdivision_name") or "").lower()
-                if value != subdivision.lower():
+                value = _first(row, *_ALIASES["subdivision"]) or ""
+                if value.lower() != subdivision.lower():
                     continue
             if municipality:
-                value = (row.get("location.municipality") or "").lower()
-                if value != municipality.lower():
+                value = _first(row, *_ALIASES["municipality"]) or ""
+                if value.lower() != municipality.lower():
                     continue
             if aoi_box is not None:
                 feed_box = _row_box(row)

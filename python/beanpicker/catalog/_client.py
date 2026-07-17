@@ -6,6 +6,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import time
 import warnings
 from pathlib import Path
@@ -23,6 +24,14 @@ TOKEN_ENV_VAR = "MOBILITY_API_REFRESH_TOKEN"
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 _PAGE_SIZE = 100
 _EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _safe_id(value):
+    """Validate a catalog ID before it is used as a path component."""
+    if not value or not _SAFE_ID.match(value):
+        raise DownloadError(f"catalog id {value!r} is not safe for filesystem use")
+    return value
 
 
 def _bounds(aoi):
@@ -145,21 +154,30 @@ class MobilityDatabase:
             response.raise_for_status()
             return response.json()
 
-    def _paginated(self, path, params, limit):
+    def _paginated(self, path, params, limit, predicate=None):
+        """Collect up to ``limit`` records matching ``predicate``, paginating
+        past non-matching records until the API is exhausted. ``limit=None``
+        fetches every record."""
         results = []
         offset = 0
-        while len(results) < limit:
+        while limit is None or len(results) < limit:
             page = dict(params)
-            page["limit"] = min(_PAGE_SIZE, limit - len(results))
+            page["limit"] = (
+                _PAGE_SIZE
+                if predicate or limit is None
+                else min(_PAGE_SIZE, limit - len(results))
+            )
             page["offset"] = offset
             batch = self._get_json(path, params=page)
             if not batch:
                 break
-            results.extend(batch)
+            results.extend(
+                record for record in batch if predicate is None or predicate(record)
+            )
             if len(batch) < page["limit"]:
                 break
             offset += len(batch)
-        return results[:limit]
+        return results if limit is None else results[:limit]
 
     def search_feeds(
         self,
@@ -195,7 +213,7 @@ class MobilityDatabase:
         enclosure : {"partially_enclosed", "completely_enclosed"}
             How feed extents must relate to the AOI bounding box.
         limit : int, default 100
-            Maximum number of feeds to return (before status filtering).
+            Maximum number of matching feeds to return.
 
         Returns
         -------
@@ -247,11 +265,15 @@ class MobilityDatabase:
             params["municipality"] = municipality
         if official_only:
             params["is_official"] = True
-        records = self._paginated("/gtfs_feeds", params, limit)
-        feeds = [Feed.from_api(record) for record in records]
-        if status is not None:
-            feeds = [feed for feed in feeds if feed.status == status]
-        return feeds
+        if status is None:
+            predicate = None
+        else:
+
+            def predicate(record):
+                return record.get("status") == status
+
+        records = self._paginated("/gtfs_feeds", params, limit, predicate)
+        return [Feed.from_api(record) for record in records]
 
     def feed(self, feed_id):
         """Fetch a single feed by its catalog ID.
@@ -269,8 +291,9 @@ class MobilityDatabase:
         ----------
         feed : Feed or str
             The feed, or its catalog ID.
-        limit : int, default 100
-            Maximum number of datasets to return.
+        limit : int or None, default 100
+            Maximum number of datasets to return; ``None`` fetches every
+            catalogued version.
 
         Returns
         -------
@@ -302,7 +325,7 @@ class MobilityDatabase:
         Dataset or None
         """
         when = as_date(when)
-        for dataset in self.datasets(feed):
+        for dataset in self.datasets(feed, limit=None):
             if dataset.covers(when):
                 return dataset
         return None
@@ -329,10 +352,12 @@ class MobilityDatabase:
         if not dataset.hosted_url:
             raise DownloadError(f"dataset {dataset.id} has no hosted download url")
         target_dir = (
-            Path(directory) if directory else self._cache_dir / "gtfs" / dataset.feed_id
+            Path(directory)
+            if directory
+            else self._cache_dir / "gtfs" / _safe_id(dataset.feed_id)
         )
         target_dir.mkdir(parents=True, exist_ok=True)
-        path = target_dir / f"{dataset.id}.zip"
+        path = target_dir / f"{_safe_id(dataset.id)}.zip"
         if path.exists() and dataset.hash and _sha256(path) == dataset.hash:
             return path
         # The catalog token is never sent to download hosts.
@@ -383,7 +408,9 @@ class MobilityDatabase:
         if not feed.latest_dataset_url:
             raise DownloadError(f"feed {feed.id} has no hosted latest-dataset url")
         target_dir = (
-            Path(directory) if directory else self._cache_dir / "gtfs" / feed.id
+            Path(directory)
+            if directory
+            else self._cache_dir / "gtfs" / _safe_id(feed.id)
         )
         path = target_dir / "latest.zip"
         digest = _stream_download(self._http, feed.latest_dataset_url, path)

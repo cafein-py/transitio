@@ -8,7 +8,7 @@ from shapely.geometry import box
 
 from beanpicker.catalog import TOKEN_ENV_VAR, MobilityDatabase
 from beanpicker.catalog._client import _bounds
-from beanpicker.catalog._models import Dataset
+from beanpicker.catalog._models import Dataset, Feed
 from beanpicker.exceptions import DownloadError, MissingTokenError
 
 FEED_RECORD = {
@@ -163,8 +163,30 @@ def test_pagination(tmp_path):
     pages = api_requests(requests, "/v1/gtfs_feeds")
     assert [(p.url.params["offset"], p.url.params["limit"]) for p in pages] == [
         ("0", "100"),
-        ("100", "50"),
+        ("100", "100"),
     ]
+
+
+def test_search_feeds_status_filter_spans_pages(tmp_path):
+    deprecated = [
+        dict(FEED_RECORD, id=f"mdb-{i}", status="deprecated") for i in range(100)
+    ]
+    active = [dict(FEED_RECORD, id=f"mdb-{100 + i}") for i in range(3)]
+    records = deprecated + active
+    requests = []
+
+    def feeds_endpoint(request):
+        offset = int(request.url.params["offset"])
+        limit = int(request.url.params["limit"])
+        return httpx.Response(200, json=records[offset : offset + limit])
+
+    routes = {"/v1/gtfs_feeds": feeds_endpoint}
+    with make_db(routes, tmp_path, requests) as db:
+        feeds = db.search_feeds(country_code="FI", limit=2)
+
+    # All page-1 records are deprecated; pagination must continue to page 2.
+    assert [f.id for f in feeds] == ["mdb-100", "mdb-101"]
+    assert len(api_requests(requests, "/v1/gtfs_feeds")) == 2
 
 
 def test_datasets_sorted_newest_first(tmp_path):
@@ -187,6 +209,23 @@ def test_dataset_for_rejects_non_dates(tmp_path):
     with make_db({}, tmp_path) as db:
         with pytest.raises(TypeError):
             db.dataset_for("mdb-1", 20260901)
+
+
+def test_as_date_accepts_zulu_datetime_strings():
+    from beanpicker.catalog._models import as_date
+
+    assert as_date("2026-09-01T08:00:00Z") == datetime.date(2026, 9, 1)
+    assert as_date("2026-09-01") == datetime.date(2026, 9, 1)
+
+
+def test_download_rejects_unsafe_ids(tmp_path):
+    with make_db({}, tmp_path) as db:
+        bad_dataset = Dataset.from_api(dict(DATASET_RECORD, id="../evil"))
+        with pytest.raises(DownloadError, match="not safe"):
+            db.download(bad_dataset)
+        bad_feed = Feed.from_api(dict(FEED_RECORD, id="../evil"))
+        with pytest.raises(DownloadError, match="not safe"):
+            db.download_latest(bad_feed)
 
 
 def test_download_verifies_checksum_and_caches(tmp_path):
@@ -298,6 +337,57 @@ def test_csv_fallback_filters_and_cache(tmp_path, monkeypatch):
     assert [f.id for f in both_statuses] == ["mdb-10", "mdb-11"]
     # The CSV itself is fetched once and cached.
     assert len(requests) == 1
+
+
+def test_csv_fallback_tolerates_alternate_headers(tmp_path, monkeypatch):
+    monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
+    header = (
+        "id,data_type,status,official,provider,"
+        "country_code,subdivision_name,municipality,"
+        "minimum_latitude,maximum_latitude,minimum_longitude,maximum_longitude,"
+        "urls.direct_download_url,urls.latest_url,urls.license_url"
+    )
+    row = (
+        "mdb-20,gtfs,active,True,HSL,FI,Uusimaa,Helsinki,59.9,60.6,24.2,25.6,"
+        "https://example.com/hsl.zip,https://files.example.com/mdb-20/latest.zip,"
+        "https://example.com/license"
+    )
+    body = f"{header}\n{row}\n"
+    routes = {"/feeds_v2.csv": lambda request: httpx.Response(200, text=body)}
+    with make_db(routes, tmp_path, token=None) as db:
+        with pytest.warns(UserWarning):
+            feeds = db.search_feeds(aoi=box(24.6, 60.1, 25.2, 60.4), country_code="FI")
+
+    (feed,) = feeds
+    assert feed.id == "mdb-20"
+    assert feed.official is True
+    assert feed.latest_dataset_url == "https://files.example.com/mdb-20/latest.zip"
+    assert feed.locations[0]["municipality"] == "Helsinki"
+
+
+def test_dataset_for_scans_all_versions(tmp_path):
+    filler = [
+        dict(
+            DATASET_RECORD,
+            id=f"mdb-1-filler-{i}",
+            service_date_range_start="2026-06-15",
+            service_date_range_end="2026-12-13",
+        )
+        for i in range(120)
+    ]
+    records = filler + [OLD_DATASET_RECORD]
+    requests = []
+
+    def datasets_endpoint(request):
+        offset = int(request.url.params["offset"])
+        limit = int(request.url.params["limit"])
+        return httpx.Response(200, json=records[offset : offset + limit])
+
+    routes = {"/v1/gtfs_feeds/mdb-1/datasets": datasets_endpoint}
+    with make_db(routes, tmp_path, requests) as db:
+        # The only dataset covering early 2025 sits past the first page.
+        assert db.dataset_for("mdb-1", "2025-03-01").id == "mdb-1-202501"
+    assert len(api_requests(requests, "/v1/gtfs_feeds/mdb-1/datasets")) == 2
 
 
 def test_token_present_skips_csv(tmp_path):
