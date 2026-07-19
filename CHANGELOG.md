@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+
+- Renamed the project from ``beanpicker`` to ``transitio`` ahead of the
+  first release: the Python package, the Rust crates, the
+  ``TRANSITIO_REQUIRE_TEST_DATA`` test gate, the platform cache directory
+  and the ``TransitioError`` exception base all follow the new name.
+
 ### Added
 
 - Sphinx documentation site (``docs/``, sphinx-book-theme): landing page,
@@ -14,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the public surface; ``.readthedocs.yml`` builds it on Read the Docs with
   the compiled package installed.
 
-- Benchmark suite: ``beanpicker.report.parity_summary`` buckets a merged
+- Benchmark suite: ``transitio.report.parity_summary`` buckets a merged
   report's notice codes into agreeing, count-disagreeing, local-only and
   canonical-only sets, and ``scripts/benchmark_validator.py`` times
   ``validate_feed`` over a corpus of feed zips and prints the parity
@@ -26,7 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (keyword arguments pass through to ``TransportNetwork.from_gtfs``), and
   ``to_pyrosm()`` opens the extract as a ``pyrosm.OSM`` reader.
 
-- One-call pipeline (``beanpicker.fetch``): resolves the OSM extract for an
+- One-call pipeline (``transitio.fetch``): resolves the OSM extract for an
   AOI, discovers every overlapping GTFS feed (ordered by the documented
   preference: official, active, most spatially specific), selects the
   dataset version covering a requested service day (or the latest
@@ -40,7 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a ``FetchResult``. Per-feed failures are recorded as skips, never
   aborting the remaining feeds.
 
-- Feed cropping (``beanpicker.crop_feed``): spatial cropping to an AOI
+- Feed cropping (``transitio.crop_feed``): spatial cropping to an AOI
   bounding box (trips serving the area with full stop sequences, or
   strictly inside with ``full_trips_only``) and temporal cropping to a
   service-date window, cascading stops, routes, shapes, calendars,
@@ -49,7 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   untouched. Same fail-closed budget, symlink and atomic-write behavior
   as repair.
 
-- Feed repair (``beanpicker.repair_feed``) under the gtfstidy contract:
+- Feed repair (``transitio.repair_feed``) under the gtfstidy contract:
   fixable optional fields reset to spec defaults, dangling optional
   references cleared in place, entities with unfixable errors dropped with
   cascading removals to referential consistency, the repaired feed
@@ -60,11 +67,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Real-feed integration harness: ``scripts/fetch_test_data.py`` downloads
   the r5py Helsinki sample data (GTFS + OSM extract, pinned by release tag
   and SHA-256, resume-capable) into the gitignored ``tests/data/``;
-  session fixtures gate on ``BEANPICKER_REQUIRE_TEST_DATA``; integration
+  session fixtures gate on ``TRANSITIO_REQUIRE_TEST_DATA``; integration
   tests validate the production Helsinki feed end-to-end and render its
   merged report. CI caches and fetches the datasets.
 
-- Report module (``beanpicker.report``): ``build_report`` groups local
+- Report module (``transitio.report``): ``build_report`` groups local
   notices by code in the canonical grouped convention and merges them with
   a hosted canonical-validator report (per-code ``source`` local/hosted/
   both), embeds the provenance block, computed service window and row
@@ -91,7 +98,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   columns, and cross-table ``foreign_key_violation`` checks — all under
   canonical notice codes, with the same per-file severity-aware notice
   sampling as the structural tier.
-- Rust GTFS core foundation: the ``beanpicker-gtfs`` crate parses a feed zip
+- Rust GTFS core foundation: the ``transitio-gtfs`` crate parses a feed zip
   into raw tables while collecting notices (never failing hard on data
   defects), covering the structural rule tier — file presence including the
   calendar pair, column shape, row shape, primary-key uniqueness, nested,
@@ -101,24 +108,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   violations reported as notices, not aborts), duplicate archive entries
   detected via a direct central-directory walk, and the GIL released for
   the whole scan.
-  ``beanpicker.validate_feed(path)`` exposes the flat notice report; the
+  ``transitio.validate_feed(path)`` exposes the flat notice report; the
   canonical grouped report rendering lands with the report module.
 
-- Repository scaffold: maturin build with a stub ``beanpicker._core`` Rust
+- Repository scaffold: maturin build with a stub ``transitio._core`` Rust
   crate, CI for lint/tests and release wheels.
-- ``beanpicker.exceptions`` module with ``BeanpickerError``,
+- ``transitio.exceptions`` module with ``TransitioError``,
   ``MissingTokenError``, ``DownloadError`` and ``ExtractNotFoundError``.
 - No-token fallback for the catalog: without a refresh token,
   ``search_feeds`` now searches the Mobility Database CSV catalogue export
   (with a ``UserWarning``) instead of failing; ``Feed`` carries
   ``latest_dataset_url`` and ``download_latest`` fetches the hosted latest
   dataset zip in both modes.
-- OSM module (``beanpicker.fetch_pbf``): AOI-driven extract acquisition on
+- OSM module (``transitio.fetch_pbf``): AOI-driven extract acquisition on
   top of pyrosm — smallest-covering-extract resolution from pyrosm's bundled
   Geofabrik index, cached download, polygon-true cropping via
   ``pyrosm.OSM(...).to_pbf``, place-name AOIs via Nominatim geocoding, and a
   provenance sidecar per file.
-- Mobility Database catalog client (``beanpicker.MobilityDatabase``):
+- Mobility Database catalog client (``transitio.MobilityDatabase``):
   token-refresh authentication, feed search by AOI bounding box, country,
   subdivision and municipality, historical dataset listing with
   date-coverage selection, cached checksum-verified dataset download with a

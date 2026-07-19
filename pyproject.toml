@@ -3,7 +3,7 @@ requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"
 
 [project]
-name = "beanpicker"
+name = "transitio"
 description = "AOI-driven OSM and GTFS acquisition, validation and repair — companion to pyrosm and cafein"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -30,13 +30,13 @@ classifiers = [
 dynamic = ["version"]
 
 [tool.maturin]
-manifest-path = "crates/beanpicker-py/Cargo.toml"
+manifest-path = "crates/transitio-py/Cargo.toml"
 python-source = "python"
-module-name = "beanpicker._core"
+module-name = "transitio._core"
 include = [{ path = "LICENSE", format = "sdist" }]
 
 [tool.black]
-include = '(python/beanpicker|tests)/.*\.py$'
+include = '(python/transitio|tests)/.*\.py$'
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

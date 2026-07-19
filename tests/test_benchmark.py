@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("beanpicker._core")
+pytest.importorskip("transitio._core")
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "benchmark_validator.py"

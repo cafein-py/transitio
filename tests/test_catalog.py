@@ -6,10 +6,10 @@ import httpx
 import pytest
 from shapely.geometry import box
 
-from beanpicker.catalog import TOKEN_ENV_VAR, MobilityDatabase
-from beanpicker.catalog._client import _bounds
-from beanpicker.catalog._models import Dataset, Feed
-from beanpicker.exceptions import DownloadError, MissingTokenError
+from transitio.catalog import TOKEN_ENV_VAR, MobilityDatabase
+from transitio.catalog._client import _bounds
+from transitio.catalog._models import Dataset, Feed
+from transitio.exceptions import DownloadError, MissingTokenError
 
 FEED_RECORD = {
     "id": "mdb-1",
@@ -212,7 +212,7 @@ def test_dataset_for_rejects_non_dates(tmp_path):
 
 
 def test_as_date_accepts_zulu_datetime_strings():
-    from beanpicker.catalog._models import as_date
+    from transitio.catalog._models import as_date
 
     assert as_date("2026-09-01T08:00:00Z") == datetime.date(2026, 9, 1)
     assert as_date("2026-09-01") == datetime.date(2026, 9, 1)

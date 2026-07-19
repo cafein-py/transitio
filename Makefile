@@ -8,11 +8,11 @@ test:
 	pytest
 
 lint:
-	black --check python/beanpicker tests
-	flake8 python/beanpicker tests
+	black --check python/transitio tests
+	flake8 python/transitio tests
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
 
 fmt:
-	black python/beanpicker tests
+	black python/transitio tests
 	cargo fmt --all

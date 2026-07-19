@@ -4,7 +4,7 @@
 
 The datasets are the r5py sample data for the Helsinki region
 (https://github.com/r5py/r5py.sampledata.helsinki), pinned by release tag
-and SHA-256 so that beanpicker, cafein and r5py test against
+and SHA-256 so that transitio, cafein and r5py test against
 byte-identical input files.
 """
 

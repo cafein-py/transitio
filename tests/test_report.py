@@ -2,9 +2,9 @@ import json
 
 import pytest
 
-pytest.importorskip("beanpicker._core")
+pytest.importorskip("transitio._core")
 
-from beanpicker.report import (  # noqa: E402
+from transitio.report import (  # noqa: E402
     build_report,
     parity_summary,
     render_html,

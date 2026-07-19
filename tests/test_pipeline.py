@@ -3,11 +3,11 @@ import zipfile
 import httpx
 import pytest
 
-pytest.importorskip("beanpicker._core")
+pytest.importorskip("transitio._core")
 
-import beanpicker.catalog  # noqa: E402
-import beanpicker.osm  # noqa: E402
-from beanpicker.pipeline import fetch  # noqa: E402
+import transitio.catalog  # noqa: E402
+import transitio.osm  # noqa: E402
+from transitio.pipeline import fetch  # noqa: E402
 
 GTFS = {
     "agency.txt": (
@@ -61,19 +61,19 @@ def pipeline_env(tmp_path, monkeypatch):
 
     monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
     transport = httpx.MockTransport(handler)
-    original = beanpicker.catalog.MobilityDatabase
+    original = transitio.catalog.MobilityDatabase
 
     def patched(refresh_token=None, **kwargs):
         kwargs["transport"] = transport
         kwargs.setdefault("cache_dir", tmp_path)
         return original(refresh_token, **kwargs)
 
-    monkeypatch.setattr("beanpicker.catalog.MobilityDatabase", patched)
+    monkeypatch.setattr("transitio.catalog.MobilityDatabase", patched)
 
     fake_pbf = tmp_path / "aoi.osm.pbf"
     fake_pbf.write_bytes(b"\x00fake")
-    monkeypatch.setattr("beanpicker.osm._fetch.fetch_pbf", lambda *a, **k: fake_pbf)
-    monkeypatch.setattr("beanpicker.osm.fetch_pbf", lambda *a, **k: fake_pbf)
+    monkeypatch.setattr("transitio.osm._fetch.fetch_pbf", lambda *a, **k: fake_pbf)
+    monkeypatch.setattr("transitio.osm.fetch_pbf", lambda *a, **k: fake_pbf)
     return tmp_path, fake_pbf
 
 
@@ -146,7 +146,7 @@ def test_fetch_place_name_aoi(pipeline_env, monkeypatch):
 
     tmp_path, fake_pbf = pipeline_env
     monkeypatch.setattr(
-        "beanpicker.osm._fetch._as_geometry",
+        "transitio.osm._fetch._as_geometry",
         lambda aoi: box(24.6, 60.1, 25.2, 60.4),
     )
     with pytest.warns(UserWarning):
@@ -170,7 +170,7 @@ def test_fetch_skips_day_outside_service_window(pipeline_env):
 
 
 def test_feed_modes_undeterminable(tmp_path):
-    from beanpicker.pipeline._fetch import _feed_modes
+    from transitio.pipeline._fetch import _feed_modes
 
     not_a_zip = tmp_path / "feed.zip"
     not_a_zip.write_bytes(b"not a zip archive")
@@ -183,7 +183,7 @@ def test_feed_modes_undeterminable(tmp_path):
 
 
 def test_mode_type_extended_blocks():
-    from beanpicker.pipeline._fetch import _MODE_TYPES
+    from transitio.pipeline._fetch import _MODE_TYPES
 
     assert 300 in _MODE_TYPES["rail"]
     assert 100 in _MODE_TYPES["rail"]
@@ -194,8 +194,8 @@ def test_mode_type_extended_blocks():
 
 
 def test_rank_prefers_official_active_specific():
-    from beanpicker.catalog import Feed
-    from beanpicker.pipeline._fetch import _rank
+    from transitio.catalog import Feed
+    from transitio.pipeline._fetch import _rank
 
     def make(feed_id, official, status, box_deg=None):
         raw = {}
@@ -242,7 +242,7 @@ def test_to_cafein_hands_feeds_and_pbf(tmp_path, monkeypatch):
     import sys
     import types
 
-    from beanpicker.pipeline import FetchResult
+    from transitio.pipeline import FetchResult
 
     calls = {}
 
@@ -274,7 +274,7 @@ def test_to_cafein_without_feeds_or_cafein(tmp_path, monkeypatch):
     import builtins
     import sys
 
-    from beanpicker.pipeline import FetchResult
+    from transitio.pipeline import FetchResult
 
     empty = FetchResult(
         osm_pbf=tmp_path / "aoi.osm.pbf", feeds=[], reports=[], repairs=[], skipped=[]
@@ -303,7 +303,7 @@ def test_to_cafein_without_feeds_or_cafein(tmp_path, monkeypatch):
 
 
 def test_to_pyrosm_opens_extract(tmp_path, monkeypatch):
-    from beanpicker.pipeline import FetchResult
+    from transitio.pipeline import FetchResult
 
     opened = {}
 

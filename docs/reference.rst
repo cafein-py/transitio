@@ -3,15 +3,15 @@
 API reference
 =============
 
-:func:`~beanpicker.fetch` is the main entry point: it runs the whole
+:func:`~transitio.fetch` is the main entry point: it runs the whole
 acquisition pipeline for an area of interest and returns a
-:class:`~beanpicker.FetchResult`. Every stage is also available on its own —
+:class:`~transitio.FetchResult`. Every stage is also available on its own —
 the catalog client, the OSM fetcher, and the validate/repair/crop functions.
 
 The pipeline
 ------------
 
-.. currentmodule:: beanpicker
+.. currentmodule:: transitio
 
 .. autosummary::
    :toctree: api/
@@ -60,7 +60,7 @@ Validation, repair and cropping
 Reporting
 ---------
 
-.. currentmodule:: beanpicker.report
+.. currentmodule:: transitio.report
 
 .. autosummary::
    :toctree: api/
@@ -73,12 +73,12 @@ Reporting
 Exceptions
 ----------
 
-.. currentmodule:: beanpicker.exceptions
+.. currentmodule:: transitio.exceptions
 
 .. autosummary::
    :toctree: api/
 
-   BeanpickerError
+   TransitioError
    MissingTokenError
    DownloadError
    ExtractNotFoundError

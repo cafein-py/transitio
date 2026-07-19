@@ -8,14 +8,14 @@ from importlib.metadata import version as _package_version
 
 current_year = datetime.now().year
 
-project = "beanpicker"
-copyright = f"2026-{current_year}, Henrikki Tenkanen + beanpicker contributors"
-author = "Henrikki Tenkanen + beanpicker contributors"
+project = "transitio"
+copyright = f"2026-{current_year}, Henrikki Tenkanen + transitio contributors"
+author = "Henrikki Tenkanen + transitio contributors"
 
-# autodoc imports the installed beanpicker (Read the Docs runs
+# autodoc imports the installed transitio (Read the Docs runs
 # `pip install .`), so the compiled `_core` is present and the version stays
 # single-sourced from the Cargo workspace via the package metadata.
-release = _package_version("beanpicker")
+release = _package_version("transitio")
 version = ".".join(release.split(".")[:2])
 
 # -- General configuration ---------------------------------------------------
@@ -46,7 +46,7 @@ html_theme = "sphinx_book_theme"
 html_title = ""
 
 html_theme_options = {
-    "repository_url": "https://github.com/cafein-py/beanpicker/",
+    "repository_url": "https://github.com/cafein-py/transitio/",
     "repository_branch": "main",
     "path_to_docs": "docs/",
     "use_edit_page_button": True,

@@ -2,37 +2,37 @@ import pytest
 
 
 def test_public_names_importable():
-    import beanpicker
+    import transitio
 
-    assert beanpicker.MobilityDatabase is not None
-    assert beanpicker.Feed is not None
-    assert beanpicker.Dataset is not None
-    assert beanpicker.fetch is beanpicker.pipeline.fetch
-    assert beanpicker.FetchResult is beanpicker.pipeline.FetchResult
+    assert transitio.MobilityDatabase is not None
+    assert transitio.Feed is not None
+    assert transitio.Dataset is not None
+    assert transitio.fetch is transitio.pipeline.fetch
+    assert transitio.FetchResult is transitio.pipeline.FetchResult
 
 
 def test_exceptions_hierarchy():
-    import beanpicker
-    from beanpicker.exceptions import (
-        BeanpickerError,
+    import transitio
+    from transitio.exceptions import (
+        TransitioError,
         DownloadError,
         MissingTokenError,
     )
 
-    assert issubclass(MissingTokenError, BeanpickerError)
-    assert issubclass(DownloadError, BeanpickerError)
-    assert beanpicker.exceptions.BeanpickerError is BeanpickerError
+    assert issubclass(MissingTokenError, TransitioError)
+    assert issubclass(DownloadError, TransitioError)
+    assert transitio.exceptions.TransitioError is TransitioError
 
 
 def test_unknown_attribute():
-    import beanpicker
+    import transitio
 
     with pytest.raises(AttributeError):
-        beanpicker.does_not_exist
+        transitio.does_not_exist
 
 
 def test_version():
-    pytest.importorskip("beanpicker._core")
-    import beanpicker
+    pytest.importorskip("transitio._core")
+    import transitio
 
-    assert beanpicker.__version__
+    assert transitio.__version__

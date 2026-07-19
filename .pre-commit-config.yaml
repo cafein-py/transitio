@@ -3,12 +3,12 @@ repos:
     rev: 25.1.0
     hooks:
       - id: black
-        files: ^(python/beanpicker|tests)/
+        files: ^(python/transitio|tests)/
   - repo: https://github.com/pycqa/flake8
     rev: 7.2.0
     hooks:
       - id: flake8
-        files: ^(python/beanpicker|tests)/
+        files: ^(python/transitio|tests)/
   - repo: local
     hooks:
       - id: cargo-fmt

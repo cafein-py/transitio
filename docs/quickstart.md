@@ -2,13 +2,13 @@
 
 ## The one-call pipeline
 
-`beanpicker.fetch` turns an area of interest into everything a routing tool
+`transitio.fetch` turns an area of interest into everything a routing tool
 needs — a cropped OpenStreetMap extract plus validated GTFS feeds:
 
 ```python
-import beanpicker
+import transitio
 
-result = beanpicker.fetch("Helsinki")
+result = transitio.fetch("Helsinki")
 ```
 
 The area of interest can be a place name (geocoded via Nominatim), a shapely
@@ -35,7 +35,7 @@ result.skipped     # [(feed id, reason), ...]
 Useful options:
 
 ```python
-result = beanpicker.fetch(
+result = transitio.fetch(
     "Helsinki",
     when="2026-09-01",        # feeds must serve this day
     modes=["rail", "tram"],   # keep only feeds serving these modes
@@ -59,23 +59,23 @@ works as expected.
 Every pipeline stage is a standalone function:
 
 ```python
-db = beanpicker.MobilityDatabase()                 # catalog client
+db = transitio.MobilityDatabase()                 # catalog client
 
 feeds = db.search_feeds(aoi=(24.6, 60.1, 25.2, 60.4))
 dataset = db.dataset_for(feeds[0], when="2026-09-01")
 path = db.download(dataset)                        # cached, checksum-verified
 hosted = db.validation_report(dataset)             # canonical-validator report
 
-pbf = beanpicker.fetch_pbf((24.6, 60.1, 25.2, 60.4))
+pbf = transitio.fetch_pbf((24.6, 60.1, 25.2, 60.4))
 
-validation = beanpicker.validate_feed(path)        # canonical notice codes
-beanpicker.repair_feed(path, "repaired.zip")       # logged, conservative
-beanpicker.crop_feed(path, "cropped.zip", aoi=(24.6, 60.1, 25.2, 60.4))
+validation = transitio.validate_feed(path)        # canonical notice codes
+transitio.repair_feed(path, "repaired.zip")       # logged, conservative
+transitio.crop_feed(path, "cropped.zip", aoi=(24.6, 60.1, 25.2, 60.4))
 
-report = beanpicker.report.build_report(
+report = transitio.report.build_report(
     validation, hosted=hosted
 )
-print(beanpicker.report.render_markdown(report))
+print(transitio.report.render_markdown(report))
 ```
 
 ## Reading the validation report

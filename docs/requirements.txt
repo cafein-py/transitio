@@ -1,6 +1,6 @@
 # Documentation toolchain for Read the Docs (Sphinx + MyST Markdown).
 #
-# beanpicker itself is installed (and compiled) by the Read the Docs build via
+# transitio itself is installed (and compiled) by the Read the Docs build via
 # `.readthedocs.yml` (`python.install` runs `pip install .`), so autodoc
 # imports the real package. Only the Sphinx toolchain is listed here.
 

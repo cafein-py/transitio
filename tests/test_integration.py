@@ -2,14 +2,14 @@ import os
 
 import pytest
 
-if os.environ.get("BEANPICKER_REQUIRE_TEST_DATA"):
+if os.environ.get("TRANSITIO_REQUIRE_TEST_DATA"):
     # In CI a missing native extension is a build failure, not a skip.
-    import beanpicker._core  # noqa: F401
+    import transitio._core  # noqa: F401
 else:
-    pytest.importorskip("beanpicker._core")
+    pytest.importorskip("transitio._core")
 
-from beanpicker.report import build_report, render_html, render_markdown  # noqa: E402
-from beanpicker.validate import validate_feed  # noqa: E402
+from transitio.report import build_report, render_html, render_markdown  # noqa: E402
+from transitio.validate import validate_feed  # noqa: E402
 
 # The sample feed's canonical query day, shared with cafein and r5py.
 REFERENCE_DATE = "20220222"

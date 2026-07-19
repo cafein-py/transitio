@@ -13,7 +13,7 @@ def _data_path(name):
             f"{name} missing; run scripts/fetch_test_data.py to download "
             "the shared test datasets"
         )
-        if os.environ.get("BEANPICKER_REQUIRE_TEST_DATA"):
+        if os.environ.get("TRANSITIO_REQUIRE_TEST_DATA"):
             pytest.fail(message)
         pytest.skip(message)
     return path

@@ -1,6 +1,6 @@
-"""Benchmark beanpicker's validator against canonical reports.
+"""Benchmark transitio's validator against canonical reports.
 
-Runs ``beanpicker.validate_feed`` over a corpus of feed zips, timing the
+Runs ``transitio.validate_feed`` over a corpus of feed zips, timing the
 scan, and compares the notices against a canonical GTFS validator report
 (the hosted Mobility Database report, or a local canonical-validator
 run) when one sits next to a feed as ``<feed stem>.canonical.json``.
@@ -8,7 +8,7 @@ run) when one sits next to a feed as ``<feed stem>.canonical.json``.
 The project's reference corpus: the pinned Helsinki sample from
 ``scripts/fetch_test_data.py`` (``tests/data/helsinki_gtfs.zip``), a
 national aggregate and a known-broken feed obtained via
-``beanpicker.fetch`` or the catalog client; hosted reports downloaded
+``transitio.fetch`` or the catalog client; hosted reports downloaded
 through ``MobilityDatabase.validation_report`` serve as the canonical
 side. A sidecar may carry a top-level ``feedSha256`` naming the feed
 zip's checksum; when present the pairing is verified (mismatch aborts),
@@ -43,8 +43,8 @@ def benchmark_feed(path, *, runs=3, max_notices=1_000_000):
     the feed's actual checksum (mismatch aborts); without the key the
     filename pairing is reported as unverified.
     """
-    from beanpicker.report import build_report, parity_summary
-    from beanpicker.validate import validate_feed
+    from transitio.report import build_report, parity_summary
+    from transitio.validate import validate_feed
 
     if runs < 1:
         raise ValueError("runs must be >= 1")

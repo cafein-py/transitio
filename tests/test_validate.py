@@ -3,9 +3,9 @@ import zipfile
 
 import pytest
 
-pytest.importorskip("beanpicker._core")
+pytest.importorskip("transitio._core")
 
-from beanpicker.validate import validate_feed  # noqa: E402
+from transitio.validate import validate_feed  # noqa: E402
 
 MINIMAL = {
     "agency.txt": (

@@ -2,7 +2,7 @@
 branch = True
 parallel = True
 source =
-    beanpicker
+    transitio
     tests
 
 [report]

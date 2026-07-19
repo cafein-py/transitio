@@ -10,7 +10,7 @@ build:
 python:
     install:
         - requirements: docs/requirements.txt
-        # Install (and compile) beanpicker itself so autodoc imports the real
+        # Install (and compile) transitio itself so autodoc imports the real
         # package instead of relying on mocks. Build deps come from
         # pyproject.toml's build-system requires.
         - method: pip

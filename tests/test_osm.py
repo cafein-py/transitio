@@ -4,9 +4,9 @@ import httpx
 import pytest
 from shapely.geometry import box
 
-from beanpicker.exceptions import ExtractNotFoundError
-from beanpicker.osm import fetch_pbf
-from beanpicker.osm._fetch import _as_geometry, _crop_filename
+from transitio.exceptions import ExtractNotFoundError
+from transitio.osm import fetch_pbf
+from transitio.osm._fetch import _as_geometry, _crop_filename
 
 pytest.importorskip("pyrosm")
 

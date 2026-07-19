@@ -1,21 +1,22 @@
-# beanpicker
+# transitio
 
 AOI-driven OSM and GTFS acquisition, validation and repair — companion to
-[pyrosm](https://github.com/HTenkanen/pyrosm) and cafein. beanpicker selects
-and prepares the raw beans (OSM and GTFS data) that cafein brews into routing
-results.
+[pyrosm](https://github.com/HTenkanen/pyrosm) and cafein. transitio moves the
+raw ingredients of routing — OSM extracts and GTFS timetables — from the open
+data ecosystem to your area of interest, validated and repaired, ready for
+cafein to brew into routing results.
 
 **Status: early development.** Acquisition (Mobility Database catalog + OSM
 extracts), GTFS validation, repair and cropping are in place, tied together by
-the one-call `beanpicker.fetch` pipeline.
+the one-call `transitio.fetch` pipeline.
 
 ## Quick example
 
 ```python
-import beanpicker
+import transitio
 
 # One call: OSM extract + validated GTFS feeds for an area of interest.
-result = beanpicker.fetch(helsinki_polygon)        # any shapely geometry,
+result = transitio.fetch(helsinki_polygon)        # any shapely geometry,
                                                    # bbox tuple or place name
 result.osm_pbf     # cropped OSM extract (path)
 result.feeds       # downloaded, cropped and validated GTFS feeds (paths)
@@ -39,22 +40,22 @@ one, the latest hosted zips are fetched as-is — unverified moving targets.
 Each pipeline stage is available on its own:
 
 ```python
-db = beanpicker.MobilityDatabase()
+db = transitio.MobilityDatabase()
 
 feeds = db.search_feeds(aoi=helsinki_polygon)
 dataset = db.dataset_for(feeds[0], when="2026-09-01")
 path = db.download(dataset)                        # cached, checksum-verified
 report = db.validation_report(dataset)             # hosted canonical-validator report
 
-pbf = beanpicker.fetch_pbf(helsinki_polygon)       # cropped OSM extract
-validation = beanpicker.validate_feed(path)        # canonical-code notices
-beanpicker.repair_feed(path, "repaired.zip")       # gtfstidy-contract repair
-beanpicker.crop_feed(path, "cropped.zip", aoi=helsinki_polygon)
+pbf = transitio.fetch_pbf(helsinki_polygon)       # cropped OSM extract
+validation = transitio.validate_feed(path)        # canonical-code notices
+transitio.repair_feed(path, "repaired.zip")       # gtfstidy-contract repair
+transitio.crop_feed(path, "cropped.zip", aoi=helsinki_polygon)
 ```
 
 ## Documentation
 
-The Sphinx site lives in `docs/`. Building it needs beanpicker itself
+The Sphinx site lives in `docs/`. Building it needs transitio itself
 installed (autodoc imports the real package) plus the Sphinx toolchain:
 
 ```

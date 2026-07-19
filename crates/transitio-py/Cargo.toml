@@ -1,0 +1,15 @@
+[package]
+name = "transitio-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+transitio-gtfs = { path = "../transitio-gtfs" }
+chrono = { workspace = true }
+pyo3 = { workspace = true }
+serde_json = { workspace = true }

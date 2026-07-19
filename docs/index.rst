@@ -1,21 +1,22 @@
-beanpicker -- AOI-driven OSM and GTFS acquisition
+transitio -- AOI-driven OSM and GTFS acquisition
 ==================================================
 
-**beanpicker** is a Python library that selects and prepares the raw
+**transitio** is a Python library that selects and prepares the raw
 ingredients of public-transport routing -- `OpenStreetMap
 <https://www.openstreetmap.org/>`__ extracts and `GTFS <https://gtfs.org/>`__
 timetables -- for an arbitrary **area of interest**. It is the companion to
 `pyrosm <https://pyrosm.readthedocs.io/>`__ and
-`cafein <https://github.com/cafein-py/cafein>`__: beanpicker picks and prepares
-the raw beans that cafein brews into routing results.
+`cafein <https://github.com/cafein-py/cafein>`__: transitio moves the raw
+ingredients of routing from the open data ecosystem to your area of interest,
+ready for cafein to brew into routing results.
 
 One call does the whole run:
 
 .. code-block:: python
 
-    import beanpicker
+    import transitio
 
-    result = beanpicker.fetch("Helsinki")   # geometry, bbox tuple or place name
+    result = transitio.fetch("Helsinki")   # geometry, bbox tuple or place name
 
     result.osm_pbf     # cropped OSM extract (path)
     result.feeds       # downloaded, cropped and validated GTFS feeds (paths)
@@ -25,7 +26,7 @@ One call does the whole run:
     net = result.to_cafein()   # routable cafein.TransportNetwork
     osm = result.to_pyrosm()   # pyrosm.OSM reader over the extract
 
-What can I do with beanpicker?
+What can I do with transitio?
 ------------------------------
 
 - discover the GTFS feeds overlapping an area through the `Mobility Database
@@ -53,7 +54,7 @@ so a matrix computed downstream stays citable to the dataset version.
 License
 -------
 
-beanpicker is licensed under the MIT license. Timetable and street data are
+transitio is licensed under the MIT license. Timetable and street data are
 © their respective providers; all `OpenStreetMap
 <https://www.openstreetmap.org>`__ data is licensed under the `Open Database
 License <https://www.openstreetmap.org/copyright>`__.

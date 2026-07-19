@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/beanpicker-gtfs", "crates/beanpicker-py"]
+members = ["crates/transitio-gtfs", "crates/transitio-py"]
 
 [workspace.package]
 version = "0.1.0"

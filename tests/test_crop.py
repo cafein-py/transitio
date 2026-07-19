@@ -2,10 +2,10 @@ import zipfile
 
 import pytest
 
-pytest.importorskip("beanpicker._core")
+pytest.importorskip("transitio._core")
 
-from beanpicker.gtfs import crop_feed  # noqa: E402
-from beanpicker.validate import validate_feed  # noqa: E402
+from transitio.gtfs import crop_feed  # noqa: E402
+from transitio.validate import validate_feed  # noqa: E402
 
 FEED = {
     "agency.txt": (
