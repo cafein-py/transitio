@@ -17,13 +17,18 @@ def validate_feed(
 ):
     """Validate a GTFS zip and return the collected notices.
 
-    The current rule set is the structural tier of beanpicker's
-    routing-oriented catalogue: file presence, column shape, row shape and
-    primary-key uniqueness. Field-format and semantic rules are added
-    incrementally. Notice codes and severities follow the canonical
-    gtfs-validator naming; the canonical *grouped report* rendering that
-    merges these notices with hosted validation reports is provided by the
-    upcoming report module, not by this function's flat notice list.
+    The current rule set covers the structural tier (file presence, column
+    shape, row shape, primary-key uniqueness) plus the field-format and
+    referential-integrity tiers of beanpicker's routing-oriented catalogue:
+    date/time/number/enum/timezone formats, required and conditionally
+    required fields, coordinate sanity, calendar and frequency ranges,
+    agency consistency, parent-station relations and cross-table foreign
+    keys. Semantic rules (stop-time progression, calendar coverage, shapes,
+    frequency overlaps) follow. Notice codes and severities use the
+    canonical gtfs-validator naming; the canonical *grouped report*
+    rendering that merges these notices with hosted validation reports is
+    provided by the upcoming report module, not by this function's flat
+    notice list.
 
     Parameters
     ----------

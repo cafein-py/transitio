@@ -35,7 +35,7 @@ fn scan_feed(
     // The whole scan (I/O, decompression, parsing, serialization) runs
     // without the GIL; only the result crosses back into Python.
     py.allow_threads(move || {
-        let result = beanpicker_gtfs::scan_with(&path, options)?;
+        let result = beanpicker_gtfs::validate(&path, options)?;
         let mut row_counts = serde_json::Map::new();
         for (name, table) in &result.tables {
             row_counts.insert(name.clone(), serde_json::Value::from(table.rows.len()));

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Field-format and referential-integrity rule tier: typed per-column
+  validation (dates, GTFS over-midnight times, integers/floats with ranges,
+  enumerations, IANA timezones, coordinates with near-origin/near-pole
+  sanity), required and conditionally required fields
+  (``stop_without_location``, ``route_both_short_and_long_name_missing``,
+  agency_id with multiple agencies), calendar/frequency range order, agency
+  timezone consistency, parent-station location-type relations, unknown
+  columns, and cross-table ``foreign_key_violation`` checks — all under
+  canonical notice codes, with the same per-file severity-aware notice
+  sampling as the structural tier.
 - Rust GTFS core foundation: the ``beanpicker-gtfs`` crate parses a feed zip
   into raw tables while collecting notices (never failing hard on data
   defects), covering the structural rule tier — file presence including the

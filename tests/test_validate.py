@@ -155,6 +155,28 @@ def test_empty_file(tmp_path):
     assert "empty_file" in codes(report)
 
 
+def test_field_rules_reach_python(tmp_path):
+    files = dict(
+        MINIMAL,
+        **{
+            "trips.txt": "route_id,service_id,trip_id\nr1,ghost-service,t1\n",
+            "calendar.txt": (
+                "service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+                "sunday,start_date,end_date\nwk,1,1,1,1,1,0,0,20260101,notadate\n"
+            ),
+        },
+    )
+    report = validate_feed(write_zip(tmp_path / "feed.zip", files))
+    found = codes(report)
+    assert "invalid_date" in found
+    assert "foreign_key_violation" in found
+
+
+def test_minimal_feed_clean_across_all_tiers(tmp_path):
+    report = validate_feed(write_zip(tmp_path / "feed.zip", MINIMAL))
+    assert errors(report) == []
+
+
 def test_row_cap_is_configurable(tmp_path):
     report = validate_feed(write_zip(tmp_path / "feed.zip", MINIMAL), max_rows=1)
     assert "too_many_rows" in codes(report)

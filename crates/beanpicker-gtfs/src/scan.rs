@@ -72,6 +72,10 @@ pub struct Table {
 pub struct ScanResult {
     pub tables: BTreeMap<String, Table>,
     pub notices: Vec<Notice>,
+    /// Files whose retained content is unreliable — truncated by the row
+    /// cap, unreadable, refused as duplicates, or header-unparseable.
+    /// Reference checks must not treat their ID sets as exhaustive.
+    pub incomplete: std::collections::BTreeSet<String>,
 }
 
 pub fn scan(path: &Path) -> Result<ScanResult, String> {
@@ -106,11 +110,13 @@ pub fn scan_reader_with<R: Read + Seek>(
         zip::ZipArchive::new(reader).map_err(|e| format!("not a readable zip: {e}"))?;
     let mut notices = Vec::new();
     let mut tables = BTreeMap::new();
+    let mut incomplete = std::collections::BTreeSet::new();
     let mut present: HashSet<&'static str> = HashSet::new();
 
     for name in &duplicated {
         notices.push(Notice::new("duplicate_zip_entry", Severity::Error).with("filename", *name));
         present.insert(name);
+        incomplete.insert(name.to_string());
     }
 
     let mut names = Vec::with_capacity(archive.len());
@@ -156,6 +162,7 @@ pub fn scan_reader_with<R: Read + Seek>(
             Err(error) => {
                 notices.push(unreadable_file(spec.name, &error.to_string()));
                 present.insert(spec.name);
+                incomplete.insert(spec.name.to_string());
                 continue;
             }
         };
@@ -173,6 +180,7 @@ pub fn scan_reader_with<R: Read + Seek>(
                 ),
             ));
             present.insert(spec.name);
+            incomplete.insert(spec.name.to_string());
             continue;
         }
         let mut bytes = Vec::new();
@@ -187,6 +195,7 @@ pub fn scan_reader_with<R: Read + Seek>(
         if let Err(error) = read_result {
             notices.push(unreadable_file(spec.name, &error.to_string()));
             present.insert(spec.name);
+            incomplete.insert(spec.name.to_string());
             continue;
         }
         if bytes.len() as u64 > budget {
@@ -195,10 +204,15 @@ pub fn scan_reader_with<R: Read + Seek>(
                 &format!("exceeds the {budget}-byte budget"),
             ));
             present.insert(spec.name);
+            incomplete.insert(spec.name.to_string());
             continue;
         }
         present.insert(spec.name);
-        if let Some(table) = read_table(spec, &bytes, &options, &mut notices) {
+        let (table, truncated) = read_table(spec, &bytes, &options, &mut notices);
+        if truncated {
+            incomplete.insert(spec.name.to_string());
+        }
+        if let Some(table) = table {
             tables.insert(spec.name.to_string(), table);
         }
     }
@@ -206,7 +220,11 @@ pub fn scan_reader_with<R: Read + Seek>(
     feed_level_checks(&tables, &present, &mut notices);
     duplicate_key_checks(&tables, &options, &mut notices);
 
-    Ok(ScanResult { tables, notices })
+    Ok(ScanResult {
+        tables,
+        notices,
+        incomplete,
+    })
 }
 
 /// Walk the central directory and return the root-level GTFS filenames that
@@ -328,11 +346,11 @@ fn read_table(
     bytes: &[u8],
     options: &ScanOptions,
     notices: &mut Vec<Notice>,
-) -> Option<Table> {
+) -> (Option<Table>, bool) {
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
     if bytes.is_empty() {
         notices.push(empty_file(spec.name));
-        return None;
+        return (None, false);
     }
     // Crude quote-agnostic guard against naive delimiter floods: the CSV
     // reader allocates per-field offsets for a whole record before any
@@ -353,7 +371,7 @@ fn read_table(
                     line_index + 1
                 ),
             ));
-            return None;
+            return (None, true);
         }
     }
     let mut reader = csv::ReaderBuilder::new()
@@ -367,11 +385,11 @@ fn read_table(
     let headers: Vec<String> = match records.next() {
         None => {
             notices.push(empty_file(spec.name));
-            return None;
+            return (None, false);
         }
         Some(Err(error)) => {
             notices.push(csv_parsing_failed(spec.name, 1, &error));
-            return None;
+            return (None, true);
         }
         Some(Ok(record)) => record
             .iter()
@@ -387,7 +405,7 @@ fn read_table(
                 options.max_columns
             ),
         ));
-        return None;
+        return (None, true);
     }
     if headers.iter().any(|h| h.contains('\u{FFFD}')) {
         notices.push(invalid_character(spec.name, 1));
@@ -429,6 +447,7 @@ fn read_table(
 
     let mut rows = Vec::new();
     let mut csv_row = 1u64;
+    let mut truncated = false;
     // Row-level notices are sampled: past the per-file cap they are counted
     // but not retained, so millions of malformed rows cannot balloon the
     // notice list. Errors and warnings have separate quotas so a flood of
@@ -452,6 +471,7 @@ fn read_table(
                     .with("filename", spec.name)
                     .with("rowNumber", csv_row),
             );
+            truncated = true;
             break;
         }
         let record = match result {
@@ -511,9 +531,9 @@ fn read_table(
         // entities; a required file passing clean in that state would be a
         // false negative.
         notices.push(empty_file(spec.name));
-        return None;
+        return (None, truncated);
     }
-    Some(Table { headers, rows })
+    (Some(Table { headers, rows }), truncated)
 }
 
 fn empty_file(filename: &'static str) -> Notice {
