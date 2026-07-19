@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Real-feed integration harness: ``scripts/fetch_test_data.py`` downloads
+  the r5py Helsinki sample data (GTFS + OSM extract, pinned by release tag
+  and SHA-256, resume-capable) into the gitignored ``tests/data/``;
+  session fixtures gate on ``BEANPICKER_REQUIRE_TEST_DATA``; integration
+  tests validate the production Helsinki feed end-to-end and render its
+  merged report. CI caches and fetches the datasets.
+
 - Report module (``beanpicker.report``): ``build_report`` groups local
   notices by code in the canonical grouped convention and merges them with
   a hosted canonical-validator report (per-code ``source`` local/hosted/

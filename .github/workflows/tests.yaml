@@ -43,7 +43,14 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: tests/data
+          key: test-data-${{ hashFiles('scripts/fetch_test_data.py') }}
+      - run: python scripts/fetch_test_data.py
       - run: cargo test --workspace
       - run: pip install pytest pytest-cov
       - run: pip install -e .
       - run: pytest --cov=beanpicker --cov-report=term-missing
+        env:
+          BEANPICKER_REQUIRE_TEST_DATA: "1"
