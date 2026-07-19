@@ -74,6 +74,9 @@ def build_report(validation, *, hosted=None, provenance=None):
         if code in groups:
             groups[code]["source"] = "both"
             groups[code]["hostedTotalNotices"] = total
+            groups[code]["hostedSampleNotices"] = hosted_group.get("sampleNotices", [])[
+                :_MAX_SAMPLES
+            ]
         else:
             # Hosted-only groups keep the hosted count as totalNotices so
             # canonical consumers see the real occurrence count;
@@ -167,10 +170,11 @@ def render_markdown(report):
         lines.append("| --- | --- | --- | --- | --- |")
         for group in report["notices"]:
             hosted_total = group.get("hostedTotalNotices", "")
+            local_total = group.get("localTotalNotices", group["totalNotices"])
             lines.append(
                 f"| {_md(group['code'])} | {_md(group['severity'])} "
                 f"| {_md(group['source'])} "
-                f"| {group['totalNotices']} | {_md(hosted_total)} |"
+                f"| {_md(local_total)} | {_md(hosted_total)} |"
             )
     return "\n".join(lines) + "\n"
 
@@ -181,14 +185,22 @@ def render_html(report):
     e = html.escape
     rows = []
     for group in report["notices"]:
+        local_total = group.get("localTotalNotices", group["totalNotices"])
         rows.append(
             "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
-                e(group["code"]),
-                e(group["severity"]),
-                e(group["source"]),
-                group["totalNotices"],
+                e(str(group["code"])),
+                e(str(group["severity"])),
+                e(str(group["source"])),
+                e(str(local_total)),
                 e(str(group.get("hostedTotalNotices", ""))),
             )
+        )
+    sampling = ""
+    if summary.get("countsAreLowerBounds"):
+        sampling = (
+            f"<p><em>Notice sampling was active "
+            f"({e(str(summary['suppressedNotices']))} suppressed); "
+            "counts are lower bounds.</em></p>"
         )
     window = ""
     if summary.get("serviceWindow"):
@@ -213,7 +225,7 @@ def render_html(report):
         f"<p>Errors: {summary['counts']['errors']} · "
         f"Warnings: {summary['counts']['warnings']} · "
         f"Infos: {summary['counts']['infos']}</p>"
-        f"{window}{provenance}"
+        f"{sampling}{window}{provenance}"
         "<h2>Notices</h2>"
         "<table><tr><th>code</th><th>severity</th><th>source</th>"
         "<th>local</th><th>hosted</th></tr>"

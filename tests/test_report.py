@@ -54,6 +54,7 @@ def test_build_report_groups_and_merges():
     assert groups["missing_required_file"]["totalNotices"] == 2
     assert groups["missing_required_file"]["source"] == "both"
     assert groups["missing_required_file"]["hostedTotalNotices"] == 2
+    assert groups["missing_required_file"]["hostedSampleNotices"] == []
     assert groups["unused_shape"]["source"] == "hosted"
     assert groups["unused_shape"]["totalNotices"] == 5
     assert groups["unused_shape"]["localTotalNotices"] == 0
