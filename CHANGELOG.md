@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Benchmark suite: ``beanpicker.report.parity_summary`` buckets a merged
+  report's notice codes into agreeing, count-disagreeing, local-only and
+  canonical-only sets, and ``scripts/benchmark_validator.py`` times
+  ``validate_feed`` over a corpus of feed zips and prints the parity
+  breakdown against a ``<feed stem>.canonical.json`` canonical-validator
+  report when present.
+
 - Handoff helpers on ``FetchResult``: ``to_cafein()`` builds a routable
   ``cafein.TransportNetwork`` from the validated feeds and OSM extract
   (keyword arguments pass through to ``TransportNetwork.from_gtfs``), and

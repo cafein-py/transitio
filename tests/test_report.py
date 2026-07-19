@@ -4,7 +4,12 @@ import pytest
 
 pytest.importorskip("beanpicker._core")
 
-from beanpicker.report import build_report, render_html, render_markdown  # noqa: E402
+from beanpicker.report import (  # noqa: E402
+    build_report,
+    parity_summary,
+    render_html,
+    render_markdown,
+)
 
 VALIDATION = {
     "notices": [
@@ -120,3 +125,37 @@ def test_build_report_without_hosted():
     report = build_report(VALIDATION)
     assert report["summary"]["hostedReportIncluded"] is False
     assert all(g["source"] == "local" for g in report["notices"])
+
+
+def test_parity_summary_buckets():
+    validation = {
+        "notices": [
+            {"code": "empty_row", "severity": "WARNING", "context": {}},
+            {"code": "empty_row", "severity": "WARNING", "context": {}},
+            {"code": "missing_required_file", "severity": "ERROR", "context": {}},
+            {"code": "duplicate_key", "severity": "ERROR", "context": {}},
+        ],
+        "row_counts": {},
+        "service_window": None,
+    }
+    hosted = {
+        "notices": [
+            {"code": "empty_row", "severity": "WARNING", "totalNotices": 2},
+            {"code": "missing_required_file", "severity": "ERROR", "totalNotices": 5},
+            {"code": "unused_shape", "severity": "WARNING", "totalNotices": 3},
+        ]
+    }
+    parity = parity_summary(build_report(validation, hosted=hosted))
+    assert parity["agreeing"] == ["empty_row"]
+    assert parity["countDisagreements"] == [
+        {"code": "missing_required_file", "local": 1, "hosted": 5}
+    ]
+    assert parity["localOnly"] == ["duplicate_key"]
+    assert parity["hostedOnly"] == ["unused_shape"]
+    assert parity["countsAreLowerBounds"] is False
+
+
+def test_parity_summary_requires_hosted():
+    report = build_report({"notices": [], "row_counts": {}, "service_window": None})
+    with pytest.raises(ValueError, match="hosted"):
+        parity_summary(report)

@@ -128,6 +128,58 @@ def build_report(validation, *, hosted=None, provenance=None):
     }
 
 
+def parity_summary(report):
+    """Summarize local-versus-canonical agreement in a merged report.
+
+    Parameters
+    ----------
+    report : dict
+        A ``build_report`` result built with a ``hosted`` canonical
+        report.
+
+    Returns
+    -------
+    dict
+        Per-code agreement buckets: ``agreeing`` (codes both tiers
+        found, with equal occurrence counts), ``countDisagreements``
+        (codes both found with differing counts, each as
+        ``{"code", "local", "hosted"}``), ``localOnly`` and
+        ``hostedOnly`` code lists, and ``countsAreLowerBounds`` carried
+        over from the summary (local sampling makes disagreement counts
+        indicative, not exact).
+
+    Raises
+    ------
+    ValueError
+        When the report was built without a hosted report.
+    """
+    if not report["summary"].get("hostedReportIncluded"):
+        raise ValueError("parity requires a report built with hosted=")
+    agreeing, disagreements, local_only, hosted_only = [], [], [], []
+    for group in report["notices"]:
+        source = group["source"]
+        if source == "local":
+            local_only.append(group["code"])
+        elif source == "hosted":
+            hosted_only.append(group["code"])
+        else:
+            local = group["totalNotices"]
+            hosted_total = group.get("hostedTotalNotices", 0)
+            if local == hosted_total:
+                agreeing.append(group["code"])
+            else:
+                disagreements.append(
+                    {"code": group["code"], "local": local, "hosted": hosted_total}
+                )
+    return {
+        "agreeing": sorted(agreeing),
+        "countDisagreements": sorted(disagreements, key=lambda d: d["code"]),
+        "localOnly": sorted(local_only),
+        "hostedOnly": sorted(hosted_only),
+        "countsAreLowerBounds": report["summary"].get("countsAreLowerBounds", False),
+    }
+
+
 def _validator_stamp():
     import beanpicker
 
