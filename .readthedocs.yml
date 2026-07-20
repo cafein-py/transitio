@@ -4,8 +4,10 @@ build:
     os: ubuntu-24.04
     tools:
         python: "3.12"
-        # The maturin build compiles the Rust core.
-        rust: "1.82"
+        # The maturin build compiles the Rust core. Without a committed
+        # Cargo.lock the resolver picks current crate versions, whose
+        # edition requirements track recent Rust — pin to latest.
+        rust: "latest"
 
 python:
     install:
