@@ -19,7 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routing-oriented rule subset) run on every save —
   error-severity notices raise ``InvalidFeedError`` (carrying the
   report) unless ``check=False``. Unparsed archive entries survive the
-  round trip.
+  round trip. Shapes are first-class: ``add_shape`` writes polylines
+  with cumulative metric ``shape_dist_traveled`` (cafein's travel
+  distances build on them), trips reference them via ``shape_id=``, the
+  ``shapes`` view returns per-shape LineStrings, and
+  ``transitio.edit.snap_to_network`` routes a waypoint sequence along
+  the pyrosm-loaded OSM street network (``transitio[snap]`` extra) —
+  the primitive behind snapped route drawing for bus and tram
+  alignments.
 
 ## 0.1.0 — 2026-07-20
 

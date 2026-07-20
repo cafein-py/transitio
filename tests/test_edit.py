@@ -351,3 +351,59 @@ def test_drop_route_clears_route_transfers_and_networks(tmp_path):
     editor.drop_route("r1")
     assert editor.tables["route_networks.txt"].empty
     assert editor.tables["transfers.txt"].empty
+
+
+def test_add_shape_and_shapes_view(tmp_path):
+    from shapely.geometry import LineString
+
+    builder = build_minimal()
+    builder.add_shape(
+        "sh1", LineString([(24.931, 60.169), (24.936, 60.170), (24.941, 60.171)])
+    )
+    builder.add_trip(
+        "r1",
+        "wk",
+        "t1",
+        [("s1", "08:00:00", "08:00:00"), ("s2", "08:05:00", "08:05:00")],
+        shape_id="sh1",
+    )
+    path = tmp_path / "with-shape.zip"
+    report = builder.save(path, reference_date="20260601")
+    assert not any(n["severity"] == "ERROR" for n in report["notices"])
+    assert report["row_counts"]["shapes.txt"] == 3
+
+    editor = FeedEditor(path)
+    assert list(editor.tables["trips.txt"]["shape_id"]) == ["sh1"]
+    distances = [float(v) for v in editor.tables["shapes.txt"]["shape_dist_traveled"]]
+    assert distances[0] == 0.0
+    assert distances == sorted(distances)
+    assert 500 < distances[-1] < 1500  # plausible meters for ~1 km
+
+    view = editor.shapes
+    assert list(view["shape_id"]) == ["sh1"]
+    assert view.geometry.iloc[0].coords[0] == (24.931, 60.169)
+
+
+def test_add_shape_from_latlon_pairs():
+    builder = build_minimal()
+    builder.add_shape("sh1", [(60.169, 24.931), (60.171, 24.941)], distances=False)
+    table = builder.tables["shapes.txt"]
+    assert "shape_dist_traveled" not in table.columns
+    assert list(table["shape_pt_lat"]) == ["60.169", "60.171"]
+    with pytest.raises(ValueError, match="at least two"):
+        builder.add_shape("sh2", [(60.169, 24.931)])
+
+
+def test_snap_to_network(kantakaupunki_pbf):
+    pytest.importorskip("networkx")
+    from transitio.edit import snap_to_network
+
+    waypoints = [(60.1699, 24.9310), (60.1719, 24.9414)]
+    line = snap_to_network(waypoints, kantakaupunki_pbf)
+    assert line.geom_type == "LineString"
+    assert len(line.coords) > 2  # follows streets, not a straight segment
+    start = line.coords[0]
+    assert start[0] == pytest.approx(24.9310, abs=0.005)
+    assert start[1] == pytest.approx(60.1699, abs=0.005)
+    with pytest.raises(ValueError, match="at least two"):
+        snap_to_network([waypoints[0]], kantakaupunki_pbf)

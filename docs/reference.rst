@@ -58,10 +58,12 @@ Editing and building feeds
    FeedBuilder.add_stop
    FeedBuilder.add_route
    FeedBuilder.add_service
+   FeedBuilder.add_shape
    FeedBuilder.add_trip
    FeedBuilder.add_frequency_trip
    FeedBuilder.stops
    FeedBuilder.set_stops
+   FeedBuilder.shapes
    FeedBuilder.save
    FeedEditor
    FeedEditor.update_stop
@@ -69,6 +71,15 @@ Editing and building feeds
    FeedEditor.set_headway
    FeedEditor.shift_trip
    FeedEditor.drop_route
+
+.. currentmodule:: transitio.edit
+
+.. autosummary::
+   :toctree: api/
+
+   snap_to_network
+
+.. currentmodule:: transitio
 
 Validation, repair and cropping
 -------------------------------

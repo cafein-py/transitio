@@ -31,6 +31,9 @@ classifiers = [
 ]
 dynamic = ["version"]
 
+[project.optional-dependencies]
+snap = ["networkx>=3"]
+
 [project.urls]
 Homepage = "https://github.com/cafein-py/transitio"
 Documentation = "https://transitio.readthedocs.io"

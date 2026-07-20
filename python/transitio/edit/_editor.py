@@ -97,6 +97,18 @@ def format_gtfs_time(seconds):
     return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
 
+def _haversine_m(a, b):
+    """Great-circle meters between two (lat, lon) points."""
+    from math import asin, cos, radians, sin, sqrt
+
+    lat1, lon1, lat2, lon2 = map(radians, (*a, *b))
+    h = (
+        sin((lat2 - lat1) / 2) ** 2
+        + cos(lat1) * cos(lat2) * sin((lon2 - lon1) / 2) ** 2
+    )
+    return 2 * 6371008.8 * asin(sqrt(h))
+
+
 def _as_yyyymmdd(value):
     if hasattr(value, "strftime"):
         return value.strftime("%Y%m%d")
@@ -207,14 +219,53 @@ class FeedBuilder:
         row["end_date"] = _as_yyyymmdd(end_date)
         return self._append("calendar.txt", row)
 
-    def add_trip(self, route_id, service_id, trip_id, stops, **fields):
+    def add_shape(self, shape_id, geometry, *, distances=True):
+        """Add a shape polyline for trips to reference.
+
+        ``geometry`` is a shapely LineString in WGS84 (x = longitude,
+        e.g. from :func:`~transitio.edit.snap_to_network`) or a sequence
+        of ``(lat, lon)`` pairs. With ``distances``, cumulative
+        great-circle ``shape_dist_traveled`` values in meters are
+        written, which cafein uses for per-trip travel distances.
+        """
+        coords = getattr(geometry, "coords", None)
+        if coords is not None:
+            points = [(y, x) for x, y in coords]
+        else:
+            points = [(float(lat), float(lon)) for lat, lon in geometry]
+        if len(points) < 2:
+            raise ValueError("a shape needs at least two points")
+        total = 0.0
+        rows = []
+        for sequence, (lat, lon) in enumerate(points, start=1):
+            row = {
+                "shape_id": shape_id,
+                "shape_pt_lat": repr(lat),
+                "shape_pt_lon": repr(lon),
+                "shape_pt_sequence": sequence,
+            }
+            if distances:
+                if sequence > 1:
+                    total += _haversine_m(points[sequence - 2], (lat, lon))
+                row["shape_dist_traveled"] = f"{total:.1f}"
+            rows.append(row)
+        for row in rows:
+            self._append("shapes.txt", row)
+        return self
+
+    def add_trip(
+        self, route_id, service_id, trip_id, stops, *, shape_id=None, **fields
+    ):
         """Add a scheduled trip.
 
         ``stops`` is a sequence of ``(stop_id, arrival, departure)``
-        with times as ``H:MM:SS`` strings or seconds since midnight.
+        with times as ``H:MM:SS`` strings or seconds since midnight;
+        ``shape_id`` references a polyline added with :meth:`add_shape`.
         All inputs are checked before anything is appended, so a bad
         tuple never leaves a partial trip behind.
         """
+        if shape_id is not None:
+            fields["shape_id"] = shape_id
         rows = [
             {
                 "trip_id": trip_id,
@@ -239,7 +290,16 @@ class FeedBuilder:
         return self
 
     def add_frequency_trip(
-        self, route_id, service_id, trip_id, stops, *, start, end, headway
+        self,
+        route_id,
+        service_id,
+        trip_id,
+        stops,
+        *,
+        start,
+        end,
+        headway,
+        shape_id=None,
     ):
         """Add a frequency-based (headway) trip.
 
@@ -263,7 +323,7 @@ class FeedBuilder:
             )
             for stop_id, offset in stops
         ]
-        self.add_trip(route_id, service_id, trip_id, template)
+        self.add_trip(route_id, service_id, trip_id, template, shape_id=shape_id)
         return self._append(
             "frequencies.txt",
             {
@@ -325,6 +385,33 @@ class FeedBuilder:
             table = table.drop(columns=[geometry.name], errors="ignore")
         self.tables["stops.txt"] = table.astype(str).reset_index(drop=True)
         return self
+
+    @property
+    def shapes(self):
+        """Shapes as a WGS84 GeoDataFrame, one LineString per shape_id."""
+        import geopandas as gpd
+        from shapely.geometry import LineString
+
+        table = self._table("shapes.txt").copy()
+        table["_lat"] = pd.to_numeric(table["shape_pt_lat"], errors="coerce")
+        table["_lon"] = pd.to_numeric(table["shape_pt_lon"], errors="coerce")
+        table["_seq"] = pd.to_numeric(table["shape_pt_sequence"], errors="coerce")
+        records = []
+        for shape_id, group in table.sort_values("_seq").groupby("shape_id", sort=True):
+            coordinates = [
+                (lon, lat)
+                for lon, lat in zip(group["_lon"], group["_lat"])
+                if pd.notna(lon) and pd.notna(lat)
+            ]
+            records.append(
+                {
+                    "shape_id": shape_id,
+                    "geometry": (
+                        LineString(coordinates) if len(coordinates) > 1 else None
+                    ),
+                }
+            )
+        return gpd.GeoDataFrame(records, crs="EPSG:4326")
 
     # -- output -----------------------------------------------------------
 
