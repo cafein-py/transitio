@@ -83,6 +83,10 @@ pub struct ScanResult {
     /// Actual service-day window computed from the calendars; None until
     /// the semantic tier runs (or when no service is active at all).
     pub service_window: Option<(String, String)>,
+    /// Root-level archive entries recognized or tolerated but not parsed
+    /// into `tables` (GTFS-Flex files, unknown files); archive rewrites
+    /// copy them through verbatim.
+    pub unparsed_entries: Vec<String>,
 }
 
 pub fn scan(path: &Path) -> Result<ScanResult, String> {
@@ -118,6 +122,7 @@ pub fn scan_reader_with<R: Read + Seek>(
     let mut notices = Vec::new();
     let mut tables = BTreeMap::new();
     let mut incomplete = std::collections::BTreeSet::new();
+    let mut unparsed_entries: Vec<String> = Vec::new();
     let mut present: HashSet<&'static str> = HashSet::new();
 
     for name in &duplicated {
@@ -141,21 +146,31 @@ pub fn scan_reader_with<R: Read + Seek>(
         }
         if let Some((_, basename)) = name.rsplit_once('/') {
             // GTFS files hidden in a subfolder are a canonical error; other
-            // nested entries (archive junk) are ignored.
+            // nested entries (archive junk) are ignored by the parser but
+            // still passed through verbatim on rewrites.
             if schema::spec_for(basename).is_some() {
                 notices.push(
                     Notice::new("invalid_input_files_in_subfolder", Severity::Error)
                         .with("filename", name.as_str()),
                 );
             }
+            if !unparsed_entries.contains(name) {
+                unparsed_entries.push(name.clone());
+            }
             continue;
         }
         if NON_CSV_FILES.contains(&name.as_str()) {
+            if !unparsed_entries.contains(name) {
+                unparsed_entries.push(name.clone());
+            }
             continue; // recognized GTFS-Flex file; contents out of scope
         }
         let Some(spec) = schema::spec_for(name) else {
             notices
                 .push(Notice::new("unknown_file", Severity::Info).with("filename", name.as_str()));
+            if !unparsed_entries.contains(name) {
+                unparsed_entries.push(name.clone());
+            }
             continue;
         };
         if duplicated.contains(spec.name) {
@@ -232,6 +247,7 @@ pub fn scan_reader_with<R: Read + Seek>(
         notices,
         incomplete,
         service_window: None,
+        unparsed_entries,
     })
 }
 

@@ -118,8 +118,17 @@ pub fn repair(path: &Path, output: &Path, options: ScanOptions) -> Result<Repair
     {
         return Err("staging path is a symlink; refusing to follow it".to_string());
     }
+    if let (Ok(a), Ok(b)) = (path.canonicalize(), staging.canonicalize()) {
+        if a == b {
+            return Err("staging path aliases the source archive".to_string());
+        }
+    }
     let _ = std::fs::remove_file(&staging);
-    write_zip(&result.tables, &staging)?;
+    write_zip(
+        &result.tables,
+        Some((path, &result.unparsed_entries)),
+        &staging,
+    )?;
 
     // The returned validation describes the REPAIRED feed, so callers see
     // exactly which notices remain.
@@ -504,7 +513,11 @@ fn retain_rows(
 }
 
 /// Write the repaired tables to a fresh zip with RFC 4180 quoting.
-pub(crate) fn write_zip(tables: &BTreeMap<String, Table>, output: &Path) -> Result<(), String> {
+pub(crate) fn write_zip(
+    tables: &BTreeMap<String, Table>,
+    passthrough: Option<(&Path, &[String])>,
+    output: &Path,
+) -> Result<(), String> {
     let file = std::fs::File::create(output)
         .map_err(|e| format!("cannot create {}: {e}", output.display()))?;
     let mut writer = zip::ZipWriter::new(file);
@@ -528,6 +541,51 @@ pub(crate) fn write_zip(tables: &BTreeMap<String, Table>, output: &Path) -> Resu
         writer
             .write_all(&bytes)
             .map_err(|e| format!("cannot write {name}: {e}"))?;
+    }
+    // Entries the parser deliberately did not model (GTFS-Flex files,
+    // unknown files) are copied through verbatim: semantic equivalence
+    // forbids dropping data the transformation never touched. Hostile
+    // names are the exception — traversal components, aliases of the
+    // rewritten tables and symlink entries must not reach the output.
+    fn safe_passthrough(name: &str, tables: &BTreeMap<String, Table>) -> bool {
+        if name.contains('\\') || name.starts_with('/') {
+            return false;
+        }
+        if name
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            return false;
+        }
+        !tables.keys().any(|table| table.eq_ignore_ascii_case(name))
+    }
+    if let Some((source, names)) = passthrough {
+        if !names.is_empty() {
+            let file = std::fs::File::open(source)
+                .map_err(|e| format!("cannot reopen {}: {e}", source.display()))?;
+            let mut archive = zip::ZipArchive::new(file)
+                .map_err(|e| format!("cannot reread {}: {e}", source.display()))?;
+            let mut copied: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for index in 0..archive.len() {
+                let entry = archive
+                    .by_index_raw(index)
+                    .map_err(|e| format!("cannot reread zip entry {index}: {e}"))?;
+                let entry_name = entry.name().to_string();
+                let symlink = entry
+                    .unix_mode()
+                    .map(|mode| mode & 0o170000 == 0o120000)
+                    .unwrap_or(false);
+                if names.contains(&entry_name)
+                    && !symlink
+                    && safe_passthrough(&entry_name, tables)
+                    && copied.insert(entry_name)
+                {
+                    writer
+                        .raw_copy_file(entry)
+                        .map_err(|e| format!("cannot copy archive entry: {e}"))?;
+                }
+            }
+        }
     }
     writer
         .finish()

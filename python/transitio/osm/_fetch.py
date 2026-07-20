@@ -88,9 +88,17 @@ def _fmt_coord(value):
 def _crop_filename(aoi, geometry):
     if isinstance(aoi, str):
         slug = re.sub(r"[^a-z0-9]+", "-", aoi.lower()).strip("-") or "place"
-        return f"{slug}.osm.pbf"
+        # Distinct place names can normalize to one slug (non-ASCII names
+        # especially); the digest keeps their cache entries apart.
+        digest = hashlib.sha256(aoi.encode("utf-8")).hexdigest()[:8]
+        return f"{slug}-{digest}.osm.pbf"
     coords = "_".join(_fmt_coord(v) for v in geometry.bounds)
-    return f"bbox_{coords}.osm.pbf"
+    if geometry.equals(box(*geometry.bounds)):
+        return f"bbox_{coords}.osm.pbf"
+    # True polygons need more than their envelope in the cache key, or
+    # different AOIs sharing a bounding box would reuse the first crop.
+    digest = hashlib.sha256(geometry.wkb).hexdigest()[:12]
+    return f"aoi_{coords}_{digest}.osm.pbf"
 
 
 def _write_provenance(path, *, geometry, url, extract_sha256, cropped):

@@ -74,8 +74,17 @@ pub fn crop(
     {
         return Err("staging path is a symlink; refusing to follow it".to_string());
     }
+    if let (Ok(a), Ok(b)) = (path.canonicalize(), staging.canonicalize()) {
+        if a == b {
+            return Err("staging path aliases the source archive".to_string());
+        }
+    }
     let _ = std::fs::remove_file(&staging);
-    write_zip(&result.tables, &staging)?;
+    write_zip(
+        &result.tables,
+        Some((path, &result.unparsed_entries)),
+        &staging,
+    )?;
     let validation = match scan::scan_with(&staging, options) {
         Ok(mut validation) => {
             rules::run_rules(&mut validation, &options);
@@ -257,8 +266,11 @@ fn retain(
     let kept_services = referenced(result, "trips.txt", "service_id");
     keep_rows(result, "calendar.txt", "service_id", &kept_services);
     keep_rows(result, "calendar_dates.txt", "service_id", &kept_services);
-    // Retained calendars must not advertise service outside the window.
-    if let (Some(start), Some(end)) = (window.0.as_ref(), window.1.as_ref()) {
+    // Retained calendars must not advertise service outside the window,
+    // including a one-sided window (the open side keeps its bound).
+    if window.0.is_some() || window.1.is_some() {
+        let start = window.0.clone().unwrap_or_else(|| "00010101".to_string());
+        let end = window.1.clone().unwrap_or_else(|| "99991231".to_string());
         if let Some(calendar) = result.tables.get_mut("calendar.txt") {
             let s = column(calendar, "start_date");
             let e = column(calendar, "end_date");
@@ -273,6 +285,12 @@ fn retain(
                         row.fields[i] = end.clone();
                     }
                 }
+            }
+            // A calendar wholly outside a one-sided window clamps to an
+            // empty interval; the service survives only through its
+            // calendar_dates additions, so the row itself must go.
+            if let (Some(i), Some(j)) = (s, e) {
+                calendar.rows.retain(|row| row.fields[i] <= row.fields[j]);
             }
         }
         if let Some(dates) = result.tables.get_mut("calendar_dates.txt") {
@@ -353,6 +371,17 @@ fn retain(
                 agency
                     .rows
                     .retain(|row| kept_agencies.contains(&row.fields[id]));
+            }
+        }
+    }
+    // Attributions pointing only at a pruned agency must go with it.
+    if !kept_agencies.is_empty() {
+        if let Some(attributions) = result.tables.get_mut("attributions.txt") {
+            if let Some(i) = column(attributions, "agency_id") {
+                attributions.rows.retain(|row| {
+                    let id = row.fields[i].as_str();
+                    id.is_empty() || kept_agencies.contains(id)
+                });
             }
         }
     }

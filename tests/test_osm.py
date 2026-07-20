@@ -116,7 +116,7 @@ def test_fetch_by_place_name(tmp_path, fake_osm, monkeypatch):
         "Helsinki, Finland", cache_dir=tmp_path, transport=make_transport()
     )
 
-    assert path.name == "helsinki-finland.osm.pbf"
+    assert path.name == "helsinki-finland-fcb962ea.osm.pbf"
 
 
 def test_fetch_no_single_covering_extract(tmp_path):

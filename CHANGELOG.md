@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+- Repair and crop now copy through verbatim every archive entry they never
+  parsed — ``locations.geojson`` (GTFS-Flex), unknown files and nested
+  entries were previously dropped by the rewrite. A duplicated unparsed
+  name is copied once, and hostile entries (path traversal, aliases of the
+  rewritten tables, symlinks) are excluded from the output.
+- Cropping with a one-sided date window clamps calendars and prunes
+  calendar_dates exceptions on the bounded side; previously clamping only
+  happened when both bounds were given.
+- Cropping drops attributions whose only reference is a pruned agency,
+  closing a dangling ``agency_id`` foreign key.
+- Repair and crop refuse to run when the staging path (``<output>.part``)
+  aliases the source archive, which previously deleted the input.
+- Cropped OSM extracts of true polygon AOIs now carry a geometry digest in
+  their cache filename; polygons sharing a bounding envelope previously
+  reused the first cached crop.
+
 ### Changed
 
 - Renamed the project from ``beanpicker`` to ``transitio`` ahead of the
