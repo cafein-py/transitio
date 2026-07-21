@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Scenario feeds from geodata (``transitio.build_feed``): reads route
+  alignments from a GeoPackage/Shapefile or GeoDataFrame under a small
+  attribute convention (mode, ``headway_min`` or per-period
+  ``headway_<name>`` columns, ``speed_kmh``/``duration_min``, operating
+  window, service days, ``bidirectional``) and writes a validated
+  frequency-based GTFS feed — geometries become shapes with metric
+  distances, stops come from an optional point layer snapped to each
+  route or are interpolated at a spacing, and trips are generated per
+  direction and period. Projected inputs are reprojected to WGS84.
+
 - Feed editing and building (``transitio.FeedBuilder`` /
   ``transitio.FeedEditor``): build a GTFS feed entity by entity
   (agencies, stops, routes, calendars, scheduled and frequency-based

@@ -142,11 +142,17 @@ class FeedBuilder:
     # -- table plumbing ---------------------------------------------------
 
     def _append(self, filename, row):
-        row = {key: "" if value is None else str(value) for key, value in row.items()}
-        addition = pd.DataFrame([row], dtype=str)
+        return self._append_rows(filename, [row])
+
+    def _append_rows(self, filename, rows):
+        rows = [
+            {key: "" if value is None else str(value) for key, value in row.items()}
+            for row in rows
+        ]
+        addition = pd.DataFrame(rows, dtype=str)
         table = self.tables.get(filename)
         if table is None:
-            self.tables[filename] = addition
+            self.tables[filename] = addition.fillna("")
         else:
             self.tables[filename] = pd.concat(
                 [table, addition], ignore_index=True
@@ -230,7 +236,7 @@ class FeedBuilder:
         """
         coords = getattr(geometry, "coords", None)
         if coords is not None:
-            points = [(y, x) for x, y in coords]
+            points = [(c[1], c[0]) for c in coords]
         else:
             points = [(float(lat), float(lon)) for lat, lon in geometry]
         if len(points) < 2:
@@ -300,6 +306,7 @@ class FeedBuilder:
         end,
         headway,
         shape_id=None,
+        **fields,
     ):
         """Add a frequency-based (headway) trip.
 
@@ -323,7 +330,9 @@ class FeedBuilder:
             )
             for stop_id, offset in stops
         ]
-        self.add_trip(route_id, service_id, trip_id, template, shape_id=shape_id)
+        self.add_trip(
+            route_id, service_id, trip_id, template, shape_id=shape_id, **fields
+        )
         return self._append(
             "frequencies.txt",
             {
