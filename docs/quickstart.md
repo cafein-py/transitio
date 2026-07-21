@@ -43,6 +43,27 @@ result = transitio.fetch(
 )
 ```
 
+## Scenario feeds from a GeoPackage
+
+Draw a planned network in any GIS tool, attach headway attributes, and
+turn it into a validated GTFS feed:
+
+```python
+import transitio
+
+transitio.build_feed(
+    "planned_network.gpkg",
+    "scenario.zip",
+    routes_layer="routes",        # LineStrings with attributes:
+    timezone="Europe/Helsinki",   #   mode, headway_min, speed_kmh, days...
+)
+```
+
+Stops come from an optional point layer (`stops_layer=`) snapped to each
+route, or are interpolated along the alignments; route geometries become
+GTFS shapes, so travel distances survive into routing. The result feeds
+straight into `cafein.TransportNetwork.from_gtfs`.
+
 ## Handing off to cafein or pyrosm
 
 ```python

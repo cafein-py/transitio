@@ -8,6 +8,7 @@ __all__ = [
     "FetchResult",
     "MobilityDatabase",
     "exceptions",
+    "build_feed",
     "crop_feed",
     "edit",
     "fetch",
@@ -33,7 +34,7 @@ def __getattr__(name):
         from transitio.osm import fetch_pbf
 
         return fetch_pbf
-    if name in ("FeedBuilder", "FeedEditor"):
+    if name in ("FeedBuilder", "FeedEditor", "build_feed"):
         from transitio import edit
 
         return getattr(edit, name)

@@ -77,6 +77,7 @@ Editing and building feeds
 .. autosummary::
    :toctree: api/
 
+   build_feed
    snap_to_network
 
 .. currentmodule:: transitio
