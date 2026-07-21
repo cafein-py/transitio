@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- Custom-filter snapping: ``snap_to_network`` and ``build_feed``
+  (``snap_custom_filter=``) now accept a pyrosm Overpass-style tag
+  filter selecting which OSM ways form the routing network — e.g.
+  ``custom_filter={"railway": ["tram"]}`` to snap alignments to tram
+  rails, or ``{"railway": ["rail", "light_rail"]}`` for heavy rail —
+  instead of only the fixed ``network_type``. When given, the network
+  is restricted to exactly the matching ways.
+
 ## 0.2.0 — 2026-07-21
 
 ### Added

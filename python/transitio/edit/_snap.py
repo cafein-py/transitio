@@ -5,14 +5,16 @@ from __future__ import annotations
 import os
 
 
-def snap_to_network(waypoints, pbf, *, network_type="driving"):
-    """Route a waypoint sequence along the OSM street network.
+def snap_to_network(
+    waypoints, pbf, *, network_type="driving", custom_filter=None, filter_type="keep"
+):
+    """Route a waypoint sequence along an OSM network.
 
     Loads the network from an OSM extract (as fetched by
     :func:`transitio.fetch_pbf`), snaps each waypoint to its nearest
     network node, and connects consecutive waypoints with the shortest
-    network path — the mechanism behind snapped route drawing for bus
-    and tram alignments.
+    network path — the mechanism behind snapped route drawing for bus,
+    tram and rail alignments.
 
     Parameters
     ----------
@@ -22,7 +24,19 @@ def snap_to_network(waypoints, pbf, *, network_type="driving"):
         OSM ``.osm.pbf`` extract covering the waypoints.
     network_type : str, default "driving"
         pyrosm network type (``walking``, ``cycling``, ``driving``,
-        ``driving+service``, ``all``).
+        ``driving+service``, ``all``). Ignored when ``custom_filter`` is
+        given.
+    custom_filter : dict, optional
+        A pyrosm Overpass-style tag filter selecting which OSM ways form
+        the routing network, e.g. ``{"railway": ["tram"]}`` to snap tram
+        alignments to their rails or ``{"railway": ["rail",
+        "light_rail"]}`` for heavy rail. When given, the network is
+        restricted to exactly the matching ways (pyrosm ``network_type``
+        ``"all"`` with ``filter_type``); when ``None``, the plain
+        ``network_type`` network is used.
+    filter_type : str, default "keep"
+        pyrosm filter mode for ``custom_filter`` (``"keep"`` or
+        ``"exclude"``).
 
     Returns
     -------
@@ -32,8 +46,10 @@ def snap_to_network(waypoints, pbf, *, network_type="driving"):
     Notes
     -----
     Requires the ``networkx`` package (install ``transitio[snap]``).
-    Street-running tram routes snap well to the driving network;
-    dedicated tram rails are not part of it.
+    Snapping tram or rail routes needs an extract that actually contains
+    the ``railway`` ways (some cropped extracts drop them); without a
+    ``custom_filter`` the driving network carries street-running trams
+    but not dedicated rails.
     """
     try:
         import networkx as nx
@@ -52,9 +68,22 @@ def snap_to_network(waypoints, pbf, *, network_type="driving"):
     from pyproj import Transformer
 
     osm = OSM(os.fspath(pbf))
-    nodes, edges = osm.get_network(nodes=True, network_type=network_type)
+    if custom_filter is not None:
+        # network_type "all" + a keep-filter restricts the network to
+        # exactly the matching ways (unlike a bare custom_filter, which
+        # pyrosm unions with the network_type base).
+        nodes, edges = osm.get_network(
+            nodes=True,
+            network_type="all",
+            custom_filter=custom_filter,
+            filter_type=filter_type,
+        )
+        described = f"custom_filter {custom_filter}"
+    else:
+        nodes, edges = osm.get_network(nodes=True, network_type=network_type)
+        described = f"{network_type} network"
     if nodes is None or edges is None or nodes.empty or edges.empty:
-        raise ValueError(f"no {network_type} network in {pbf}")
+        raise ValueError(f"no {described} in {pbf}")
     graph = osm.to_graph(nodes, edges, graph_type="networkx")
 
     # Nearest-node search in a locally metric, antimeridian-safe frame:

@@ -407,3 +407,37 @@ def test_snap_to_network(kantakaupunki_pbf):
     assert start[1] == pytest.approx(60.1699, abs=0.005)
     with pytest.raises(ValueError, match="at least two"):
         snap_to_network([waypoints[0]], kantakaupunki_pbf)
+
+
+def test_snap_to_network_custom_filter(kantakaupunki_pbf):
+    pytest.importorskip("networkx")
+    from transitio.edit import snap_to_network
+
+    waypoints = [(60.1699, 24.9310), (60.1719, 24.9414)]
+    roads = {
+        "highway": [
+            "primary",
+            "secondary",
+            "tertiary",
+            "residential",
+            "service",
+            "unclassified",
+            "living_street",
+        ]
+    }
+    # A restricting road filter still routes these road-connected points.
+    line = snap_to_network(waypoints, kantakaupunki_pbf, custom_filter=roads)
+    assert line.geom_type == "LineString"
+    assert len(line.coords) > 2
+
+    # Restricting to cycleways only leaves the road points unconnected.
+    with pytest.raises(ValueError, match="no network path"):
+        snap_to_network(
+            waypoints, kantakaupunki_pbf, custom_filter={"highway": ["cycleway"]}
+        )
+
+    # A filter matching no ways in the extract reports an empty network.
+    with pytest.raises(ValueError, match="custom_filter"):
+        snap_to_network(
+            waypoints, kantakaupunki_pbf, custom_filter={"railway": ["tram"]}
+        )

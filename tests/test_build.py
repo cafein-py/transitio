@@ -228,6 +228,41 @@ def test_build_feed_snapped(tmp_path, kantakaupunki_pbf):
     assert len(outbound.coords) > 2  # follows streets
 
 
+def test_build_feed_snapped_custom_filter(tmp_path, kantakaupunki_pbf):
+    pytest.importorskip("networkx")
+    frame = gpd.GeoDataFrame(
+        [
+            {
+                "route_id": "snapped",
+                "route_short_name": "S",
+                "mode": "bus",
+                "headway_min": 10,
+            }
+        ],
+        geometry=[LineString([(24.9310, 60.1699), (24.9414, 60.1719)])],
+        crs="EPSG:4326",
+    )
+    report = build_feed(
+        frame,
+        tmp_path / "scenario.zip",
+        timezone="Europe/Helsinki",
+        snap_to=kantakaupunki_pbf,
+        snap_custom_filter={
+            "highway": [
+                "primary",
+                "secondary",
+                "tertiary",
+                "residential",
+                "service",
+                "unclassified",
+                "living_street",
+            ]
+        },
+        reference_date="20260601",
+    )
+    assert not any(n["severity"] == "ERROR" for n in report["notices"])
+
+
 def test_layer_stop_offsets_rebase_to_window_start(tmp_path):
     # A stop layer that starts mid-line must still depart the first
     # served stop exactly at the window start.

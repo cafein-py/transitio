@@ -144,6 +144,7 @@ def build_feed(
     exact_times=False,
     snap_to=None,
     network_type="driving",
+    snap_custom_filter=None,
     check=True,
     **budgets,
 ):
@@ -206,7 +207,12 @@ def build_feed(
         :func:`~transitio.edit.snap_to_network` before becoming the
         shape (requires ``transitio[snap]``).
     network_type : str, default "driving"
-        pyrosm network type for ``snap_to``.
+        pyrosm network type for ``snap_to`` (ignored when
+        ``snap_custom_filter`` is given).
+    snap_custom_filter : dict, optional
+        A pyrosm Overpass-style tag filter for ``snap_to`` — e.g.
+        ``{"railway": ["tram"]}`` to snap alignments to tram rails. See
+        :func:`~transitio.edit.snap_to_network`.
     check : bool, default True
         Passed to :meth:`FeedBuilder.save`.
     **budgets
@@ -265,7 +271,10 @@ def build_feed(
             from transitio.edit._snap import snap_to_network
 
             geometry = snap_to_network(
-                _line_latlon(geometry), snap_to, network_type=network_type
+                _line_latlon(geometry),
+                snap_to,
+                network_type=network_type,
+                custom_filter=snap_custom_filter,
             )
         route_id = str(_value(row, "route_id", f"route-{index}"))
         short_name = str(_value(row, "route_short_name", route_id))
