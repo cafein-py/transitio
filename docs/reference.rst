@@ -80,15 +80,6 @@ Editing and building feeds
    build_feed
    snap_to_network
 
-The GUI
--------
-
-.. currentmodule:: transitio.gui
-
-.. autosummary::
-   :toctree: api/
-
-   create_app
 
 .. currentmodule:: transitio
 

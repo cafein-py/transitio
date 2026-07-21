@@ -50,7 +50,7 @@ jobs:
       - run: python scripts/fetch_test_data.py
       - run: cargo test --workspace
       - run: pip install pytest pytest-cov
-      - run: pip install -e ".[snap,gui]"
+      - run: pip install -e ".[snap]"
       - run: pytest --cov=transitio --cov-report=term-missing
         env:
           TRANSITIO_REQUIRE_TEST_DATA: "1"

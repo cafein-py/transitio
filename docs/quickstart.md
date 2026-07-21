@@ -46,9 +46,13 @@ result = transitio.fetch(
 ## Editing a feed in the GUI
 
 ```
-pip install "transitio[gui,snap]"
+pip install "transitio-editor[snap]"
 transitio edit feed.zip --osm-pbf helsinki.osm.pbf
 ```
+
+The editor lives in its own package,
+[transitio-editor](https://github.com/cafein-py/transitio-editor); the
+`transitio edit` command delegates to it.
 
 The editor opens on `http://127.0.0.1:8300`: stops and shapes render on
 a map where they can be added, moved and drawn — with the `--osm-pbf`

@@ -32,7 +32,6 @@ classifiers = [
 dynamic = ["version"]
 
 [project.optional-dependencies]
-gui = ["fastapi>=0.110", "uvicorn>=0.29"]
 snap = ["networkx>=3"]
 
 [project.scripts]

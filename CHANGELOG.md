@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+
+- The editing GUI moved to its own package,
+  `transitio-editor <https://github.com/cafein-py/transitio-editor>`_:
+  the ``transitio.gui`` module and the ``[gui]`` extra are gone from the
+  core library, and ``transitio edit feed.zip`` now delegates to the
+  installed ``transitio-editor`` (with a clear error when it is absent).
+
 ### Added
 
 - Map UI for the editor: ``transitio edit feed.zip`` now serves a

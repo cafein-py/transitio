@@ -2,6 +2,3 @@
 max-line-length = 88
 select = C,E,F,W,B,B950
 ignore = E203, E501, W503, F401
-# FastAPI's Body(...) default is the framework idiom.
-per-file-ignores =
-    python/transitio/gui/_app.py: B008
