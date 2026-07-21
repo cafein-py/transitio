@@ -5,34 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
-
-### Changed
-
-- The editing GUI moved to its own package,
-  `transitio-editor <https://github.com/cafein-py/transitio-editor>`_:
-  the ``transitio.gui`` module and the ``[gui]`` extra are gone from the
-  core library, and ``transitio edit feed.zip`` now delegates to the
-  installed ``transitio-editor`` (with a clear error when it is absent).
+## 0.2.0 — 2026-07-21
 
 ### Added
 
-- Map UI for the editor: ``transitio edit feed.zip`` now serves a
-  MapLibre-based editing interface (vendored assets, no CDN; base map
-  tiles stream from openstreetmap.org) — stops render and can be added,
-  renamed and moved on the map; route shapes draw click by click with
-  optional street snapping when an OSM extract is given; routes,
-  agencies, services and frequency trips (stop sequence picked by
-  clicking stops) are created from sidebar forms; and Save & validate
-  reports the notice counts of the written feed.
-
-- GUI backend (``transitio edit feed.zip`` console command, optional
-  extra ``transitio[gui]``): a loopback FastAPI app over a
-  ``FeedEditor`` exposing table browsing, stop and shape GeoJSON,
-  mutation endpoints mirroring the editor helpers, a shape-snapping
-  endpoint backed by ``snap_to_network`` when an OSM extract is given,
-  and validated saving. The map UI ships in a following release; the
-  API is browsable at ``/api/docs``.
+- The map-based feed editor, as a companion package:
+  `transitio-editor <https://github.com/cafein-py/transitio-editor>`_
+  serves a local MapLibre GUI over the editing API below, and
+  ``transitio edit feed.zip`` delegates to it when installed (with a
+  clear error otherwise). The core library carries no GUI code (the
+  interim ``transitio.gui`` module and ``[gui]`` extra existed only on
+  the development branch and never shipped in a release).
 
 - Scenario feeds from geodata (``transitio.build_feed``): reads route
   alignments from a GeoPackage/Shapefile or GeoDataFrame under a small
