@@ -8,6 +8,7 @@ list of member node ids — and writes the result back to a re-readable PBF.
 
 from __future__ import annotations
 
+import copy
 import os
 from pathlib import Path
 
@@ -88,6 +89,14 @@ class OsmEditor:
         self._osm = OSM(os.fspath(self.source), keep_node_info=True)
         if custom_filter is None and network_type is None:
             custom_filter = _DEFAULT_NETWORK_FILTER
+        # Own the filter (isolate from later caller mutation and the shared
+        # module default) so snapping defaults to exactly what was loaded.
+        custom_filter = copy.deepcopy(custom_filter)
+        self._load = {
+            "network_type": network_type,
+            "custom_filter": custom_filter,
+            "filter_type": filter_type,
+        }
         if custom_filter is not None:
             # network_type "all" + a keep-filter restricts the network to
             # exactly the matching ways (the idiom used by snap_to_network).
@@ -115,17 +124,24 @@ class OsmEditor:
         self._nodes = nodes.reset_index(drop=True)
         self._ways = ways
         self._deletions = set()
+        # Snapping materializes the edited network to a temp PBF; rebuild it
+        # only after an edit (dirty), reusing it across snaps otherwise.
+        self._network_dirty = True
+        self._snap_dir = None
         # Ids added in *this* session, tracked explicitly: reopening a file
         # this editor wrote turns its negative ids into ordinary source
         # elements, so the sign alone cannot say what is new.
         self._provisional = set()
         # New elements get provisional negative ids. Start below the lowest
-        # id present, so reopening a file this editor wrote never re-issues an
-        # existing id.
+        # id present — including ids that appear only in way member lists
+        # (out-of-extract members) — so reopening a file this editor wrote
+        # never re-issues an existing id.
+        member_ids = [int(m) for members in self._ways["nodes"] for m in members]
         lowest = min(
             [0]
             + ([int(self._nodes["id"].min())] if len(self._nodes) else [])
             + ([int(self._ways["id"].min())] if len(self._ways) else [])
+            + member_ids
         )
         self._next_new_id = min(-1, lowest - 1)
 
@@ -238,6 +254,7 @@ class OsmEditor:
         for column, value in (("lon", lon), ("lat", lat)):
             if column in self._nodes.columns:
                 self._nodes.at[index, column] = value
+        self._network_dirty = True
         return self
 
     def add_node(self, lon, lat, **tags):
@@ -251,6 +268,7 @@ class OsmEditor:
         row = {"id": node_id, "osm_type": "node", **tags}
         new = gpd.GeoDataFrame([row], geometry=[Point(lon, lat)], crs="EPSG:4326")
         self._nodes = pd.concat([self._nodes, new], ignore_index=True)
+        self._network_dirty = True
         return node_id
 
     def delete_node(self, node_id):
@@ -259,6 +277,7 @@ class OsmEditor:
         self._nodes = self._nodes.drop(index=index).reset_index(drop=True)
         self._record_delete("node", node_id)
         self._strip_node_from_ways(node_id)
+        self._network_dirty = True
         return self
 
     def _record_delete(self, osm_type, element_id):
@@ -279,6 +298,7 @@ class OsmEditor:
                 continue
             remaining = [n for n in members if n != node_id]
             if len(remaining) < 2 and self._ways.at[index, "id"] in self._provisional:
+                self._provisional.discard(self._ways.at[index, "id"])
                 drop.append(index)  # a provisional way cannot survive
             else:
                 self._ways.at[index, "nodes"] = remaining
@@ -291,6 +311,7 @@ class OsmEditor:
         index = self._node_index(node_id)
         for key, value in tags.items():
             self._nodes.at[index, key] = value
+        self._network_dirty = True
         return self
 
     # -- way edits ---------------------------------------------------------
@@ -312,12 +333,14 @@ class OsmEditor:
         row = {"id": way_id, "osm_type": "way", "nodes": members, **tags}
         new = gpd.GeoDataFrame([row], geometry=[None], crs="EPSG:4326")
         self._ways = pd.concat([self._ways, new], ignore_index=True)
+        self._network_dirty = True
         return way_id
 
     def reshape_way(self, way_id, node_ids):
         """Replace a way's ordered member-node list (insert/remove/reorder)."""
         index = self._way_index(way_id)
         self._ways.at[index, "nodes"] = self._checked_members(node_ids)
+        self._network_dirty = True
         return self
 
     def _checked_members(self, node_ids):
@@ -330,11 +353,29 @@ class OsmEditor:
         return members
 
     def delete_way(self, way_id):
-        """Remove a way. Its orphaned nodes are dropped on save."""
+        """Remove a way and any of its nodes no other way still references."""
         index = self._way_index(way_id)
+        members = list(self._ways.at[index, "nodes"])
         self._ways = self._ways.drop(index=index).reset_index(drop=True)
         self._record_delete("way", way_id)
+        self._drop_orphan_nodes(members)
+        self._network_dirty = True
         return self
+
+    def _drop_orphan_nodes(self, candidate_ids):
+        # Keep the in-memory network equal to what save/snap produce: drop the
+        # deleted way's nodes that no remaining way references (write_pbf's
+        # on_orphan_node='remove'). Shared nodes stay.
+        still_used = set()
+        for members in self._ways["nodes"]:
+            still_used.update(members)
+        orphans = {int(node_id) for node_id in candidate_ids} - still_used
+        if not orphans:
+            return
+        mask = self._nodes["id"].isin(orphans)
+        for node_id in self._nodes.loc[mask, "id"]:
+            self._record_delete("node", int(node_id))
+        self._nodes = self._nodes[~mask].reset_index(drop=True)
 
     def retag_way(self, way_id, **tags):
         """Set tag columns on a way."""
@@ -342,6 +383,7 @@ class OsmEditor:
         index = self._way_index(way_id)
         for key, value in tags.items():
             self._ways.at[index, key] = value
+        self._network_dirty = True
         return self
 
     # -- save --------------------------------------------------------------
@@ -392,3 +434,54 @@ class OsmEditor:
 
         frame = self._ways.drop(columns=["geometry"], errors="ignore").copy()
         return gpd.GeoDataFrame(frame, geometry=[None] * len(frame), crs="EPSG:4326")
+
+    # -- snapping ----------------------------------------------------------
+
+    def snap(
+        self, waypoints, *, network_type=None, custom_filter=None, filter_type=None
+    ):
+        """Route a waypoint sequence along the *current edited* network.
+
+        The edited network is materialized to a temporary PBF (reused until
+        the next edit) and routed with :func:`snap_to_network`, so a shape
+        follows exactly the network on screen — including edits and new ways.
+        Without a filter the network is the one the editor loaded; pass
+        ``custom_filter`` (and ``filter_type``) to narrow within it, e.g. to
+        tram rails for a tram route.
+
+        Parameters
+        ----------
+        waypoints : sequence of (lat, lon)
+            At least two points, in visit order.
+        network_type, custom_filter, filter_type
+            Passed to :func:`~transitio.edit.snap_to_network`; default to how
+            the editor loaded its network.
+
+        Returns
+        -------
+        shapely.LineString
+            The snapped alignment in WGS84.
+        """
+        from transitio.edit._snap import snap_to_network
+
+        if network_type is None and custom_filter is None:
+            network_type = self._load["network_type"]
+            custom_filter = self._load["custom_filter"]
+        return snap_to_network(
+            waypoints,
+            self._materialize_network(),
+            network_type=network_type if network_type is not None else "driving",
+            custom_filter=custom_filter,
+            filter_type=filter_type or self._load["filter_type"],
+        )
+
+    def _materialize_network(self):
+        import tempfile
+
+        if self._snap_dir is None:
+            self._snap_dir = tempfile.TemporaryDirectory(prefix="transitio-osm-")
+        pbf = Path(self._snap_dir.name) / "network.osm.pbf"
+        if self._network_dirty or not pbf.exists():
+            self.save(pbf)
+            self._network_dirty = False
+        return pbf

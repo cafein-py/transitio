@@ -81,6 +81,19 @@ def test_delete_way_roundtrip(pbf, tmp_path):
     assert not (ways["id"] == way_id).any()
 
 
+def test_delete_way_drops_orphans_keeps_shared(pbf):
+    editor = _editor(pbf)
+    a = editor.add_node(24.9500, 60.1800)  # exclusive to way 1
+    shared = editor.add_node(24.9600, 60.1900)
+    b = editor.add_node(24.9700, 60.2000)  # exclusive to way 2
+    way1 = editor.add_way([a, shared], highway="footway")
+    editor.add_way([shared, b], highway="footway")  # way 2 also uses `shared`
+    editor.delete_way(way1)
+    ids = set(editor.nodes["id"])
+    assert a not in ids  # orphaned by the deleted way -> dropped in memory
+    assert shared in ids and b in ids  # still referenced by way 2 -> kept
+
+
 def test_retag_way_roundtrip(pbf, tmp_path):
     editor = _editor(pbf)
     way_id = int(editor.ways.iloc[0]["id"])
@@ -204,3 +217,40 @@ def test_unknown_ids_and_short_ways_raise(pbf):
 def test_empty_network_raises(pbf):
     with pytest.raises(ValueError, match="no routable network"):
         OsmEditor(pbf, custom_filter={"aerialway": ["zip_line"]})
+
+
+def _two_waypoints(editor):
+    a = editor.nodes.iloc[0].geometry
+    b = editor.nodes.iloc[5].geometry
+    return [(a.y, a.x), (b.y, b.x)]
+
+
+def test_snap_routes_along_edited_network(pbf):
+    pytest.importorskip("networkx")
+    editor = _editor(pbf)
+    line = editor.snap(_two_waypoints(editor))
+    assert line.geom_type == "LineString"
+    assert len(line.coords) >= 2
+
+
+def test_snap_cache_invalidates_on_edit(pbf):
+    pytest.importorskip("networkx")
+    editor = _editor(pbf)
+    waypoints = _two_waypoints(editor)
+    editor.snap(waypoints)
+    assert editor._network_dirty is False  # materialized and cached
+    editor.snap(waypoints)
+    assert editor._network_dirty is False  # reused, not rebuilt
+    node = editor.nodes.iloc[0]
+    editor.move_node(int(node["id"]), node.geometry.x + 1e-4, node.geometry.y + 1e-4)
+    assert editor._network_dirty is True  # an edit invalidates the cache
+    editor.snap(waypoints)
+    assert editor._network_dirty is False  # rebuilt from the edited network
+
+
+def test_snap_custom_filter_narrows(pbf):
+    pytest.importorskip("networkx")
+    editor = _editor(pbf)
+    # narrowing to a subset absent from the network yields no path
+    with pytest.raises(ValueError):
+        editor.snap(_two_waypoints(editor), custom_filter={"aerialway": ["zip_line"]})

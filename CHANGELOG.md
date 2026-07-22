@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``retag_*`` helpers. ``save`` writes a network-only file by default
   (``subset_only``) so editing a shared node cannot deform a feature that
   was not loaded.
+- ``OsmEditor.snap``: route a waypoint sequence along the *current edited*
+  network — the edited network is materialized to a temporary PBF (reused
+  until the next edit) and routed with ``snap_to_network``, so a shape
+  follows edits and new ways. Defaults to the loaded network; a
+  ``custom_filter`` narrows within it (e.g. to tram rails).
 
 ### Changed
 
