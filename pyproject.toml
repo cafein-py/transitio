@@ -14,7 +14,7 @@ dependencies = [
     "httpx>=0.27",
     "pandas>=2.0",
     "platformdirs>=3",
-    "pyrosm>=0.11.0",
+    "pyrosm>=0.12.0",
     "shapely>=2.0",
 ]
 classifiers = [

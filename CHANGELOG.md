@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- ``OsmEditor`` (``transitio.edit.OsmEditor``): edit the routable network
+  of a local OSM extract and write it back to a re-readable
+  ``*.osm.pbf``. Loads nodes and whole ways with pyrosm (now ``>=0.12.0``),
+  exposes them as GeoDataFrames, and edits them in the OSM data model —
+  coordinates on nodes, a way as an ordered member-node list — via
+  ``move_node``, ``add_node``, ``delete_node``, ``add_way`` (referencing
+  existing and/or new nodes), ``reshape_way``, ``delete_way`` and the
+  ``retag_*`` helpers. ``save`` writes a network-only file by default
+  (``subset_only``) so editing a shared node cannot deform a feature that
+  was not loaded.
+
+### Changed
+
+- ``pyrosm`` requirement raised to ``>=0.12.0`` for its geometry-editing
+  ``write_pbf``.
+
 ## 0.3.0 — 2026-07-21
 
 ### Added
