@@ -59,6 +59,15 @@ def _feed_from_row(row):
     )
 
 
+def _overlap_share(aoi_box, feed_box):
+    # The share of the feed's bounding box inside the AOI: a local feed about
+    # the searched area scores near 1, a continental aggregate whose rectangle
+    # merely sweeps over it scores near 0.
+    if feed_box.area == 0:
+        return 1.0  # a degenerate (point/line) box that intersects lies inside
+    return aoi_box.intersection(feed_box).area / feed_box.area
+
+
 def _row_box(row):
     values = []
     for key in ("min_lon", "min_lat", "max_lon", "max_lat"):
@@ -96,9 +105,16 @@ def search_csv(
     enclosure="partially_enclosed",
     limit=100,
 ):
-    """Filter the CSV catalogue with the same semantics as the API search."""
+    """Filter the CSV catalogue with the same semantics as the API search.
+
+    With ``bounds``, results are ordered by the share of each feed's
+    bounding box lying inside the AOI, so feeds about the searched area
+    rank above continental aggregates whose rectangles merely sweep over
+    it; ``limit`` applies after that ordering.
+    """
     aoi_box = box(*bounds) if bounds is not None else None
     feeds = []
+    scored = []
     with open(path, newline="", encoding="utf-8-sig") as handle:
         for row in csv.DictReader(handle):
             if _first(row, "data_type") != "gtfs":
@@ -115,6 +131,7 @@ def search_csv(
                 value = _first(row, *_ALIASES["municipality"]) or ""
                 if value.lower() != municipality.lower():
                     continue
+            feed_box = None
             if aoi_box is not None:
                 feed_box = _row_box(row)
                 if feed_box is None:
@@ -129,7 +146,14 @@ def search_csv(
                 continue
             if official_only and not feed.official:
                 continue
-            feeds.append(feed)
-            if len(feeds) >= limit:
-                break
+            if aoi_box is None:
+                feeds.append(feed)
+                if len(feeds) >= limit:
+                    break
+            else:
+                scored.append((_overlap_share(aoi_box, feed_box), feed))
+    if aoi_box is not None:
+        # Stable sort: equal shares keep their catalogue order.
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [feed for _, feed in scored[:limit]]
     return feeds
