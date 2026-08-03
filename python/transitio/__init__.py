@@ -15,6 +15,8 @@ __all__ = [
     "fetch",
     "fetch_pbf",
     "gtfs",
+    "merge_feeds",
+    "merge_tables",
     "osm",
     "pipeline",
     "repair",
@@ -43,10 +45,10 @@ def __getattr__(name):
         from transitio import pipeline
 
         return getattr(pipeline, name)
-    if name == "crop_feed":
-        from transitio.gtfs import crop_feed
+    if name in ("crop_feed", "merge_feeds", "merge_tables"):
+        from transitio import gtfs
 
-        return crop_feed
+        return getattr(gtfs, name)
     if name == "repair_feed":
         from transitio.repair import repair_feed
 

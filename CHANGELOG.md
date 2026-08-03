@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- ``merge_feeds`` / ``merge_tables`` (``transitio.gtfs``): merge several
+  GTFS feeds into one referentially consistent feed. Every id (and every
+  standard reference to it, including Fares v2, networks, areas and
+  location-group tables) is namespaced with a per-feed prefix so ids from
+  different feeds never collide; single-agency feeds with blank agency
+  ids get them backfilled; mixed ``routes.network_id`` /
+  ``route_networks.txt`` representations are normalised to the latter.
+  ``feed_info.txt`` and ``translations.txt`` are dropped and reported;
+  GTFS-Flex feeds and conflicting agency timezones or fare defaults are
+  refused. ``merge_feeds`` writes the zip atomically, validates it, and
+  returns the validation report with a ``dropped_files`` key.
+
 ### Fixed
 
 - Area-filtered catalogue searches in the CSV fallback now rank results by
