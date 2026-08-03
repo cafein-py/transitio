@@ -188,3 +188,31 @@ def test_hostile_passthrough_names_are_not_copied(tmp_path):
     assert "../evil.txt" not in names
     assert "STOPS.TXT" not in names
     assert "innocent-link" not in names
+
+
+def test_area_search_ranks_local_feed_over_continental_aggregate(tmp_path):
+    # an aggregate whose huge bounding rectangle sweeps over the searched
+    # area must not outrank or crowd out the local feed (issue seen with a
+    # Turku-area search returning German/Swedish/Norwegian aggregates)
+    from transitio.catalog._csv import search_csv
+
+    header = (
+        "id,data_type,status,is_official,provider,"
+        "location.country_code,location.subdivision_name,location.municipality,"
+        "location.bounding_box.minimum_latitude,"
+        "location.bounding_box.maximum_latitude,"
+        "location.bounding_box.minimum_longitude,"
+        "location.bounding_box.maximum_longitude,"
+        "urls.direct_download,urls.latest,urls.license"
+    )
+    rows = [
+        "mdb-1,gtfs,active,True,Aggregate,DE,,,39.0,79.0,0.0,159.0,,,",
+        "mdb-2,gtfs,active,True,HSL,FI,Uusimaa,Helsinki,59.9,60.6,24.2,25.6,,,",
+    ]
+    path = tmp_path / "feeds_v2.csv"
+    path.write_text("\n".join([header, *rows]) + "\n")
+    helsinki = (24.6, 60.1, 25.2, 60.4)
+    ranked = search_csv(path, bounds=helsinki)
+    assert [feed.id for feed in ranked] == ["mdb-2", "mdb-1"]
+    # the limit applies after ranking, not in catalogue file order
+    assert [feed.id for feed in search_csv(path, bounds=helsinki, limit=1)] == ["mdb-2"]

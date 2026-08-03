@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- Area-filtered catalogue searches in the CSV fallback now rank results by
+  the share of each feed's bounding box inside the searched area (with the
+  result limit applied after ranking), so local feeds are no longer
+  outranked or crowded out by continental aggregates whose bounding
+  rectangles merely sweep over the area.
+
 ## 0.4.0 — 2026-07-22
 
 ### Added
