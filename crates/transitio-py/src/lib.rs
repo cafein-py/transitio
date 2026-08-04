@@ -108,13 +108,14 @@ fn repair_feed(
 
 /// Crop a feed spatially and/or temporally into `output`.
 #[pyfunction]
-#[pyo3(signature = (path, output, *, bbox=None, start_date=None, end_date=None, full_trips_only=false, max_entry_bytes=None, max_total_bytes=None, max_rows=None, max_columns=None, max_notices_per_file=None, reference_date=None))]
+#[pyo3(signature = (path, output, *, bbox=None, polygon=None, start_date=None, end_date=None, full_trips_only=false, max_entry_bytes=None, max_total_bytes=None, max_rows=None, max_columns=None, max_notices_per_file=None, reference_date=None))]
 #[allow(clippy::too_many_arguments)]
 fn crop_feed(
     py: Python<'_>,
     path: std::path::PathBuf,
     output: std::path::PathBuf,
     bbox: Option<(f64, f64, f64, f64)>,
+    polygon: Option<Vec<transitio_gtfs::PolygonRings>>,
     start_date: Option<String>,
     end_date: Option<String>,
     full_trips_only: bool,
@@ -125,10 +126,18 @@ fn crop_feed(
     max_notices_per_file: Option<u64>,
     reference_date: Option<&str>,
 ) -> PyResult<String> {
-    if bbox.is_none() && start_date.is_none() && end_date.is_none() {
+    if bbox.is_none() && polygon.is_none() && start_date.is_none() && end_date.is_none() {
         return Err(PyValueError::new_err(
-            "nothing to crop: pass bbox and/or a date window",
+            "nothing to crop: pass an area and/or a date window",
         ));
+    }
+    if bbox.is_some() && polygon.is_some() {
+        return Err(PyValueError::new_err(
+            "pass either bbox or polygon, not both",
+        ));
+    }
+    if let Some(parts) = polygon.as_deref() {
+        transitio_gtfs::validate_polygon(parts).map_err(PyValueError::new_err)?;
     }
     let mut options = transitio_gtfs::ScanOptions::default();
     if let Some(value) = max_entry_bytes {
@@ -153,6 +162,7 @@ fn crop_feed(
     }
     let crop_options = transitio_gtfs::CropOptions {
         bbox,
+        polygon,
         start_date,
         end_date,
         full_trips_only,

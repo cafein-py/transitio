@@ -10,15 +10,26 @@ use crate::repair::write_zip;
 use crate::scan::{ScanOptions, ScanResult, Table};
 use crate::{rules, scan, semantics};
 
+/// One polygon: its outer ring first, then any holes, as WGS84
+/// (longitude, latitude) pairs.
+pub type PolygonRings = Vec<Vec<(f64, f64)>>;
+
+/// The spatial crop area: a bounding box, plus the polygon parts to test
+/// within it when the crop is polygon-true.
+type CropArea<'a> = ((f64, f64, f64, f64), Option<&'a [PolygonRings]>);
+
 pub struct CropOptions {
     /// (minx, miny, maxx, maxy) in WGS84; None disables the spatial crop.
     pub bbox: Option<(f64, f64, f64, f64)>,
+    /// Polygon parts to crop to instead of a box; None disables it. A
+    /// stop inside any part is inside the area.
+    pub polygon: Option<Vec<PolygonRings>>,
     /// YYYYMMDD inclusive window; None disables the temporal crop.
     pub start_date: Option<String>,
     pub end_date: Option<String>,
-    /// Retain only trips whose every stop lies inside the box (stricter);
-    /// the default keeps any trip serving at least one inside stop, with
-    /// its full stop sequence.
+    /// Retain only trips whose every stop lies inside the crop area
+    /// (stricter); the default keeps any trip serving at least one inside
+    /// stop, with its full stop sequence.
     pub full_trips_only: bool,
 }
 
@@ -33,6 +44,18 @@ pub fn crop(
     options: ScanOptions,
     crop_options: &CropOptions,
 ) -> Result<CropResult, String> {
+    // Check the area before reading anything: an invalid one would
+    // otherwise crop silently wrong.
+    if crop_options.bbox.is_some() && crop_options.polygon.is_some() {
+        return Err("pass either bbox or polygon, not both".to_string());
+    }
+    let area = match &crop_options.polygon {
+        Some(parts) => {
+            validate_polygon(parts)?;
+            Some(closed_parts(parts))
+        }
+        None => None,
+    };
     let mut result = scan::scan_with(path, options)?;
     rules::run_rules(&mut result, &options);
     semantics::run_semantics(&mut result, &options);
@@ -59,7 +82,7 @@ pub fn crop(
         }
     }
 
-    let kept_trips = select_trips(&result, options, crop_options)?;
+    let kept_trips = select_trips(&result, options, crop_options, area.as_deref())?;
     retain(
         &mut result,
         &kept_trips,
@@ -113,6 +136,141 @@ fn column(table: &Table, name: &str) -> Option<usize> {
     table.headers.iter().position(|h| h == name)
 }
 
+/// Whether a point lies on a ring's boundary (within a rounding
+/// tolerance), which counts as inside for every ring, hole or not.
+fn on_boundary(x: f64, y: f64, ring: &[(f64, f64)]) -> bool {
+    // Degrees: about a tenth of a millimetre, and compared against the
+    // point's distance from the edge rather than the raw cross product,
+    // which grows with edge length.
+    const EPSILON: f64 = 1e-9;
+    ring.windows(2).any(|edge| {
+        let ((x1, y1), (x2, y2)) = (edge[0], edge[1]);
+        let (dx, dy) = (x2 - x1, y2 - y1);
+        let length = dx.hypot(dy);
+        let cross = (x - x1) * dy - (y - y1) * dx;
+        let distance = if length > 0.0 {
+            cross.abs() / length
+        } else {
+            (x - x1).hypot(y - y1) // a zero-length edge is a point
+        };
+        if distance > EPSILON {
+            return false;
+        }
+        // collinear: inside the segment's own extent
+        x >= x1.min(x2) - EPSILON
+            && x <= x1.max(x2) + EPSILON
+            && y >= y1.min(y2) - EPSILON
+            && y <= y1.max(y2) + EPSILON
+    })
+}
+
+/// Even-odd ray cast, excluding the boundary (callers test that first).
+fn strictly_inside_ring(x: f64, y: f64, ring: &[(f64, f64)]) -> bool {
+    let mut inside = false;
+    for edge in ring.windows(2) {
+        let ((x1, y1), (x2, y2)) = (edge[0], edge[1]);
+        if (y1 > y) != (y2 > y) {
+            let t = (y - y1) / (y2 - y1);
+            if x < x1 + t * (x2 - x1) {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+/// Whether a point is inside one polygon part: inside its outer ring and
+/// not strictly inside a hole. A point on any ring counts as inside.
+fn inside_part(x: f64, y: f64, rings: &PolygonRings) -> bool {
+    let mut parts = rings.iter();
+    let Some(outer) = parts.next() else {
+        return false;
+    };
+    if on_boundary(x, y, outer) {
+        return true;
+    }
+    if !strictly_inside_ring(x, y, outer) {
+        return false;
+    }
+    !parts.any(|hole| !on_boundary(x, y, hole) && strictly_inside_ring(x, y, hole))
+}
+
+/// Whether a point is inside any part of the cropping area.
+fn inside_polygon(x: f64, y: f64, parts: &[PolygonRings]) -> bool {
+    parts.iter().any(|rings| inside_part(x, y, rings))
+}
+
+/// The bounding box of every ring, as a cheap pre-filter.
+fn polygon_bounds(parts: &[PolygonRings]) -> (f64, f64, f64, f64) {
+    let (mut minx, mut miny) = (f64::INFINITY, f64::INFINITY);
+    let (mut maxx, mut maxy) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for rings in parts {
+        for ring in rings {
+            for &(x, y) in ring {
+                minx = minx.min(x);
+                miny = miny.min(y);
+                maxx = maxx.max(x);
+                maxy = maxy.max(y);
+            }
+        }
+    }
+    (minx, miny, maxx, maxy)
+}
+
+/// Every ring closed (its first point repeated at the end), so the
+/// edge walk covers the closing segment. Callers that already close
+/// their rings — GeoJSON requires it — are unaffected.
+pub fn closed_parts(parts: &[PolygonRings]) -> Vec<PolygonRings> {
+    parts
+        .iter()
+        .map(|rings| {
+            rings
+                .iter()
+                .map(|ring| {
+                    let mut ring = ring.clone();
+                    match (ring.first().copied(), ring.last().copied()) {
+                        (Some(first), Some(last)) if first != last => ring.push(first),
+                        _ => {}
+                    }
+                    ring
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Reject areas that cannot describe a region before any work starts.
+pub fn validate_polygon(parts: &[PolygonRings]) -> Result<(), String> {
+    if parts.is_empty() {
+        return Err("crop polygon has no parts".to_string());
+    }
+    for rings in parts {
+        let Some(outer) = rings.first() else {
+            return Err("crop polygon part has no outer ring".to_string());
+        };
+        for ring in rings {
+            for &(x, y) in ring {
+                if !x.is_finite() || !y.is_finite() {
+                    return Err("crop polygon has a non-finite coordinate".to_string());
+                }
+                if !(-180.0..=180.0).contains(&x) || !(-90.0..=90.0).contains(&y) {
+                    return Err(format!("crop polygon coordinate out of range: ({x}, {y})"));
+                }
+            }
+        }
+        let mut distinct: Vec<(f64, f64)> = Vec::new();
+        for &point in outer {
+            if !distinct.contains(&point) {
+                distinct.push(point);
+            }
+        }
+        if distinct.len() < 3 {
+            return Err("crop polygon needs at least three distinct points".to_string());
+        }
+    }
+    Ok(())
+}
+
 fn ids<'t>(table: &'t Table, field: &str) -> Option<(usize, &'t Table)> {
     column(table, field).map(|i| (i, table))
 }
@@ -122,6 +280,7 @@ fn select_trips(
     result: &ScanResult,
     scan_options_ref: ScanOptions,
     crop_options: &CropOptions,
+    polygon: Option<&[PolygonRings]>,
 ) -> Result<HashSet<String>, String> {
     let trips_table = result
         .tables
@@ -130,34 +289,42 @@ fn select_trips(
     let trip_index = column(trips_table, "trip_id").ok_or("trips.txt has no trip_id column")?;
     let service_index = column(trips_table, "service_id");
 
-    // Spatial selection over stop coordinates.
-    let inside_stops: Option<HashSet<String>> =
-        crop_options.bbox.map(|(minx, miny, maxx, maxy)| {
-            result
-                .tables
-                .get("stops.txt")
-                .and_then(|stops| {
-                    let id = column(stops, "stop_id")?;
-                    let lat = column(stops, "stop_lat")?;
-                    let lon = column(stops, "stop_lon")?;
-                    Some(
-                        stops
-                            .rows
-                            .iter()
-                            .filter_map(|row| {
-                                let latitude: f64 = row.fields[lat].trim().parse().ok()?;
-                                let longitude: f64 = row.fields[lon].trim().parse().ok()?;
-                                (latitude >= miny
-                                    && latitude <= maxy
-                                    && longitude >= minx
-                                    && longitude <= maxx)
-                                    .then(|| row.fields[id].clone())
-                            })
-                            .collect(),
-                    )
-                })
-                .unwrap_or_default()
-        });
+    // Spatial selection over stop coordinates: a box, or the polygon
+    // parts (pre-filtered by their own bounds) when one was given.
+    let area: Option<CropArea> = match (polygon, crop_options.bbox) {
+        (Some(parts), _) => Some((polygon_bounds(parts), Some(parts))),
+        (None, Some(bbox)) => Some((bbox, None)),
+        (None, None) => None,
+    };
+    let inside_stops: Option<HashSet<String>> = area.map(|((minx, miny, maxx, maxy), parts)| {
+        result
+            .tables
+            .get("stops.txt")
+            .and_then(|stops| {
+                let id = column(stops, "stop_id")?;
+                let lat = column(stops, "stop_lat")?;
+                let lon = column(stops, "stop_lon")?;
+                Some(
+                    stops
+                        .rows
+                        .iter()
+                        .filter_map(|row| {
+                            let latitude: f64 = row.fields[lat].trim().parse().ok()?;
+                            let longitude: f64 = row.fields[lon].trim().parse().ok()?;
+                            let in_box = latitude >= miny
+                                && latitude <= maxy
+                                && longitude >= minx
+                                && longitude <= maxx;
+                            let inside = in_box
+                                && parts
+                                    .is_none_or(|parts| inside_polygon(longitude, latitude, parts));
+                            inside.then(|| row.fields[id].clone())
+                        })
+                        .collect(),
+                )
+            })
+            .unwrap_or_default()
+    });
 
     // Temporal selection over actual service activity: weekday flags and
     // calendar_dates exceptions included, via the semantic tier's
@@ -258,6 +425,9 @@ fn retain(
         }
     }
     keep_rows(result, "stops.txt", "stop_id", &kept_stops);
+    // stop associations follow their stops, or they dangle
+    keep_rows(result, "stop_areas.txt", "stop_id", &kept_stops);
+    keep_rows(result, "location_group_stops.txt", "stop_id", &kept_stops);
 
     let kept_routes = referenced(result, "trips.txt", "route_id");
     keep_rows(result, "routes.txt", "route_id", &kept_routes);
@@ -426,4 +596,108 @@ fn keep_rows(result: &mut ScanResult, file: &str, field: &str, kept: &HashSet<St
         return;
     };
     table.rows.retain(|row| kept.contains(&row.fields[index]));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn triangle() -> Vec<PolygonRings> {
+        // the lower-right half of the unit square, left unclosed
+        vec![vec![vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]]]
+    }
+
+    #[test]
+    fn unclosed_rings_are_closed_before_testing() {
+        let open = triangle();
+        // without the closing edge the diagonal is missing and a point
+        // above it reads as inside
+        assert!(inside_polygon(0.2, 0.8, &open));
+        let closed = closed_parts(&open);
+        assert!(!inside_polygon(0.2, 0.8, &closed));
+        assert!(inside_polygon(0.6, 0.2, &closed));
+    }
+
+    #[test]
+    fn long_edges_keep_their_boundary_points() {
+        // a degree-wide sloped edge: the raw cross product for a point on
+        // it is far larger than a coordinate-scale epsilon
+        let wedge = closed_parts(&[vec![vec![(0.0, 0.0), (60.0, 30.0), (60.0, 0.0)]]]);
+        assert!(inside_polygon(20.0, 10.0, &wedge)); // exactly on the slope
+        assert!(!inside_polygon(20.0, 10.1, &wedge));
+    }
+
+    #[test]
+    fn ring_boundaries_count_as_inside() {
+        let closed = closed_parts(&triangle());
+        assert!(inside_polygon(0.5, 0.5, &closed)); // on the diagonal
+        assert!(inside_polygon(0.5, 0.0, &closed)); // on an axis edge
+        assert!(inside_polygon(0.0, 0.0, &closed)); // on a vertex
+    }
+
+    #[test]
+    fn holes_are_excluded_but_their_boundary_is_not() {
+        let square = vec![vec![
+            vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)],
+            vec![(0.4, 0.4), (0.6, 0.4), (0.6, 0.6), (0.4, 0.6), (0.4, 0.4)],
+        ]];
+        assert!(!inside_polygon(0.5, 0.5, &square)); // inside the hole
+        assert!(inside_polygon(0.4, 0.5, &square)); // on the hole's edge
+        assert!(inside_polygon(0.1, 0.1, &square)); // outside the hole
+    }
+
+    #[test]
+    fn later_parts_are_not_holes() {
+        let two = vec![
+            vec![vec![
+                (0.0, 0.0),
+                (1.0, 0.0),
+                (1.0, 1.0),
+                (0.0, 1.0),
+                (0.0, 0.0),
+            ]],
+            vec![vec![
+                (4.0, 4.0),
+                (5.0, 4.0),
+                (5.0, 5.0),
+                (4.0, 5.0),
+                (4.0, 4.0),
+            ]],
+        ];
+        assert!(inside_polygon(0.5, 0.5, &two));
+        assert!(inside_polygon(4.5, 4.5, &two));
+        assert!(!inside_polygon(2.0, 2.0, &two));
+    }
+
+    #[test]
+    fn degenerate_areas_are_refused() {
+        assert!(validate_polygon(&[]).is_err());
+        assert!(validate_polygon(&[vec![]]).is_err());
+        // fewer than three distinct points
+        assert!(validate_polygon(&[vec![vec![(0.0, 0.0), (1.0, 1.0), (0.0, 0.0)]]]).is_err());
+        assert!(validate_polygon(&[vec![vec![(0.0, 0.0), (1.0, 0.0), (f64::NAN, 1.0)]]]).is_err());
+        assert!(validate_polygon(&[vec![vec![(0.0, 0.0), (200.0, 0.0), (1.0, 1.0)]]]).is_err());
+        assert!(validate_polygon(&triangle()).is_ok());
+    }
+
+    #[test]
+    fn crop_refuses_both_predicates() {
+        let options = CropOptions {
+            bbox: Some((0.0, 0.0, 1.0, 1.0)),
+            polygon: Some(triangle()),
+            start_date: None,
+            end_date: None,
+            full_trips_only: false,
+        };
+        let error = match crop(
+            Path::new("does-not-matter.zip"),
+            Path::new("out.zip"),
+            ScanOptions::default(),
+            &options,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("crop accepted both a bbox and a polygon"),
+        };
+        assert!(error.contains("not both"), "{error}");
+    }
 }
