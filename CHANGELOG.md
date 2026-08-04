@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+
+- ``crop_feed`` (and ``fetch``, which forwards its ``aoi``) crops to a
+  polygon itself rather than to its bounding box: a Polygon or
+  MultiPolygon — a shapely geometry, a GeoDataFrame/GeoSeries of them, or
+  a GeoJSON-style mapping — now selects the stops inside the area, holes
+  excluded, with points on a boundary counted as inside. Bounding-box
+  tuples and non-polygon geometries are unaffected. Callers that already
+  passed a polygon get a tighter crop than before, which is what the
+  argument always described; the previous behaviour was documented as a
+  limitation.
+
 ## 0.5.0 — 2026-08-03
 
 ### Added

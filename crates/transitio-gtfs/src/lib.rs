@@ -11,7 +11,7 @@ pub mod scan;
 pub mod schema;
 pub mod semantics;
 
-pub use crop::{crop, CropOptions, CropResult};
+pub use crop::{closed_parts, crop, validate_polygon, CropOptions, CropResult, PolygonRings};
 pub use notice::{Notice, Severity};
 pub use repair::{repair, Fix, RepairResult};
 pub use scan::{
