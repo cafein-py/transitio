@@ -26,7 +26,7 @@ def repair_feed(path, output, **options):
         Destination path for the repaired ``.zip`` (overwritten).
     **options
         The ``validate_feed`` keyword arguments (size/row/notice budgets,
-        ``reference_date``).
+        ``reference_date``, ``reference_time``).
 
     Returns
     -------

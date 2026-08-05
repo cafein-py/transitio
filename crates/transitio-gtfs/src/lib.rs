@@ -15,7 +15,7 @@ pub use crop::{closed_parts, crop, validate_polygon, CropOptions, CropResult, Po
 pub use notice::{Notice, Severity};
 pub use repair::{repair, Fix, RepairResult};
 pub use scan::{
-    scan, scan_reader, scan_reader_with, scan_with, ScanOptions, ScanResult, Table,
+    scan, scan_reader, scan_reader_with, scan_with, Moment, ScanOptions, ScanResult, Table,
     DEFAULT_MAX_COLUMNS, DEFAULT_MAX_ENTRY_BYTES, DEFAULT_MAX_ROWS, DEFAULT_MAX_TOTAL_BYTES,
 };
 

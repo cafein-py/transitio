@@ -96,7 +96,7 @@ def crop_feed(
         Keep only trips whose every stop lies inside the AOI.
     **options
         The ``validate_feed`` keyword arguments (budgets,
-        ``reference_date``).
+        ``reference_date``, ``reference_time``).
 
     Returns
     -------

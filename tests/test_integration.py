@@ -35,6 +35,29 @@ def test_validate_helsinki_sample(helsinki_gtfs):
     assert hit == [], hit
 
 
+def test_moment_validation_on_helsinki_sample(helsinki_gtfs):
+    report = validate_feed(
+        helsinki_gtfs, reference_date=REFERENCE_DATE, reference_time="08:30"
+    )
+    # A February weekday morning: the feed as a whole serves the moment.
+    feed_level = {
+        "no_service_on_reference_date",
+        "no_trips_at_reference_time",
+        "service_level_below_baseline",
+    }
+    hit = [n for n in report["notices"] if n["code"] in feed_level]
+    assert hit == [], hit
+    # 2022-02-22 falls in the school winter-break week, so routes that
+    # run only on school days are legitimately silent that day.
+    inactive = [
+        n for n in report["notices"] if n["code"] == "route_inactive_on_reference_date"
+    ]
+    assert inactive, "expected winter-break school routes to be flagged"
+    for notice in inactive:
+        assert notice["context"]["referenceDate"] == REFERENCE_DATE
+        assert 0 < notice["context"]["activeDays"] <= notice["context"]["windowDays"]
+
+
 def test_report_renders_for_helsinki(helsinki_gtfs):
     validation = validate_feed(helsinki_gtfs, reference_date=REFERENCE_DATE)
     report = build_report(validation, provenance={"source": "r5py sample v1.1.1"})

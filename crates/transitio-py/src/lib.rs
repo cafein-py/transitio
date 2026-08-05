@@ -1,12 +1,65 @@
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 
+/// Wall-clock "HH:MM" / "HH:MM:SS" (00-23 h) — GTFS >24:00 notation is a
+/// service-day offset, not a clock time.
+fn parse_clock_time(value: &str) -> Option<u32> {
+    let parts: Vec<&str> = value.trim().split(':').collect();
+    if parts.len() != 2 && parts.len() != 3 {
+        return None;
+    }
+    // 1-2 digit hours, exactly 2-digit minutes and seconds, digits only.
+    if parts
+        .iter()
+        .any(|part| part.is_empty() || part.len() > 2 || !part.bytes().all(|b| b.is_ascii_digit()))
+        || parts[1..].iter().any(|part| part.len() != 2)
+    {
+        return None;
+    }
+    let hours: u32 = parts[0].parse().ok()?;
+    let minutes: u32 = parts[1].parse().ok()?;
+    let seconds: u32 = parts.get(2).map_or(Some(0), |p| p.parse().ok())?;
+    if hours > 23 || minutes > 59 || seconds > 59 {
+        return None;
+    }
+    Some(hours * 3600 + minutes * 60 + seconds)
+}
+
+/// An explicit reference_date drives the expiry checks AND targets the
+/// date(-time) service checks; reference_time refines the latter.
+fn apply_reference(
+    options: &mut transitio_gtfs::ScanOptions,
+    reference_date: Option<&str>,
+    reference_time: Option<&str>,
+) -> PyResult<()> {
+    if reference_time.is_some() && reference_date.is_none() {
+        return Err(PyValueError::new_err(
+            "reference_time requires reference_date",
+        ));
+    }
+    if let Some(value) = reference_date {
+        let date = chrono::NaiveDate::parse_from_str(value.trim(), "%Y%m%d")
+            .map_err(|_| PyValueError::new_err(format!("invalid reference_date: {value:?}")))?;
+        let time = match reference_time {
+            Some(value) => Some(parse_clock_time(value).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "invalid reference_time: {value:?} (expected HH:MM or HH:MM:SS)"
+                ))
+            })?),
+            None => None,
+        };
+        options.reference_date = Some(date);
+        options.moment = Some(transitio_gtfs::Moment { date, time });
+    }
+    Ok(())
+}
+
 /// Run the structural scan on a GTFS zip; returns the report as a JSON
 /// string ({"notices": [...], "row_counts": {...}}) that the Python layer
 /// decodes. Serializing once here keeps the boundary to a single string
 /// instead of nested Python object construction.
 #[pyfunction]
-#[pyo3(signature = (path, *, max_entry_bytes=None, max_total_bytes=None, max_rows=None, max_columns=None, max_notices_per_file=None, reference_date=None))]
+#[pyo3(signature = (path, *, max_entry_bytes=None, max_total_bytes=None, max_rows=None, max_columns=None, max_notices_per_file=None, reference_date=None, reference_time=None))]
 #[allow(clippy::too_many_arguments)]
 fn scan_feed(
     py: Python<'_>,
@@ -17,6 +70,7 @@ fn scan_feed(
     max_columns: Option<usize>,
     max_notices_per_file: Option<u64>,
     reference_date: Option<&str>,
+    reference_time: Option<&str>,
 ) -> PyResult<String> {
     let mut options = transitio_gtfs::ScanOptions::default();
     if let Some(value) = max_entry_bytes {
@@ -34,11 +88,7 @@ fn scan_feed(
     if let Some(value) = max_notices_per_file {
         options.max_notices_per_file = value;
     }
-    if let Some(value) = reference_date {
-        let parsed = chrono::NaiveDate::parse_from_str(value.trim(), "%Y%m%d")
-            .map_err(|_| PyValueError::new_err(format!("invalid reference_date: {value:?}")))?;
-        options.reference_date = Some(parsed);
-    }
+    apply_reference(&mut options, reference_date, reference_time)?;
     // The whole scan (I/O, decompression, parsing, serialization) runs
     // without the GIL; only the result crosses back into Python.
     py.allow_threads(move || {
@@ -60,7 +110,7 @@ fn scan_feed(
 /// Repair a feed into `output` and return the fix log plus the
 /// post-parse validation notices as JSON.
 #[pyfunction]
-#[pyo3(signature = (path, output, *, max_entry_bytes=None, max_total_bytes=None, max_rows=None, max_columns=None, max_notices_per_file=None, reference_date=None))]
+#[pyo3(signature = (path, output, *, max_entry_bytes=None, max_total_bytes=None, max_rows=None, max_columns=None, max_notices_per_file=None, reference_date=None, reference_time=None))]
 #[allow(clippy::too_many_arguments)]
 fn repair_feed(
     py: Python<'_>,
@@ -72,6 +122,7 @@ fn repair_feed(
     max_columns: Option<usize>,
     max_notices_per_file: Option<u64>,
     reference_date: Option<&str>,
+    reference_time: Option<&str>,
 ) -> PyResult<String> {
     let mut options = transitio_gtfs::ScanOptions::default();
     if let Some(value) = max_entry_bytes {
@@ -89,11 +140,7 @@ fn repair_feed(
     if let Some(value) = max_notices_per_file {
         options.max_notices_per_file = value;
     }
-    if let Some(value) = reference_date {
-        let parsed = chrono::NaiveDate::parse_from_str(value.trim(), "%Y%m%d")
-            .map_err(|_| PyValueError::new_err(format!("invalid reference_date: {value:?}")))?;
-        options.reference_date = Some(parsed);
-    }
+    apply_reference(&mut options, reference_date, reference_time)?;
     py.allow_threads(move || {
         let result = transitio_gtfs::repair(&path, &output, options)?;
         let report = serde_json::json!({
@@ -108,7 +155,7 @@ fn repair_feed(
 
 /// Crop a feed spatially and/or temporally into `output`.
 #[pyfunction]
-#[pyo3(signature = (path, output, *, bbox=None, polygon=None, start_date=None, end_date=None, full_trips_only=false, max_entry_bytes=None, max_total_bytes=None, max_rows=None, max_columns=None, max_notices_per_file=None, reference_date=None))]
+#[pyo3(signature = (path, output, *, bbox=None, polygon=None, start_date=None, end_date=None, full_trips_only=false, max_entry_bytes=None, max_total_bytes=None, max_rows=None, max_columns=None, max_notices_per_file=None, reference_date=None, reference_time=None))]
 #[allow(clippy::too_many_arguments)]
 fn crop_feed(
     py: Python<'_>,
@@ -125,6 +172,7 @@ fn crop_feed(
     max_columns: Option<usize>,
     max_notices_per_file: Option<u64>,
     reference_date: Option<&str>,
+    reference_time: Option<&str>,
 ) -> PyResult<String> {
     if bbox.is_none() && polygon.is_none() && start_date.is_none() && end_date.is_none() {
         return Err(PyValueError::new_err(
@@ -155,11 +203,7 @@ fn crop_feed(
     if let Some(value) = max_notices_per_file {
         options.max_notices_per_file = value;
     }
-    if let Some(value) = reference_date {
-        let parsed = chrono::NaiveDate::parse_from_str(value.trim(), "%Y%m%d")
-            .map_err(|_| PyValueError::new_err(format!("invalid reference_date: {value:?}")))?;
-        options.reference_date = Some(parsed);
-    }
+    apply_reference(&mut options, reference_date, reference_time)?;
     let crop_options = transitio_gtfs::CropOptions {
         bbox,
         polygon,

@@ -204,6 +204,34 @@ def test_expired_calendar_uses_reference_date(tmp_path):
     assert "expired_calendar" in codes(report)
 
 
+def test_reference_date_targets_service_checks(tmp_path):
+    report = validate_feed(
+        write_zip(tmp_path / "feed.zip", MINIMAL), reference_date="20270601"
+    )
+    assert "no_service_on_reference_date" in codes(report)
+
+
+def test_reference_time_targets_moment(tmp_path):
+    feed = write_zip(tmp_path / "feed.zip", MINIMAL)
+    report = validate_feed(feed, reference_date="20260601", reference_time="22:00")
+    assert "no_trips_at_reference_time" in codes(report)
+    report = validate_feed(feed, reference_date="20260601", reference_time="08:03")
+    assert "no_trips_at_reference_time" not in codes(report)
+
+
+def test_reference_time_requires_date(tmp_path):
+    feed = write_zip(tmp_path / "feed.zip", MINIMAL)
+    with pytest.raises(ValueError):
+        validate_feed(feed, reference_time="08:00")
+
+
+def test_invalid_reference_time(tmp_path):
+    feed = write_zip(tmp_path / "feed.zip", MINIMAL)
+    for bad in ("25:00", "8am", "08:60", "080000", "8:0"):
+        with pytest.raises(ValueError):
+            validate_feed(feed, reference_date="20260601", reference_time=bad)
+
+
 def test_row_cap_is_configurable(tmp_path):
     report = validate_feed(write_zip(tmp_path / "feed.zip", MINIMAL), max_rows=1)
     assert "too_many_rows" in codes(report)
