@@ -249,7 +249,7 @@ def test_readiness_predicts_distance_tiers(tmp_path):
     distances = report["readiness"]["distances"]
     assert distances["predicted"]["shape_linref"] == 1
     assert distances["verdict"] == "full"
-    assert distances["cafein"] == "0.9.0"
+    assert distances["cafein"] == "0.10.0"
 
 
 def test_omitted_reference_date_runs_no_moment_checks(tmp_path):

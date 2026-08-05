@@ -1,7 +1,9 @@
 //! Cafein-readiness tier: predicts, per trip, which tier of cafein's
 //! distance ladder will accept the feed's data, so problems surface
 //! before handoff instead of as silent fallbacks after it. The rules
-//! mirror cafein 0.9.0 (python/cafein/geometry.py); the constants
+//! mirror cafein 0.10.0 (python/cafein/geometry.py — byte-identical
+//! to 0.9.0, re-verified 2026-08-05; 0.10.0's route-relation extraction
+//! is groundwork that feeds no ladder tier yet); the constants
 //! duplicated here are pinned to that release and must track it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -25,7 +27,7 @@ const RATIO_KILOMETERS: (f64, f64) = (0.8e-3, 5e-3);
 /// patterns that no longer fit are counted as unprocessed.
 const MAX_TIER2_POINT_CHECKS: u64 = 20_000_000;
 
-const CAFEIN_VERSION: &str = "0.9.0";
+const CAFEIN_VERSION: &str = "0.10.0";
 
 #[derive(Serialize, Debug)]
 pub struct Readiness {

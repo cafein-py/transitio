@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Cafein-readiness (distances): ``validate_feed`` now returns a
-  ``readiness`` block predicting, per trip, which tier of cafein 0.9.0's
+  ``readiness`` block predicting, per trip, which tier of cafein 0.10.0's
   distance ladder will accept the feed's data — validated
   ``shape_dist_traveled`` (non-NaN, non-decreasing, detour ratio within
   cafein's meter or kilometer bands against stop-to-stop great-circle

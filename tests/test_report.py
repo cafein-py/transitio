@@ -92,7 +92,7 @@ def test_readiness_renders_in_summary_and_pages():
                 "unprocessed": 0,
                 "predicted": {"shape_dist": 6, "shape_linref": 2, "crow_fly": 1},
                 "verdict": "partial",
-                "cafein": "0.9.0",
+                "cafein": "0.10.0",
             }
         },
     )
