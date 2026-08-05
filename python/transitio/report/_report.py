@@ -130,29 +130,41 @@ def build_report(validation, *, hosted=None, provenance=None):
 
 
 def _readiness_text(readiness):
-    """One line per readiness section, or None when nothing to show."""
-    distances = (readiness or {}).get("distances")
-    if not distances:
-        return None
-    predicted = distances["predicted"]
-    counted = sum(predicted.values())
-    shares = ", ".join(
-        f"{tier} {100 * count / counted:.0f}%"
-        for tier, count in predicted.items()
-        if counted
-    )
-    extras = ", ".join(
-        f"{key} {distances[key]}"
-        for key in ("skipped", "unprocessed")
-        if distances.get(key)
-    )
-    verdict = distances["verdict"] or "unknown"
-    detail = "; ".join(part for part in (shares, extras) if part)
-    return (
-        f"distances: {verdict} ({detail}) — cafein {distances['cafein']}"
-        if detail
-        else f"distances: {verdict} — cafein {distances['cafein']}"
-    )
+    """One line covering the readiness sections, or None when silent."""
+    readiness = readiness or {}
+    parts = []
+    distances = readiness.get("distances")
+    if distances:
+        predicted = distances["predicted"]
+        counted = sum(predicted.values())
+        shares = ", ".join(
+            f"{tier} {100 * count / counted:.0f}%"
+            for tier, count in predicted.items()
+            if counted
+        )
+        extras = ", ".join(
+            f"{key} {distances[key]}"
+            for key in ("skipped", "unprocessed")
+            if distances.get(key)
+        )
+        verdict = distances["verdict"] or "unknown"
+        detail = "; ".join(part for part in (shares, extras) if part)
+        parts.append(
+            f"distances: {verdict} ({detail}) — cafein {distances['cafein']}"
+            if detail
+            else f"distances: {verdict} — cafein {distances['cafein']}"
+        )
+    fares = readiness.get("fares")
+    if fares:
+        v1 = fares["v1"]
+        detail = f"v1 {v1['priceable']}/{v1['fares']} priceable"
+        if v1["routeCompatibility"] is not None:
+            detail += f", route compatibility {100 * v1['routeCompatibility']:.0f}%"
+        detail += f", transfers {fares['transferPricing']}"
+        if fares["v2"]["present"]:
+            detail += ", Fares v2 present (not read by cafein)"
+        parts.append(f"fares: {fares['verdict']} ({detail})")
+    return "; ".join(parts) or None
 
 
 def parity_summary(report):

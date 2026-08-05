@@ -252,6 +252,31 @@ def test_readiness_predicts_distance_tiers(tmp_path):
     assert distances["cafein"] == "0.10.0"
 
 
+def test_readiness_reports_fares(tmp_path):
+    files = dict(
+        MINIMAL,
+        **{
+            "fare_attributes.txt": (
+                "fare_id,price,currency_type,payment_method,transfers\n"
+                "f1,2.80,EUR,0,0\n"
+            )
+        },
+    )
+    report = validate_feed(write_zip(tmp_path / "feed.zip", files))
+    fares = report["readiness"]["fares"]
+    assert fares["v1"] == {
+        "fares": 1,
+        "priceable": 1,
+        "routeCompatibility": 1.0,
+        "agencyAmbiguous": False,
+    }
+    assert fares["transferPricing"] == "present"
+    assert fares["verdict"] == "computable"
+    report = validate_feed(write_zip(tmp_path / "bare.zip", MINIMAL))
+    assert report["readiness"]["fares"]["verdict"] == "absent"
+    assert "no_fare_information" in codes(report)
+
+
 def test_omitted_reference_date_runs_no_moment_checks(tmp_path):
     report = validate_feed(write_zip(tmp_path / "feed.zip", MINIMAL))
     moment_codes = {

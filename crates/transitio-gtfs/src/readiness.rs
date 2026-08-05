@@ -26,12 +26,50 @@ const RATIO_KILOMETERS: (f64, f64) = (0.8e-3, 5e-3);
 /// Tier-2 work cap: point-to-segment evaluations summed feed-wide;
 /// patterns that no longer fit are counted as unprocessed.
 const MAX_TIER2_POINT_CHECKS: u64 = 20_000_000;
+/// Fare-compatibility budget: each (route, priceable fare) pair
+/// charges a fixed, precomputed 2 + |OD clauses| + |zones| units, so
+/// the cap bounds real comparisons; exhaustion serializes
+/// routeCompatibility null.
+const MAX_FARE_COMPAT_CHECKS: u64 = 1_000_000;
+/// "Near-zero" coverage per the roadmap: warn below this share.
+const FARE_COVERAGE_WARN_SHARE: f64 = 0.2;
 
 const CAFEIN_VERSION: &str = "0.10.0";
 
 #[derive(Serialize, Debug)]
 pub struct Readiness {
     pub distances: Option<DistanceReadiness>,
+    pub fares: Option<FareReadiness>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct FareReadiness {
+    pub v1: V1Fares,
+    pub v2: V2Fares,
+    #[serde(rename = "transferPricing")]
+    pub transfer_pricing: &'static str,
+    pub verdict: &'static str,
+}
+
+#[derive(Serialize, Debug)]
+pub struct V1Fares {
+    pub fares: u64,
+    pub priceable: u64,
+    #[serde(rename = "routeCompatibility")]
+    pub route_compatibility: Option<f64>,
+    #[serde(rename = "agencyAmbiguous")]
+    pub agency_ambiguous: bool,
+}
+
+#[derive(Serialize, Debug)]
+pub struct V2Fares {
+    pub present: bool,
+    pub products: u64,
+    pub priceable: u64,
+    #[serde(rename = "legRules")]
+    pub leg_rules: bool,
+    #[serde(rename = "transferRules")]
+    pub transfer_rules: bool,
 }
 
 #[derive(Serialize, Debug)]
@@ -54,6 +92,7 @@ pub struct Predicted {
 pub fn run_readiness(result: &mut ScanResult, options: &ScanOptions) {
     result.readiness = Some(Readiness {
         distances: distance_readiness(result, options, MAX_TIER2_POINT_CHECKS),
+        fares: fare_readiness(result, options, MAX_FARE_COMPAT_CHECKS),
     });
 }
 
@@ -579,6 +618,406 @@ fn distance_readiness(
     })
 }
 
+fn nonblank(value: &str) -> Option<&str> {
+    (!value.trim().is_empty()).then_some(value)
+}
+
+/// The shared v1/v2 acceptance rule: a finite non-negative amount and a
+/// three-ASCII-letter currency.
+fn priceable_amount(value: &str) -> bool {
+    matches!(value.trim().parse::<f64>(), Ok(v) if v.is_finite() && v >= 0.0)
+}
+
+fn priceable_currency(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.len() == 3 && trimmed.bytes().all(|b| b.is_ascii_alphabetic())
+}
+
+/// Per-fare grants under cafein's row→grant mapping (fares.py, verified
+/// 2026-08-05): contains_id joins the fare's one zone set whatever else
+/// its row carries; a row with either endpoint adds one OD clause with
+/// exactly its present fields; a row whose only field is route_id joins
+/// the route grant; a fare with no grants is unrestricted.
+#[derive(Default)]
+struct Grants {
+    routes: HashSet<u32>,
+    od: Vec<(Option<u32>, Option<u32>, Option<u32>)>,
+    zones: HashSet<u32>,
+}
+
+impl Grants {
+    fn unrestricted(&self) -> bool {
+        self.routes.is_empty() && self.od.is_empty() && self.zones.is_empty()
+    }
+}
+
+/// Interns an id: hashed once here, compared as a compact number
+/// afterwards, so a hostile very-long id cannot multiply per-pair work
+/// under the compatibility budget.
+fn intern<'t>(numbers: &mut HashMap<&'t str, u32>, id: &'t str) -> u32 {
+    let next = numbers.len() as u32;
+    *numbers.entry(id).or_insert(next)
+}
+
+/// Predicts whether cafein can price journeys on the feed. Coarse
+/// route-level compatibility, not a per-journey guarantee; `cap` bounds
+/// the (route, fare) evaluations (a parameter so tests exhaust it).
+fn fare_readiness(
+    result: &mut ScanResult,
+    options: &ScanOptions,
+    cap: u64,
+) -> Option<FareReadiness> {
+    // The multi-agency `blocked` detection reads agency.txt, so its
+    // truncation must yield the null section like the fare tables'.
+    for file in [
+        "fare_attributes.txt",
+        "fare_rules.txt",
+        "fare_products.txt",
+        "fare_leg_rules.txt",
+        "fare_transfer_rules.txt",
+        "agency.txt",
+        "routes.txt",
+        "stops.txt",
+        "trips.txt",
+        "stop_times.txt",
+    ] {
+        if result.incomplete.contains(file) {
+            return None;
+        }
+    }
+    let tables = &result.tables;
+    // The five core tables must be PRESENT, not merely un-truncated —
+    // a feed missing them must not draw a fare verdict; the fare
+    // tables themselves stay optional.
+    for file in [
+        "agency.txt",
+        "routes.txt",
+        "stops.txt",
+        "trips.txt",
+        "stop_times.txt",
+    ] {
+        tables.get(file)?;
+    }
+    let mut notices = Vec::new();
+    let mut samplers = Samplers::new(options.max_notices_per_file);
+
+    // Agency universe and per-route owners, cafein semantics: a blank
+    // owner falls back to a sole agency; values compare verbatim.
+    // Multi-agency means multiple DISTINCT agency_id values (blank as
+    // one value), exactly like cafein's `agencies` set — counting rows
+    // instead would predict `blocked` for feeds cafein accepts.
+    let mut agencies: HashSet<Option<&str>> = HashSet::new();
+    if let Some(table) = tables.get("agency.txt") {
+        for row in &table.rows {
+            agencies.insert(nonblank(cell(table, row, "agency_id")));
+        }
+    }
+    let multi_agency = agencies.len() > 1;
+    let mut agency_numbers: HashMap<&str, u32> = HashMap::new();
+    let sole_agency: Option<u32> = if agencies.len() == 1 {
+        agencies
+            .iter()
+            .next()
+            .copied()
+            .flatten()
+            .map(|a| intern(&mut agency_numbers, a))
+    } else {
+        None
+    };
+    let mut agency_of_route: HashMap<&str, Option<u32>> = HashMap::new();
+    if let Some(table) = tables.get("routes.txt") {
+        for row in &table.rows {
+            if let Some(route) = nonblank(cell(table, row, "route_id")) {
+                agency_of_route.insert(
+                    route,
+                    nonblank(cell(table, row, "agency_id")).map(|a| intern(&mut agency_numbers, a)),
+                );
+            }
+        }
+    }
+
+    struct FareProduct<'t> {
+        id: &'t str,
+        priceable: bool,
+        agency: Option<u32>,
+        transfers_present: bool,
+    }
+    let mut v1_fares: Vec<FareProduct> = Vec::new();
+    let mut agency_ambiguous = false;
+    if let Some(table) = tables.get("fare_attributes.txt") {
+        let sampler = samplers.file("fare_attributes.txt");
+        for row in &table.rows {
+            let id = cell(table, row, "fare_id");
+            let priceable = priceable_amount(cell(table, row, "price"))
+                && priceable_currency(cell(table, row, "currency_type"));
+            if !priceable {
+                // transitio-specific: cafein cannot price this product.
+                sampler.push(
+                    &mut notices,
+                    Notice::new("fare_attribute_not_priceable", Severity::Warning)
+                        .with("fareId", clip(id))
+                        .with("csvRowNumber", row.csv_row),
+                );
+            }
+            let agency =
+                nonblank(cell(table, row, "agency_id")).map(|a| intern(&mut agency_numbers, a));
+            if multi_agency && agency.is_none() {
+                agency_ambiguous = true;
+                // transitio-specific: cafein rejects the whole feed
+                // when a multi-agency fare names no agency.
+                sampler.push(
+                    &mut notices,
+                    Notice::new("fare_without_agency_id", Severity::Warning)
+                        .with("fareId", clip(id))
+                        .with("csvRowNumber", row.csv_row),
+                );
+            }
+            let transfers = cell(table, row, "transfers").trim();
+            let duration = cell(table, row, "transfer_duration").trim();
+            v1_fares.push(FareProduct {
+                id,
+                priceable,
+                agency,
+                transfers_present: matches!(transfers, "0" | "1" | "2")
+                    || (!duration.is_empty() && duration.parse::<u64>().is_ok()),
+            });
+        }
+    }
+
+    let mut route_numbers: HashMap<&str, u32> = HashMap::new();
+    let mut zone_numbers: HashMap<&str, u32> = HashMap::new();
+    let mut grants: HashMap<&str, Grants> = HashMap::new();
+    if let Some(table) = tables.get("fare_rules.txt") {
+        for row in &table.rows {
+            let Some(fare) = nonblank(cell(table, row, "fare_id")) else {
+                continue;
+            };
+            let contains = nonblank(cell(table, row, "contains_id"));
+            let origin = nonblank(cell(table, row, "origin_id"));
+            let destination = nonblank(cell(table, row, "destination_id"));
+            let route = nonblank(cell(table, row, "route_id"));
+            let zone = contains.map(|z| intern(&mut zone_numbers, z));
+            let origin = origin.map(|z| intern(&mut zone_numbers, z));
+            let destination = destination.map(|z| intern(&mut zone_numbers, z));
+            let route = route.map(|r| intern(&mut route_numbers, r));
+            let entry = grants.entry(fare).or_default();
+            if let Some(zone) = zone {
+                entry.zones.insert(zone);
+            }
+            if origin.is_some() || destination.is_some() {
+                entry.od.push((origin, destination, route));
+            } else if let (Some(route), None) = (route, zone) {
+                entry.routes.insert(route);
+            }
+        }
+    }
+
+    // Served zone sets per route with at least one usable trip — the
+    // compatibility denominator.
+    let mut stop_zone: HashMap<&str, u32> = HashMap::new();
+    if let Some(table) = tables.get("stops.txt") {
+        for row in &table.rows {
+            if let Some(zone) = nonblank(cell(table, row, "zone_id")) {
+                let zone = intern(&mut zone_numbers, zone);
+                stop_zone.insert(cell(table, row, "stop_id"), zone);
+            }
+        }
+    }
+    let mut trip_route: HashMap<&str, &str> = HashMap::new();
+    if let Some(table) = tables.get("trips.txt") {
+        for row in &table.rows {
+            if let (Some(trip), Some(route)) = (
+                nonblank(cell(table, row, "trip_id")),
+                nonblank(cell(table, row, "route_id")),
+            ) {
+                trip_route.insert(trip, route);
+            }
+        }
+    }
+    let mut trip_stops: HashMap<&str, Vec<&str>> = HashMap::new();
+    if let Some(table) = tables.get("stop_times.txt") {
+        for row in &table.rows {
+            trip_stops
+                .entry(cell(table, row, "trip_id"))
+                .or_default()
+                .push(cell(table, row, "stop_id"));
+        }
+    }
+    let mut route_zones: BTreeMap<&str, HashSet<u32>> = BTreeMap::new();
+    for (trip, stops) in &trip_stops {
+        if stops.len() < 2 {
+            continue;
+        }
+        if let Some(route) = trip_route.get(trip) {
+            let zones = route_zones.entry(route).or_default();
+            for stop in stops {
+                if let Some(zone) = stop_zone.get(stop) {
+                    zones.insert(*zone);
+                }
+            }
+        }
+    }
+
+    // Deterministic evaluation: routes in sorted order, fares in file
+    // order, grants in fixed order; each pair's precomputed cost is
+    // charged whether or not a grant matches.
+    // Each fare's grants and cost resolve ONCE here (one fare-id hash
+    // total), and every id inside the loop is an interned number, so a
+    // charged unit is genuinely constant-cost.
+    let fare_data: Vec<(Option<u32>, Option<&Grants>, u64)> = v1_fares
+        .iter()
+        .filter(|f| f.priceable)
+        .map(|fare| {
+            let fare_grants = grants.get(fare.id);
+            let cost = 2 + fare_grants.map_or(0, |g| (g.od.len() + g.zones.len()) as u64);
+            (fare.agency, fare_grants, cost)
+        })
+        .collect();
+    let mut checks = 0u64;
+    let mut exhausted = false;
+    let mut compatible = 0usize;
+    'routes: for (route, zones_r) in &route_zones {
+        let route_num = route_numbers.get(*route).copied();
+        let owner = agency_of_route
+            .get(*route)
+            .copied()
+            .flatten()
+            .or(sole_agency);
+        let mut covered = false;
+        for (fare_agency, fare_grants, cost) in &fare_data {
+            // The pair's cost is known before evaluation and covers
+            // every comparison its grants can cause (base + route
+            // grant + each OD clause + each zone), so the cap bounds
+            // real work and stays independent of match timing.
+            if checks.saturating_add(*cost) > cap {
+                exhausted = true;
+                break 'routes;
+            }
+            checks += *cost;
+            if let Some(agency) = fare_agency {
+                if owner != Some(*agency) {
+                    continue;
+                }
+            }
+            let Some(fare_grants) = fare_grants else {
+                covered = true; // no rule rows: unrestricted
+                break;
+            };
+            if fare_grants.unrestricted() {
+                covered = true;
+                break;
+            }
+            if route_num.is_some_and(|r| fare_grants.routes.contains(&r)) {
+                covered = true;
+                break;
+            }
+            if fare_grants
+                .od
+                .iter()
+                .any(|(origin, destination, od_route)| {
+                    od_route.is_none_or(|r| Some(r) == route_num)
+                        && origin.is_none_or(|z| zones_r.contains(&z))
+                        && destination.is_none_or(|z| zones_r.contains(&z))
+                })
+            {
+                covered = true;
+                break;
+            }
+            if fare_grants.zones.iter().any(|z| zones_r.contains(z)) {
+                covered = true;
+                break;
+            }
+        }
+        if covered {
+            compatible += 1;
+        }
+    }
+    let route_compatibility = if exhausted || route_zones.is_empty() {
+        None
+    } else {
+        Some(compatible as f64 / route_zones.len() as f64)
+    };
+    let fully_compatible = !exhausted && !route_zones.is_empty() && compatible == route_zones.len();
+
+    let (mut products, mut v2_priceable) = (0u64, 0u64);
+    if let Some(table) = tables.get("fare_products.txt") {
+        for row in &table.rows {
+            products += 1;
+            if priceable_amount(cell(table, row, "amount"))
+                && priceable_currency(cell(table, row, "currency"))
+            {
+                v2_priceable += 1;
+            }
+        }
+    }
+    let leg_rules = tables
+        .get("fare_leg_rules.txt")
+        .is_some_and(|t| !t.rows.is_empty());
+    let transfer_rules = tables
+        .get("fare_transfer_rules.txt")
+        .is_some_and(|t| !t.rows.is_empty());
+    let v2_present = products > 0 || leg_rules || transfer_rules;
+
+    let priceable = v1_fares.iter().filter(|f| f.priceable).count() as u64;
+    if v1_fares.is_empty() && products == 0 {
+        // transitio-specific: no monetary information for cafein at all.
+        samplers.file("fare_attributes.txt").push(
+            &mut notices,
+            Notice::new("no_fare_information", Severity::Info),
+        );
+    }
+    if let Some(share) = route_compatibility {
+        // Any v1 fare rows count as "fares exist" — a feed whose fares
+        // are all unpriceable still deserves the aggregate warning.
+        if !v1_fares.is_empty() && share < FARE_COVERAGE_WARN_SHARE {
+            // transitio-specific: fares exist but cover almost nothing.
+            samplers.file("fare_attributes.txt").push(
+                &mut notices,
+                Notice::new("partial_fare_coverage", Severity::Warning)
+                    .with("routeCompatibility", (share * 1e4).round() / 1e4)
+                    .with("threshold", FARE_COVERAGE_WARN_SHARE),
+            );
+        }
+    }
+
+    samplers.finish(&mut notices);
+    result.notices.append(&mut notices);
+
+    // The verdict means "cafein can ingest the fare structure and every
+    // used route has a compatible priceable fare" — never a per-journey
+    // priceability promise.
+    let verdict = if agency_ambiguous {
+        "blocked"
+    } else if priceable == 0 {
+        "absent"
+    } else if fully_compatible {
+        "computable"
+    } else {
+        "partial"
+    };
+    Some(FareReadiness {
+        v1: V1Fares {
+            fares: v1_fares.len() as u64,
+            priceable,
+            route_compatibility,
+            agency_ambiguous,
+        },
+        v2: V2Fares {
+            present: v2_present,
+            products,
+            priceable: v2_priceable,
+            leg_rules,
+            transfer_rules,
+        },
+        transfer_pricing: if v1_fares.iter().any(|f| f.priceable && f.transfers_present) {
+            "present"
+        } else {
+            "absent"
+        },
+        verdict,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -1015,6 +1454,620 @@ mod tests {
         let b = projection.project(60.17, 24.9424);
         let span = (a.0 - b.0).hypot(a.1 - b.1);
         assert!((span - 632.7021).abs() < 0.01, "span {span}");
+    }
+
+    fn fares_with_cap(files: &[(&str, &str)], cap: u64) -> (Option<FareReadiness>, Vec<Notice>) {
+        let mut result = scan_zip(files);
+        let options = ScanOptions::default();
+        let fares = fare_readiness(&mut result, &options, cap);
+        (fares, result.notices)
+    }
+
+    fn fares_of(files: &[(&str, &str)]) -> (Option<FareReadiness>, Vec<Notice>) {
+        fares_with_cap(files, MAX_FARE_COMPAT_CHECKS)
+    }
+
+    fn upsert(
+        files: &mut Vec<(&'static str, &'static str)>,
+        name: &'static str,
+        content: &'static str,
+    ) {
+        files.retain(|(existing, _)| *existing != name);
+        files.push((name, content));
+    }
+
+    /// Two routes over three zoned stops: Z(r1) = {za, zb}, Z(r2) =
+    /// {zb, zc}.
+    fn fare_feed() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (
+                "agency.txt",
+                "agency_id,agency_name,agency_url,agency_timezone\na1,One,https://one.fi,Europe/Helsinki\n",
+            ),
+            (
+                "stops.txt",
+                "stop_id,stop_name,stop_lat,stop_lon,zone_id\ns1,A,60.1700,24.9310,za\ns2,B,60.1700,24.9424,zb\ns3,C,60.1800,24.9500,zc\n",
+            ),
+            (
+                "routes.txt",
+                "route_id,agency_id,route_short_name,route_type\nr1,a1,1,3\nr2,a1,2,3\n",
+            ),
+            (
+                "calendar.txt",
+                "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\nwk,1,1,1,1,1,1,1,20260101,20261231\n",
+            ),
+            ("trips.txt", "route_id,service_id,trip_id\nr1,wk,t1\nr2,wk,t2\n"),
+            (
+                "stop_times.txt",
+                "trip_id,arrival_time,departure_time,stop_id,stop_sequence\nt1,08:00:00,08:00:00,s1,1\nt1,08:05:00,08:05:00,s2,2\nt2,09:00:00,09:00:00,s2,1\nt2,09:05:00,09:05:00,s3,2\n",
+            ),
+        ]
+    }
+
+    fn multi_agency_feed() -> Vec<(&'static str, &'static str)> {
+        let mut files = fare_feed();
+        upsert(
+            &mut files,
+            "agency.txt",
+            "agency_id,agency_name,agency_url,agency_timezone\na1,One,https://one.fi,Europe/Helsinki\na2,Two,https://two.fi,Europe/Helsinki\n",
+        );
+        upsert(
+            &mut files,
+            "routes.txt",
+            "route_id,agency_id,route_short_name,route_type\nr1,a1,1,3\nr2,a2,2,3\n",
+        );
+        files
+    }
+
+    #[test]
+    fn priceable_rule_edges() {
+        let mut files = fare_feed();
+        upsert(
+            &mut files,
+            "fare_attributes.txt",
+            "fare_id,price,currency_type,payment_method\nf1,,EUR,0\nf2,-0.5,EUR,0\nf3,inf,EUR,0\nf4,NaN,EUR,0\nf5,2.5,EU,0\nf6,2.5,EURO,0\nf7,2.5,EÜR,0\nf8,2.50,EUR,0\n",
+        );
+        let (fares, notices) = fares_of(&files);
+        let fares = fares.unwrap();
+        assert_eq!(fares.v1.fares, 8);
+        assert_eq!(fares.v1.priceable, 1);
+        let flagged = notices
+            .iter()
+            .filter(|n| n.code == "fare_attribute_not_priceable")
+            .count();
+        assert_eq!(flagged, 7);
+        // The one priceable fare has no rules: unrestricted, unscoped.
+        assert_eq!(fares.v1.route_compatibility, Some(1.0));
+        assert_eq!(fares.verdict, "computable");
+    }
+
+    #[test]
+    fn contains_bearing_row_grants_its_zone_never_the_route() {
+        let mut files = fare_feed();
+        upsert(
+            &mut files,
+            "fare_attributes.txt",
+            "fare_id,price,currency_type,payment_method\nfz,2.50,EUR,0\n",
+        );
+        // The row names r2, but per cafein a contains-bearing row
+        // contributes its zone alone: r1 is covered via za, r2 is not.
+        upsert(
+            &mut files,
+            "fare_rules.txt",
+            "fare_id,route_id,origin_id,destination_id,contains_id\nfz,r2,,,za\n",
+        );
+        let (fares, _) = fares_of(&files);
+        let fares = fares.unwrap();
+        assert_eq!(fares.v1.route_compatibility, Some(0.5));
+        assert_eq!(fares.verdict, "partial");
+    }
+
+    #[test]
+    fn mixed_grant_rows_cover_both_routes() {
+        let mut files = fare_feed();
+        upsert(
+            &mut files,
+            "fare_attributes.txt",
+            "fare_id,price,currency_type,payment_method\nfz,2.50,EUR,0\nfr,3.00,EUR,0\n",
+        );
+        // fz: zone grant za (contains+route row); fr: route grant r2.
+        upsert(
+            &mut files,
+            "fare_rules.txt",
+            "fare_id,route_id,origin_id,destination_id,contains_id\nfz,r1,,,za\nfr,r2,,,\n",
+        );
+        let (fares, _) = fares_of(&files);
+        let fares = fares.unwrap();
+        assert_eq!(fares.v1.route_compatibility, Some(1.0));
+        assert_eq!(fares.verdict, "computable");
+    }
+
+    #[test]
+    fn od_clause_needs_served_zones_and_matching_route() {
+        let mut files = fare_feed();
+        upsert(
+            &mut files,
+            "fare_attributes.txt",
+            "fare_id,price,currency_type,payment_method\nfo,2.50,EUR,0\n",
+        );
+        // Origin zc is never served by r1, and the clause binds to r1,
+        // so neither route is covered.
+        upsert(
+            &mut files,
+            "fare_rules.txt",
+            "fare_id,route_id,origin_id,destination_id,contains_id\nfo,r1,zc,zc,\n",
+        );
+        let (fares, notices) = fares_of(&files);
+        let fares = fares.unwrap();
+        assert_eq!(fares.v1.route_compatibility, Some(0.0));
+        assert_eq!(fares.verdict, "partial");
+        assert!(notices.iter().any(|n| n.code == "partial_fare_coverage"));
+    }
+
+    #[test]
+    fn unsatisfiable_fares_do_not_combine() {
+        let mut files = fare_feed();
+        upsert(
+            &mut files,
+            "fare_attributes.txt",
+            "fare_id,price,currency_type,payment_method\nfa,2.50,EUR,0\nfb,2.50,EUR,0\n",
+        );
+        // Each clause needs za AND zc on one route; no route serves
+        // both, and two fares never merge their zones.
+        upsert(
+            &mut files,
+            "fare_rules.txt",
+            "fare_id,route_id,origin_id,destination_id,contains_id\nfa,,za,zc,\nfb,,zc,za,\n",
+        );
+        let (fares, _) = fares_of(&files);
+        assert_eq!(fares.unwrap().v1.route_compatibility, Some(0.0));
+    }
+
+    #[test]
+    fn fare_id_only_row_is_unrestricted() {
+        let mut files = fare_feed();
+        upsert(
+            &mut files,
+            "fare_attributes.txt",
+            "fare_id,price,currency_type,payment_method\nfu,2.50,EUR,0\n",
+        );
+        upsert(
+            &mut files,
+            "fare_rules.txt",
+            "fare_id,route_id,origin_id,destination_id,contains_id\nfu,,,,\n",
+        );
+        let (fares, _) = fares_of(&files);
+        let fares = fares.unwrap();
+        assert_eq!(fares.v1.route_compatibility, Some(1.0));
+        assert_eq!(fares.verdict, "computable");
+    }
+
+    #[test]
+    fn agency_scoped_no_rules_fare_covers_only_its_routes() {
+        let mut files = multi_agency_feed();
+        upsert(
+            &mut files,
+            "fare_attributes.txt",
+            "fare_id,price,currency_type,payment_method,transfers,agency_id\nf1,2.50,EUR,0,,a1\n",
+        );
+        let (fares, _) = fares_of(&files);
+        let fares = fares.unwrap();
+        // No network-wide fast path: agency a2's route stays uncovered.
+        assert_eq!(fares.v1.route_compatibility, Some(0.5));
+        assert_eq!(fares.verdict, "partial");
+    }
+
+    #[test]
+    fn multi_agency_fare_without_agency_blocks() {
+        let mut files = multi_agency_feed();
+        upsert(
+            &mut files,
+            "fare_attributes.txt",
+            "fare_id,price,currency_type,payment_method\nf1,2.50,EUR,0\n",
+        );
+        let (fares, notices) = fares_of(&files);
+        let fares = fares.unwrap();
+        assert!(fares.v1.agency_ambiguous);
+        assert_eq!(fares.verdict, "blocked");
+        assert!(notices.iter().any(|n| n.code == "fare_without_agency_id"));
+    }
+
+    #[test]
+    fn v2_only_feed_is_absent_for_cafein() {
+        let mut files = fare_feed();
+        upsert(
+            &mut files,
+            "fare_products.txt",
+            "fare_product_id,fare_product_name,amount,currency\np1,Ticket,2.50,EUR\np2,Broken,,EUR\n",
+        );
+        upsert(
+            &mut files,
+            "fare_leg_rules.txt",
+            "leg_group_id,network_id,fare_product_id\nlg,net,p1\n",
+        );
+        let (fares, _) = fares_of(&files);
+        let fares = fares.unwrap();
+        assert!(fares.v2.present);
+        assert_eq!(fares.v2.products, 2);
+        assert_eq!(fares.v2.priceable, 1);
+        assert!(fares.v2.leg_rules);
+        assert!(!fares.v2.transfer_rules);
+        assert_eq!(fares.verdict, "absent");
+    }
+
+    #[test]
+    fn compat_budget_is_a_deterministic_prefix() {
+        let mut files = fare_feed();
+        upsert(
+            &mut files,
+            "fare_attributes.txt",
+            "fare_id,price,currency_type,payment_method\nf1,2.50,EUR,0\n",
+        );
+        // Two routes x one unrestricted fare = two pairs of cost 2:
+        // exactly fitting completes with the computed verdict...
+        let (fares, _) = fares_with_cap(&files, 4);
+        let fares = fares.unwrap();
+        assert_eq!(fares.v1.route_compatibility, Some(1.0));
+        assert_eq!(fares.verdict, "computable");
+        // ...while an incomplete prefix yields null, never computable.
+        let (fares, _) = fares_with_cap(&files, 3);
+        let fares = fares.unwrap();
+        assert_eq!(fares.v1.route_compatibility, None);
+        assert_eq!(fares.verdict, "partial");
+    }
+
+    #[test]
+    fn grant_order_within_a_fare_is_irrelevant() {
+        for rules in [
+            "fare_id,route_id,origin_id,destination_id,contains_id\nfz,r1,,,\nfz,,,,zd\nfz,r2,,,\n",
+            "fare_id,route_id,origin_id,destination_id,contains_id\nfz,,,,zd\nfz,r2,,,\nfz,r1,,,\n",
+        ] {
+            let mut files = fare_feed();
+            upsert(
+                &mut files,
+                "fare_attributes.txt",
+                "fare_id,price,currency_type,payment_method\nfz,2.50,EUR,0\n",
+            );
+            upsert(&mut files, "fare_rules.txt", rules);
+            let (fares, _) = fares_of(&files);
+            let fares = fares.unwrap();
+            assert_eq!(fares.v1.route_compatibility, Some(1.0));
+            assert_eq!(fares.verdict, "computable");
+        }
+    }
+
+    #[test]
+    fn transfer_pricing_predicate() {
+        for (columns, row, expected) in [
+            (
+                "fare_id,price,currency_type,payment_method,transfers",
+                "f1,2.50,EUR,0,0",
+                "present",
+            ),
+            (
+                "fare_id,price,currency_type,payment_method,transfer_duration",
+                "f1,2.50,EUR,0,5400",
+                "present",
+            ),
+            (
+                "fare_id,price,currency_type,payment_method,transfers",
+                "f1,2.50,EUR,0,",
+                "absent",
+            ),
+            (
+                "fare_id,price,currency_type,payment_method",
+                "f1,2.50,EUR,0",
+                "absent",
+            ),
+            // An unpriceable fare cannot carry the transfer policy.
+            (
+                "fare_id,price,currency_type,payment_method,transfers",
+                "f1,,EUR,0,0",
+                "absent",
+            ),
+        ] {
+            let mut files = fare_feed();
+            let content: &'static str = Box::leak(format!("{columns}\n{row}\n").into_boxed_str());
+            upsert(&mut files, "fare_attributes.txt", content);
+            let (fares, _) = fares_of(&files);
+            assert_eq!(fares.unwrap().transfer_pricing, expected, "{row}");
+        }
+    }
+
+    #[test]
+    fn missing_fares_are_reported_once() {
+        let (fares, notices) = fares_of(&fare_feed());
+        let fares = fares.unwrap();
+        assert_eq!(fares.v1.fares, 0);
+        assert_eq!(fares.verdict, "absent");
+        let infos = notices
+            .iter()
+            .filter(|n| n.code == "no_fare_information")
+            .count();
+        assert_eq!(infos, 1);
+    }
+
+    #[test]
+    fn all_unpriceable_fares_still_warn_on_coverage() {
+        let mut files = fare_feed();
+        upsert(
+            &mut files,
+            "fare_attributes.txt",
+            "fare_id,price,currency_type,payment_method\nf1,,EUR,0\n",
+        );
+        let (fares, notices) = fares_of(&files);
+        let fares = fares.unwrap();
+        assert_eq!(fares.verdict, "absent");
+        assert_eq!(fares.v1.route_compatibility, Some(0.0));
+        assert!(notices
+            .iter()
+            .any(|n| n.code == "fare_attribute_not_priceable"));
+        assert!(notices.iter().any(|n| n.code == "partial_fare_coverage"));
+    }
+
+    #[test]
+    fn one_fare_with_mixed_rows_follows_the_truth_table() {
+        let mut files = fare_feed();
+        upsert(
+            &mut files,
+            "fare_attributes.txt",
+            "fare_id,price,currency_type,payment_method\nfm,2.50,EUR,0\n",
+        );
+        // contains+route: zone za only; contains+OD: zone zc AND the
+        // (za, zb, r2) clause; route-only: a grant for unused r9. r2 is
+        // covered only because the contains+OD row contributed zc even
+        // though its own OD clause fails (origin za unserved) — the
+        // dual contribution the truth table requires — and nothing may
+        // fabricate a cross-row combination.
+        upsert(
+            &mut files,
+            "fare_rules.txt",
+            "fare_id,route_id,origin_id,destination_id,contains_id\nfm,r1,,,za\nfm,r2,za,zb,zc\nfm,r9,,,\n",
+        );
+        let (fares, _) = fares_of(&files);
+        assert_eq!(fares.unwrap().v1.route_compatibility, Some(1.0));
+    }
+
+    #[test]
+    fn near_cap_exhaustion_is_order_independent() {
+        // OD clauses are the one row-ordered grant category, so the
+        // matching clause genuinely sits first versus last.
+        for rules in [
+            "fare_id,route_id,origin_id,destination_id,contains_id\nfz,,za,zb,\nfz,,zc,zc,\n",
+            "fare_id,route_id,origin_id,destination_id,contains_id\nfz,,zc,zc,\nfz,,za,zb,\n",
+        ] {
+            let mut files = fare_feed();
+            upsert(
+                &mut files,
+                "fare_attributes.txt",
+                "fare_id,price,currency_type,payment_method\nfz,2.50,EUR,0\n",
+            );
+            upsert(&mut files, "fare_rules.txt", rules);
+            // Each pair costs 2 + 2 OD clauses = 4: one of two routes
+            // is evaluated when the cap hits and work remains, so the
+            // result is null regardless of clause position.
+            let (fares, _) = fares_with_cap(&files, 4);
+            let fares = fares.unwrap();
+            assert_eq!(fares.v1.route_compatibility, None);
+            assert_eq!(fares.verdict, "partial");
+        }
+    }
+
+    #[test]
+    fn duplicate_or_blank_agency_rows_follow_cafein_not_row_counts() {
+        // cafein counts DISTINCT agency_id values, so two blank-id rows
+        // (or duplicated ids) are one agency to it and a fare without
+        // agency_id is accepted; the prediction must mirror that,
+        // however the rows read as GTFS.
+        for agency_rows in [
+            "agency_id,agency_name,agency_url,agency_timezone\n,One,https://one.fi,Europe/Helsinki\n,Two,https://two.fi,Europe/Helsinki\n",
+            "agency_id,agency_name,agency_url,agency_timezone\na1,One,https://one.fi,Europe/Helsinki\na1,Two,https://two.fi,Europe/Helsinki\n",
+        ] {
+            let mut files = fare_feed();
+            upsert(&mut files, "agency.txt", agency_rows);
+            upsert(
+                &mut files,
+                "fare_attributes.txt",
+                "fare_id,price,currency_type,payment_method\nf1,2.50,EUR,0\n",
+            );
+            let (fares, notices) = fares_of(&files);
+            let fares = fares.unwrap();
+            assert!(!fares.v1.agency_ambiguous);
+            assert_ne!(fares.verdict, "blocked");
+            assert!(notices.iter().all(|n| n.code != "fare_without_agency_id"));
+        }
+    }
+
+    #[test]
+    fn v2_priceable_boundaries() {
+        for (amount, currency, priceable) in [
+            ("2.50", "EUR", 1u64),
+            ("", "EUR", 0),
+            ("-0.5", "EUR", 0),
+            ("inf", "EUR", 0),
+            ("NaN", "EUR", 0),
+            ("2.50", "EU", 0),
+            ("2.50", "EURO", 0),
+            ("2.50", "EÜR", 0),
+        ] {
+            let mut files = fare_feed();
+            let content: &'static str = Box::leak(
+                format!(
+                    "fare_product_id,fare_product_name,amount,currency\np1,Ticket,{amount},{currency}\n"
+                )
+                .into_boxed_str(),
+            );
+            upsert(&mut files, "fare_products.txt", content);
+            let (fares, _) = fares_of(&files);
+            let fares = fares.unwrap();
+            assert_eq!(fares.v2.products, 1);
+            assert_eq!(fares.v2.priceable, priceable, "{amount} {currency}");
+        }
+    }
+
+    #[test]
+    fn rule_volume_counts_against_the_budget() {
+        // 60 OD rows on one fare: each (route, fare) pair pre-charges
+        // 2 + 60 units, so a 50-unit cap refuses to evaluate at all
+        // and a rule-heavy feed cannot exceed the advertised bound.
+        let mut files = fare_feed();
+        upsert(
+            &mut files,
+            "fare_attributes.txt",
+            "fare_id,price,currency_type,payment_method\nfz,2.50,EUR,0\n",
+        );
+        let mut rules = String::from("fare_id,route_id,origin_id,destination_id,contains_id\n");
+        for i in 0..60 {
+            rules.push_str(&format!("fz,,zx{i},zx{i},\n"));
+        }
+        let content: &'static str = Box::leak(rules.into_boxed_str());
+        upsert(&mut files, "fare_rules.txt", content);
+        let (fares, _) = fares_with_cap(&files, 50);
+        let fares = fares.unwrap();
+        assert_eq!(fares.v1.route_compatibility, None);
+        assert_eq!(fares.verdict, "partial");
+        // A cap covering the full 2 x 62 units completes.
+        let (fares, _) = fares_with_cap(&files, 124);
+        assert!(fares.unwrap().v1.route_compatibility.is_some());
+    }
+
+    #[test]
+    fn very_long_ids_are_interned_once_and_stay_functional() {
+        // Every id is hashed exactly once at interning and compared as
+        // a number afterwards, so pathological id lengths cannot
+        // multiply per-pair work under the budget; boundedness is
+        // structural, and this asserts the interned path's semantics.
+        let long_zone: &'static str =
+            Box::leak(format!("z{}", "x".repeat(10_000)).into_boxed_str());
+        let mut files = fare_feed();
+        let stops: &'static str = Box::leak(
+            format!(
+                "stop_id,stop_name,stop_lat,stop_lon,zone_id\ns1,A,60.1700,24.9310,{long_zone}\ns2,B,60.1700,24.9424,zb\ns3,C,60.1800,24.9500,zc\n"
+            )
+            .into_boxed_str(),
+        );
+        upsert(&mut files, "stops.txt", stops);
+        let fare_id: &'static str = Box::leak(format!("f{}", "y".repeat(10_000)).into_boxed_str());
+        let attributes: &'static str = Box::leak(
+            format!("fare_id,price,currency_type,payment_method\n{fare_id},2.50,EUR,0\n")
+                .into_boxed_str(),
+        );
+        upsert(&mut files, "fare_attributes.txt", attributes);
+        let rules: &'static str = Box::leak(
+            format!(
+                "fare_id,route_id,origin_id,destination_id,contains_id\n{fare_id},,,,{long_zone}\n"
+            )
+            .into_boxed_str(),
+        );
+        upsert(&mut files, "fare_rules.txt", rules);
+        // The long zone covers r1 only: Z(r1) carries it, Z(r2) not.
+        let (fares, _) = fares_of(&files);
+        assert_eq!(fares.unwrap().v1.route_compatibility, Some(0.5));
+    }
+
+    #[test]
+    fn missing_mandatory_tables_yield_no_fares_section() {
+        for file in [
+            "agency.txt",
+            "routes.txt",
+            "stops.txt",
+            "trips.txt",
+            "stop_times.txt",
+        ] {
+            let mut files = fare_feed();
+            upsert(
+                &mut files,
+                "fare_attributes.txt",
+                "fare_id,price,currency_type,payment_method\nf1,2.50,EUR,0\n",
+            );
+            files.retain(|(name, _)| *name != file);
+            let (fares, _) = fares_of(&files);
+            assert!(fares.is_none(), "{file}");
+        }
+    }
+
+    #[test]
+    fn any_incomplete_input_yields_no_fares_section() {
+        for file in [
+            "fare_attributes.txt",
+            "fare_rules.txt",
+            "fare_products.txt",
+            "fare_leg_rules.txt",
+            "fare_transfer_rules.txt",
+            "stops.txt",
+            "trips.txt",
+            "stop_times.txt",
+            "routes.txt",
+        ] {
+            let mut files = fare_feed();
+            upsert(
+                &mut files,
+                "fare_attributes.txt",
+                "fare_id,price,currency_type,payment_method\nf1,2.50,EUR,0\n",
+            );
+            let mut result = scan_zip(&files);
+            result.incomplete.insert(file.to_string());
+            let options = ScanOptions::default();
+            assert!(
+                fare_readiness(&mut result, &options, MAX_FARE_COMPAT_CHECKS).is_none(),
+                "{file}"
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_agency_table_yields_no_fares_section() {
+        let mut files = fare_feed();
+        upsert(
+            &mut files,
+            "fare_attributes.txt",
+            "fare_id,price,currency_type,payment_method\nf1,2.50,EUR,0\n",
+        );
+        let mut result = scan_zip(&files);
+        result.incomplete.insert("agency.txt".to_string());
+        let options = ScanOptions::default();
+        assert!(fare_readiness(&mut result, &options, MAX_FARE_COMPAT_CHECKS).is_none());
+    }
+
+    #[test]
+    fn no_usable_routes_never_computable() {
+        let mut files = fare_feed();
+        // A single-stop trip keeps the tables present but leaves no
+        // route with a usable trip.
+        upsert(
+            &mut files,
+            "trips.txt",
+            "route_id,service_id,trip_id\nr1,wk,t1\n",
+        );
+        upsert(
+            &mut files,
+            "stop_times.txt",
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\nt1,08:00:00,08:00:00,s1,1\n",
+        );
+        upsert(
+            &mut files,
+            "fare_attributes.txt",
+            "fare_id,price,currency_type,payment_method\nf1,2.50,EUR,0\n",
+        );
+        let (fares, _) = fares_of(&files);
+        let fares = fares.unwrap();
+        assert_eq!(fares.v1.route_compatibility, None);
+        assert_eq!(fares.verdict, "partial");
+    }
+
+    #[test]
+    fn single_agency_blank_fare_agency_is_unscoped() {
+        let mut files = fare_feed();
+        upsert(
+            &mut files,
+            "fare_attributes.txt",
+            "fare_id,price,currency_type,payment_method\nf1,2.50,EUR,0\n",
+        );
+        let (fares, notices) = fares_of(&files);
+        let fares = fares.unwrap();
+        assert!(!fares.v1.agency_ambiguous);
+        assert_eq!(fares.verdict, "computable");
+        assert!(notices.iter().all(|n| n.code != "fare_without_agency_id"));
     }
 
     #[test]
