@@ -27,6 +27,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tolerance) and ``trips_without_shapes`` (INFO, aggregate). The report
   renderers show the summary as a one-line readiness block.
 
+- Cafein-readiness (fares): the ``readiness`` block gains a ``fares``
+  section predicting whether cafein can price journeys. GTFS v1 fares
+  are counted as priceable when the price parses to a finite
+  non-negative number and the currency is a three-letter code, and a
+  coarse route-compatibility share is computed under cafein's own
+  fare-rule grant model (contains rows contribute their zone alone,
+  origin/destination rows form clauses with exactly their present
+  fields, route-only rows grant the route, a fare with no grants is
+  unrestricted, and agency scope bounds every grant). The verdict is
+  ``computable``/``partial``/``absent``/``blocked`` — ``blocked`` when
+  a multi-agency feed carries a fare without ``agency_id``, which
+  cafein rejects outright; Fares v2 presence is reported separately
+  since cafein does not read v2. Transfer pricing is reported present
+  when a priceable fare carries an explicit ``transfers`` value or a
+  ``transfer_duration``. Four advisory notices:
+  ``no_fare_information`` (INFO), ``fare_attribute_not_priceable``
+  (WARNING), ``partial_fare_coverage`` (WARNING, below a 20 %
+  route-compatibility share) and ``fare_without_agency_id`` (WARNING).
+
 ### Fixed
 
 - The date-time-targeted checks' over-midnight lookback is no longer

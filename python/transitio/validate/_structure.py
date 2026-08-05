@@ -78,8 +78,15 @@ def validate_feed(
         which tier of cafein's distance ladder applies (validated
         ``shape_dist_traveled``, stops linear-referenced onto the shape,
         or crow-fly fallback) with a ``full``/``partial``/``straight_line``
-        verdict — ``None`` when truncated input made the section
-        uncomputable.
+        verdict, and ``readiness["fares"]`` whether cafein can price
+        journeys — GTFS v1 fare counts, the share of used routes some
+        priceable fare is compatible with (a coarse route-level check,
+        not a per-journey guarantee), transfer-pricing presence, Fares
+        v2 presence (cafein does not read v2), and a
+        ``computable``/``partial``/``absent``/``blocked`` verdict
+        (``blocked``: a multi-agency feed whose fares name no agency,
+        which cafein rejects outright). Either section is ``None`` when
+        truncated input made it uncomputable.
 
     Raises
     ------

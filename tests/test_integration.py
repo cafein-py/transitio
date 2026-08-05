@@ -65,6 +65,8 @@ def test_readiness_on_helsinki_sample(helsinki_gtfs):
     assert sum(predicted.values()) > 0
     # A real production feed carries usable shapes for most trips.
     assert predicted["shape_dist"] + predicted["shape_linref"] > 0
+    fares = report["readiness"]["fares"]
+    assert fares["verdict"] in {"computable", "partial", "absent", "blocked"}
 
 
 def test_readiness_distribution_matches_cafein(helsinki_gtfs):

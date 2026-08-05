@@ -103,8 +103,37 @@ def test_readiness_renders_in_summary_and_pages():
     assert "partial" in markdown
     page = render_html(report)
     assert "Cafein readiness" in page
-    # A gated-off section renders nothing rather than an empty block.
-    silent = build_report(dict(VALIDATION, readiness={"distances": None}))
+    fares = dict(
+        VALIDATION,
+        readiness={
+            "distances": None,
+            "fares": {
+                "v1": {
+                    "fares": 3,
+                    "priceable": 2,
+                    "routeCompatibility": 0.5,
+                    "agencyAmbiguous": False,
+                },
+                "v2": {
+                    "present": True,
+                    "products": 1,
+                    "priceable": 1,
+                    "legRules": False,
+                    "transferRules": False,
+                },
+                "transferPricing": "present",
+                "verdict": "partial",
+            },
+        },
+    )
+    markdown = render_markdown(build_report(fares))
+    assert "fares: partial" in markdown
+    assert "route compatibility 50%" in markdown
+    assert "Fares v2 present" in markdown
+    # Gated-off sections render nothing rather than an empty block.
+    silent = build_report(
+        dict(VALIDATION, readiness={"distances": None, "fares": None})
+    )
     assert "Cafein readiness" not in render_markdown(silent)
 
 
