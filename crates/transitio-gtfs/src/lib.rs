@@ -5,6 +5,7 @@
 pub mod crop;
 pub mod fields;
 pub mod notice;
+pub mod readiness;
 pub mod repair;
 pub mod rules;
 pub mod scan;
@@ -13,6 +14,7 @@ pub mod semantics;
 
 pub use crop::{closed_parts, crop, validate_polygon, CropOptions, CropResult, PolygonRings};
 pub use notice::{Notice, Severity};
+pub use readiness::{DistanceReadiness, Readiness};
 pub use repair::{repair, Fix, RepairResult};
 pub use scan::{
     scan, scan_reader, scan_reader_with, scan_with, Moment, ScanOptions, ScanResult, Table,
@@ -28,5 +30,6 @@ pub fn validate(path: &std::path::Path, mut options: ScanOptions) -> Result<Scan
     let mut result = scan::scan_with(path, options)?;
     rules::run_rules(&mut result, &options);
     semantics::run_semantics(&mut result, &options);
+    readiness::run_readiness(&mut result, &options);
     Ok(result)
 }

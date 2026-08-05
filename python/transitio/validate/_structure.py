@@ -66,13 +66,20 @@ def validate_feed(
     Returns
     -------
     dict
-        ``{"notices": [...], "row_counts": {...}, "service_window": ...}``.
+        ``{"notices": [...], "row_counts": {...}, "service_window": ...,
+        "readiness": ...}``.
         Each notice carries ``code``, ``severity``
         (``ERROR``/``WARNING``/``INFO``) and a ``context`` mapping with the
         notice-specific fields. ``service_window`` is the actual computed
         service-day span as a ``[start, end]`` pair of ``YYYYMMDD`` strings
         (or ``None``) — use it to verify the optimistic published dataset
-        ranges from the catalog.
+        ranges from the catalog. ``readiness`` summarizes what cafein will
+        get from the feed: ``readiness["distances"]`` predicts, per trip,
+        which tier of cafein's distance ladder applies (validated
+        ``shape_dist_traveled``, stops linear-referenced onto the shape,
+        or crow-fly fallback) with a ``full``/``partial``/``straight_line``
+        verdict — ``None`` when truncated input made the section
+        uncomputable.
 
     Raises
     ------

@@ -100,6 +100,7 @@ fn scan_feed(
             "notices": result.notices,
             "row_counts": row_counts,
             "service_window": result.service_window,
+            "readiness": result.readiness,
         });
         Ok(report.to_string())
     })

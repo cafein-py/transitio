@@ -99,6 +99,8 @@ pub struct ScanResult {
     /// into `tables` (GTFS-Flex files, unknown files); archive rewrites
     /// copy them through verbatim.
     pub unparsed_entries: Vec<String>,
+    /// Cafein-readiness summary; None until the readiness tier runs.
+    pub readiness: Option<crate::readiness::Readiness>,
 }
 
 pub fn scan(path: &Path) -> Result<ScanResult, String> {
@@ -260,6 +262,7 @@ pub fn scan_reader_with<R: Read + Seek>(
         incomplete,
         service_window: None,
         unparsed_entries,
+        readiness: None,
     })
 }
 
