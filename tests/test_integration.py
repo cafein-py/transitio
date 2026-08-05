@@ -58,6 +58,28 @@ def test_moment_validation_on_helsinki_sample(helsinki_gtfs):
         assert 0 < notice["context"]["activeDays"] <= notice["context"]["windowDays"]
 
 
+def test_readiness_on_helsinki_sample(helsinki_gtfs):
+    report = validate_feed(helsinki_gtfs)
+    distances = report["readiness"]["distances"]
+    predicted = distances["predicted"]
+    assert sum(predicted.values()) > 0
+    # A real production feed carries usable shapes for most trips.
+    assert predicted["shape_dist"] + predicted["shape_linref"] > 0
+
+
+def test_readiness_distribution_matches_cafein(helsinki_gtfs):
+    cafein_geometry = pytest.importorskip("cafein.geometry")
+    from collections import Counter
+
+    report = validate_feed(helsinki_gtfs)
+    predicted = report["readiness"]["distances"]["predicted"]
+    actual = Counter(
+        provenance for _, _, provenance in cafein_geometry.trip_distances(helsinki_gtfs)
+    )
+    for tier in ("shape_dist", "shape_linref", "crow_fly"):
+        assert predicted[tier] == actual.get(tier, 0), tier
+
+
 def test_report_renders_for_helsinki(helsinki_gtfs):
     validation = validate_feed(helsinki_gtfs, reference_date=REFERENCE_DATE)
     report = build_report(validation, provenance={"source": "r5py sample v1.1.1"})

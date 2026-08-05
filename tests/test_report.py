@@ -82,6 +82,32 @@ def test_render_markdown_and_html():
     assert page.startswith("<!doctype html>")
 
 
+def test_readiness_renders_in_summary_and_pages():
+    validation = dict(
+        VALIDATION,
+        readiness={
+            "distances": {
+                "trips": 10,
+                "skipped": 1,
+                "unprocessed": 0,
+                "predicted": {"shape_dist": 6, "shape_linref": 2, "crow_fly": 1},
+                "verdict": "partial",
+                "cafein": "0.9.0",
+            }
+        },
+    )
+    report = build_report(validation)
+    assert report["summary"]["readiness"]["distances"]["verdict"] == "partial"
+    markdown = render_markdown(report)
+    assert "Cafein readiness" in markdown
+    assert "partial" in markdown
+    page = render_html(report)
+    assert "Cafein readiness" in page
+    # A gated-off section renders nothing rather than an empty block.
+    silent = build_report(dict(VALIDATION, readiness={"distances": None}))
+    assert "Cafein readiness" not in render_markdown(silent)
+
+
 def test_sampling_marks_counts_as_lower_bounds():
     validation = dict(
         VALIDATION,

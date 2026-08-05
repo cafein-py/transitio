@@ -232,6 +232,26 @@ def test_invalid_reference_time(tmp_path):
             validate_feed(feed, reference_date="20260601", reference_time=bad)
 
 
+def test_readiness_predicts_distance_tiers(tmp_path):
+    files = dict(
+        MINIMAL,
+        **{
+            "trips.txt": "route_id,service_id,trip_id,shape_id\nr1,wk,t1,sh1\n",
+            "shapes.txt": (
+                "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence\n"
+                "sh1,60.169,24.931,1\n"
+                "sh1,60.170,24.936,2\n"
+                "sh1,60.171,24.941,3\n"
+            ),
+        },
+    )
+    report = validate_feed(write_zip(tmp_path / "feed.zip", files))
+    distances = report["readiness"]["distances"]
+    assert distances["predicted"]["shape_linref"] == 1
+    assert distances["verdict"] == "full"
+    assert distances["cafein"] == "0.9.0"
+
+
 def test_omitted_reference_date_runs_no_moment_checks(tmp_path):
     report = validate_feed(write_zip(tmp_path / "feed.zip", MINIMAL))
     moment_codes = {

@@ -121,11 +121,38 @@ def build_report(validation, *, hosted=None, provenance=None):
             "countsAreLowerBounds": suppressed > 0,
             "serviceWindow": validation.get("service_window"),
             "rowCounts": validation.get("row_counts", {}),
+            "readiness": validation.get("readiness"),
             "provenance": provenance,
             "hostedReportIncluded": hosted is not None,
         },
         "notices": notices,
     }
+
+
+def _readiness_text(readiness):
+    """One line per readiness section, or None when nothing to show."""
+    distances = (readiness or {}).get("distances")
+    if not distances:
+        return None
+    predicted = distances["predicted"]
+    counted = sum(predicted.values())
+    shares = ", ".join(
+        f"{tier} {100 * count / counted:.0f}%"
+        for tier, count in predicted.items()
+        if counted
+    )
+    extras = ", ".join(
+        f"{key} {distances[key]}"
+        for key in ("skipped", "unprocessed")
+        if distances.get(key)
+    )
+    verdict = distances["verdict"] or "unknown"
+    detail = "; ".join(part for part in (shares, extras) if part)
+    return (
+        f"distances: {verdict} ({detail}) — cafein {distances['cafein']}"
+        if detail
+        else f"distances: {verdict} — cafein {distances['cafein']}"
+    )
 
 
 def parity_summary(report):
@@ -208,6 +235,9 @@ def render_markdown(report):
     if summary.get("serviceWindow"):
         start, end = summary["serviceWindow"]
         lines += [f"Computed service window: {_md(start)} – {_md(end)}", ""]
+    readiness = _readiness_text(summary.get("readiness"))
+    if readiness:
+        lines += [f"Cafein readiness — {_md(readiness)}", ""]
     if summary.get("provenance"):
         lines.append("## Provenance")
         lines.append("")
@@ -258,6 +288,10 @@ def render_html(report):
     if summary.get("serviceWindow"):
         start, end = summary["serviceWindow"]
         window = f"<p>Computed service window: {e(start)} – {e(end)}</p>"
+    readiness_line = _readiness_text(summary.get("readiness"))
+    readiness = (
+        f"<p>Cafein readiness — {e(readiness_line)}</p>" if readiness_line else ""
+    )
     provenance = ""
     if summary.get("provenance"):
         items = "".join(
@@ -277,7 +311,7 @@ def render_html(report):
         f"<p>Errors: {summary['counts']['errors']} · "
         f"Warnings: {summary['counts']['warnings']} · "
         f"Infos: {summary['counts']['infos']}</p>"
-        f"{sampling}{window}{provenance}"
+        f"{sampling}{window}{readiness}{provenance}"
         "<h2>Notices</h2>"
         "<table><tr><th>code</th><th>severity</th><th>source</th>"
         "<th>local</th><th>hosted</th></tr>"

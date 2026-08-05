@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- Cafein-readiness (distances): ``validate_feed`` now returns a
+  ``readiness`` block predicting, per trip, which tier of cafein 0.9.0's
+  distance ladder will accept the feed's data — validated
+  ``shape_dist_traveled`` (non-NaN, non-decreasing, detour ratio within
+  cafein's meter or kilometer bands against stop-to-stop great-circle
+  distances), stops linear-referenced onto the shape (a real UTM
+  projection with the tier decided only when every candidate zone
+  agrees), or the crow-fly fallback — with a
+  ``full``/``partial``/``straight_line`` verdict, and ``null`` for the
+  whole section when truncated input would make it guesswork. Five
+  advisory transitio-specific notices accompany it:
+  ``shape_dist_ratio_implausible`` (WARNING),
+  ``shape_dist_in_kilometers`` (INFO), ``chord_only_shape`` (WARNING,
+  shapes with no more vertices than the trip has stops),
+  ``stop_far_from_shape`` (WARNING, a stop beyond cafein's 100 m snap
+  tolerance) and ``trips_without_shapes`` (INFO, aggregate). The report
+  renderers show the summary as a one-line readiness block.
+
 ### Fixed
 
 - The date-time-targeted checks' over-midnight lookback is no longer
