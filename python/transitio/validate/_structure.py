@@ -15,6 +15,7 @@ def validate_feed(
     max_columns=None,
     max_notices_per_file=None,
     reference_date=None,
+    reference_time=None,
 ):
     """Validate a GTFS zip and return the collected notices.
 
@@ -51,6 +52,16 @@ def validate_feed(
         occurrences are counted in a ``notice_limit_reached`` notice.
     reference_date : str, optional
         ``YYYYMMDD`` day for calendar-expiry checks; defaults to today.
+        Passing it explicitly also runs the date-targeted service checks:
+        whether any service is active on the day, whether the day's
+        active-trip count sits far below the feed's own per-day baseline,
+        and whether normally active routes are silent on it.
+    reference_time : str, optional
+        ``HH:MM`` or ``HH:MM:SS`` wall-clock time refining the
+        date-targeted checks to a moment: trips must actually be
+        operating at it (frequency windows and over-midnight trips
+        included) and the baseline comparison switches to the same clock
+        time across the service window. Requires ``reference_date``.
 
     Returns
     -------
@@ -81,5 +92,6 @@ def validate_feed(
             max_columns=max_columns,
             max_notices_per_file=max_notices_per_file,
             reference_date=reference_date,
+            reference_time=reference_time,
         )
     )

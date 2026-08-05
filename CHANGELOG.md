@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- Date-time-targeted validation: passing ``reference_date`` to
+  ``validate_feed`` (and ``repair_feed`` / ``crop_feed``) now also checks
+  that the feed is in working order on that day, and the new
+  ``reference_time`` keyword (``HH:MM`` or ``HH:MM:SS``) narrows the
+  check to a moment. Four transitio-specific WARNING notices:
+  ``no_service_on_reference_date`` (nothing runs on the day),
+  ``no_trips_at_reference_time`` (services active but no trip operating
+  at the time — frequency-window departures and over-midnight trips from
+  the previous service day are accounted for),
+  ``service_level_below_baseline`` (the moment's active-trip count falls
+  under half of the feed's own per-day or per-clock-time average, the
+  threshold explicit in the notice), and
+  ``route_inactive_on_reference_date`` (a route active on at least half
+  of the service-window days has no service on the target day).
+
+- An invertible change log with undo/redo on ``FeedBuilder`` /
+  ``FeedEditor``: every helper mutation is recorded (grouped so one
+  helper call is one undo step), three public logged primitives —
+  ``set_value``, ``insert_rows``, ``delete_rows`` — plus a public
+  ``action(label)`` context group multi-step operations, and ``undo()``
+  / ``redo()`` revert or replay whole actions atomically, verifying the
+  tables still match the log first (``ChangeLogDesyncError`` otherwise;
+  direct edits through ``tables`` remain outside the log). ``save``
+  writes the applied history to ``<name>.changes.txt`` beside the feed —
+  a plain CSV whose final ``meta`` row carries the source and result
+  checksums — and removes a stale sidecar when the log is empty or
+  ``change_log=False``.
+
 ## 0.6.0 — 2026-08-04
 
 ### Changed

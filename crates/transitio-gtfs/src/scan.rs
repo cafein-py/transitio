@@ -34,6 +34,15 @@ const MAX_ARCHIVE_ENTRIES: u64 = 4096;
 /// structural tier's scope.
 const NON_CSV_FILES: &[&str] = &["locations.geojson"];
 
+/// An explicit validation target: a service day, optionally with a
+/// wall-clock time of day in seconds. Unlike `reference_date` it is never
+/// defaulted — the date-targeted checks run only when the caller asked.
+#[derive(Clone, Copy)]
+pub struct Moment {
+    pub date: chrono::NaiveDate,
+    pub time: Option<u32>,
+}
+
 #[derive(Clone, Copy)]
 pub struct ScanOptions {
     pub max_entry_bytes: u64,
@@ -44,6 +53,8 @@ pub struct ScanOptions {
     /// Reference day for expiry checks; `None` disables them. `validate`
     /// defaults it to the current date.
     pub reference_date: Option<chrono::NaiveDate>,
+    /// Target for the date(-time)-targeted service checks.
+    pub moment: Option<Moment>,
 }
 
 impl Default for ScanOptions {
@@ -55,6 +66,7 @@ impl Default for ScanOptions {
             max_columns: DEFAULT_MAX_COLUMNS,
             max_notices_per_file: DEFAULT_MAX_NOTICES_PER_FILE,
             reference_date: None,
+            moment: None,
         }
     }
 }
