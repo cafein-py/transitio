@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- The date-time-targeted checks' over-midnight lookback is no longer
+  clamped at seven days: a trip legally completing more than a week
+  after its service day (GTFS times allow 3-digit hours) is now
+  attributed to the target moment instead of producing a false
+  ``no_trips_at_reference_time``.
+- ``reference_time`` now rejects single-digit hours (``8:00``),
+  matching its documented ``HH:MM``/``HH:MM:SS`` format.
+- Frequency rows with a reversed or empty window or a non-positive
+  ``headway_secs`` no longer count as service in the date-time-targeted
+  checks, and a trip whose frequency rows are all unusable is excluded
+  from the timed checks entirely rather than silently falling back to
+  its stop-time span.
+
 ## 0.7.0 — 2026-08-05
 
 ### Added

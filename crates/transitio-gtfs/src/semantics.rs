@@ -19,8 +19,7 @@ const MAX_SERVICE_DAYS: i64 = 4000;
 const MAX_TOTAL_SERVICE_DAYS: i64 = 2_000_000;
 const MAX_BLOCK_PAIR_CHECKS: usize = 10_000;
 /// Block-overlap day offsets follow actual span lengths but are clamped so
-/// hostile 100-hour times cannot force wide scans. The moment checks use
-/// the same clamp for their over-midnight lookback.
+/// hostile 100-hour times cannot force wide scans.
 const MAX_BLOCK_DAY_OFFSET: i64 = 7;
 /// Share threshold under which the target moment's active-trip count is
 /// flagged against the feed's own baseline.
@@ -647,22 +646,29 @@ fn moment_checks(
     };
     let window_days = ((window_last - window_first).num_days() + 1) as f64;
 
-    // Rows with unparseable times are ignored (the field tier flags
-    // them); a frequency trip with no parseable windows falls back to
-    // its stop-time span in the shared predicate below.
+    // A frequency row yields a usable window only when its times parse,
+    // end > start, and headway_secs is a positive integer — anything
+    // else generates no service (the field tier flags the bad values).
     let mut freq_windows: HashMap<&str, Vec<(u64, u64)>> = HashMap::new();
+    let mut freq_trips: HashSet<&str> = HashSet::new();
     if let Some(frequencies) = tables.get("frequencies.txt") {
         for row in &frequencies.rows {
+            let trip_id = cell(frequencies, row, "trip_id");
+            if trip_id.is_empty() {
+                continue;
+            }
+            freq_trips.insert(trip_id);
             let (Some(start), Some(end)) = (
                 parse_gtfs_time(cell(frequencies, row, "start_time").trim()),
                 parse_gtfs_time(cell(frequencies, row, "end_time").trim()),
             ) else {
                 continue;
             };
-            freq_windows
-                .entry(cell(frequencies, row, "trip_id"))
-                .or_default()
-                .push((start, end));
+            let headway = cell(frequencies, row, "headway_secs").trim().parse::<u64>();
+            if end <= start || !matches!(headway, Ok(h) if h > 0) {
+                continue;
+            }
+            freq_windows.entry(trip_id).or_default().push((start, end));
         }
     }
 
@@ -672,6 +678,10 @@ fn moment_checks(
         start: u64,
         end: u64,
         windows: &'a [(u64, u64)],
+        /// False when every frequency row is unusable: the schedule is
+        /// broken, and the span alone must not fabricate service, so
+        /// the timed predicate skips the trip on both sides.
+        timed: bool,
     }
 
     // A frequency window holds first-stop departures; an instance
@@ -694,15 +704,17 @@ fn moment_checks(
         let Some(span) = spans.get(trip_id) else {
             continue; // unusable trips cannot serve the moment
         };
+        let windows = freq_windows
+            .get(trip_id)
+            .map(|w| w.as_slice())
+            .unwrap_or(&[]);
         trips.push(Operates {
             service_id: &span.service_id,
             route_id: cell(trips_table, row, "route_id"),
             start: span.start,
             end: span.end,
-            windows: freq_windows
-                .get(trip_id)
-                .map(|w| w.as_slice())
-                .unwrap_or(&[]),
+            windows,
+            timed: !(freq_trips.contains(trip_id) && windows.is_empty()),
         });
     }
 
@@ -739,6 +751,7 @@ fn moment_checks(
             reference_time = Some(format_time(time));
             let max_completion = trips
                 .iter()
+                .filter(|trip| trip.timed)
                 .map(|trip| {
                     let duration = trip.end.saturating_sub(trip.start);
                     trip.windows
@@ -750,15 +763,18 @@ fn moment_checks(
                 })
                 .max()
                 .unwrap_or(0);
-            let max_offset = ((max_completion / 86400) as i64).min(MAX_BLOCK_DAY_OFFSET);
+            // The lookback follows the actual completion times; the
+            // parser's 3-digit-hour cap already bounds them to under
+            // three months, so no defensive clamp is needed.
+            let max_offset = (max_completion / 86400) as usize;
             // n_k per service: trips operating at clock time T with
             // over-midnight offset k — the one predicate that feeds both
             // the target count and the baseline.
             let mut per_service: HashMap<&str, Vec<u64>> = HashMap::new();
-            for trip in &trips {
+            for trip in trips.iter().filter(|trip| trip.timed) {
                 let counts = per_service
                     .entry(trip.service_id)
-                    .or_insert_with(|| vec![0; max_offset as usize + 1]);
+                    .or_insert_with(|| vec![0; max_offset + 1]);
                 for (k, slot) in counts.iter_mut().enumerate() {
                     if operates_at(trip, time as u64 + k as u64 * 86400) {
                         *slot += 1;
@@ -1364,16 +1380,171 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_frequency_windows_fall_back_to_span() {
+    fn all_unusable_frequency_rows_exclude_the_trip() {
+        // A frequency-based trip whose rows are all unusable has a
+        // broken schedule; the span must not fabricate service.
+        for rows in [
+            "t1,bad,09:00:00,600\n",      // unparseable start
+            "t1,09:00:00,08:00:00,600\n", // reversed window
+            "t1,08:00:00,08:00:00,600\n", // empty window
+            "t1,07:00:00,09:00:00,0\n",   // zero headway
+            "t1,07:00:00,09:00:00,x\n",   // unparseable headway
+        ] {
+            let mut files = minimal();
+            let content: &'static str = Box::leak(
+                format!("trip_id,start_time,end_time,headway_secs\n{rows}").into_boxed_str(),
+            );
+            files.push(("frequencies.txt", content));
+            // 08:03 lies inside the stop-time span, but the trip is
+            // excluded from the timed predicate entirely.
+            let result = validate_zip_at(&files, "20260601", Some(8 * 3600 + 180));
+            assert!(
+                codes(&result).contains(&"no_trips_at_reference_time"),
+                "expected exclusion for rows {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_unusable_frequency_trips_stay_out_of_the_baseline() {
+        let mut files = minimal();
+        replace(
+            &mut files,
+            "calendar.txt",
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\nok,1,1,1,1,1,1,1,20260101,20261231\nbrk,1,1,1,1,1,1,1,20260101,20261231\n",
+        );
+        replace(
+            &mut files,
+            "trips.txt",
+            "route_id,service_id,trip_id\nr1,ok,t1\nr1,brk,t2\nr1,brk,t3\nr1,brk,t4\n",
+        );
+        replace(
+            &mut files,
+            "stop_times.txt",
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\nt1,08:00:00,08:00:00,s1,1\nt1,08:05:00,08:05:00,s2,2\nt2,08:00:00,08:00:00,s1,1\nt2,08:05:00,08:05:00,s2,2\nt3,08:00:00,08:00:00,s1,1\nt3,08:05:00,08:05:00,s2,2\nt4,08:00:00,08:00:00,s1,1\nt4,08:05:00,08:05:00,s2,2\n",
+        );
+        files.push((
+            "frequencies.txt",
+            "trip_id,start_time,end_time,headway_secs\nt2,07:00:00,09:00:00,0\nt3,07:00:00,09:00:00,0\nt4,07:00:00,09:00:00,0\n",
+        ));
+        // Counting the three broken trips' spans on the baseline side
+        // only would leave target 1 vs baseline 4 and flag a phantom
+        // service drop; exclusion must hold on BOTH sides.
+        let result = validate_zip_at(&files, "20260601", Some(8 * 3600 + 180));
+        let codes = codes(&result);
+        assert!(!codes.contains(&"service_level_below_baseline"));
+        assert!(!codes.contains(&"no_trips_at_reference_time"));
+    }
+
+    #[test]
+    fn one_usable_frequency_row_governs_among_bad_ones() {
         let mut files = minimal();
         files.push((
             "frequencies.txt",
-            "trip_id,start_time,end_time,headway_secs\nt1,bad,09:00:00,600\n",
+            "trip_id,start_time,end_time,headway_secs\nt1,bad,09:00:00,600\nt1,07:00:00,07:30:00,600\n",
         ));
-        let result = validate_zip_at(&files, "20260601", Some(8 * 3600 + 180));
+        // The usable 07:00-07:30 window (plus template duration) governs.
+        let result = validate_zip_at(&files, "20260601", Some(7 * 3600 + 20 * 60));
         assert!(!codes(&result).contains(&"no_trips_at_reference_time"));
-        let result = validate_zip_at(&files, "20260601", Some(22 * 3600));
+        let result = validate_zip_at(&files, "20260601", Some(8 * 3600 + 180));
         assert!(codes(&result).contains(&"no_trips_at_reference_time"));
+    }
+
+    #[test]
+    fn lookback_beyond_seven_days_is_not_clamped() {
+        let mut files = minimal();
+        replace(
+            &mut files,
+            "calendar.txt",
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\nnight,1,0,0,0,0,0,0,20260601,20260601\n",
+        );
+        replace(
+            &mut files,
+            "trips.txt",
+            "route_id,service_id,trip_id\nr1,night,t1\n",
+        );
+        // 195:00 on the Monday service day = 03:00 eight days later.
+        replace(
+            &mut files,
+            "stop_times.txt",
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\nt1,195:00:00,195:00:00,s1,1\nt1,195:30:00,195:30:00,s2,2\n",
+        );
+        let result = validate_zip_at(&files, "20260609", Some(3 * 3600 + 600));
+        let codes = codes(&result);
+        for code in MOMENT_CODES {
+            assert!(!codes.contains(&code), "unexpected {code}");
+        }
+    }
+
+    #[test]
+    fn calendar_exception_removal_flags_quiet_day() {
+        let mut files = minimal();
+        replace(
+            &mut files,
+            "calendar.txt",
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\nwk,1,1,1,1,1,1,1,20260101,20261231\nsmall,1,1,1,1,1,1,1,20260101,20261231\n",
+        );
+        files.push((
+            "calendar_dates.txt",
+            "service_id,date,exception_type\nwk,20260607,2\n",
+        ));
+        replace(
+            &mut files,
+            "trips.txt",
+            "route_id,service_id,trip_id\nr1,wk,t1\nr1,wk,t2\nr1,wk,t3\nr2,small,t4\n",
+        );
+        replace(
+            &mut files,
+            "stop_times.txt",
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\nt1,08:00:00,08:00:00,s1,1\nt1,08:05:00,08:05:00,s2,2\nt2,09:00:00,09:00:00,s1,1\nt2,09:05:00,09:05:00,s2,2\nt3,10:00:00,10:00:00,s1,1\nt3,10:05:00,10:05:00,s2,2\nt4,08:00:00,08:00:00,s1,1\nt4,08:05:00,08:05:00,s2,2\n",
+        );
+        let result = validate_zip_at(&files, "20260607", None);
+        assert!(codes(&result).contains(&"service_level_below_baseline"));
+        let inactive: Vec<_> = result
+            .notices
+            .iter()
+            .filter(|n| n.code == "route_inactive_on_reference_date")
+            .collect();
+        assert_eq!(inactive.len(), 1);
+        assert_eq!(inactive[0].context["routeId"], "r1");
+    }
+
+    #[test]
+    fn calendar_exception_removal_flags_quiet_moment_for_frequency_trips() {
+        let mut files = minimal();
+        replace(
+            &mut files,
+            "calendar.txt",
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\nbig,1,1,1,1,1,1,1,20260101,20261231\nsmall,1,1,1,1,1,1,1,20260101,20261231\n",
+        );
+        files.push((
+            "calendar_dates.txt",
+            "service_id,date,exception_type\nbig,20260607,2\n",
+        ));
+        replace(
+            &mut files,
+            "trips.txt",
+            "route_id,service_id,trip_id\nr1,big,t1\nr1,big,t2\nr1,big,t3\nr2,small,t4\n",
+        );
+        replace(
+            &mut files,
+            "stop_times.txt",
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\nt1,07:00:00,07:00:00,s1,1\nt1,07:05:00,07:05:00,s2,2\nt2,07:00:00,07:00:00,s1,1\nt2,07:05:00,07:05:00,s2,2\nt3,07:00:00,07:00:00,s1,1\nt3,07:05:00,07:05:00,s2,2\nt4,08:00:00,08:00:00,s1,1\nt4,08:05:00,08:05:00,s2,2\n",
+        );
+        files.push((
+            "frequencies.txt",
+            "trip_id,start_time,end_time,headway_secs\nt1,07:00:00,09:00:00,600\nt2,07:00:00,09:00:00,600\nt3,07:00:00,09:00:00,600\n",
+        ));
+        // The removed frequency service leaves one span trip at 08:00.
+        let result = validate_zip_at(&files, "20260607", Some(8 * 3600));
+        assert!(codes(&result).contains(&"service_level_below_baseline"));
+        let inactive: Vec<_> = result
+            .notices
+            .iter()
+            .filter(|n| n.code == "route_inactive_on_reference_date")
+            .collect();
+        assert_eq!(inactive.len(), 1);
+        assert_eq!(inactive[0].context["routeId"], "r1");
     }
 
     #[test]

@@ -227,9 +227,20 @@ def test_reference_time_requires_date(tmp_path):
 
 def test_invalid_reference_time(tmp_path):
     feed = write_zip(tmp_path / "feed.zip", MINIMAL)
-    for bad in ("25:00", "8am", "08:60", "080000", "8:0"):
+    for bad in ("25:00", "8am", "08:60", "080000", "8:0", "8:00"):
         with pytest.raises(ValueError):
             validate_feed(feed, reference_date="20260601", reference_time=bad)
+
+
+def test_omitted_reference_date_runs_no_moment_checks(tmp_path):
+    report = validate_feed(write_zip(tmp_path / "feed.zip", MINIMAL))
+    moment_codes = {
+        "no_service_on_reference_date",
+        "no_trips_at_reference_time",
+        "service_level_below_baseline",
+        "route_inactive_on_reference_date",
+    }
+    assert not (codes(report) & moment_codes)
 
 
 def test_row_cap_is_configurable(tmp_path):
