@@ -8,11 +8,10 @@ fn parse_clock_time(value: &str) -> Option<u32> {
     if parts.len() != 2 && parts.len() != 3 {
         return None;
     }
-    // 1-2 digit hours, exactly 2-digit minutes and seconds, digits only.
+    // Exactly two digits per component, per the documented "HH:MM[:SS]".
     if parts
         .iter()
-        .any(|part| part.is_empty() || part.len() > 2 || !part.bytes().all(|b| b.is_ascii_digit()))
-        || parts[1..].iter().any(|part| part.len() != 2)
+        .any(|part| part.len() != 2 || !part.bytes().all(|b| b.is_ascii_digit()))
     {
         return None;
     }
