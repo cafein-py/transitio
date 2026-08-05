@@ -439,12 +439,18 @@ def test_publication_failures(tmp_path, monkeypatch):
         pass
     zip_now = path.read_bytes()
 
-    def failing_unlink(target, *args, **kwargs):
-        if str(target).endswith(".changes.txt"):
-            raise OSError("cannot remove")
-        return os_module.remove(target)
+    from pathlib import Path
 
-    monkeypatch.setattr(os_module, "unlink", failing_unlink)
+    real_unlink = Path.unlink
+
+    def failing_unlink(self, *args, **kwargs):
+        if str(self).endswith(".changes.txt"):
+            raise OSError("cannot remove")
+        return real_unlink(self, *args, **kwargs)
+
+    # patch the Path method, not os.unlink: 3.10's pathlib binds its
+    # accessor functions at import time
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
     with pytest.raises(OSError, match="stale change log"):
         builder.save(path, check=False)
     monkeypatch.undo()
