@@ -24,3 +24,11 @@ class InvalidFeedError(TransitioError):
     """
 
     report = None
+
+
+class ChangeLogDesyncError(TransitioError):
+    """The tables no longer match the change log, so undo/redo refused.
+
+    Raised when a direct edit through the ``tables`` escape hatch has
+    changed what a logged entry recorded; nothing is modified.
+    """

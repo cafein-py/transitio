@@ -24,6 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``route_inactive_on_reference_date`` (a route active on at least half
   of the service-window days has no service on the target day).
 
+- An invertible change log with undo/redo on ``FeedBuilder`` /
+  ``FeedEditor``: every helper mutation is recorded (grouped so one
+  helper call is one undo step), three public logged primitives —
+  ``set_value``, ``insert_rows``, ``delete_rows`` — plus a public
+  ``action(label)`` context group multi-step operations, and ``undo()``
+  / ``redo()`` revert or replay whole actions atomically, verifying the
+  tables still match the log first (``ChangeLogDesyncError`` otherwise;
+  direct edits through ``tables`` remain outside the log). ``save``
+  writes the applied history to ``<name>.changes.txt`` beside the feed —
+  a plain CSV whose final ``meta`` row carries the source and result
+  checksums — and removes a stale sidecar when the log is empty or
+  ``change_log=False``.
+
 ## 0.6.0 — 2026-08-04
 
 ### Changed
