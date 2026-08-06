@@ -714,7 +714,10 @@ def test_symlinked_or_oversized_sidecar_is_ignored(tmp_path):
     sidecar = donor.with_suffix(".provenance.json")
     elsewhere = tmp_path / "elsewhere.json"
     elsewhere.write_text(payload)
-    sidecar.symlink_to(elsewhere)
+    try:
+        sidecar.symlink_to(elsewhere)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation not permitted here")
     report = patch_feed(base, donor, tmp_path / "out1.zip")
     assert report["donor"]["catalog"] == "unavailable"
     sidecar.unlink()

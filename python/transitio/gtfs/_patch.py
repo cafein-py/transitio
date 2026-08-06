@@ -308,18 +308,25 @@ def _error_ids(validation, field):
 def _read_sidecar(sidecar):
     """Parse the sidecar defensively: the file is advisory metadata, so
     a symlink, FIFO, oversized or malformed file is None, never a hang
-    or a crash. Platforms without ``O_NOFOLLOW`` cannot open it safely,
-    so there catalog provenance is simply unavailable and the report
-    carries the computed hash alone."""
+    or a crash.
+
+    Where the platform offers ``O_NOFOLLOW`` the symlink refusal is
+    atomic; elsewhere it falls back to an ``lstat`` check before the
+    open, whose residual race is the same local-adversary level the
+    repair staging path already accepts.
+    """
     import os
     import stat
 
-    no_follow = getattr(os, "O_NOFOLLOW", None)
-    if no_follow is None:
-        # Without an atomic no-follow open the symlink check would be
-        # racy; advisory metadata is not worth that, so fail closed.
-        return None
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if not no_follow:
+        try:
+            if stat.S_ISLNK(os.lstat(sidecar).st_mode):
+                return None
+        except OSError:
+            return None
     flags = os.O_RDONLY | no_follow | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_BINARY", 0)
     try:
         descriptor = os.open(sidecar, flags)
     except OSError:
