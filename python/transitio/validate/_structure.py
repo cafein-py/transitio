@@ -67,7 +67,18 @@ def validate_feed(
     -------
     dict
         ``{"notices": [...], "row_counts": {...}, "service_window": ...,
-        "readiness": ...}``.
+        "readiness": ..., "moment": ..., "incomplete": [...],
+        "stop_bounds": ...}``.
+        ``moment`` (present when ``reference_date`` was passed and the
+        inputs were reliable, else ``None``) measures the target:
+        ``activeTrips``/``activeRoutes``/``stopsServed`` at the date
+        (or clock time), the feed's own ``baselineTrips`` mean and the
+        ``windowDays`` denominator — measurement only, judgement stays
+        with the notices. ``incomplete`` lists files whose retained
+        content was truncated or unreadable (their row counts are lower
+        bounds). ``stop_bounds`` is ``[min_lon, min_lat, max_lon,
+        max_lat]`` over the parseable stop coordinates, ``None`` when
+        none exist or stops.txt is incomplete.
         Each notice carries ``code``, ``severity``
         (``ERROR``/``WARNING``/``INFO``) and a ``context`` mapping with the
         notice-specific fields. ``service_window`` is the actual computed

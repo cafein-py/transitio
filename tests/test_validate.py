@@ -232,6 +232,29 @@ def test_invalid_reference_time(tmp_path):
             validate_feed(feed, reference_date="20260601", reference_time=bad)
 
 
+def test_moment_summary_and_bounds_exposed(tmp_path):
+    feed = write_zip(tmp_path / "feed.zip", MINIMAL)
+    report = validate_feed(feed, reference_date="20260601")
+    moment = report["moment"]
+    assert moment["referenceDate"] == "20260601"
+    assert moment["referenceTime"] is None
+    assert moment["activeTrips"] == 1
+    assert moment["activeRoutes"] == 1
+    assert moment["stopsServed"] == 2
+    assert moment["windowDays"] == 365
+    assert report["incomplete"] == []
+    assert report["stop_bounds"] == [24.931, 60.169, 24.941, 60.171]
+    # Without an explicit reference date the block stays absent.
+    assert validate_feed(feed)["moment"] is None
+
+
+def test_truncated_stops_null_bounds(tmp_path):
+    report = validate_feed(write_zip(tmp_path / "feed.zip", MINIMAL), max_rows=1)
+    assert report["stop_bounds"] is None
+    assert "stops.txt" in report["incomplete"]
+    assert report["moment"] is None  # unreliable inputs measure nothing
+
+
 def test_readiness_predicts_distance_tiers(tmp_path):
     files = dict(
         MINIMAL,

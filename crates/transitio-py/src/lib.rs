@@ -24,6 +24,36 @@ fn parse_clock_time(value: &str) -> Option<u32> {
     Some(hours * 3600 + minutes * 60 + seconds)
 }
 
+/// Stop bounds from the already-budgeted stops table: [min_lon,
+/// min_lat, max_lon, max_lat], skipping non-finite coordinates. None
+/// when no finite coordinate exists or stops.txt is incomplete —
+/// partial bounds from a truncated table would mislead.
+fn stop_bounds(result: &transitio_gtfs::ScanResult) -> Option<[f64; 4]> {
+    if result.incomplete.contains("stops.txt") {
+        return None;
+    }
+    let table = result.tables.get("stops.txt")?;
+    let lat = table.headers.iter().position(|h| h == "stop_lat")?;
+    let lon = table.headers.iter().position(|h| h == "stop_lon")?;
+    let mut bounds: Option<[f64; 4]> = None;
+    for row in &table.rows {
+        let (Ok(lat), Ok(lon)) = (
+            row.fields[lat].trim().parse::<f64>(),
+            row.fields[lon].trim().parse::<f64>(),
+        ) else {
+            continue;
+        };
+        if !lat.is_finite() || !lon.is_finite() {
+            continue;
+        }
+        bounds = Some(match bounds {
+            None => [lon, lat, lon, lat],
+            Some(b) => [b[0].min(lon), b[1].min(lat), b[2].max(lon), b[3].max(lat)],
+        });
+    }
+    bounds
+}
+
 /// An explicit reference_date drives the expiry checks AND targets the
 /// date(-time) service checks; reference_time refines the latter.
 fn apply_reference(
@@ -101,6 +131,9 @@ fn scan_feed(
             "row_counts": row_counts,
             "service_window": result.service_window,
             "readiness": result.readiness,
+            "moment": result.moment,
+            "incomplete": result.incomplete,
+            "stop_bounds": stop_bounds(&result),
         });
         Ok(report.to_string())
     })
