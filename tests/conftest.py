@@ -27,3 +27,9 @@ def helsinki_gtfs():
 @pytest.fixture(scope="session")
 def kantakaupunki_pbf():
     return _data_path("kantakaupunki.osm.pbf")
+
+
+@pytest.fixture(scope="session")
+def helsinki_metro_pbf():
+    """The metropolitan clip — locally generated, absent in CI."""
+    return _data_path("helsinki-metro.osm.pbf")

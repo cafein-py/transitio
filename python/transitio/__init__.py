@@ -23,8 +23,10 @@ __all__ = [
     "patch_feed",
     "pipeline",
     "repair",
+    "infer_shapes",
     "repair_feed",
     "report",
+    "shapes",
     "validate",
     "validate_feed",
     "__version__",
@@ -36,6 +38,10 @@ def __getattr__(name):
         from transitio import catalog
 
         return getattr(catalog, name)
+    if name == "infer_shapes":
+        from transitio.shapes import infer_shapes
+
+        return infer_shapes
     if name == "fetch_pbf":
         from transitio.osm import fetch_pbf
 
@@ -75,6 +81,7 @@ def __getattr__(name):
         "pipeline",
         "repair",
         "report",
+        "shapes",
         "validate",
     ):
         import importlib

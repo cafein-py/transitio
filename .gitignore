@@ -15,7 +15,14 @@ dist/
 htmlcov/
 
 # Test data and caches
-tests/data/
+# The contents, not the directory: git never descends into an ignored
+# directory, so a negation under one has no effect.
+tests/data/*
+# ...except the committed transit fixtures: small, relation-preserving
+# subsets that keep the shape-inference tests running everywhere.
+!tests/data/helsinki-transit.osm.pbf
+!tests/data/helsinki-transit-gap.osm.pbf
+!tests/data/helsinki-transit-missing.osm.pbf
 cache/
 
 # Sphinx build artifacts (docs/api holds generated autosummary stubs)

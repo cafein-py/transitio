@@ -36,6 +36,18 @@ class PatchError(TransitioError):
     """
 
 
+class ShapeInferenceError(TransitioError):
+    """The feed written with inferred shapes does not validate.
+
+    Raised when the output carries error-severity notices the input did
+    not, so a broken ``shapes.txt`` can never leave silently. The file
+    is still written, like :class:`InvalidFeedError`; the full report is
+    available as :attr:`report`.
+    """
+
+    report = None
+
+
 class ChangeLogDesyncError(TransitioError):
     """The tables no longer match the change log, so undo/redo refused.
 

@@ -35,6 +35,43 @@ and `repair=True` to repair feeds before use. With a token, GTFS downloads
 are catalogued dataset versions verified against catalog checksums; without
 one, the latest hosted zips are fetched as-is — unverified moving targets.
 
+### Inferring missing route shapes
+
+Many feeds ship without `shapes.txt`, leaving every consumer to draw
+straight lines between stops. `infer_shapes` fills that gap from an OSM
+extract — matching OSM route relations where they exist, map matching
+over tram, rail and bus-drivable networks where they do not — and
+writes a feed carrying real alignments:
+
+```python
+report = transitio.infer_shapes(
+    "feed.zip", "shaped.zip", pbf, strictness="strict"
+)
+report["written"]     # shapes written
+report["shapes"]      # per shape: method, matched OSM relation, score
+report["skipped"]     # per refused pattern: the stage that refused it
+```
+
+How much inference is acceptable is yours to choose. `"strict"` (the
+default) writes only unambiguous matches; `"relaxed"` and
+`"permissive"` trade certainty for coverage, which is the trade worth
+making where a feed has no shapes at all and the alternative is a
+straight line. Every shape is validated against the pattern's own stops
+before it is written — each stop must lie on the alignment, in order —
+so no level writes a shape the feed's own data contradicts.
+
+On the Helsinki tram fixture with the feed's shapes withheld, the
+levels measured (`scripts/validate_shapes.py`):
+
+| level | shapes written | median length error | worst offset |
+| ----- | -------------- | ------------------- | ------------ |
+| strict | 35/80 | 0.9% | 42 m |
+| relaxed | 40/80 | 0.9% | 34 m |
+| permissive | 43/80 | 0.9% | 184 m |
+
+Helsinki's OSM data is unusually good; expect a worse trade where it is
+not, and keep the report.
+
 ### Lower-level access
 
 Each pipeline stage is available on its own:

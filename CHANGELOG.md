@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+- **`transitio.infer_shapes`** — write a feed's missing `shapes.txt`
+  from an OSM extract. Two strategies per distinct stop pattern,
+  best first: a matched OSM `type=route` relation (the operator's own
+  alignment, stitched from its member ways and cut to the span the
+  pattern serves) and, failing that, map matching over a mode graph —
+  tram/light-rail/subway/rail tracks, or a bus-drivable street network
+  resolved per way through the full PSV access hierarchy
+  (`access → vehicle → motor_vehicle → psv → bus`), with the graph
+  split at every barrier node whose bus access is not an explicit
+  allow. Matching is deterministic: mode compatibility (never
+  relaxed), route-ref agreement, corridor containment measured as the
+  pattern's stops covered by the relation, an operator/network filter,
+  then an approximate-subsequence stop-sequence distance that scores a
+  short working on the stops it actually serves. Every candidate
+  alignment is validated against the pattern's own stops — each within
+  snap tolerance, positions monotone along the line, total length
+  plausible — before anything is written, and the returned report names
+  the method, matched relation and score behind every shape and the
+  stage behind every refusal.
+- **Strictness levels** (`strictness="strict" | "relaxed" |
+  "permissive"`, or a `Level`): how much uncertainty the caller will
+  accept. The levels move the judgement thresholds only — the mode
+  filter, one-way and ring-direction legality, and barrier access never
+  relax, because those produce alignments that are impossible rather
+  than merely uncertain. Measured on the Helsinki tram fixture with the
+  feed's own shapes withheld (`scripts/validate_shapes.py`): strict
+  writes 35 of 80 patterns, relaxed 40, permissive 43, all at ~0.9%
+  median length error with no shape in a different corridor.
+- Feeds whose `trips.shape_id` points at a missing or empty
+  `shapes.txt` are treated as shapeless rather than shaped, so a feed
+  that lost its shapes is repaired instead of passed through.
+
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
