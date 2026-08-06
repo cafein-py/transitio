@@ -329,3 +329,95 @@ def render_html(report):
         "<th>local</th><th>hosted</th></tr>"
         f"{''.join(rows)}</table></body></html>"
     )
+
+
+def _comparison_cells(row):
+    moment = row.get("moment") or {}
+    overlap = row.get("areaOverlap")
+    margin = row.get("windowMarginDays")
+    return [
+        row["label"],
+        str(row["errors"]),
+        str(row["warnings"]),
+        str(moment.get("activeTrips", "—")),
+        str(moment.get("activeRoutes", "—")),
+        str(moment.get("stopsServed", "—")),
+        str(row["transfers"]),
+        str(margin) if margin is not None else "—",
+        str(row.get("distancesVerdict") or "—"),
+        str(row.get("faresVerdict") or "—"),
+        f"{overlap:.2f}" if overlap is not None else "—",
+        "no" if row["unreliableCounts"] else "yes",
+    ]
+
+
+_COMPARISON_COLUMNS = [
+    "candidate",
+    "errors",
+    "warnings",
+    "active trips",
+    "active routes",
+    "stops served",
+    "transfers",
+    "window margin",
+    "distances",
+    "fares",
+    "area overlap",
+    "counts reliable",
+]
+
+
+def render_comparison_markdown(comparison):
+    """Render a ``compare_feeds`` result as a Markdown page."""
+    target = comparison["when"] + (
+        f" {comparison['time']}" if comparison.get("time") else ""
+    )
+    lines = [
+        "# GTFS feed comparison",
+        "",
+        f"Target: {_md(target)}",
+        f"Winner (recommendation): **{_md(comparison['winner'])}**",
+        "",
+    ]
+    for caveat in comparison.get("caveats", []):
+        lines.append(f"- Caveat: {_md(caveat)}")
+    if comparison.get("caveats"):
+        lines.append("")
+    lines.append("| " + " | ".join(_COMPARISON_COLUMNS) + " |")
+    lines.append("|" + " --- |" * len(_COMPARISON_COLUMNS))
+    by_label = {row["label"]: row for row in comparison["candidates"]}
+    for label in comparison["ranking"]:
+        cells = [_md(cell) for cell in _comparison_cells(by_label[label])]
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def render_comparison_html(comparison):
+    """Render a ``compare_feeds`` result as a self-contained HTML page."""
+    e = html.escape
+    by_label = {row["label"]: row for row in comparison["candidates"]}
+    rows = "".join(
+        "<tr>"
+        + "".join(f"<td>{e(cell)}</td>" for cell in _comparison_cells(by_label[label]))
+        + "</tr>"
+        for label in comparison["ranking"]
+    )
+    caveats = "".join(
+        f"<li>{e(str(caveat))}</li>" for caveat in comparison.get("caveats", [])
+    )
+    caveats = f"<ul>{caveats}</ul>" if caveats else ""
+    target = comparison["when"] + (
+        f" {comparison['time']}" if comparison.get("time") else ""
+    )
+    header = "".join(f"<th>{e(column)}</th>" for column in _COMPARISON_COLUMNS)
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<title>GTFS feed comparison</title>"
+        "<style>body{font-family:sans-serif;margin:2em}"
+        "table{border-collapse:collapse}td,th{border:1px solid #999;"
+        "padding:4px 8px}</style></head><body>"
+        "<h1>GTFS feed comparison</h1>"
+        f"<p>Target: {e(target)} · Winner (recommendation): "
+        f"<strong>{e(comparison['winner'])}</strong></p>"
+        f"{caveats}<table><tr>{header}</tr>{rows}</table></body></html>"
+    )

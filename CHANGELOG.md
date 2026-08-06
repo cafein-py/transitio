@@ -20,6 +20,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   incomplete: partial bounds would mislead). Groundwork for
   ``compare_feeds``.
 
+- ``transitio.compare_feeds``: rank candidate GTFS feeds for a
+  user-specified date (and optional time of day). Each candidate is
+  validated with the date as the target moment and tabulated —
+  activity at the moment, ERROR/WARNING counts, cafein-readiness
+  verdicts, transfer counts, service-window margin, stop-bounds
+  agreement with the other candidates — then ranked by a documented
+  deterministic scoring tuple in which unusable-at-the-target and
+  unreliable-counts (sampling or truncation) always dominate, so
+  incomplete evidence can never flatter a candidate. The winner is a
+  recommendation: the full metric table, every score component, the
+  caveats (e.g. poor area overlap) and the applied thresholds are all
+  in the result, and ``render_comparison_markdown`` /
+  ``render_comparison_html`` produce shareable pages.
+
 ## 0.8.0 — 2026-08-05
 
 ### Added
