@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- ``validate_feed`` exposes the date-targeted MEASUREMENTS the moment
+  checks already computed internally: a ``moment`` block (with an
+  explicit ``reference_date``) carrying ``activeTrips``,
+  ``activeRoutes``, ``stopsServed``, the feed's own ``baselineTrips``
+  mean and ``windowDays`` — judgement stays with the notices — plus an
+  ``incomplete`` list naming truncated/unreadable files (row counts for
+  them are lower bounds) and ``stop_bounds``, the feed's stop bounding
+  box from the already-budgeted scan (``None`` when stops.txt is
+  incomplete: partial bounds would mislead). Groundwork for
+  ``compare_feeds``.
+
 ## 0.8.0 — 2026-08-05
 
 ### Added

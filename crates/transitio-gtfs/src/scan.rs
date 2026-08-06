@@ -101,6 +101,9 @@ pub struct ScanResult {
     pub unparsed_entries: Vec<String>,
     /// Cafein-readiness summary; None until the readiness tier runs.
     pub readiness: Option<crate::readiness::Readiness>,
+    /// Moment measurement block; None without an explicit reference
+    /// date or under unreliable inputs.
+    pub moment: Option<crate::semantics::MomentSummary>,
 }
 
 pub fn scan(path: &Path) -> Result<ScanResult, String> {
@@ -263,6 +266,7 @@ pub fn scan_reader_with<R: Read + Seek>(
         service_window: None,
         unparsed_entries,
         readiness: None,
+        moment: None,
     })
 }
 

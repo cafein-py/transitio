@@ -9,9 +9,33 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{Datelike, NaiveDate};
 
+use serde::Serialize;
+
 use crate::notice::{Notice, Severity};
+use crate::readiness::intern;
 use crate::rules::{clip, parse_gtfs_time, Samplers};
 use crate::scan::{Moment, ScanOptions, ScanResult, Table};
+
+/// Measurement companion to the moment notices: what actually runs at
+/// the target, plus the feed's own baseline. Judgement stays with the
+/// notices; this block only reports numbers.
+#[derive(Serialize, Debug)]
+pub struct MomentSummary {
+    #[serde(rename = "referenceDate")]
+    pub reference_date: String,
+    #[serde(rename = "referenceTime")]
+    pub reference_time: Option<String>,
+    #[serde(rename = "activeTrips")]
+    pub active_trips: u64,
+    #[serde(rename = "activeRoutes")]
+    pub active_routes: u64,
+    #[serde(rename = "stopsServed")]
+    pub stops_served: u64,
+    #[serde(rename = "baselineTrips")]
+    pub baseline_trips: f64,
+    #[serde(rename = "windowDays")]
+    pub window_days: u64,
+}
 
 /// Hostile-input guards: calendars are expanded to at most this many days
 /// per service, and per-block overlap comparisons are capped.
@@ -51,6 +75,7 @@ pub fn run_semantics(result: &mut ScanResult, options: &ScanOptions) {
     let stop_times_unreliable =
         result.incomplete.contains("stop_times.txt") || result.incomplete.contains("trips.txt");
 
+    let mut moment_summary = None;
     let (services, expansion_truncated) =
         service_calendars(&result.tables, options, &mut samplers, &mut notices);
     // A truncated expansion under-covers, so the window is not published.
@@ -77,7 +102,7 @@ pub fn run_semantics(result: &mut ScanResult, options: &ScanOptions) {
                 || result.incomplete.contains("routes.txt");
             if let Some(moment) = options.moment {
                 if !moment_inputs_unreliable {
-                    moment_checks(
+                    moment_summary = moment_checks(
                         &result.tables,
                         &trips,
                         &services,
@@ -89,6 +114,7 @@ pub fn run_semantics(result: &mut ScanResult, options: &ScanOptions) {
             }
         }
     }
+    result.moment = moment_summary;
     frequency_checks(&result.tables, &mut samplers, &mut notices);
     shape_checks(&result.tables, &mut samplers, &mut notices);
 
@@ -621,9 +647,9 @@ fn moment_checks(
     moment: Moment,
     samplers: &mut Samplers,
     notices: &mut Vec<Notice>,
-) {
+) -> Option<MomentSummary> {
     let Some(trips_table) = tables.get("trips.txt") else {
-        return;
+        return None; // measurement without trips is meaningless
     };
     let target = moment.date;
     let target_ymd = target.format("%Y%m%d").to_string();
@@ -640,9 +666,26 @@ fn moment_checks(
         samplers.file("calendar.txt").push(notices, notice);
     };
 
+    // The summary measures nothing without the tables and columns it
+    // reads — absent pieces make it unavailable (never a zero-valued
+    // pretend measurement) while every notice below still runs.
+    let summary_available = tables.get("stop_times.txt").is_some_and(|table| {
+        column(table, "trip_id").is_some() && column(table, "stop_id").is_some()
+    }) && column(trips_table, "trip_id").is_some()
+        && column(trips_table, "route_id").is_some()
+        && column(trips_table, "service_id").is_some();
+    let reference_time_text = moment.time.map(format_time);
     let Some((window_first, window_last)) = window_dates(services) else {
         no_service(samplers, notices);
-        return;
+        return summary_available.then(|| MomentSummary {
+            reference_date: target_ymd.clone(),
+            reference_time: reference_time_text,
+            active_trips: 0,
+            active_routes: 0,
+            stops_served: 0,
+            baseline_trips: 0.0,
+            window_days: 0,
+        });
     };
     let window_days = ((window_last - window_first).num_days() + 1) as f64;
 
@@ -673,6 +716,7 @@ fn moment_checks(
     }
 
     struct Operates<'a> {
+        trip_id: &'a str,
         service_id: &'a str,
         route_id: &'a str,
         start: u64,
@@ -709,6 +753,7 @@ fn moment_checks(
             .map(|w| w.as_slice())
             .unwrap_or(&[]);
         trips.push(Operates {
+            trip_id,
             service_id: &span.service_id,
             route_id: cell(trips_table, row, "route_id"),
             start: span.start,
@@ -723,16 +768,23 @@ fn moment_checks(
     let mut day_counts: HashMap<NaiveDate, u64> = HashMap::new();
     let target_count: u64;
     let mut reference_time = None;
+    // Trips operating at the target, for the summary's distinct route
+    // and stop counts (the notice comparison keeps its own convention).
+    let mut operating: HashSet<&str> = HashSet::new();
+    // The specific notice already said it; the rest would only restate.
+    let mut skip_rest = false;
 
     match moment.time {
         None => {
-            if !has_service_on_target {
-                no_service(samplers, notices);
-                return;
-            }
             let mut service_trips: HashMap<&str, u64> = HashMap::new();
             for trip in &trips {
                 *service_trips.entry(trip.service_id).or_default() += 1;
+                if services
+                    .get(trip.service_id)
+                    .is_some_and(|dates| active_on(dates, target))
+                {
+                    operating.insert(trip.trip_id);
+                }
             }
             target_count = services
                 .iter()
@@ -745,6 +797,10 @@ fn moment_checks(
                         *day_counts.entry(*date).or_default() += count;
                     }
                 }
+            }
+            if !has_service_on_target {
+                no_service(samplers, notices);
+                skip_rest = true;
             }
         }
         Some(time) => {
@@ -802,6 +858,18 @@ fn moment_checks(
                 }
             }
             target_count = count;
+            for trip in trips.iter().filter(|trip| trip.timed) {
+                let runs = (0..=max_offset).any(|k| {
+                    shift(target, -(k as i64)).is_some_and(|day| {
+                        services
+                            .get(trip.service_id)
+                            .is_some_and(|dates| active_on(dates, day))
+                    }) && operates_at(trip, time as u64 + k as u64 * 86400)
+                });
+                if runs {
+                    operating.insert(trip.trip_id);
+                }
+            }
             if target_count == 0 {
                 if has_service_on_target {
                     samplers.file("stop_times.txt").push(
@@ -813,7 +881,7 @@ fn moment_checks(
                 } else {
                     no_service(samplers, notices);
                 }
-                return;
+                skip_rest = true;
             }
         }
     }
@@ -824,6 +892,38 @@ fn moment_checks(
         .map(|(_, count)| *count)
         .sum();
     let baseline = total as f64 / window_days;
+
+    let mut stop_numbers: HashMap<&str, u32> = HashMap::new();
+    let mut stops_served: HashSet<u32> = HashSet::new();
+    if summary_available {
+        let stop_times = tables.get("stop_times.txt").unwrap();
+        for row in &stop_times.rows {
+            if operating.contains(cell(stop_times, row, "trip_id")) {
+                let stop_id = cell(stop_times, row, "stop_id");
+                if stop_id.is_empty() {
+                    continue; // blank ids are flagged elsewhere
+                }
+                stops_served.insert(intern(&mut stop_numbers, stop_id));
+            }
+        }
+    }
+    let active_routes: HashSet<&str> = trips
+        .iter()
+        .filter(|trip| operating.contains(trip.trip_id) && !trip.route_id.is_empty())
+        .map(|trip| trip.route_id)
+        .collect();
+    let summary = summary_available.then(|| MomentSummary {
+        reference_date: target_ymd.clone(),
+        reference_time: reference_time.clone(),
+        active_trips: target_count,
+        active_routes: active_routes.len() as u64,
+        stops_served: stops_served.len() as u64,
+        baseline_trips: (baseline * 100.0).round() / 100.0,
+        window_days: window_days as u64,
+    });
+    if skip_rest {
+        return summary;
+    }
     if (target_count as f64) < MOMENT_BASELINE_THRESHOLD * baseline {
         let mut notice = Notice::new("service_level_below_baseline", Severity::Warning)
             .with("referenceDate", target_ymd.clone())
@@ -840,7 +940,7 @@ fn moment_checks(
     // coverage from D-1 (no service on D itself) every route would fire,
     // so it runs only when D has active service.
     if !has_service_on_target {
-        return;
+        return summary;
     }
     let mut route_services: BTreeMap<&str, HashSet<&str>> = BTreeMap::new();
     for trip in &trips {
@@ -878,6 +978,7 @@ fn moment_checks(
             );
         }
     }
+    summary
 }
 
 fn shape_checks(
@@ -1577,6 +1678,179 @@ mod tests {
             .collect();
         assert_eq!(inactive.len(), 1);
         assert_eq!(inactive[0].context["routeId"], "r1");
+    }
+
+    #[test]
+    fn moment_summary_measures_the_quiet_day() {
+        // The quiet-day fixture: three wk trips on r1, one daily on r2.
+        let mut files = minimal();
+        replace(
+            &mut files,
+            "calendar.txt",
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\nwk,1,1,1,1,1,0,0,20260101,20261231\ndaily,1,1,1,1,1,1,1,20260101,20261231\n",
+        );
+        replace(
+            &mut files,
+            "trips.txt",
+            "route_id,service_id,trip_id\nr1,wk,t1\nr1,wk,t2\nr1,wk,t3\nr2,daily,t4\n",
+        );
+        replace(
+            &mut files,
+            "stop_times.txt",
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\nt1,08:00:00,08:00:00,s1,1\nt1,08:05:00,08:05:00,s2,2\nt2,09:00:00,09:00:00,s1,1\nt2,09:05:00,09:05:00,s2,2\nt3,10:00:00,10:00:00,s1,1\nt3,10:05:00,10:05:00,s2,2\nt4,11:00:00,11:00:00,s1,1\nt4,11:05:00,11:05:00,s2,2\n",
+        );
+        // Sunday: only the daily trip runs.
+        let result = validate_zip_at(&files, "20260607", None);
+        let moment = result.moment.unwrap();
+        assert_eq!(moment.reference_date, "20260607");
+        assert_eq!(moment.reference_time, None);
+        assert_eq!(moment.active_trips, 1);
+        assert_eq!(moment.active_routes, 1);
+        assert_eq!(moment.stops_served, 2);
+        assert_eq!(moment.window_days, 365);
+        assert!(moment.baseline_trips > 3.0 && moment.baseline_trips < 4.0);
+        // A weekday: everything runs.
+        let result = validate_zip_at(&files, "20260601", None);
+        let moment = result.moment.unwrap();
+        assert_eq!(moment.active_trips, 4);
+        assert_eq!(moment.active_routes, 2);
+        assert_eq!(moment.stops_served, 2);
+    }
+
+    #[test]
+    fn moment_summary_counts_timed_operations() {
+        let result = validate_zip_at(&minimal(), "20260601", Some(8 * 3600 + 180));
+        let moment = result.moment.unwrap();
+        assert_eq!(moment.reference_time.as_deref(), Some("08:03:00"));
+        assert_eq!(moment.active_trips, 1);
+        assert_eq!(moment.active_routes, 1);
+        assert_eq!(moment.stops_served, 2);
+        // Outside the span: zero activity, summary still measured.
+        let result = validate_zip_at(&minimal(), "20260601", Some(22 * 3600));
+        let moment = result.moment.unwrap();
+        assert_eq!(moment.active_trips, 0);
+        assert_eq!(moment.active_routes, 0);
+        assert_eq!(moment.stops_served, 0);
+    }
+
+    #[test]
+    fn moment_summary_measures_frequency_and_overnight_service() {
+        let mut files = minimal();
+        files.push((
+            "frequencies.txt",
+            "trip_id,start_time,end_time,headway_secs\nt1,07:00:00,09:00:00,600\n",
+        ));
+        let result = validate_zip_at(&files, "20260601", Some(8 * 3600));
+        let moment = result.moment.unwrap();
+        assert_eq!(moment.active_trips, 1);
+        assert_eq!(moment.active_routes, 1);
+        assert_eq!(moment.stops_served, 2);
+
+        let mut files = minimal();
+        replace(
+            &mut files,
+            "calendar.txt",
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\nnight,1,0,0,0,0,0,0,20260601,20260601\n",
+        );
+        replace(
+            &mut files,
+            "trips.txt",
+            "route_id,service_id,trip_id\nr1,night,t1\n",
+        );
+        replace(
+            &mut files,
+            "stop_times.txt",
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\nt1,25:30:00,25:30:00,s1,1\nt1,25:45:00,25:45:00,s2,2\n",
+        );
+        // 01:35 the day after: the over-midnight trip counts.
+        let result = validate_zip_at(&files, "20260602", Some(3600 + 35 * 60));
+        let moment = result.moment.unwrap();
+        assert_eq!(moment.reference_time.as_deref(), Some("01:35:00"));
+        assert_eq!(moment.active_trips, 1);
+        assert_eq!(moment.active_routes, 1);
+        assert_eq!(moment.stops_served, 2);
+    }
+
+    #[test]
+    fn moment_summary_null_under_each_unreliable_input() {
+        for file in [
+            "calendar.txt",
+            "calendar_dates.txt",
+            "trips.txt",
+            "stop_times.txt",
+            "frequencies.txt",
+            "routes.txt",
+        ] {
+            let mut result = scan_reader(zip_cursor(&minimal())).unwrap();
+            result.incomplete.insert(file.to_string());
+            let date = parse_date("20260601").unwrap();
+            let options = ScanOptions {
+                reference_date: Some(date),
+                moment: Some(Moment { date, time: None }),
+                ..ScanOptions::default()
+            };
+            run_semantics(&mut result, &options);
+            assert!(result.moment.is_none(), "{file}");
+        }
+    }
+
+    #[test]
+    fn blank_or_missing_stop_ids_never_count_as_served() {
+        let mut files = minimal();
+        replace(
+            &mut files,
+            "stop_times.txt",
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\nt1,08:00:00,08:00:00,s1,1\nt1,08:02:00,08:02:00,,2\nt1,08:05:00,08:05:00,s2,3\n",
+        );
+        let result = validate_zip_at(&files, "20260601", None);
+        assert_eq!(result.moment.unwrap().stops_served, 2);
+
+        let mut files = minimal();
+        replace(
+            &mut files,
+            "stop_times.txt",
+            "trip_id,arrival_time,departure_time,stop_sequence\nt1,08:00:00,08:00:00,1\nt1,08:05:00,08:05:00,2\n",
+        );
+        let result = validate_zip_at(&files, "20260601", None);
+        assert!(result.moment.is_none());
+        // The unavailable summary must not swallow the notice tail: the
+        // same feed on an inactive day still yields the moment notices.
+        let mut files = minimal();
+        replace(
+            &mut files,
+            "stop_times.txt",
+            "trip_id,arrival_time,departure_time,stop_sequence\nt1,08:00:00,08:00:00,1\nt1,08:05:00,08:05:00,2\n",
+        );
+        let result = validate_zip_at(&files, "20260606", None);
+        assert!(result.moment.is_none());
+        assert!(codes(&result).contains(&"no_service_on_reference_date"));
+        // An absent stop_times.txt or a trips.txt without route_id must
+        // not fabricate a zero-valued measurement either.
+        let files: Vec<_> = minimal()
+            .into_iter()
+            .filter(|(name, _)| *name != "stop_times.txt")
+            .collect();
+        let result = validate_zip_at(&files, "20260601", None);
+        assert!(result.moment.is_none());
+        let mut files = minimal();
+        replace(&mut files, "trips.txt", "service_id,trip_id\nwk,t1\n");
+        let result = validate_zip_at(&files, "20260601", None);
+        assert!(result.moment.is_none());
+    }
+
+    #[test]
+    fn moment_summary_absent_without_reference_date() {
+        let result = validate_zip(&minimal(), Some("20260601"));
+        assert!(result.moment.is_none());
+    }
+
+    #[test]
+    fn moment_summary_zeroes_outside_the_window() {
+        let result = validate_zip_at(&minimal(), "20270601", None);
+        let moment = result.moment.unwrap();
+        assert_eq!(moment.active_trips, 0);
+        assert_eq!(moment.active_routes, 0);
+        assert_eq!(moment.window_days, 365);
     }
 
     #[test]

@@ -654,7 +654,7 @@ impl Grants {
 /// Interns an id: hashed once here, compared as a compact number
 /// afterwards, so a hostile very-long id cannot multiply per-pair work
 /// under the compatibility budget.
-fn intern<'t>(numbers: &mut HashMap<&'t str, u32>, id: &'t str) -> u32 {
+pub(crate) fn intern<'t>(numbers: &mut HashMap<&'t str, u32>, id: &'t str) -> u32 {
     let next = numbers.len() as u32;
     *numbers.entry(id).or_insert(next)
 }
