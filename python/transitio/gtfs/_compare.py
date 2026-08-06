@@ -118,6 +118,172 @@ def compare_feeds(candidates, when, *, time=None, labels=None, **budgets):
     }
 
 
+def compare_feed_history(
+    feed,
+    when,
+    *,
+    time=None,
+    refresh_token=None,
+    cache_dir=None,
+    directory=None,
+    limit=None,
+    **budgets,
+):
+    """Compare the historical dataset versions of one catalogued feed.
+
+    Enumerates every Mobility Database dataset version whose published
+    service range covers ``when``, downloads each (checksum-verified,
+    cached, with the usual provenance sidecars), and delegates to
+    :func:`compare_feeds` with the dataset ids as labels. Requires a
+    catalog token — dataset history has no CSV fallback.
+
+    Parameters
+    ----------
+    feed : Feed or str
+        The catalogued feed, or its catalog ID.
+    when : str or datetime.date
+        The target day.
+    time : str, optional
+        Wall-clock time narrowing the moment.
+    refresh_token, cache_dir, directory
+        Passed to :class:`transitio.MobilityDatabase` / its download.
+    limit : int, optional
+        Compare at most this many covering versions, newest first;
+        must be at least 2.
+    **budgets
+        The ``validate_feed`` budget keyword arguments.
+
+    Returns
+    -------
+    dict
+        The :func:`compare_feeds` result, with each candidate row
+        carrying its dataset ``provenance`` (dataset id, catalogued
+        sha256, download timestamp).
+
+    Raises
+    ------
+    ValueError
+        When ``limit`` is below 2, no dataset covers ``when``, or only
+        one does (nothing to compare — the message names it).
+    """
+    import shutil
+    import tempfile
+
+    from transitio.catalog import MobilityDatabase
+    from transitio.exceptions import DownloadError
+
+    if limit is not None and limit < 2:
+        raise ValueError("limit must be at least 2 to compare anything")
+    workdir = None
+    try:
+        digests = {}
+        with MobilityDatabase(refresh_token, cache_dir=cache_dir) as db:
+            datasets = db.datasets_for(feed, when)
+            if limit is not None:
+                datasets = datasets[:limit]
+            if not datasets:
+                raise ValueError(f"no datasets cover {when}")
+            if len(datasets) == 1:
+                raise ValueError(
+                    f"only dataset {datasets[0].id} covers {when}; "
+                    "nothing to compare"
+                )
+            paths = []
+            for index, dataset in enumerate(datasets):
+                source = db.download(dataset, directory=directory)
+                if workdir is None:
+                    # Beside the downloads, so the final content-addressed
+                    # install below is an atomic same-filesystem rename.
+                    workdir = pathlib.Path(
+                        tempfile.mkdtemp(prefix=".compare-", dir=source.parent)
+                    )
+                # The comparison reads a private snapshot, hashed while
+                # copying — a shared cache path mutated between download
+                # and ranking can neither change the compared bytes
+                # unnoticed nor inherit the catalogued hash. Snapshot
+                # names are index-based: dataset ids differing only in
+                # case must not collide on case-insensitive filesystems.
+                snapshot = workdir / f"{index}.zip"
+                digest = _snapshot(source, snapshot)
+                if dataset.hash and digest != dataset.hash:
+                    raise DownloadError(
+                        f"dataset {dataset.id} changed on disk: expected "
+                        f"{dataset.hash}, found {digest}"
+                    )
+                digests[dataset.id] = digest
+                paths.append(snapshot)
+        result = compare_feeds(
+            paths, when, time=time, labels=[d.id for d in datasets], **budgets
+        )
+        # Install each ranked snapshot durably under a content-addressed
+        # name: the returned path holds the exact ranked bytes by
+        # construction, immune to cache mutation races.
+        import os
+
+        installed = {}
+        for dataset, snapshot in zip(datasets, paths):
+            digest = digests[dataset.id]
+            # A function-owned directory with content-addressed names:
+            # nothing of the caller's is ever clobbered — a symlinked
+            # directory is refused (the repo's accepted local-adversary
+            # level; fd-level no-follow I/O is beyond it, as for the
+            # repair staging), an existing entry is reused only when its
+            # bytes verify, and a mismatching entry is never replaced.
+            durable_dir = snapshot.parent.parent / "compared"
+            durable_dir.mkdir(exist_ok=True)
+            if durable_dir.is_symlink():
+                raise DownloadError(f"refusing symlinked directory: {durable_dir}")
+            durable = durable_dir / f"{digest}.zip"
+            if durable.exists():
+                if durable.is_symlink() or _sha256_of(durable) != digest:
+                    raise DownloadError(
+                        f"unexpected content at {durable}; refusing to replace it"
+                    )
+                snapshot.unlink()
+            else:
+                os.replace(snapshot, durable)
+            installed[dataset.id] = durable
+    finally:
+        if workdir is not None:
+            shutil.rmtree(workdir, ignore_errors=True)
+    provenance = {
+        dataset.id: {
+            "datasetId": dataset.id,
+            "sha256": digests[dataset.id],
+            "downloadedAt": (
+                dataset.downloaded_at.isoformat() if dataset.downloaded_at else None
+            ),
+        }
+        for dataset in datasets
+    }
+    for row in result["candidates"]:
+        row["provenance"] = provenance[row["label"]]
+        row["path"] = str(installed[row["label"]])
+    return result
+
+
+def _sha256_of(path):
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as reader:
+        while chunk := reader.read(1 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _snapshot(source, target):
+    """Copy ``source`` to ``target`` streaming through a SHA-256."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(source, "rb") as reader, open(target, "wb") as writer:
+        while chunk := reader.read(1 << 20):
+            digest.update(chunk)
+            writer.write(chunk)
+    return digest.hexdigest()
+
+
 def _as_ymd(when):
     text = str(when).replace("-", "")
     if len(text) != 8 or not text.isdigit():

@@ -1,10 +1,14 @@
+import hashlib
+import io
+import pathlib
 import zipfile
 
+import httpx
 import pytest
 
 pytest.importorskip("transitio._core")
 
-from transitio.gtfs import compare_feeds  # noqa: E402
+from transitio.gtfs import compare_feed_history, compare_feeds  # noqa: E402
 from transitio.gtfs._compare import _area_overlap  # noqa: E402
 from transitio.report import (  # noqa: E402
     render_comparison_html,
@@ -199,6 +203,140 @@ def test_area_overlap_degenerate_and_nested():
     assert _area_overlap(inner, [inner, outer]) == 0.25
     unbounded = row("u", None)
     assert _area_overlap(unbounded, [unbounded, outer]) is None
+
+
+def zip_bytes(files):
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, content in files.items():
+            archive.writestr(name, content)
+    return buffer.getvalue()
+
+
+def history_transport(datasets, bodies, requests=None):
+    def handler(request):
+        if requests is not None:
+            requests.append(request.url.path)
+        if request.url.path == "/v1/tokens":
+            return httpx.Response(
+                200, json={"access_token": "access-abc", "expires_in": 3600}
+            )
+        if request.url.path == "/v1/gtfs_feeds/mdb-1/datasets":
+            return httpx.Response(200, json=datasets)
+        name = request.url.path.rsplit("/", 1)[-1]
+        if name in bodies:
+            return httpx.Response(200, content=bodies[name])
+        return httpx.Response(404, json={"detail": "not found"})
+
+    return httpx.MockTransport(handler)
+
+
+def dataset_record(dataset_id, downloaded_at, body):
+    return {
+        "id": dataset_id,
+        "feed_id": "mdb-1",
+        "hosted_url": f"https://files.example.com/{dataset_id}.zip",
+        "downloaded_at": downloaded_at,
+        "hash": hashlib.sha256(body).hexdigest(),
+        "service_date_range_start": "2026-01-01",
+        "service_date_range_end": "2026-12-31",
+        "validation_report": None,
+    }
+
+
+def test_compare_feed_history_end_to_end(tmp_path, monkeypatch):
+    healthy = zip_bytes(FEED)
+    degraded = zip_bytes(
+        dict(
+            FEED,
+            **{"calendar_dates.txt": "service_id,date,exception_type\nwk,20260601,2\n"},
+        )
+    )
+    datasets = [
+        dataset_record("mdb-1-202607", "2026-07-01T03:00:00Z", degraded),
+        dataset_record("mdb-1-202606", "2026-06-01T03:00:00Z", healthy),
+        # A version whose published range misses the day entirely.
+        dict(
+            dataset_record("mdb-1-202501", "2025-01-05T03:00:00Z", healthy),
+            service_date_range_start="2025-01-01",
+            service_date_range_end="2025-06-30",
+        ),
+    ]
+    transport = history_transport(
+        datasets, {"mdb-1-202607.zip": degraded, "mdb-1-202606.zip": healthy}
+    )
+    import transitio.catalog as catalog
+
+    original = catalog.MobilityDatabase
+
+    def patched(token=None, **kwargs):
+        kwargs["cache_dir"] = tmp_path
+        return original("refresh-xyz", transport=transport, **kwargs)
+
+    monkeypatch.setattr(catalog, "MobilityDatabase", patched)
+    result = compare_feed_history("mdb-1", "20260601")
+    assert result["winner"] == "mdb-1-202606"
+    assert set(result["ranking"]) == {"mdb-1-202606", "mdb-1-202607"}
+    for row in result["candidates"]:
+        assert row["provenance"]["datasetId"] == row["label"]
+        # The path is the content-addressed install of the exact
+        # ranked bytes.
+        source = pathlib.Path(row["path"])
+        assert source.exists()
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        assert digest == row["provenance"]["sha256"]
+        assert source.name == f"{digest}.zip"
+
+    with pytest.raises(ValueError, match="at least 2"):
+        compare_feed_history("mdb-1", "20260601", limit=1)
+    with pytest.raises(ValueError, match="no datasets cover"):
+        compare_feed_history("mdb-1", "20250901")
+    with pytest.raises(ValueError, match="mdb-1-202501"):
+        compare_feed_history("mdb-1", "20250301")
+
+
+def test_compare_feed_history_limit_caps_newest_first(tmp_path, monkeypatch):
+    healthy = zip_bytes(FEED)
+    requests = []
+    # Served in scrambled order: the client sorts newest-first, the cap
+    # keeps the two newest, and the excluded version is never fetched.
+    datasets = [
+        dataset_record("mdb-1-202604", "2026-04-01T03:00:00Z", healthy),
+        dataset_record("mdb-1-202607", "2026-07-01T03:00:00Z", healthy),
+        dataset_record("mdb-1-202606", "2026-06-01T03:00:00Z", healthy),
+    ]
+    transport = history_transport(
+        datasets,
+        {
+            "mdb-1-202607.zip": healthy,
+            "mdb-1-202606.zip": healthy,
+            "mdb-1-202604.zip": healthy,
+        },
+        requests,
+    )
+    import transitio.catalog as catalog
+
+    original = catalog.MobilityDatabase
+
+    def patched(token=None, **kwargs):
+        kwargs["cache_dir"] = tmp_path
+        return original("refresh-xyz", transport=transport, **kwargs)
+
+    monkeypatch.setattr(catalog, "MobilityDatabase", patched)
+    result = compare_feed_history("mdb-1", "20260601", limit=2)
+    assert set(result["ranking"]) == {"mdb-1-202607", "mdb-1-202606"}
+    fetched = [path for path in requests if path.endswith(".zip")]
+    assert "/mdb-1-202604.zip" not in [p[p.rfind("/") :] for p in fetched]
+    for row in result["candidates"]:
+        assert row["provenance"]["sha256"]
+
+
+def test_compare_feed_history_needs_token(tmp_path, monkeypatch):
+    from transitio.exceptions import MissingTokenError
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    with pytest.raises(MissingTokenError):
+        compare_feed_history("mdb-1", "20260601", cache_dir=tmp_path)
 
 
 def test_comparison_renderers(tmp_path):

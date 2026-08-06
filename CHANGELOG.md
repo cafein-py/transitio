@@ -34,6 +34,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the result, and ``render_comparison_markdown`` /
   ``render_comparison_html`` produce shareable pages.
 
+- ``transitio.compare_feed_history`` and
+  ``MobilityDatabase.datasets_for``: enumerate every Mobility Database
+  dataset version whose published service range covers a target day
+  (published ranges are optimistic — the comparison then verifies
+  reality against the computed calendars), download each version with
+  the existing checksum and provenance machinery, and rank them with
+  ``compare_feeds``, dataset ids as labels and per-candidate dataset
+  provenance attached. Catalog history requires an API token; zero or
+  one covering version raises with the concrete situation named.
+
 ## 0.8.0 — 2026-08-05
 
 ### Added

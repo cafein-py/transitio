@@ -330,6 +330,28 @@ class MobilityDatabase:
                 return dataset
         return None
 
+    def datasets_for(self, feed, when):
+        """Every dataset version whose published range covers a date.
+
+        Newest first, like :meth:`datasets`. Published service ranges
+        are frequently optimistic, so coverage should be verified
+        against the actual calendar files after download —
+        ``compare_feed_history`` does exactly that.
+
+        Parameters
+        ----------
+        feed : Feed or str
+            The feed, or its catalog ID.
+        when : datetime.date, datetime.datetime or str
+            The service day; any time-of-day component is ignored.
+
+        Returns
+        -------
+        list of Dataset
+        """
+        when = as_date(when)
+        return [d for d in self.datasets(feed, limit=None) if d.covers(when)]
+
     def download(self, dataset, directory=None):
         """Download a dataset zip with checksum verification and caching.
 
