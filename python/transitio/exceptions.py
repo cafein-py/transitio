@@ -26,6 +26,16 @@ class InvalidFeedError(TransitioError):
     report = None
 
 
+class PatchError(TransitioError):
+    """Patching could not certify the output.
+
+    Raised when any validation stage is sampled/truncated (always), or
+    when the patched output still carries ERROR notices (under
+    ``check=True``; the output file is still written and the exception
+    carries the full report as ``.report``).
+    """
+
+
 class ChangeLogDesyncError(TransitioError):
     """The tables no longer match the change log, so undo/redo refused.
 

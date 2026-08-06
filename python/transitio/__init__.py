@@ -20,6 +20,7 @@ __all__ = [
     "merge_feeds",
     "merge_tables",
     "osm",
+    "patch_feed",
     "pipeline",
     "repair",
     "repair_feed",
@@ -53,6 +54,7 @@ def __getattr__(name):
         "crop_feed",
         "merge_feeds",
         "merge_tables",
+        "patch_feed",
     ):
         from transitio import gtfs
 

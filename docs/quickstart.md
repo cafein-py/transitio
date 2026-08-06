@@ -109,6 +109,7 @@ pbf = transitio.fetch_pbf((24.6, 60.1, 25.2, 60.4))
 validation = transitio.validate_feed(path)        # canonical notice codes
 transitio.repair_feed(path, "repaired.zip")       # logged, conservative
 transitio.crop_feed(path, "cropped.zip", aoi=(24.6, 60.1, 25.2, 60.4))
+transitio.patch_feed(path, "sibling.zip", "patched.zip")  # heal broken trips
 
 report = transitio.report.build_report(
     validation, hosted=hosted
