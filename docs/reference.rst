@@ -92,6 +92,7 @@ Validation, repair and cropping
    validate_feed
    repair_feed
    crop_feed
+   patch_feed
 
 Reporting
 ---------
@@ -116,6 +117,7 @@ Exceptions
 
    TransitioError
    InvalidFeedError
+   PatchError
    MissingTokenError
    DownloadError
    ExtractNotFoundError

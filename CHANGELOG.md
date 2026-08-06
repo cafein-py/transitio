@@ -44,6 +44,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provenance attached. Catalog history requires an API token; zero or
   one covering version raises with the concrete situation named.
 
+- ``transitio.patch_feed``: heal a feed by replacing the trips its own
+  ERROR notices implicate with matched counterparts from a sibling
+  (donor) feed of the same area and period. Matching never trusts
+  cross-feed ids: agencies pair by name, routes by type and name within
+  the paired agency, trips by first-departure proximity (60 s) and a
+  stop-sequence similarity of at least 0.8 over name-and-proximity stop
+  identity. Replacements import the donor subgraph under a
+  collision-free id prefix with full referential closure (stops with
+  parent stations and levels, routes with agencies and networks,
+  frequencies; donor fares and translations stay out), dependent base
+  rows that referenced a replaced trip are dropped and logged, and the
+  output is revalidated. Every action lands in a patch report with
+  donor provenance (checksum-verified sidecar) and the applied
+  thresholds; ``semantic_equivalence`` is explicitly ``false`` — the
+  donor timetable may genuinely differ. Because the base feed is by
+  definition broken, matching reads it strictly rather than leniently:
+  a trip whose stop_times cannot be ordered with confidence, or whose
+  first stop has no valid departure, is unmatchable instead of being
+  matched on the rows that happen to parse. Matching work is bounded
+  per candidate and per call; a candidate left unscored by that bound
+  is logged as a resource caveat and never resolved into a match, so a
+  donor is never chosen from partial evidence. Sampled or truncated
+  validation at any stage raises ``PatchError`` (new exception)
+  regardless of ``check``; with ``check=True`` remaining ERRORs raise
+  too, with the report attached and the file written for inspection.
+
 ## 0.8.0 — 2026-08-05
 
 ### Added
