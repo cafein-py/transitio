@@ -10,6 +10,8 @@ __all__ = [
     "MobilityDatabase",
     "exceptions",
     "build_feed",
+    "compare_feed_history",
+    "compare_feeds",
     "crop_feed",
     "edit",
     "fetch",
@@ -45,7 +47,13 @@ def __getattr__(name):
         from transitio import pipeline
 
         return getattr(pipeline, name)
-    if name in ("crop_feed", "merge_feeds", "merge_tables"):
+    if name in (
+        "compare_feed_history",
+        "compare_feeds",
+        "crop_feed",
+        "merge_feeds",
+        "merge_tables",
+    ):
         from transitio import gtfs
 
         return getattr(gtfs, name)
