@@ -174,18 +174,24 @@ def compare_feed_history(
 
     if limit is not None and limit < 2:
         raise ValueError("limit must be at least 2 to compare anything")
+    # A real date object: the catalog's ISO parsing only accepts the
+    # compact YYYYMMDD form from Python 3.11 on.
+    import datetime
+
+    when_ymd = _as_ymd(when)
+    when_date = datetime.datetime.strptime(when_ymd, "%Y%m%d").date()
     workdir = None
     try:
         digests = {}
         with MobilityDatabase(refresh_token, cache_dir=cache_dir) as db:
-            datasets = db.datasets_for(feed, when)
+            datasets = db.datasets_for(feed, when_date)
             if limit is not None:
                 datasets = datasets[:limit]
             if not datasets:
-                raise ValueError(f"no datasets cover {when}")
+                raise ValueError(f"no datasets cover {when_ymd}")
             if len(datasets) == 1:
                 raise ValueError(
-                    f"only dataset {datasets[0].id} covers {when}; "
+                    f"only dataset {datasets[0].id} covers {when_ymd}; "
                     "nothing to compare"
                 )
             paths = []
@@ -213,7 +219,7 @@ def compare_feed_history(
                 digests[dataset.id] = digest
                 paths.append(snapshot)
         result = compare_feeds(
-            paths, when, time=time, labels=[d.id for d in datasets], **budgets
+            paths, when_ymd, time=time, labels=[d.id for d in datasets], **budgets
         )
         # Install each ranked snapshot durably under a content-addressed
         # name: the returned path holds the exact ranked bytes by
