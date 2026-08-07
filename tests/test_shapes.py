@@ -58,13 +58,6 @@ def shapeless(helsinki_gtfs, tmp_path_factory):
 
 
 @pytest.fixture(scope="module")
-def transit_pbf(request):
-    from tests.conftest import _data_path
-
-    return _data_path("helsinki-transit.osm.pbf")
-
-
-@pytest.fixture(scope="module")
 def strict_run(shapeless, transit_pbf, tmp_path_factory):
     output = tmp_path_factory.mktemp("strict") / "shaped.zip"
     report = infer_shapes(
