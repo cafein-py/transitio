@@ -1,6 +1,13 @@
 # Changelog
 
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
 ## Unreleased
+
+### Added
 
 - **`transitio.infer_shapes`** — write a feed's missing `shapes.txt`
   from an OSM extract. Two strategies per distinct stop pattern,
@@ -32,13 +39,36 @@
   median length error with no shape in a different corridor.
 - Feeds whose `trips.shape_id` points at a missing or empty
   `shapes.txt` are treated as shapeless rather than shaped, so a feed
-  that lost its shapes is repaired instead of passed through.
+  that lost its shapes is repaired instead of passed through. A pattern
+  whose trips mix published and missing shapes has only the shapeless
+  ones assigned; an operator-published shape is never overwritten.
 
+- The written feed is **certified** against the input: any
+  error-severity notice inference introduced raises
+  `transitio.exceptions.ShapeInferenceError` (the file is still
+  written, like `InvalidFeedError`), notices compare by full identity
+  with multiplicity, and a sampled or truncated validation refuses
+  rather than certifying on partial evidence. `check=False` records the
+  outcome without raising.
 
-All notable changes to this project will be documented in this file.
+- A **`<output>.provenance.json` sidecar** records the run beside the
+  feed, because GTFS itself cannot say that a shape was inferred rather
+  than published. Every inferred shape carries its method, matched
+  relation, score, the effective strictness thresholds and the OSM
+  extract digest; a prior run's sidecar is inherited per shape — bound
+  to the input feed's checksum — so a twice-inferred feed never passes
+  as operator-published.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+- Mode coverage follows GTFS's extended route types, so feeds using the
+  Hierarchical Vehicle Type ranges are handled: coach (200s) and
+  taxi-bus (1500s) with bus, suburban rail (300s) with train,
+  urban/metro/underground (400s–600s) with subway, and ferry (1200s)
+  with water transport.
+
+- Circular patterns are supported: a route whose last stop returns to
+  its first is a completed loop rather than a monotonicity failure,
+  recognised only when the alignment itself closes.
+
 
 ## 0.9.0 — 2026-08-06
 
