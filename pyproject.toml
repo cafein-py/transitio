@@ -53,7 +53,7 @@ module-name = "transitio._core"
 include = [{ path = "LICENSE", format = "sdist" }]
 
 [tool.black]
-include = '(python/transitio|tests)/.*\.py$'
+include = '(python/transitio|scripts|tests)/.*\.py$'
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
