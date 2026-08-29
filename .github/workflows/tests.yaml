@@ -23,8 +23,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: pip install black flake8 flake8-bugbear
-      - run: black --check python/transitio tests
-      - run: flake8 python/transitio tests
+      - run: black --check python/transitio scripts tests
+      - run: flake8 python/transitio scripts tests
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
