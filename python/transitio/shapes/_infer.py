@@ -30,7 +30,6 @@ How much uncertainty is acceptable is the caller's, through
 import collections
 import dataclasses
 import datetime
-import io
 import json
 import os
 import pathlib
