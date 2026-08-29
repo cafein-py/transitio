@@ -9,6 +9,10 @@ class MissingTokenError(TransitioError):
     """No Mobility Database refresh token is available."""
 
 
+class IncompatibleIndexError(TransitioError):
+    """The feed index was built for a schema this transitio cannot read."""
+
+
 class DownloadError(TransitioError):
     """A dataset cannot be downloaded or fails checksum verification."""
 

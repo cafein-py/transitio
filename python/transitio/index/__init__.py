@@ -1,0 +1,172 @@
+"""The read layer over a published feed index.
+
+An index is a directory of ``feeds.parquet`` (one row per feed) and a
+``snapshot.json`` manifest. :func:`read_index` loads one and returns an
+:class:`Index` exposing the manifest and the feeds as a DataFrame. Building an
+index is a maintainer step (``scripts/build_index.py --stage publish``);
+discovering and refreshing bundled snapshots is a later addition.
+
+Only feeds are read here — places and edges come later — and only schema
+versions this transitio understands are accepted, so a newer index is refused
+with a clear upgrade message rather than misread.
+"""
+
+import hashlib
+import io
+import json
+import os
+import stat
+from pathlib import Path
+
+from transitio.exceptions import IncompatibleIndexError
+
+__all__ = ["Index", "read_index", "SUPPORTED_SCHEMA_VERSIONS"]
+
+# The index schema versions this reader understands. A snapshot outside the set
+# is refused rather than read against columns that may have moved.
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1})
+
+FEEDS_FILE = "feeds.parquet"
+SNAPSHOT_FILE = "snapshot.json"
+
+# Ceilings on what one index file may be, so a swapped-in or damaged file cannot
+# read an unbounded amount into memory. A real feeds index is a few MB.
+_MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
+_MAX_FEEDS_BYTES = 512 * 1024 * 1024
+
+# The columns a schema_version 1 feeds table carries. A correctly-hashed but
+# structurally wrong Parquet is refused against this rather than misread later.
+_SCHEMA_COLUMNS = frozenset(
+    {
+        "feed_id",
+        "onestop_id",
+        "mdb_id",
+        "id_minted",
+        "source",
+        "spec",
+        "name",
+        "aliases",
+        "crosswalk_method",
+        "crosswalk_confidence",
+        "static_feed_id",
+        "static_link_method",
+        "atlas",
+        "mdb",
+        "gbfs",
+        "snapshot",
+    }
+)
+
+
+def _read_regular(path, limit):
+    """The bytes of ``path``, refusing a symlink, special file, or over-size read.
+
+    Opened ``O_NOFOLLOW`` where the platform has it, then checked by ``fstat`` on
+    the open descriptor rather than a separate ``lstat`` on the name, so a swap
+    between the check and the read cannot slip a symlink or special file past it.
+    ``O_NONBLOCK`` keeps a FIFO named in place of a file from blocking the open
+    until a writer appears — it opens, is seen not to be regular, and is refused.
+    Windows lacks ``O_NOFOLLOW`` and follows a symlink here — its symlinks need
+    privilege to create, the residual the build store also accepts.
+    """
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    try:
+        handle = os.open(path, flags)
+    except OSError as error:
+        raise IncompatibleIndexError(f"{path}: cannot read ({error.strerror})")
+    try:
+        info = os.fstat(handle)
+        if not stat.S_ISREG(info.st_mode):
+            raise IncompatibleIndexError(f"{path}: not a regular file")
+        with os.fdopen(handle, "rb", closefd=False) as opened:
+            data = opened.read(limit + 1)
+        if len(data) > limit:
+            raise IncompatibleIndexError(f"{path}: over the {limit}-byte ceiling")
+        return data
+    finally:
+        os.close(handle)
+
+
+class Index:
+    """A resolved feed index: its manifest and its feeds."""
+
+    def __init__(self, snapshot, feeds):
+        self.snapshot = snapshot
+        self.feeds = feeds
+
+    @property
+    def snapshot_id(self):
+        return self.snapshot["snapshot_id"]
+
+    @property
+    def schema_version(self):
+        return self.snapshot["schema_version"]
+
+    def __repr__(self):
+        return (
+            f"<Index snapshot_id={self.snapshot_id!r} "
+            f"feeds={len(self.feeds)} schema_version={self.schema_version}>"
+        )
+
+
+def read_index(path):
+    """Read the index at ``path``, or raise if it is unsupported or corrupt.
+
+    ``pandas`` (and its ``pyarrow`` Parquet engine, a required dependency) reads
+    ``feeds.parquet``. The manifest is read first, so an incompatible snapshot
+    is refused before the larger file is touched, and the Parquet's bytes are
+    checked against the ``feeds_sha256`` the manifest records. That match proves
+    the Parquet and manifest are the paired halves of one build — not that the
+    build is authentic; authenticating a downloaded snapshot against its release
+    checksum is a later addition. Each file is read as a size-bounded regular
+    file, so a symlinked or over-large one is refused rather than followed. The
+    manifest's ``snapshot_id`` and the Parquet's columns are checked against the
+    schema version, so a structurally wrong but correctly-hashed index is refused
+    rather than misread downstream.
+    """
+    import pandas
+
+    path = Path(path)
+    snapshot = json.loads(
+        _read_regular(path / SNAPSHOT_FILE, _MAX_SNAPSHOT_BYTES).decode("utf-8")
+    )
+    version = snapshot.get("schema_version")
+    # A real int only: bool is an int subclass and ``True == 1``, and ``1.0``
+    # also equals ``1``, so a malformed version must not slip through.
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version not in SUPPORTED_SCHEMA_VERSIONS
+    ):
+        raise IncompatibleIndexError(
+            f"feed index schema_version {version!r} is not one this transitio "
+            f"reads ({sorted(SUPPORTED_SCHEMA_VERSIONS)}); upgrade transitio"
+        )
+    if not isinstance(snapshot.get("snapshot_id"), str):
+        raise IncompatibleIndexError(
+            f"{path / SNAPSHOT_FILE}: manifest declares no snapshot_id"
+        )
+    data = _read_regular(path / FEEDS_FILE, _MAX_FEEDS_BYTES)
+    expected = snapshot.get("feeds_sha256")
+    if not isinstance(expected, str):
+        raise IncompatibleIndexError(
+            f"{path / SNAPSHOT_FILE}: manifest declares no feeds_sha256"
+        )
+    if hashlib.sha256(data).hexdigest() != expected:
+        raise IncompatibleIndexError(
+            f"{path / FEEDS_FILE}: does not match the snapshot's feeds_sha256"
+        )
+    feeds = pandas.read_parquet(io.BytesIO(data))
+    columns = set(feeds.columns)
+    if columns != _SCHEMA_COLUMNS:
+        raise IncompatibleIndexError(
+            f"{path / FEEDS_FILE}: feeds columns do not match schema_version "
+            f"{version} (missing {sorted(_SCHEMA_COLUMNS - columns)}, "
+            f"unexpected {sorted(columns - _SCHEMA_COLUMNS)})"
+        )
+    return Index(snapshot, feeds)
