@@ -14,6 +14,9 @@ dependencies = [
     "httpx>=0.27",
     "pandas>=2.0",
     "platformdirs>=3",
+    # pyarrow backs the Parquet feed index; geopandas does not pull it in, and
+    # the index is a headline feature that must work straight after install.
+    "pyarrow>=14",
     "pyrosm>=0.12.0",
     # scipy backs the shape-inference mode graphs (csgraph shortest
     # paths, cKDTree stop snapping).
