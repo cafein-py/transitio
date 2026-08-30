@@ -20,9 +20,21 @@ import os
 import stat
 from pathlib import Path
 
-from transitio.exceptions import IncompatibleIndexError
+from transitio.exceptions import (
+    IncompatibleIndexError,
+    PlaceNotFoundError,
+    TransitioError,
+)
+from transitio.index.places import Place, _PlaceLookup
 
-__all__ = ["Index", "read_index", "SUPPORTED_SCHEMA_VERSIONS"]
+__all__ = [
+    "Index",
+    "Place",
+    "read_index",
+    "place",
+    "places",
+    "SUPPORTED_SCHEMA_VERSIONS",
+]
 
 # The index schema versions this reader understands. A snapshot outside the set
 # is refused rather than read against columns that may have moved.
@@ -234,3 +246,37 @@ def _read_places(path, snapshot, version):
             f"unexpected {sorted(columns - _PLACES_COLUMNS)})"
         )
     return places
+
+
+def _coerce_index(index):
+    if index is None:
+        raise TransitioError("no active feed index; pass index=<path to a built index>")
+    if isinstance(index, Index):
+        return index
+    return read_index(index)
+
+
+def _lookup_for(index):
+    lookup = getattr(index, "_place_lookup", None)
+    if lookup is None:
+        if index.places is None:
+            raise PlaceNotFoundError("this index carries no places")
+        lookup = _PlaceLookup(index.places)
+        index._place_lookup = lookup
+    return lookup
+
+
+def place(query, *, kind=None, index=None):
+    """Resolve ``query`` to a single :class:`Place`, or raise.
+
+    ``query`` is a name, a QID, or a :class:`Place`. A bare city name promotes to
+    its default metro; ``kind`` pins the scope and suppresses promotion. Raises
+    :class:`~transitio.exceptions.PlaceNotFoundError` or
+    :class:`~transitio.exceptions.AmbiguousPlaceError`.
+    """
+    return _lookup_for(_coerce_index(index)).resolve(query, kind=kind)
+
+
+def places(query, *, index=None):
+    """The places matching ``query``, ranked best first (never promoted)."""
+    return _lookup_for(_coerce_index(index)).search(query)

@@ -13,6 +13,19 @@ class IncompatibleIndexError(TransitioError):
     """The feed index was built for a schema this transitio cannot read."""
 
 
+class PlaceNotFoundError(TransitioError):
+    """No place in the index matches the query."""
+
+
+class AmbiguousPlaceError(TransitioError):
+    """Several places match the query and none wins outright.
+
+    The tied candidates are available as :attr:`candidates`, in ranked order.
+    """
+
+    candidates = ()
+
+
 class DownloadError(TransitioError):
     """A dataset cannot be downloaded or fails checksum verification."""
 

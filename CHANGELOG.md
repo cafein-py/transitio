@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `transitio.place` / `transitio.places` and the `Place` object — name resolution
+  over a published index's places. A query (name, QID or `Place`) is matched
+  against every label and alias in every language by a defined ranking (exact
+  beats prefix beats token-subset, then `metro > city > region > country`); a
+  bare city name promotes to its default metro; anything unresolved raises
+  `PlaceNotFoundError` or `AmbiguousPlaceError` (which carries the candidates).
+
 - `transitio.index.read_index` — the read layer over a published index, loading
   a `feeds.parquet`, an optional `places.parquet` (a GeoParquet of the gazetteer
   places, with boundary geometry) and its `snapshot.json` manifest into an
