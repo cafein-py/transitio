@@ -39,6 +39,8 @@ dynamic = ["version"]
 
 [project.optional-dependencies]
 snap = ["networkx>=3"]
+# Maintainer-only: the index build pipeline under scripts/ reads override YAML.
+build = ["pyyaml>=6"]
 
 [project.scripts]
 transitio = "transitio._cli:main"
