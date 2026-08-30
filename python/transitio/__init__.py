@@ -8,6 +8,7 @@ __all__ = [
     "OsmEditor",
     "FetchResult",
     "MobilityDatabase",
+    "Place",
     "exceptions",
     "build_feed",
     "compare_feed_history",
@@ -23,6 +24,8 @@ __all__ = [
     "osm",
     "patch_feed",
     "pipeline",
+    "place",
+    "places",
     "repair",
     "infer_shapes",
     "repair_feed",
@@ -74,6 +77,10 @@ def __getattr__(name):
         from transitio.validate import validate_feed
 
         return validate_feed
+    if name in ("Place", "place", "places"):
+        from transitio import index
+
+        return getattr(index, name)
     if name in (
         "edit",
         "exceptions",
