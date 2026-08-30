@@ -1,14 +1,16 @@
 """The read layer over a published feed index.
 
-An index is a directory of ``feeds.parquet`` (one row per feed) and a
+An index is a directory of ``feeds.parquet`` (one row per feed), an optional
+``places.parquet`` (one row per place, with boundary geometry) and a
 ``snapshot.json`` manifest. :func:`read_index` loads one and returns an
-:class:`Index` exposing the manifest and the feeds as a DataFrame. Building an
+:class:`Index` exposing the manifest, the feeds as a DataFrame and the places as
+a GeoDataFrame (or ``None`` when the index predates the gazetteer). Building an
 index is a maintainer step (``scripts/build_index.py --stage publish``);
 discovering and refreshing bundled snapshots is a later addition.
 
-Only feeds are read here — places and edges come later — and only schema
-versions this transitio understands are accepted, so a newer index is refused
-with a clear upgrade message rather than misread.
+Edges come later, and only schema versions this transitio understands are
+accepted, so a newer index is refused with a clear upgrade message rather than
+misread.
 """
 
 import hashlib
@@ -27,12 +29,14 @@ __all__ = ["Index", "read_index", "SUPPORTED_SCHEMA_VERSIONS"]
 SUPPORTED_SCHEMA_VERSIONS = frozenset({1})
 
 FEEDS_FILE = "feeds.parquet"
+PLACES_FILE = "places.parquet"
 SNAPSHOT_FILE = "snapshot.json"
 
 # Ceilings on what one index file may be, so a swapped-in or damaged file cannot
-# read an unbounded amount into memory. A real feeds index is a few MB.
+# read an unbounded amount into memory. A real index is a few MB.
 _MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 _MAX_FEEDS_BYTES = 512 * 1024 * 1024
+_MAX_PLACES_BYTES = 512 * 1024 * 1024
 
 # The columns a schema_version 1 feeds table carries. A correctly-hashed but
 # structurally wrong Parquet is refused against this rather than misread later.
@@ -54,6 +58,32 @@ _SCHEMA_COLUMNS = frozenset(
         "mdb",
         "gbfs",
         "snapshot",
+    }
+)
+
+# The columns a schema_version 1 places table carries, geometry included.
+_PLACES_COLUMNS = frozenset(
+    {
+        "place_id",
+        "kind",
+        "source_subtype",
+        "name",
+        "names",
+        "aliases",
+        "default_metro_id",
+        "resolution_method",
+        "curated",
+        "parent_id",
+        "metro_ids",
+        "member_ids",
+        "country_code",
+        "overture_id",
+        "osm_relation_id",
+        "statistical_area_id",
+        "geonames_id",
+        "geometry_source",
+        "snapshot",
+        "geometry",
     }
 )
 
@@ -93,11 +123,12 @@ def _read_regular(path, limit):
 
 
 class Index:
-    """A resolved feed index: its manifest and its feeds."""
+    """A resolved index: its manifest, its feeds and (if present) its places."""
 
-    def __init__(self, snapshot, feeds):
+    def __init__(self, snapshot, feeds, places=None):
         self.snapshot = snapshot
         self.feeds = feeds
+        self.places = places
 
     @property
     def snapshot_id(self):
@@ -108,9 +139,10 @@ class Index:
         return self.snapshot["schema_version"]
 
     def __repr__(self):
+        places = "None" if self.places is None else len(self.places)
         return (
-            f"<Index snapshot_id={self.snapshot_id!r} "
-            f"feeds={len(self.feeds)} schema_version={self.schema_version}>"
+            f"<Index snapshot_id={self.snapshot_id!r} feeds={len(self.feeds)} "
+            f"places={places} schema_version={self.schema_version}>"
         )
 
 
@@ -169,4 +201,36 @@ def read_index(path):
             f"{version} (missing {sorted(_SCHEMA_COLUMNS - columns)}, "
             f"unexpected {sorted(columns - _SCHEMA_COLUMNS)})"
         )
-    return Index(snapshot, feeds)
+    return Index(snapshot, feeds, _read_places(path, snapshot, version))
+
+
+def _read_places(path, snapshot, version):
+    """The places GeoDataFrame, or None when the index carries no places.
+
+    Read only when the manifest declares a ``places_sha256``; the Parquet is then
+    a size-bounded regular file, its bytes checked against that digest, and its
+    columns against the schema before it is returned.
+    """
+    expected = snapshot.get("places_sha256")
+    if expected is None:
+        return None
+    if not isinstance(expected, str):
+        raise IncompatibleIndexError(
+            f"{path / SNAPSHOT_FILE}: places_sha256 is not a string"
+        )
+    import geopandas
+
+    data = _read_regular(path / PLACES_FILE, _MAX_PLACES_BYTES)
+    if hashlib.sha256(data).hexdigest() != expected:
+        raise IncompatibleIndexError(
+            f"{path / PLACES_FILE}: does not match the snapshot's places_sha256"
+        )
+    places = geopandas.read_parquet(io.BytesIO(data))
+    columns = set(places.columns)
+    if columns != _PLACES_COLUMNS:
+        raise IncompatibleIndexError(
+            f"{path / PLACES_FILE}: places columns do not match schema_version "
+            f"{version} (missing {sorted(_PLACES_COLUMNS - columns)}, "
+            f"unexpected {sorted(columns - _PLACES_COLUMNS)})"
+        )
+    return places

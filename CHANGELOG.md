@@ -9,10 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `transitio.index.read_index` — the read layer over a published feed index,
-  loading a `feeds.parquet` and its `snapshot.json` manifest. Feeds only for
-  now; a schema version it does not understand is refused with
-  `IncompatibleIndexError`.
+- `transitio.index.read_index` — the read layer over a published index, loading
+  a `feeds.parquet`, an optional `places.parquet` (a GeoParquet of the gazetteer
+  places, with boundary geometry) and its `snapshot.json` manifest into an
+  `Index` exposing `.feeds` and `.places`. A schema version it does not
+  understand is refused with `IncompatibleIndexError`.
 
 ### Changed
 
