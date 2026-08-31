@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Place.feeds()` and the `IndexedFeed` object — the feeds serving a place,
+  joined with their membership edges. `tiers=`/`exclude=` filter by tier,
+  `on_unknown` governs unclassified edges and `min_confidence` filters weak
+  ones; the aggregate `confidence` is the minimum across matched tiers,
+  `needs_review` the *or*, and `selector` their union (always a `Selector`,
+  with `unavailable` dominating). `feeds().to_geodataframe()` tabulates the
+  result.
+
 - `transitio.place` / `transitio.places` and the `Place` object — name resolution
   over a published index's places. A query (name, QID or `Place`) is matched
   against every label and alias in every language by a defined ranking (exact
