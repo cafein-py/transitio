@@ -1,16 +1,17 @@
 """The read layer over a published feed index.
 
 An index is a directory of ``feeds.parquet`` (one row per feed), an optional
-``places.parquet`` (one row per place, with boundary geometry) and a
+``places.parquet`` (one row per place, with boundary geometry), an optional
+``edges.parquet`` (one membership row per place/feed/tier) and a
 ``snapshot.json`` manifest. :func:`read_index` loads one and returns an
-:class:`Index` exposing the manifest, the feeds as a DataFrame and the places as
-a GeoDataFrame (or ``None`` when the index predates the gazetteer). Building an
-index is a maintainer step (``scripts/build_index.py --stage publish``);
-discovering and refreshing bundled snapshots is a later addition.
+:class:`Index` exposing the manifest, the feeds as a DataFrame, the places as a
+GeoDataFrame and the edges as a DataFrame (``None`` for tables the build
+predates). Building an index is a maintainer step
+(``scripts/build_index.py --stage publish``); discovering and refreshing bundled
+snapshots is a later addition.
 
-Edges come later, and only schema versions this transitio understands are
-accepted, so a newer index is refused with a clear upgrade message rather than
-misread.
+Only schema versions this transitio understands are accepted, so a newer index
+is refused with a clear upgrade message rather than misread.
 """
 
 import hashlib
@@ -42,6 +43,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset({1})
 
 FEEDS_FILE = "feeds.parquet"
 PLACES_FILE = "places.parquet"
+EDGES_FILE = "edges.parquet"
 SNAPSHOT_FILE = "snapshot.json"
 
 # Ceilings on what one index file may be, so a swapped-in or damaged file cannot
@@ -49,6 +51,7 @@ SNAPSHOT_FILE = "snapshot.json"
 _MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 _MAX_FEEDS_BYTES = 512 * 1024 * 1024
 _MAX_PLACES_BYTES = 512 * 1024 * 1024
+_MAX_EDGES_BYTES = 512 * 1024 * 1024
 
 # The columns a schema_version 1 feeds table carries. A correctly-hashed but
 # structurally wrong Parquet is refused against this rather than misread later.
@@ -69,6 +72,32 @@ _SCHEMA_COLUMNS = frozenset(
         "atlas",
         "mdb",
         "gbfs",
+        "crawlable",
+        "uncrawlable_reason",
+        "coverage_source",
+        "snapshot",
+    }
+)
+
+# The columns a schema_version 1 edges table carries.
+_EDGES_COLUMNS = frozenset(
+    {
+        "place_id",
+        "feed_id",
+        "tier",
+        "confidence",
+        "tier_confidence",
+        "method",
+        "rehomed_from",
+        "evidence",
+        "curation",
+        "merged_evidence",
+        "curation_history",
+        "classification_fingerprint",
+        "fingerprint_kind",
+        "selector_state",
+        "selector",
+        "needs_review",
         "snapshot",
     }
 )
@@ -98,6 +127,29 @@ _PLACES_COLUMNS = frozenset(
         "geometry",
     }
 )
+
+
+def _load_table(read, data, path, table):
+    """Read Parquet bytes into a frame, or refuse with a controlled error.
+
+    A correctly-hashed but unreadable table — a duplicated column label, a
+    truncated page — otherwise escapes as a raw Arrow exception.
+    """
+    try:
+        return read(io.BytesIO(data))
+    except Exception as error:
+        raise IncompatibleIndexError(f"{path}: not a readable {table} table ({error})")
+
+
+def _check_columns(frame, expected, path, version, table):
+    """Refuse a table whose column labels are not exactly ``expected``."""
+    columns = set(frame.columns)
+    if columns != expected:
+        raise IncompatibleIndexError(
+            f"{path}: {table} columns do not match schema_version {version} "
+            f"(missing {sorted(expected - columns)}, "
+            f"unexpected {sorted(columns - expected)})"
+        )
 
 
 def _read_regular(path, limit):
@@ -135,12 +187,13 @@ def _read_regular(path, limit):
 
 
 class Index:
-    """A resolved index: its manifest, its feeds and (if present) its places."""
+    """A resolved index: its manifest, feeds, and (if present) places and edges."""
 
-    def __init__(self, snapshot, feeds, places=None):
+    def __init__(self, snapshot, feeds, places=None, edges=None):
         self.snapshot = snapshot
         self.feeds = feeds
         self.places = places
+        self.edges = edges
 
     @property
     def snapshot_id(self):
@@ -152,9 +205,11 @@ class Index:
 
     def __repr__(self):
         places = "None" if self.places is None else len(self.places)
+        edges = "None" if self.edges is None else len(self.edges)
         return (
             f"<Index snapshot_id={self.snapshot_id!r} feeds={len(self.feeds)} "
-            f"places={places} schema_version={self.schema_version}>"
+            f"places={places} edges={edges} "
+            f"schema_version={self.schema_version}>"
         )
 
 
@@ -205,15 +260,14 @@ def read_index(path):
         raise IncompatibleIndexError(
             f"{path / FEEDS_FILE}: does not match the snapshot's feeds_sha256"
         )
-    feeds = pandas.read_parquet(io.BytesIO(data))
-    columns = set(feeds.columns)
-    if columns != _SCHEMA_COLUMNS:
-        raise IncompatibleIndexError(
-            f"{path / FEEDS_FILE}: feeds columns do not match schema_version "
-            f"{version} (missing {sorted(_SCHEMA_COLUMNS - columns)}, "
-            f"unexpected {sorted(columns - _SCHEMA_COLUMNS)})"
-        )
-    return Index(snapshot, feeds, _read_places(path, snapshot, version))
+    feeds = _load_table(pandas.read_parquet, data, path / FEEDS_FILE, "feeds")
+    _check_columns(feeds, _SCHEMA_COLUMNS, path / FEEDS_FILE, version, "feeds")
+    return Index(
+        snapshot,
+        feeds,
+        _read_places(path, snapshot, version),
+        _read_edges(path, snapshot, version),
+    )
 
 
 def _read_places(path, snapshot, version):
@@ -237,15 +291,35 @@ def _read_places(path, snapshot, version):
         raise IncompatibleIndexError(
             f"{path / PLACES_FILE}: does not match the snapshot's places_sha256"
         )
-    places = geopandas.read_parquet(io.BytesIO(data))
-    columns = set(places.columns)
-    if columns != _PLACES_COLUMNS:
-        raise IncompatibleIndexError(
-            f"{path / PLACES_FILE}: places columns do not match schema_version "
-            f"{version} (missing {sorted(_PLACES_COLUMNS - columns)}, "
-            f"unexpected {sorted(columns - _PLACES_COLUMNS)})"
-        )
+    places = _load_table(geopandas.read_parquet, data, path / PLACES_FILE, "places")
+    _check_columns(places, _PLACES_COLUMNS, path / PLACES_FILE, version, "places")
     return places
+
+
+def _read_edges(path, snapshot, version):
+    """The edges DataFrame, or None when the index carries no edges.
+
+    Read only when the manifest declares an ``edges_sha256``; the Parquet is then
+    a size-bounded regular file, its bytes checked against that digest, and its
+    columns against the schema before it is returned.
+    """
+    expected = snapshot.get("edges_sha256")
+    if expected is None:
+        return None
+    if not isinstance(expected, str):
+        raise IncompatibleIndexError(
+            f"{path / SNAPSHOT_FILE}: edges_sha256 is not a string"
+        )
+    import pandas
+
+    data = _read_regular(path / EDGES_FILE, _MAX_EDGES_BYTES)
+    if hashlib.sha256(data).hexdigest() != expected:
+        raise IncompatibleIndexError(
+            f"{path / EDGES_FILE}: does not match the snapshot's edges_sha256"
+        )
+    edges = _load_table(pandas.read_parquet, data, path / EDGES_FILE, "edges")
+    _check_columns(edges, _EDGES_COLUMNS, path / EDGES_FILE, version, "edges")
+    return edges
 
 
 def _coerce_index(index):
