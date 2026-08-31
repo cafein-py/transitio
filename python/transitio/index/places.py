@@ -15,7 +15,11 @@ import re
 import unicodedata
 from collections import defaultdict
 
-from transitio.exceptions import AmbiguousPlaceError, PlaceNotFoundError
+from transitio.exceptions import (
+    AmbiguousPlaceError,
+    PlaceNotFoundError,
+    TransitioError,
+)
 
 # The places table is read back through GeoParquet, so list columns arrive as
 # arrays and null cells as NaN, not None; these coerce both to plain Python.
@@ -154,6 +158,33 @@ class Place:
         """The places that make up this one, resolved from ``member_ids``."""
         return self._lookup.resolve_ids(self.member_ids)
 
+    def feeds(
+        self,
+        *,
+        tiers=None,
+        exclude=None,
+        spec="gtfs",
+        on_unknown="include",
+        min_confidence=None,
+    ):
+        """The feeds serving this place, as :class:`IndexedFeed` objects.
+
+        ``tiers`` keeps only edges of those tiers, ``exclude`` drops edges of
+        the named tiers (a feed with nothing left is dropped), ``spec`` selects
+        the feed kind (static GTFS by default; ``None`` for everything, a list
+        to narrow), ``on_unknown`` governs unknown-tier edges and
+        ``min_confidence`` filters low-confidence ones. See
+        :func:`transitio.index.feeds.feeds_for_place`.
+        """
+        return self._lookup.feeds(
+            self,
+            tiers=tiers,
+            exclude=exclude,
+            spec=spec,
+            on_unknown=on_unknown,
+            min_confidence=min_confidence,
+        )
+
     def __eq__(self, other):
         return isinstance(other, Place) and other.id == self.id
 
@@ -167,8 +198,9 @@ class Place:
 class _PlaceLookup:
     """Resolution over one index's places, with an optional feed-count ranker."""
 
-    def __init__(self, places, *, feed_count=None):
+    def __init__(self, places, *, feed_count=None, index=None):
         self._feed_count = feed_count or (lambda place_id: 0)
+        self._index = index
         self._records = {}
         self._labels = {}
         self._children = defaultdict(list)
@@ -203,6 +235,13 @@ class _PlaceLookup:
 
     def resolve_ids(self, place_ids):
         return [place for place in map(self.get, place_ids) if place is not None]
+
+    def feeds(self, place, **query):
+        if self._index is None:
+            raise TransitioError("this lookup is not attached to an index")
+        from transitio.index.feeds import feeds_for_place
+
+        return feeds_for_place(self._index, place, **query)
 
     def _tier(self, query_norm, query_tokens, labels):
         best = 0

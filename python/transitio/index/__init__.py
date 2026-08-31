@@ -26,11 +26,14 @@ from transitio.exceptions import (
     PlaceNotFoundError,
     TransitioError,
 )
+from transitio.index.feeds import IndexedFeed, Selector
 from transitio.index.places import Place, _PlaceLookup
 
 __all__ = [
     "Index",
+    "IndexedFeed",
     "Place",
+    "Selector",
     "read_index",
     "place",
     "places",
@@ -152,6 +155,19 @@ def _check_columns(frame, expected, path, version, table):
         )
 
 
+def _check_snapshot_column(frame, snapshot, path, table):
+    """Every row's ``snapshot`` must equal the manifest's ``snapshot_id``.
+
+    The rows surface the id through the public API, so a divergence would report
+    two different snapshots for one index.
+    """
+    if not (frame["snapshot"] == snapshot["snapshot_id"]).all():
+        raise IncompatibleIndexError(
+            f"{path}: {table} rows carry a snapshot other than the manifest's "
+            f"snapshot_id"
+        )
+
+
 def _read_regular(path, limit):
     """The bytes of ``path``, refusing a symlink, special file, or over-size read.
 
@@ -262,6 +278,7 @@ def read_index(path):
         )
     feeds = _load_table(pandas.read_parquet, data, path / FEEDS_FILE, "feeds")
     _check_columns(feeds, _SCHEMA_COLUMNS, path / FEEDS_FILE, version, "feeds")
+    _check_snapshot_column(feeds, snapshot, path / FEEDS_FILE, "feeds")
     return Index(
         snapshot,
         feeds,
@@ -293,6 +310,7 @@ def _read_places(path, snapshot, version):
         )
     places = _load_table(geopandas.read_parquet, data, path / PLACES_FILE, "places")
     _check_columns(places, _PLACES_COLUMNS, path / PLACES_FILE, version, "places")
+    _check_snapshot_column(places, snapshot, path / PLACES_FILE, "places")
     return places
 
 
@@ -319,6 +337,7 @@ def _read_edges(path, snapshot, version):
         )
     edges = _load_table(pandas.read_parquet, data, path / EDGES_FILE, "edges")
     _check_columns(edges, _EDGES_COLUMNS, path / EDGES_FILE, version, "edges")
+    _check_snapshot_column(edges, snapshot, path / EDGES_FILE, "edges")
     return edges
 
 
@@ -330,12 +349,22 @@ def _coerce_index(index):
     return read_index(index)
 
 
+def _feed_count_for(index):
+    """A place_id -> distinct-feed-count callable over the index's edges."""
+    if index.edges is None:
+        return None
+    counts = index.edges.groupby("place_id")["feed_id"].nunique().to_dict()
+    return lambda place_id: counts.get(place_id, 0)
+
+
 def _lookup_for(index):
     lookup = getattr(index, "_place_lookup", None)
     if lookup is None:
         if index.places is None:
             raise PlaceNotFoundError("this index carries no places")
-        lookup = _PlaceLookup(index.places)
+        lookup = _PlaceLookup(
+            index.places, feed_count=_feed_count_for(index), index=index
+        )
         index._place_lookup = lookup
     return lookup
 
