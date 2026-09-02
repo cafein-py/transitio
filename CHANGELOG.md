@@ -26,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bare city name promotes to its default metro; anything unresolved raises
   `PlaceNotFoundError` or `AmbiguousPlaceError` (which carries the candidates).
 
+- `transitio.index.fingerprint` — the classification fingerprint of a feed's
+  evidence (route ids, agencies, types, served stops and rounded stop
+  coordinates), computed the same way when an index is built and when a
+  selector is validated against a downloaded feed.
+
 - `transitio.index.read_index` — the read layer over a published index, loading
   a `feeds.parquet`, an optional `places.parquet` (a GeoParquet of the gazetteer
   places, with boundary geometry), an optional `edges.parquet` (one membership
