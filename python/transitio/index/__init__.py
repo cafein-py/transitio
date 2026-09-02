@@ -42,7 +42,7 @@ __all__ = [
 
 # The index schema versions this reader understands. A snapshot outside the set
 # is refused rather than read against columns that may have moved.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({1})
+SUPPORTED_SCHEMA_VERSIONS = frozenset({2})
 
 FEEDS_FILE = "feeds.parquet"
 PLACES_FILE = "places.parquet"
@@ -56,7 +56,7 @@ _MAX_FEEDS_BYTES = 512 * 1024 * 1024
 _MAX_PLACES_BYTES = 512 * 1024 * 1024
 _MAX_EDGES_BYTES = 512 * 1024 * 1024
 
-# The columns a schema_version 1 feeds table carries. A correctly-hashed but
+# The columns a schema_version 2 feeds table carries. A correctly-hashed but
 # structurally wrong Parquet is refused against this rather than misread later.
 _SCHEMA_COLUMNS = frozenset(
     {
@@ -82,13 +82,13 @@ _SCHEMA_COLUMNS = frozenset(
     }
 )
 
-# The columns a schema_version 1 edges table carries.
+# The columns a schema_version 2 edges table carries.
 _EDGES_COLUMNS = frozenset(
     {
         "place_id",
         "feed_id",
         "tier",
-        "confidence",
+        "service",
         "tier_confidence",
         "method",
         "rehomed_from",
@@ -105,7 +105,7 @@ _EDGES_COLUMNS = frozenset(
     }
 )
 
-# The columns a schema_version 1 places table carries, geometry included.
+# The columns a schema_version 2 places table carries, geometry included.
 _PLACES_COLUMNS = frozenset(
     {
         "place_id",
@@ -126,6 +126,7 @@ _PLACES_COLUMNS = frozenset(
         "statistical_area_id",
         "geonames_id",
         "geometry_source",
+        "service",
         "snapshot",
         "geometry",
     }

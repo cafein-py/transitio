@@ -134,6 +134,19 @@ class Place:
         return self._record.get("default_metro_id")
 
     @property
+    def service(self):
+        """The place's transit service level, summed over the feeds serving
+        it: ``feeds``, ``stops``, ``routes`` and ``departures_per_day``.
+
+        The numbers describe how much service the index knows about in the
+        place — a capital's thousands of daily stop-events against a small
+        town's few dozen — not how certain the membership is.
+        """
+        from transitio.index.feeds import PlaceService, _parse
+
+        return PlaceService(_parse(self._record.get("service")))
+
+    @property
     def geometry(self):
         return self._record.get("geometry")
 
@@ -165,15 +178,13 @@ class Place:
         exclude=None,
         spec="gtfs",
         on_unknown="include",
-        min_confidence=None,
     ):
         """The feeds serving this place, as :class:`IndexedFeed` objects.
 
         ``tiers`` keeps only edges of those tiers, ``exclude`` drops edges of
         the named tiers (a feed with nothing left is dropped), ``spec`` selects
         the feed kind (static GTFS by default; ``None`` for everything, a list
-        to narrow), ``on_unknown`` governs unknown-tier edges and
-        ``min_confidence`` filters low-confidence ones. See
+        to narrow) and ``on_unknown`` governs unknown-tier edges. See
         :func:`transitio.index.feeds.feeds_for_place`.
         """
         return self._lookup.feeds(
@@ -182,7 +193,6 @@ class Place:
             exclude=exclude,
             spec=spec,
             on_unknown=on_unknown,
-            min_confidence=min_confidence,
         )
 
     def __eq__(self, other):
