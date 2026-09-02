@@ -3,22 +3,23 @@
 :meth:`Place.feeds` queries the index's membership edges for one place and
 returns :class:`IndexedFeed` objects — a feed joined with its matched edges.
 ``edges`` is the authoritative per-tier record; the singular fields are
-aggregates over *the tiers the query matched*: ``confidence`` is the minimum
-across them (a feed is only as trustworthy as its weakest qualifying edge),
-``needs_review`` the *or*, and ``selector`` the union — always a
-:class:`Selector` object, never ``None``, with ``unavailable`` dominating,
-because a union that silently omitted the unfilterable part would be exactly
-the wrong answer.
+aggregates over *the tiers the query matched*: ``needs_review`` is the *or*,
+``selector`` the union — always a :class:`Selector` object, never ``None``,
+with ``unavailable`` dominating, because a union that silently omitted the
+unfilterable part would be exactly the wrong answer — and ``service`` the
+feed's service level in the place (stops, routes, departures per day), which
+every tier edge of the pair carries identically.
 
-An edge is *unknown* only when its tier is ``"unknown"``; ``on_unknown``
-governs those (``"include"``, the default, keeps them flagged), while
-``min_confidence`` separately filters classified-but-unconfident edges.
+Membership is a fact, not a score: a feed is in the index for a place because
+a scheduled stop lies there. An edge is *unknown* only when its tier is
+``"unknown"``; ``on_unknown`` governs those (``"include"``, the default, keeps
+them flagged), and ``needs_review`` marks the tiers a person should check.
 """
 
 import json
 import math
 
-__all__ = ["IndexedFeed", "Selector", "TierEdge"]
+__all__ = ["IndexedFeed", "PlaceService", "Selector", "ServiceLevel", "TierEdge"]
 
 
 def _parse(value):
@@ -53,22 +54,65 @@ class Selector:
         return f"Selector(state={self.state!r})"
 
 
+class ServiceLevel:
+    """How much service a feed (or every feed together) offers in a place.
+
+    ``stops`` are distinct scheduled stops inside the place, ``routes`` the
+    routes with a scheduled stop there, and ``departures_per_day`` the
+    scheduled stop-events at those stops per average calendar day — ``None``
+    when nothing could be measured: the feed's timetable was not read (a
+    feed that legitimately skipped ``stop_times``, or a declared-only
+    placement), or it carried no usable calendar to weight the events by.
+    """
+
+    def __init__(self, record):
+        record = record or {}
+        self.stops = _count(record.get("stops"))
+        self.routes = _count(record.get("routes"))
+        departures = record.get("departures_per_day")
+        self.departures_per_day = None if departures is None else float(departures)
+
+    def __repr__(self):
+        return (
+            f"ServiceLevel(stops={self.stops}, routes={self.routes}, "
+            f"departures_per_day={self.departures_per_day})"
+        )
+
+
+def _count(value):
+    return None if value is None else int(value)
+
+
+class PlaceService(ServiceLevel):
+    """A place's service level summed over the feeds serving it."""
+
+    def __init__(self, record):
+        super().__init__(record)
+        self.feeds = _count((record or {}).get("feeds")) or 0
+
+    def __repr__(self):
+        return (
+            f"PlaceService(feeds={self.feeds}, stops={self.stops}, "
+            f"routes={self.routes}, departures_per_day={self.departures_per_day})"
+        )
+
+
 class TierEdge:
     """One membership edge, as the query matched it."""
 
     def __init__(self, record):
         self.tier = record["tier"]
-        self.confidence = float(record["confidence"])
         self.tier_confidence = float(record["tier_confidence"])
         self.method = record["method"]
         self.needs_review = bool(record["needs_review"])
         self.selector_state = record["selector_state"]
         self.selector = _parse(record.get("selector"))
         self.evidence = _parse(record.get("evidence"))
+        self.service = ServiceLevel(_parse(record.get("service")))
 
     def __repr__(self):
         return (
-            f"TierEdge({self.tier!r}, confidence={self.confidence}, "
+            f"TierEdge({self.tier!r}, tier_confidence={self.tier_confidence}, "
             f"needs_review={self.needs_review}, method={self.method!r})"
         )
 
@@ -116,9 +160,10 @@ class IndexedFeed:
         return frozenset(self.edges)
 
     @property
-    def confidence(self):
-        """The minimum membership confidence across the matched tiers."""
-        return min(edge.confidence for edge in self.edges.values())
+    def service(self):
+        """The feed's service level in the place — identical on every tier
+        edge of the pair, so any matched edge's copy is the answer."""
+        return next(iter(self.edges.values())).service
 
     @property
     def needs_review(self):
@@ -153,10 +198,7 @@ class IndexedFeed:
         return Selector("complete", sorted(route_ids), declared_as)
 
     def __repr__(self):
-        return (
-            f"IndexedFeed({self.feed_id!r}, tiers={sorted(self.tiers)}, "
-            f"confidence={self.confidence})"
-        )
+        return f"IndexedFeed({self.feed_id!r}, tiers={sorted(self.tiers)})"
 
 
 class FeedList(list):
@@ -177,7 +219,9 @@ class FeedList(list):
             "spec",
             "coverage_source",
             "tiers",
-            "confidence",
+            "stops",
+            "routes",
+            "departures_per_day",
             "needs_review",
             "selector_state",
         )
@@ -189,7 +233,9 @@ class FeedList(list):
                 "spec": feed.spec,
                 "coverage_source": feed.coverage_source,
                 "tiers": sorted(feed.tiers),
-                "confidence": feed.confidence,
+                "stops": feed.service.stops,
+                "routes": feed.service.routes,
+                "departures_per_day": feed.service.departures_per_day,
                 "needs_review": feed.needs_review,
                 "selector_state": feed.selector.state,
             }
@@ -202,7 +248,7 @@ class FeedList(list):
         )
 
 
-def _matched(edges, tiers, exclude, on_unknown, min_confidence):
+def _matched(edges, tiers, exclude, on_unknown):
     """The edges of one feed the query matches, keyed by tier."""
     matched = {}
     for edge in edges:
@@ -212,8 +258,6 @@ def _matched(edges, tiers, exclude, on_unknown, min_confidence):
         elif tiers is not None and edge["tier"] not in tiers:
             continue
         if exclude and edge["tier"] in exclude:
-            continue
-        if min_confidence is not None and edge["confidence"] < min_confidence:
             continue
         matched.setdefault(edge["tier"], TierEdge(edge))
     return matched
@@ -227,7 +271,6 @@ def feeds_for_place(
     exclude=None,
     spec="gtfs",
     on_unknown="include",
-    min_confidence=None,
 ):
     """The :class:`IndexedFeed` list for ``place``, filtered by the query.
 
@@ -254,7 +297,7 @@ def feeds_for_place(
             continue
         if allowed is not None and row.get("spec") not in allowed:
             continue
-        matched = _matched(by_feed[feed_id], tiers, exclude, on_unknown, min_confidence)
+        matched = _matched(by_feed[feed_id], tiers, exclude, on_unknown)
         if matched:
             found.append(IndexedFeed(row, matched))
     return found

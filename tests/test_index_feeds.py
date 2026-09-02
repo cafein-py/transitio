@@ -52,7 +52,7 @@ def _edge_row(place_id, feed_id, **kw):
         "place_id": place_id,
         "feed_id": feed_id,
         "tier": kw.get("tier", "unknown"),
-        "confidence": kw.get("confidence", 0.5),
+        "service": json.dumps(kw["service"]) if kw.get("service") else None,
         "tier_confidence": kw.get("tier_confidence", 0.0),
         "method": kw.get("method", "inferred"),
         "needs_review": kw.get("needs_review", True),
@@ -87,6 +87,8 @@ FEEDS = [
     _feed_row("f-bike", spec="gbfs"),
 ]
 
+# Every tier edge of a (place, feed) pair carries the pair's service level.
+MIX_SERVICE = {"stops": 12, "routes": 2, "departures_per_day": 400.0}
 EDGES = [
     # A declared city feed, propagated to region and metro.
     _edge_row("Q101", "f-city"),
@@ -97,7 +99,7 @@ EDGES = [
         "Q102",
         "f-mix",
         tier="local",
-        confidence=0.9,
+        service=MIX_SERVICE,
         needs_review=False,
         selector_state="complete",
         selector={"route_id": ["r1", "r2"], "declared_as": {"agency_id": ["a1"]}},
@@ -107,7 +109,7 @@ EDGES = [
         "Q102",
         "f-mix",
         tier="national",
-        confidence=0.95,
+        service=MIX_SERVICE,
         needs_review=False,
         selector_state="whole_feed",
     ),
@@ -115,7 +117,7 @@ EDGES = [
         "Q102",
         "f-nat",
         tier="national",
-        confidence=0.8,
+        service={"stops": 1, "routes": 1, "departures_per_day": 6.0},
         needs_review=False,
         selector_state="whole_feed",
     ),
@@ -147,7 +149,7 @@ def test_a_bare_query_lists_every_feed_with_an_edge(idx):
     assert [f.feed_id for f in feeds] == ["f-city", "f-mix", "f-nat"]
     declared = feeds[0]
     assert declared.tiers == frozenset({"unknown"})
-    assert declared.confidence == 0.5
+    assert declared.service.stops is None  # declared: nothing measured
     assert declared.needs_review is True
     assert declared.selector.state == "unavailable"
     assert declared.coverage_source == "declared"
@@ -159,7 +161,7 @@ def test_a_tier_query_keeps_unknown_edges_flagged_by_default(idx):
     assert [f.feed_id for f in feeds] == ["f-city", "f-mix"]  # f-nat dropped
     mix = feeds[1]
     assert mix.tiers == frozenset({"local"})
-    assert mix.confidence == 0.9
+    assert mix.service.departures_per_day == 400.0
     assert mix.needs_review is False
 
 
@@ -177,7 +179,7 @@ def test_exclude_drops_a_feed_whose_every_edge_is_excluded(idx):
     mix = next(f for f in feeds if f.feed_id == "f-mix")
     # Only the local edge remains matched, so the aggregates follow it.
     assert mix.tiers == frozenset({"local"})
-    assert mix.confidence == 0.9
+    assert mix.service.stops == 12
 
 
 def test_selector_aggregation_follows_the_weakest_link(idx):
@@ -229,10 +231,15 @@ def test_a_feed_carries_its_snapshot_id(idx):
     assert next(iter(metro.feeds())).snapshot == "snap-1"
 
 
-def test_min_confidence_filters_edges(idx):
+def test_the_service_level_is_the_pairs_shared_struct(idx):
+    # Whichever tier the query matched, the feed's service in the place is
+    # the same struct; a place without published totals reports none.
     metro = transitio_index.place("Q102", index=idx)
-    feeds = metro.feeds(min_confidence=0.8)
-    assert [f.feed_id for f in feeds] == ["f-mix", "f-nat"]
+    by_id = {f.feed_id: f for f in metro.feeds(tiers=["national"])}
+    assert by_id["f-mix"].service.routes == 2
+    assert by_id["f-nat"].service.departures_per_day == 6.0
+    assert metro.service.feeds == 0
+    assert metro.service.stops is None
 
 
 def test_the_license_block_comes_from_the_atlas_record(idx):
@@ -247,12 +254,12 @@ def test_to_geodataframe_tabulates_the_feeds(idx):
     frame = metro.feeds().to_geodataframe()
     assert len(frame) == 3
     assert set(frame["feed_id"]) == {"f-city", "f-mix", "f-nat"}
-    assert "confidence" in frame.columns
+    assert frame.set_index("feed_id").loc["f-mix", "departures_per_day"] == 400.0
     # An empty result keeps the documented columns.
     empty = metro.feeds(spec=["nonexistent"]).to_geodataframe()
     assert len(empty) == 0
     assert "feed_id" in empty.columns
-    assert "confidence" in empty.columns
+    assert "departures_per_day" in empty.columns
 
 
 def test_a_bare_city_name_promotes_and_finds_the_declared_feed(idx):
