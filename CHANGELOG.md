@@ -10,7 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - The index release contract (`transitio.index.release`): each snapshot is
-  its own GitHub release tagged `index-<snapshot_id>` holding the archive,
+  its own GitHub release in the `transitio-dev/transitio-index` repository,
+  tagged `index-<snapshot_id>` and holding the archive,
   its `.sha256` and an immutable `manifest.json`, and the rule for picking
   the newest release a reader supports. `scripts/publish_index.py` packs a
   built index deterministically, creates the release as a draft, uploads and

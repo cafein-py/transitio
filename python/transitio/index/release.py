@@ -1,14 +1,19 @@
 """The release contract a published index snapshot follows.
 
-Each snapshot is its own GitHub release, tagged ``index-<snapshot_id>``, holding
-the archive ``transitio-index-<snapshot_id>.tar.gz``, its ``.sha256`` and an
-immutable ``manifest.json``. The publisher (``scripts/publish_index.py``) writes
-them; the refresh side lists releases and takes the newest one whose manifest
-declares a schema this reader supports. Both sides share the names and the
-selection rule here, so they cannot drift apart.
+Each snapshot is its own GitHub release in the index repository
+(``transitio-dev/transitio-index``, the home of the build, never the code
+repository), tagged ``index-<snapshot_id>``, holding the archive
+``transitio-index-<snapshot_id>.tar.gz``, its ``.sha256`` and an immutable
+``manifest.json``. The publisher (``scripts/publish_index.py``) writes them;
+the refresh side lists releases and takes the newest one whose manifest
+declares a schema this reader supports. Both sides share the names, the
+selection rule and the HTTP helpers here, so they cannot drift apart.
 """
 
+import json
 import re
+
+import httpx
 
 __all__ = [
     "API_URL",
@@ -23,10 +28,19 @@ __all__ = [
     "compatible",
     "candidates",
     "newest_compatible",
+    "list_releases",
+    "download",
+    "read_manifest",
+    "MAX_MANIFEST_BYTES",
+    "MAX_ASSET_BYTES",
 ]
 
 API_URL = "https://api.github.com"
-DEFAULT_REPOSITORY = "cafein-py/transitio"
+DEFAULT_REPOSITORY = "transitio-dev/transitio-index"
+# GitHub caps release assets at 2 GiB; an index is a few MB, a manifest a
+# few hundred bytes.
+MAX_ASSET_BYTES = 2 * 1024 * 1024 * 1024
+MAX_MANIFEST_BYTES = 1024 * 1024
 TAG_PREFIX = "index-"
 MANIFEST_NAME = "manifest.json"
 CHECKSUM_SUFFIX = ".sha256"
@@ -139,3 +153,62 @@ def newest_compatible(releases, read_manifest):
             continue
         return release, manifest, skipped
     return None, None, skipped
+
+
+class ReleaseError(RuntimeError):
+    """A release could not be listed or an asset read."""
+
+
+def _check(response, what):
+    if response.status_code // 100 != 2:
+        raise ReleaseError(f"{what}: HTTP {response.status_code}")
+    return response
+
+
+def list_releases(client, repository):
+    """The repository's releases as the API lists them, following the
+    redirect GitHub keeps for a moved repository (the client drops any
+    token across hosts)."""
+    try:
+        response = client.get(
+            f"/repos/{repository}/releases",
+            params={"per_page": 100},
+            follow_redirects=True,
+        )
+        return _check(response, "listing the releases").json()
+    except (httpx.HTTPError, ValueError) as error:
+        raise ReleaseError(f"listing the releases: {error}") from error
+
+
+def download(client, url, what, limit=MAX_ASSET_BYTES):
+    """An asset's bytes, streamed up to ``limit`` and refused beyond it,
+    following GitHub's redirect to its object store."""
+    chunks = []
+    size = 0
+    try:
+        with client.stream(
+            "GET",
+            url,
+            headers={"Accept": "application/octet-stream"},
+            follow_redirects=True,
+        ) as response:
+            _check(response, what)
+            for chunk in response.iter_bytes():
+                size += len(chunk)
+                if size > limit:
+                    raise ReleaseError(f"{what}: larger than {limit} bytes")
+                chunks.append(chunk)
+    except httpx.HTTPError as error:
+        raise ReleaseError(f"{what}: {error}") from error
+    return b"".join(chunks)
+
+
+def read_manifest(client, asset):
+    """A release manifest read as a client would, or None when unreadable."""
+    try:
+        data = download(
+            client, asset["browser_download_url"], "manifest", MAX_MANIFEST_BYTES
+        )
+        return json.loads(data.decode("utf-8"))
+    except (ReleaseError, KeyError, ValueError):
+        return None
