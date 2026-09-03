@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+
+- Index schema version 3: `feeds.parquet` carries the crawl evidence
+  (`coverage` hull, `stop_count`, `etag`, `last_modified`, `last_crawled`,
+  `crawl_status`) and `snapshot.json` records the `discovery_semantics_version`
+  the build used, the oldest transitio that reads the schema
+  (`min_reader_version`) and the version that built it (`built_with`).
+  Every `IndexedFeed` exposes its `provenance` (the
+  snapshot id, the reader's discovery semantics version and the transitio
+  version) so a reproduction can say whether it is exact. Older snapshots are
+  refused with an upgrade message.
+
 ### Added
 
 - `Place.feeds()` and the `IndexedFeed` object — the feeds serving a place,

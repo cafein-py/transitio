@@ -18,6 +18,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import stat
 from pathlib import Path
 
@@ -38,11 +39,22 @@ __all__ = [
     "place",
     "places",
     "SUPPORTED_SCHEMA_VERSIONS",
+    "MIN_READER_VERSIONS",
+    "DISCOVERY_SEMANTICS_VERSION",
 ]
 
 # The index schema versions this reader understands. A snapshot outside the set
 # is refused rather than read against columns that may have moved.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({2})
+SUPPORTED_SCHEMA_VERSIONS = frozenset({3})
+
+# The oldest transitio that reads each schema version: what a snapshot records
+# as its reader floor, fixed per schema rather than taken from the build.
+MIN_READER_VERSIONS = {3: "0.11.0"}
+
+# Bumped whenever name resolution, ranking, promotion or filtering changes:
+# the snapshot pins the data, this pins how the reader interprets it, and a
+# result that records both (with the transitio version) is reproducible.
+DISCOVERY_SEMANTICS_VERSION = 1
 
 FEEDS_FILE = "feeds.parquet"
 PLACES_FILE = "places.parquet"
@@ -56,7 +68,7 @@ _MAX_FEEDS_BYTES = 512 * 1024 * 1024
 _MAX_PLACES_BYTES = 512 * 1024 * 1024
 _MAX_EDGES_BYTES = 512 * 1024 * 1024
 
-# The columns a schema_version 2 feeds table carries. A correctly-hashed but
+# The columns a schema_version 3 feeds table carries. A correctly-hashed but
 # structurally wrong Parquet is refused against this rather than misread later.
 _SCHEMA_COLUMNS = frozenset(
     {
@@ -78,11 +90,17 @@ _SCHEMA_COLUMNS = frozenset(
         "crawlable",
         "uncrawlable_reason",
         "coverage_source",
+        "coverage",
+        "stop_count",
+        "etag",
+        "last_modified",
+        "last_crawled",
+        "crawl_status",
         "snapshot",
     }
 )
 
-# The columns a schema_version 2 edges table carries.
+# The columns a schema_version 3 edges table carries.
 _EDGES_COLUMNS = frozenset(
     {
         "place_id",
@@ -105,7 +123,7 @@ _EDGES_COLUMNS = frozenset(
     }
 )
 
-# The columns a schema_version 2 places table carries, geometry included.
+# The columns a schema_version 3 places table carries, geometry included.
 _PLACES_COLUMNS = frozenset(
     {
         "place_id",
@@ -220,6 +238,11 @@ class Index:
     def schema_version(self):
         return self.snapshot["schema_version"]
 
+    @property
+    def discovery_semantics_version(self):
+        """The discovery semantics the snapshot was built under."""
+        return self.snapshot.get("discovery_semantics_version")
+
     def __repr__(self):
         places = "None" if self.places is None else len(self.places)
         edges = "None" if self.edges is None else len(self.edges)
@@ -263,6 +286,7 @@ def read_index(path):
             f"feed index schema_version {version!r} is not one this transitio "
             f"reads ({sorted(SUPPORTED_SCHEMA_VERSIONS)}); upgrade transitio"
         )
+    _check_reader_range(snapshot, path)
     if not isinstance(snapshot.get("snapshot_id"), str):
         raise IncompatibleIndexError(
             f"{path / SNAPSHOT_FILE}: manifest declares no snapshot_id"
@@ -340,6 +364,69 @@ def _read_edges(path, snapshot, version):
     _check_columns(edges, _EDGES_COLUMNS, path / EDGES_FILE, version, "edges")
     _check_snapshot_column(edges, snapshot, path / EDGES_FILE, "edges")
     return edges
+
+
+# Version components are bounded: the manifest is an untrusted input and an
+# unbounded digit run would be a slow or refused int() rather than a version.
+_VERSION = re.compile(
+    r"(?P<release>\d{1,9}(?:\.\d{1,9}){0,7})"
+    r"(?:[-.]?(?P<pre>a|b|rc|alpha|beta|dev)\.?(?P<pre_n>\d{0,9}))?"
+    r"(?:\.post(?P<post>\d{1,9}))?"
+    r"(?:\+[0-9A-Za-z.]{1,64})?"
+)
+_MAX_VERSION_LENGTH = 128
+# Pre-release labels in their standard order, below a final release.
+_PRE_RANK = {"dev": 0, "a": 1, "alpha": 1, "b": 2, "beta": 2, "rc": 3}
+_FINAL = 4
+
+
+def _version_key(version):
+    """A comparable key for a version, or None when it is not one: the
+    release numbers, then finals above pre-releases, then the post number."""
+    text = str(version).strip()
+    match = _VERSION.fullmatch(text) if len(text) <= _MAX_VERSION_LENGTH else None
+    if match is None:
+        return None
+    release = tuple(int(part) for part in match.group("release").split("."))
+    while len(release) > 1 and release[-1] == 0:
+        release = release[:-1]
+    if match.group("pre") is None:
+        pre = (_FINAL, 0)
+    else:
+        pre = (_PRE_RANK[match.group("pre")], int(match.group("pre_n") or 0))
+    return (release, pre, int(match.group("post") or 0))
+
+
+def _check_reader_range(snapshot, path):
+    """A schema-3 manifest names the discovery semantics it was built under
+    and the transitio version that introduced its schema; a reader older
+    than that refuses rather than misreads, and a manifest without them is
+    incomplete."""
+    semantics = snapshot.get("discovery_semantics_version")
+    if not isinstance(semantics, int) or isinstance(semantics, bool):
+        raise IncompatibleIndexError(
+            f"{path / SNAPSHOT_FILE}: manifest declares no discovery_semantics_version"
+        )
+    minimum = snapshot.get("min_reader_version")
+    if not isinstance(minimum, str) or _version_key(minimum) is None:
+        raise IncompatibleIndexError(
+            f"{path / SNAPSHOT_FILE}: manifest declares no min_reader_version"
+        )
+    from transitio import __version__
+
+    current = _version_key(__version__)
+    if current is None:
+        # Fail closed: a reader that cannot place itself cannot vouch for
+        # its compatibility.
+        raise IncompatibleIndexError(
+            f"this transitio's version {__version__!r} cannot be compared with "
+            f"the index's min_reader_version {minimum!r}"
+        )
+    if current < _version_key(minimum):
+        raise IncompatibleIndexError(
+            f"feed index needs transitio >= {minimum} (this is {__version__}); "
+            "upgrade transitio"
+        )
 
 
 def _coerce_index(index):
