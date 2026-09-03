@@ -150,6 +150,38 @@ class IndexedFeed:
         return _scalar(self._row.get("snapshot"))
 
     @property
+    def provenance(self):
+        """What a reproduction must match to be exact: the snapshot id, the
+        reader's discovery semantics version and the transitio version."""
+        from transitio import __version__
+        from transitio.index import DISCOVERY_SEMANTICS_VERSION
+
+        return {
+            "snapshot": self.snapshot,
+            "discovery_semantics_version": DISCOVERY_SEMANTICS_VERSION,
+            "transitio_version": __version__,
+        }
+
+    @property
+    def coverage(self):
+        """The feed's published coverage geometry as WKB — the crawled stop
+        hull, or the declared coverage — or None without one."""
+        return _scalar(self._row.get("coverage"))
+
+    @property
+    def stop_count(self):
+        value = _scalar(self._row.get("stop_count"))
+        return None if value is None else int(value)
+
+    @property
+    def crawl_status(self):
+        return _scalar(self._row.get("crawl_status"))
+
+    @property
+    def last_crawled(self):
+        return _scalar(self._row.get("last_crawled"))
+
+    @property
     def license(self):
         """The feed's verbatim licence block, from its Atlas record, or None."""
         atlas = _parse(self._row.get("atlas"))
@@ -207,10 +239,11 @@ class FeedList(list):
     def to_geodataframe(self):
         """The feeds as a GeoDataFrame, one row per feed.
 
-        The geometry column is empty for now: per-feed coverage geometry (the
-        crawled stop hull) is not part of the index yet.
+        The geometry is each feed's published coverage (the crawled stop
+        hull, or the declared coverage); a feed without one has none.
         """
         import geopandas
+        import shapely
 
         columns = (
             "feed_id",
@@ -243,9 +276,11 @@ class FeedList(list):
         ]
         # Built column-wise so an empty result keeps the documented columns.
         data = {column: [row[column] for row in rows] for column in columns}
-        return geopandas.GeoDataFrame(
-            data, geometry=[None] * len(rows), crs="EPSG:4326"
-        )
+        hulls = [
+            None if feed.coverage is None else shapely.from_wkb(feed.coverage)
+            for feed in self
+        ]
+        return geopandas.GeoDataFrame(data, geometry=hulls, crs="EPSG:4326")
 
 
 def _matched(edges, tiers, exclude, on_unknown):
