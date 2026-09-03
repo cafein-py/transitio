@@ -151,12 +151,42 @@ _PLACES_COLUMNS = frozenset(
 )
 
 
+# What a table may declare before it is materialised: the on-disk ceiling
+# bounds the file, not the memory a highly compressed file expands into.
+_MAX_TABLE_ROWS = 20_000_000
+_MAX_TABLE_ROW_GROUPS = 10_000
+_MAX_TABLE_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
+
+
 def _load_table(read, data, path, table):
     """Read Parquet bytes into a frame, or refuse with a controlled error.
 
-    A correctly-hashed but unreadable table — a duplicated column label, a
+    The file's own metadata is checked first — rows, row groups and the
+    uncompressed size it declares — so a small file that would expand far
+    past the on-disk ceiling is refused before anything is allocated. A
+    correctly-hashed but unreadable table — a duplicated column label, a
     truncated page — otherwise escapes as a raw Arrow exception.
     """
+    import pyarrow.parquet
+
+    try:
+        metadata = pyarrow.parquet.ParquetFile(io.BytesIO(data)).metadata
+        declared = sum(
+            metadata.row_group(i).total_byte_size
+            for i in range(metadata.num_row_groups)
+        )
+    except Exception as error:
+        raise IncompatibleIndexError(f"{path}: not a readable {table} table ({error})")
+    if (
+        metadata.num_rows > _MAX_TABLE_ROWS
+        or metadata.num_row_groups > _MAX_TABLE_ROW_GROUPS
+        or declared > _MAX_TABLE_UNCOMPRESSED_BYTES
+    ):
+        raise IncompatibleIndexError(
+            f"{path}: the {table} table declares more than this reader loads "
+            f"({metadata.num_rows} rows, {metadata.num_row_groups} row groups, "
+            f"{declared} uncompressed bytes)"
+        )
     try:
         return read(io.BytesIO(data))
     except Exception as error:
@@ -164,7 +194,10 @@ def _load_table(read, data, path, table):
 
 
 def _check_columns(frame, expected, path, version, table):
-    """Refuse a table whose column labels are not exactly ``expected``."""
+    """Refuse a table whose column labels are not exactly ``expected``, each
+    once: a duplicated label would reach callers as a two-column frame."""
+    if not frame.columns.is_unique:
+        raise IncompatibleIndexError(f"{path}: {table} has duplicate columns")
     columns = set(frame.columns)
     if columns != expected:
         raise IncompatibleIndexError(
@@ -180,7 +213,9 @@ def _check_snapshot_column(frame, snapshot, path, table):
     The rows surface the id through the public API, so a divergence would report
     two different snapshots for one index.
     """
-    if not (frame["snapshot"] == snapshot["snapshot_id"]).all():
+    # A null never equals the id, and ``all()`` must not skip it as missing.
+    matches = frame["snapshot"] == snapshot["snapshot_id"]
+    if matches.isna().any() or not bool(matches.all()):
         raise IncompatibleIndexError(
             f"{path}: {table} rows carry a snapshot other than the manifest's "
             f"snapshot_id"
@@ -195,9 +230,17 @@ def _read_regular(path, limit):
     between the check and the read cannot slip a symlink or special file past it.
     ``O_NONBLOCK`` keeps a FIFO named in place of a file from blocking the open
     until a writer appears — it opens, is seen not to be regular, and is refused.
-    Windows lacks ``O_NOFOLLOW`` and follows a symlink here — its symlinks need
-    privilege to create, the residual the build store also accepts.
+    Windows lacks ``O_NOFOLLOW``, so there the name is checked for a reparse
+    point (a symlink or junction) before the open; the window between that
+    check and the open is the residual the build store also accepts.
     """
+    if os.name == "nt":
+        try:
+            attributes = getattr(os.lstat(path), "st_file_attributes", 0)
+        except OSError as error:
+            raise IncompatibleIndexError(f"{path}: cannot read ({error.strerror})")
+        if attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
+            raise IncompatibleIndexError(f"{path}: not a regular file")
     flags = (
         os.O_RDONLY
         | getattr(os, "O_NOFOLLOW", 0)
@@ -261,8 +304,9 @@ def read_index(path):
     is refused before the larger file is touched, and the Parquet's bytes are
     checked against the ``feeds_sha256`` the manifest records. That match proves
     the Parquet and manifest are the paired halves of one build — not that the
-    build is authentic; authenticating a downloaded snapshot against its release
-    checksum is a later addition. Each file is read as a size-bounded regular
+    build is authentic; :func:`refresh` additionally checks a downloaded archive
+    against the digest its release manifest declares. Each file is read as a
+    size-bounded regular
     file, so a symlinked or over-large one is refused rather than followed. The
     manifest's ``snapshot_id`` and the Parquet's columns are checked against the
     schema version, so a structurally wrong but correctly-hashed index is refused
@@ -271,9 +315,16 @@ def read_index(path):
     import pandas
 
     path = Path(path)
-    snapshot = json.loads(
-        _read_regular(path / SNAPSHOT_FILE, _MAX_SNAPSHOT_BYTES).decode("utf-8")
-    )
+    try:
+        snapshot = json.loads(
+            _read_regular(path / SNAPSHOT_FILE, _MAX_SNAPSHOT_BYTES).decode("utf-8")
+        )
+    except ValueError as error:
+        raise IncompatibleIndexError(
+            f"{path / SNAPSHOT_FILE}: not a JSON manifest: {error}"
+        ) from error
+    if not isinstance(snapshot, dict):
+        raise IncompatibleIndexError(f"{path / SNAPSHOT_FILE}: not a JSON object")
     version = snapshot.get("schema_version")
     # A real int only: bool is an int subclass and ``True == 1``, and ``1.0``
     # also equals ``1``, so a malformed version must not slip through.
@@ -394,7 +445,9 @@ def _version_key(version):
         pre = (_FINAL, 0)
     else:
         pre = (_PRE_RANK[match.group("pre")], int(match.group("pre_n") or 0))
-    return (release, pre, int(match.group("post") or 0))
+    # An absent post segment sorts below every explicit one, ``.post0`` included.
+    post = match.group("post")
+    return (release, pre, (0, 0) if post is None else (1, int(post)))
 
 
 def _check_reader_range(snapshot, path):
