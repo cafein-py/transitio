@@ -7,11 +7,12 @@ An index is a directory of ``feeds.parquet`` (one row per feed), an optional
 :class:`Index` exposing the manifest, the feeds as a DataFrame, the places as a
 GeoDataFrame and the edges as a DataFrame (``None`` for tables the build
 predates). Building an index is a maintainer step
-(``scripts/build_index.py --stage publish``); discovering and refreshing bundled
-snapshots is a later addition.
+(``scripts/build_index.py --stage publish``).
 
 Only schema versions this transitio understands are accepted, so a newer index
-is refused with a clear upgrade message rather than misread.
+is refused with a clear upgrade message rather than misread. :func:`refresh`
+installs the newest published snapshot this reader supports and :func:`use`
+selects among installed ones; a query given no index reads the active one.
 """
 
 import hashlib
@@ -22,11 +23,7 @@ import re
 import stat
 from pathlib import Path
 
-from transitio.exceptions import (
-    IncompatibleIndexError,
-    PlaceNotFoundError,
-    TransitioError,
-)
+from transitio.exceptions import IncompatibleIndexError, PlaceNotFoundError
 from transitio.index.feeds import IndexedFeed, Selector
 from transitio.index.places import Place, _PlaceLookup
 
@@ -38,6 +35,9 @@ __all__ = [
     "read_index",
     "place",
     "places",
+    "refresh",
+    "use",
+    "installed",
     "SUPPORTED_SCHEMA_VERSIONS",
     "MIN_READER_VERSIONS",
     "DISCOVERY_SEMANTICS_VERSION",
@@ -430,8 +430,12 @@ def _check_reader_range(snapshot, path):
 
 
 def _coerce_index(index):
+    """The index a query reads: the one given (an :class:`Index` or a path),
+    else the active installed snapshot, resolved lazily."""
     if index is None:
-        raise TransitioError("no active feed index; pass index=<path to a built index>")
+        from transitio.index._refresh import active_index
+
+        return active_index()
     if isinstance(index, Index):
         return index
     return read_index(index)
@@ -471,3 +475,6 @@ def place(query, *, kind=None, index=None):
 def places(query, *, index=None):
     """The places matching ``query``, ranked best first (never promoted)."""
     return _lookup_for(_coerce_index(index)).search(query)
+
+
+from transitio.index._refresh import installed, refresh, use  # noqa: E402

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `transitio.index.refresh()` installs the newest published index snapshot
+  this transitio reads into the platformdirs cache — the archive is
+  downloaded, checked against the digest its release manifest declares,
+  unpacked defensively (expected members only, regular files, size
+  ceilings), validated by the reader and activated by one atomic rename,
+  with the three newest snapshots kept — and `transitio.index.use()` selects
+  an installed snapshot for the current process. Which snapshot a query
+  reads is resolved on first use: the `use()` selection, then the
+  `TRANSITIO_INDEX_SNAPSHOT` environment variable, then the newest
+  compatible installed snapshot. `place()`, `places()` and `Place.feeds()`
+  read the active snapshot when no index is passed.
+
 - The index release contract (`transitio.index.release`): each snapshot is
   its own GitHub release in the `transitio-dev/transitio-index` repository,
   tagged `index-<snapshot_id>` and holding the archive,
