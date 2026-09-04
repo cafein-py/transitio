@@ -22,8 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   asserts that none survived; `IndexedFeed.redistribution_allowed` exposes
   the judgement. A place without a boundary of its own is given the buffered
   union of the redistributable coverage hulls of its feeds, labelled
-  `geometry_source = "derived_from_feeds"`; places still without one are
-  counted in the stage manifest.
+  `geometry_source = "derived_from_feeds"`. A place still without one is not
+  published: its edges are rehomed to the nearest published administrative
+  ancestor, else the published country of its `country_code`, merging with
+  an edge already there column by column (`rehomed_from`, `merged_evidence`
+  and `curation_history` record the origin); a feed left with no edge is
+  listed in the manifest's `feeds_without_edges`. The pruning closure is
+  re-applied and every foreign key checked before the artifacts are written.
 
 - `transitio.index.refresh()` installs the newest published index snapshot
   this transitio reads into the platformdirs cache — the archive is
