@@ -10,9 +10,9 @@ installed snapshots for this process only: it writes nothing to disk.
 
 Which snapshot a query reads is resolved lazily on first index access, never
 at import: an active :func:`use` selection, then the ``TRANSITIO_INDEX_SNAPSHOT``
-environment variable, then the newest compatible installed snapshot. Nothing
-installed is an error that says to run :func:`refresh`, since no snapshot is
-bundled with the wheel yet.
+environment variable, then the newest compatible installed snapshot, then the
+index bundled in the wheel. Nothing installed and nothing bundled is an error
+that says to run :func:`refresh`.
 """
 
 import contextlib
@@ -141,13 +141,8 @@ def _verified(root, snapshot_id):
     if _installed_snapshot(root, snapshot_id) is None:
         return False
     path = _snapshots(root) / snapshot_id
-    for name in contract.MEMBERS:
-        try:
-            info = os.lstat(path / name)
-        except OSError:
-            return False
-        if not stat.S_ISREG(info.st_mode) or info.st_size > _MEMBER_LIMITS[name]:
-            return False
+    if not _whole_members(path):
+        return False
     try:
         index = read_index(path)
     except (TransitioError, ValueError, OSError):
@@ -157,6 +152,20 @@ def _verified(root, snapshot_id):
         and index.places is not None
         and index.edges is not None
     )
+
+
+def _whole_members(path):
+    """Every release member present at ``path`` as a bounded regular file
+    (never a symlink or an over-large one) -- the licence ``NOTICE`` among
+    them, since it is authoritative for the snapshot."""
+    for name in contract.MEMBERS:
+        try:
+            info = os.lstat(path / name)
+        except OSError:
+            return False
+        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= _MEMBER_LIMITS[name]:
+            return False
+    return True
 
 
 def installed(*, cache_dir=None):
@@ -244,11 +253,14 @@ def _load(root, snapshot_id):
 
     lock = _hold(root, snapshot_id)
     try:
-        if _installed_snapshot(root, snapshot_id) is None:
+        path = _snapshots(root) / snapshot_id
+        if _installed_snapshot(root, snapshot_id) is None or not _whole_members(path):
             raise TransitioError("not installed")
-        index = read_index(_snapshots(root) / snapshot_id)
+        index = read_index(path)
         if index.snapshot_id != snapshot_id:
             raise TransitioError("names another snapshot")
+        if index.places is None or index.edges is None:
+            raise TransitioError("not whole")
     except (TransitioError, ValueError, OSError):
         # Not installed, or not whole: a candidate to pass over, and for a
         # pin the caller's error says to refresh.
@@ -262,10 +274,49 @@ def _load(root, snapshot_id):
     return index, lock
 
 
+def _bundled_root():
+    """The directory the wheel bundles the index into, beside this package.
+    A wheel with a compiled extension is never zip-imported, so the package
+    files are always a real directory on disk."""
+    import importlib.resources
+
+    return Path(str(importlib.resources.files("transitio.index")))
+
+
+def _bundled():
+    """The index bundled in the wheel as ``(Index, None)``, or ``(None, None)``
+    when none was shipped or it cannot be read or is incompatible. It carries
+    no lock: it is read-only package data that no refresh prunes."""
+    from transitio.index import read_index
+
+    try:
+        root = _bundled_root()
+    except (ImportError, TypeError, OSError):
+        return None, None
+    # Whole like an installed snapshot -- every member present, the licence
+    # NOTICE included -- with a readable places-and-edges index; a partial
+    # bundle is no more use than an uninstalled one.
+    if not _whole_members(root):
+        return None, None
+    try:
+        index = read_index(root)
+    except (TransitioError, ValueError, OSError):
+        return None, None
+    # Licensed like a released snapshot: a development build can be whole yet
+    # carry ``licensed: false``, which the release publisher refuses, so the
+    # wheel must not activate one either.
+    if index.places is None or index.edges is None:
+        return None, None
+    if index.snapshot.get("licensed") is not True:
+        return None, None
+    return index, None
+
+
 def active_index(*, cache_dir=None):
     """The :class:`~transitio.index.Index` queries read when none is passed,
     resolved lazily: the :func:`use` selection, then ``TRANSITIO_INDEX_SNAPSHOT``,
-    then the newest compatible installed snapshot."""
+    then the newest compatible installed snapshot, then the index bundled in
+    the wheel."""
     root, pinned = _pinned(cache_dir)
     if pinned is not None and not contract.is_snapshot_id(pinned):
         raise TransitioError(f"{SNAPSHOT_ENV}: not a snapshot id: {pinned!r}")
@@ -280,6 +331,10 @@ def active_index(*, cache_dir=None):
     if pinned is not None:
         index, lock = _load(root, pinned)
         if index is None:
+            index, lock = _bundled()
+            if index is not None and index.snapshot_id != pinned:
+                index, lock = None, None
+        if index is None:
             raise TransitioError(
                 f"snapshot {pinned} is not installed; run transitio.index.refresh()"
             )
@@ -291,6 +346,8 @@ def active_index(*, cache_dir=None):
             index, lock = _load(root, snapshot_id)
             if index is not None:
                 break
+        if index is None:
+            index, lock = _bundled()
         if index is None:
             raise TransitioError(
                 "no compatible feed index snapshot is installed; run "
@@ -398,6 +455,10 @@ def _install(root, snapshot_id, data):
             )
         if index.places is None or index.edges is None:
             raise DownloadError("the snapshot lacks its places or edges table")
+        # read_index never reads NOTICE, so an archive with an empty licence
+        # NOTICE reads back fine; the wholeness check keeps it from activating.
+        if not _whole_members(staging):
+            raise DownloadError("the downloaded snapshot is not whole")
         target = snapshots / snapshot_id
         if target.exists() or target.is_symlink():
             if _verified(root, snapshot_id):

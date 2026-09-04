@@ -1,12 +1,13 @@
 [build-system]
-requires = ["maturin>=1.7,<2"]
+requires = ["maturin>=1.8,<2"]
 build-backend = "maturin"
 
 [project]
 name = "transitio"
 description = "AOI-driven OSM and GTFS acquisition, validation and repair — companion to pyrosm and cafein"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Henrikki Tenkanen" }]
 requires-python = ">=3.10"
 dependencies = [
@@ -26,7 +27,6 @@ dependencies = [
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -55,7 +55,13 @@ Changelog = "https://github.com/cafein-py/transitio/blob/main/CHANGELOG.md"
 manifest-path = "crates/transitio-py/Cargo.toml"
 python-source = "python"
 module-name = "transitio._core"
-include = [{ path = "LICENSE", format = "sdist" }]
+# LICENSE and NOTICE ship in both the sdist and the wheel; the index files
+# are bundled when a build populates them (see transitio.index).
+include = [
+    "python/transitio/index/*.parquet",
+    "python/transitio/index/snapshot.json",
+    "python/transitio/index/NOTICE",
+]
 
 [tool.black]
 include = '(python/transitio|scripts|tests)/.*\.py$'

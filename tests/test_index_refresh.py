@@ -343,3 +343,88 @@ def test_a_damaged_install_is_replaced_and_a_forged_one_is_not_used(tmp_path):
     with pytest.raises(TransitioError, match="not installed"):
         client.use("0000000000000003")
     assert [s for s, _ in client.installed()] == [snapshot_id]
+
+
+def test_active_index_falls_back_to_the_bundled_index(tmp_path, monkeypatch):
+    bundled = _index(tmp_path)
+    snapshot_id = json.loads((bundled / "snapshot.json").read_text())["snapshot_id"]
+    monkeypatch.setattr(client, "_bundled_root", lambda: bundled)
+    # No selection, no pin, an empty cache: the bundled index is the last resort.
+    assert client.active_index().snapshot_id == snapshot_id
+    # An env pin to the bundled id resolves to it even with an empty cache.
+    monkeypatch.setattr(client, "_state", {key: None for key in client._state})
+    monkeypatch.setenv(client.SNAPSHOT_ENV, snapshot_id)
+    assert client.active_index().snapshot_id == snapshot_id
+
+
+def test_no_bundle_and_empty_cache_says_to_refresh(tmp_path, monkeypatch):
+    monkeypatch.setattr(client, "_bundled_root", lambda: tmp_path / "nothing")
+    with pytest.raises(TransitioError, match="run transitio.index.refresh"):
+        client.active_index()
+
+
+def test_a_feeds_only_bundle_is_not_used(tmp_path, monkeypatch):
+    bundled = _index(tmp_path)
+    # A whole index, but drop its places so the layout is feeds-only.
+    (bundled / "places.parquet").unlink()
+    monkeypatch.setattr(client, "_bundled_root", lambda: bundled)
+    with pytest.raises(TransitioError, match="run transitio.index.refresh"):
+        client.active_index()
+
+
+def test_a_bundle_without_its_notice_is_not_used(tmp_path, monkeypatch):
+    bundled = _index(tmp_path)
+    # The licence NOTICE is a required member; a bundle missing it is refused.
+    (bundled / "NOTICE").unlink()
+    monkeypatch.setattr(client, "_bundled_root", lambda: bundled)
+    with pytest.raises(TransitioError, match="run transitio.index.refresh"):
+        client.active_index()
+
+
+def test_a_whole_but_unlicensed_bundle_is_not_used(tmp_path, monkeypatch):
+    bundled = _index(tmp_path)
+    manifest = json.loads((bundled / "snapshot.json").read_text())
+    manifest["licensed"] = False
+    (bundled / "snapshot.json").write_text(json.dumps(manifest))
+    monkeypatch.setattr(client, "_bundled_root", lambda: bundled)
+    with pytest.raises(TransitioError, match="run transitio.index.refresh"):
+        client.active_index()
+
+
+def test_a_damaged_cache_snapshot_is_passed_over(tmp_path):
+    # A cache snapshot readable by read_index but missing a required member
+    # (its NOTICE) is not whole, so active_index passes it over rather than
+    # activating data without its attribution or masking a bundle behind it.
+    import shutil
+
+    built = _index(tmp_path)
+    snapshot_id = json.loads((built / "snapshot.json").read_text())["snapshot_id"]
+    installed = client._snapshots(client.cache_root()) / snapshot_id
+    installed.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(built, installed)
+    (installed / "NOTICE").unlink()
+    with pytest.raises(TransitioError, match="run transitio.index.refresh"):
+        client.active_index()
+
+
+def test_a_bundle_with_an_empty_notice_is_not_used(tmp_path, monkeypatch):
+    bundled = _index(tmp_path)
+    # Present but empty: it carries no attribution, so the bundle is not whole.
+    (bundled / "NOTICE").write_bytes(b"")
+    monkeypatch.setattr(client, "_bundled_root", lambda: bundled)
+    with pytest.raises(TransitioError, match="run transitio.index.refresh"):
+        client.active_index()
+
+
+def test_an_archive_with_an_empty_notice_is_refused(tmp_path):
+    # A complete, readable archive whose licence NOTICE is empty must not
+    # install: read_index never reads NOTICE, so the wholeness check catches it.
+    built = _index(tmp_path)
+    members = {name: (built / name).read_bytes() for name in contract.MEMBERS}
+    members["NOTICE"] = b""
+    snapshot_id = json.loads((built / "snapshot.json").read_text())["snapshot_id"]
+    fake = FakeGitHub()
+    _seed_archive(fake, snapshot_id, _tar(members))
+    with pytest.raises(DownloadError, match="not whole"):
+        _refresh(fake)
+    assert client.installed() == []
