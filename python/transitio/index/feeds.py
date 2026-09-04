@@ -182,6 +182,13 @@ class IndexedFeed:
         return _scalar(self._row.get("last_crawled"))
 
     @property
+    def redistribution_allowed(self):
+        """Whether the feed's licence permits redistributing data derived
+        from it, as the build judged it; None when unknown."""
+        value = _scalar(self._row.get("redistribution_allowed"))
+        return None if value is None else bool(value)
+
+    @property
     def license(self):
         """The feed's verbatim licence block, from its Atlas record, or None."""
         atlas = _parse(self._row.get("atlas"))

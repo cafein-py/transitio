@@ -57,7 +57,7 @@ def _seed_archive(fake, snapshot_id, archive, *, manifest=None, tag=None):
     for exactly them, so the archive's own content is what is tested."""
     body = {
         "snapshot_id": snapshot_id,
-        "schema_version": 3,
+        "schema_version": 4,
         "min_reader_version": "0.11.0",
         "archive": {
             "name": contract.archive_name(snapshot_id),

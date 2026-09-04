@@ -45,11 +45,11 @@ __all__ = [
 
 # The index schema versions this reader understands. A snapshot outside the set
 # is refused rather than read against columns that may have moved.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({3})
+SUPPORTED_SCHEMA_VERSIONS = frozenset({4})
 
 # The oldest transitio that reads each schema version: what a snapshot records
 # as its reader floor, fixed per schema rather than taken from the build.
-MIN_READER_VERSIONS = {3: "0.11.0"}
+MIN_READER_VERSIONS = {4: "0.11.0"}
 
 # Bumped whenever name resolution, ranking, promotion or filtering changes:
 # the snapshot pins the data, this pins how the reader interprets it, and a
@@ -68,7 +68,7 @@ _MAX_FEEDS_BYTES = 512 * 1024 * 1024
 _MAX_PLACES_BYTES = 512 * 1024 * 1024
 _MAX_EDGES_BYTES = 512 * 1024 * 1024
 
-# The columns a schema_version 3 feeds table carries. A correctly-hashed but
+# The columns a schema_version 4 feeds table carries. A correctly-hashed but
 # structurally wrong Parquet is refused against this rather than misread later.
 _SCHEMA_COLUMNS = frozenset(
     {
@@ -96,11 +96,12 @@ _SCHEMA_COLUMNS = frozenset(
         "last_modified",
         "last_crawled",
         "crawl_status",
+        "redistribution_allowed",
         "snapshot",
     }
 )
 
-# The columns a schema_version 3 edges table carries.
+# The columns a schema_version 4 edges table carries.
 _EDGES_COLUMNS = frozenset(
     {
         "place_id",
@@ -123,7 +124,7 @@ _EDGES_COLUMNS = frozenset(
     }
 )
 
-# The columns a schema_version 3 places table carries, geometry included.
+# The columns a schema_version 4 places table carries, geometry included.
 _PLACES_COLUMNS = frozenset(
     {
         "place_id",
@@ -451,7 +452,7 @@ def _version_key(version):
 
 
 def _check_reader_range(snapshot, path):
-    """A schema-3 manifest names the discovery semantics it was built under
+    """A schema-4 manifest names the discovery semantics it was built under
     and the transitio version that introduced its schema; a reader older
     than that refuses rather than misreads, and a manifest without them is
     incomplete."""

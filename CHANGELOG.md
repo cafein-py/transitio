@@ -16,7 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   publishes the tables as `*_licensed.jsonl`. Publication reads those when
   the generation is current, ships the `NOTICE` beside the Parquet files and
   records `licensed` in `snapshot.json`; a release is made only from a
-  licensed snapshot.
+  licensed snapshot. The stage judges each feed's `redistribution_allowed`
+  from its declared licence (or a known-permissive SPDX identifier), nulls
+  the coverage hull of a feed whose licence disallows redistribution, and
+  asserts that none survived; `IndexedFeed.redistribution_allowed` exposes
+  the judgement.
 
 - `transitio.index.refresh()` installs the newest published index snapshot
   this transitio reads into the platformdirs cache — the archive is
@@ -43,9 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Index schema version 3: `feeds.parquet` carries the crawl evidence
+- Index schema version 4: `feeds.parquet` carries the crawl evidence
   (`coverage` hull, `stop_count`, `etag`, `last_modified`, `last_crawled`,
-  `crawl_status`) and `snapshot.json` records the `discovery_semantics_version`
+  `crawl_status`) and `redistribution_allowed`, and `snapshot.json` records the `discovery_semantics_version`
   the build used, the oldest transitio that reads the schema
   (`min_reader_version`) and the version that built it (`built_with`).
   Every `IndexedFeed` exposes its `provenance` (the
