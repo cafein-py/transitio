@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The `license` build stage (stage 7) between prune and publish: it reads
+  exactly what publication would read, records every contributing source in
+  `licence_inventory.jsonl` (the geometry audit's rows and the feeds'
+  declared licences), writes the `NOTICE` that ships with the index, and
+  publishes the tables as `*_licensed.jsonl`. Publication reads those when
+  the generation is current, ships the `NOTICE` beside the Parquet files and
+  records `licensed` in `snapshot.json`; a release is made only from a
+  licensed snapshot.
+
 - `transitio.index.refresh()` installs the newest published index snapshot
   this transitio reads into the platformdirs cache — the archive is
   downloaded, checked against the digest its release manifest declares,
