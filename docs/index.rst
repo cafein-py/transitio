@@ -72,6 +72,12 @@ License <https://www.openstreetmap.org/copyright>`__.
 
     reference
 
+.. toctree::
+    :caption: About
+    :maxdepth: 1
+
+    attribution
+
 Indices and tables
 ==================
 

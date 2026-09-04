@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `active_index()` falls back to an index bundled in the wheel when no
+  snapshot is installed and none is pinned, after the `use()` selection,
+  the `TRANSITIO_INDEX_SNAPSHOT` pin and the platformdirs cache. The
+  wheel ships `LICENSE` and `NOTICE`, and the docs carry an attribution
+  page for the index's upstream sources.
+
 - The `license` build stage (stage 7) between prune and publish: it reads
   exactly what publication would read, records every contributing source in
   `licence_inventory.jsonl` (the geometry audit's rows and the feeds'

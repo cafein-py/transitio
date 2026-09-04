@@ -1,0 +1,31 @@
+transitio
+Copyright (c) 2026 Henrikki Tenkanen
+
+This software is licensed under the MIT License; see LICENSE for the terms.
+
+The feed index that transitio bundles and downloads is derived data compiled
+from several open sources. Every built index also carries its own NOTICE file,
+generated when it is built, recording the exact versions and licences of the
+sources that index was built from; that per-snapshot NOTICE travels with the
+index and is authoritative for a given snapshot. The upstream sources are:
+
+  - Transitland Atlas (Interline) -- feed identities, URLs and licences.
+    Licensed CC-BY 4.0; attribution required.
+    https://github.com/transitland/transitland-atlas
+  - Mobility Database catalog (MobilityData) -- feed identities and metadata.
+    https://mobilitydatabase.org/
+  - GBFS systems.csv (MobilityData) -- shared-mobility system identities.
+    https://github.com/MobilityData/gbfs
+  - Overture Maps divisions -- administrative boundary geometry. The divisions
+    theme includes content derived from OpenStreetMap (c) OpenStreetMap
+    contributors, available under the Open Database License (ODbL 1.0), whose
+    share-alike and attribution terms apply to the boundary geometry.
+    https://overturemaps.org/  https://www.openstreetmap.org/copyright
+  - Wikidata -- place identifiers and names, dedicated to the public domain
+    under CC0. https://www.wikidata.org/
+
+A feed's coverage geometry is withheld only where the feed's licence explicitly
+disallows redistribution. A feed whose licence is unknown keeps its coverage
+geometry, and the index's `redistribution_allowed` column records the status
+(true, false or unresolved) the build judged for each feed. The per-snapshot
+NOTICE records the licence judged for each feed.
