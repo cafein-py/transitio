@@ -46,9 +46,7 @@ def test_the_wheel_declares_the_licence_files():
     import re
     from pathlib import Path
 
-    text = (
-        Path(__file__).resolve().parent.parent.joinpath("pyproject.toml").read_text()
-    )
+    text = Path(__file__).resolve().parent.parent.joinpath("pyproject.toml").read_text()
     match = re.search(r"(?m)^license-files = \[(.*?)\]", text)
     assert match, "the license-files list was not found"
     body = match.group(1)
@@ -78,8 +76,14 @@ def test_the_built_wheel_contains_the_licence_files(tmp_path):
     # globs are still exercised. Copying only what maturin reads keeps it cheap.
     src = Path(tempfile.mkdtemp())
     try:
-        for name in ("pyproject.toml", "Cargo.toml", "Cargo.lock", "README.md",
-                     "LICENSE", "NOTICE"):
+        for name in (
+            "pyproject.toml",
+            "Cargo.toml",
+            "Cargo.lock",
+            "README.md",
+            "LICENSE",
+            "NOTICE",
+        ):
             source = repo / name
             if source.exists():
                 shutil.copy2(source, src / name)

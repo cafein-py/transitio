@@ -163,7 +163,10 @@ def _whole_members(path):
             info = os.lstat(path / name)
         except OSError:
             return False
-        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= _MEMBER_LIMITS[name]:
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or not 0 < info.st_size <= _MEMBER_LIMITS[name]
+        ):
             return False
     return True
 
