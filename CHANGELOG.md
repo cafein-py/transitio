@@ -20,7 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from its declared licence (or a known-permissive SPDX identifier), nulls
   the coverage hull of a feed whose licence disallows redistribution, and
   asserts that none survived; `IndexedFeed.redistribution_allowed` exposes
-  the judgement.
+  the judgement. A place without a boundary of its own is given the buffered
+  union of the redistributable coverage hulls of its feeds, labelled
+  `geometry_source = "derived_from_feeds"`; places still without one are
+  counted in the stage manifest.
 
 - `transitio.index.refresh()` installs the newest published index snapshot
   this transitio reads into the platformdirs cache — the archive is
