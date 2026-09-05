@@ -91,19 +91,17 @@ pub fn crop(
         }
     }
 
-    let source_routes: Option<Vec<String>> = result.tables.get("routes.txt").and_then(
-        |table| {
-            column(table, "route_id").map(|i| {
-                table
-                    .rows
-                    .iter()
-                    .map(|row| row.fields[i].clone())
-                    .collect::<std::collections::BTreeSet<String>>()
-                    .into_iter()
-                    .collect()
-            })
-        },
-    );
+    let source_routes: Option<Vec<String>> = result.tables.get("routes.txt").and_then(|table| {
+        column(table, "route_id").map(|i| {
+            table
+                .rows
+                .iter()
+                .map(|row| row.fields[i].clone())
+                .collect::<std::collections::BTreeSet<String>>()
+                .into_iter()
+                .collect()
+        })
+    });
     let kept_trips = select_trips(&result, options, crop_options, area.as_deref())?;
     retain(
         &mut result,
