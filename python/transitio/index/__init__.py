@@ -45,11 +45,12 @@ __all__ = [
 
 # The index schema versions this reader understands. A snapshot outside the set
 # is refused rather than read against columns that may have moved.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({4})
+SUPPORTED_SCHEMA_VERSIONS = frozenset({4, 5})
 
 # The oldest transitio that reads each schema version: what a snapshot records
 # as its reader floor, fixed per schema rather than taken from the build.
-MIN_READER_VERSIONS = {4: "0.11.0"}
+# Schema 5 adds the per-feed ``files`` manifest; both ship first in 0.11.0.
+MIN_READER_VERSIONS = {4: "0.11.0", 5: "0.11.0"}
 
 # Bumped whenever name resolution, ranking, promotion or filtering changes:
 # the snapshot pins the data, this pins how the reader interprets it, and a
@@ -70,6 +71,8 @@ _MAX_EDGES_BYTES = 512 * 1024 * 1024
 
 # The columns a schema_version 4 feeds table carries. A correctly-hashed but
 # structurally wrong Parquet is refused against this rather than misread later.
+# Schema 5 adds the ``files`` manifest; the check is keyed on the snapshot's
+# version below, so a shipped schema-4 index still reads unchanged.
 _SCHEMA_COLUMNS = frozenset(
     {
         "feed_id",
@@ -101,7 +104,10 @@ _SCHEMA_COLUMNS = frozenset(
     }
 )
 
-# The columns a schema_version 4 edges table carries.
+# The feeds columns per schema version: schema 5 adds the ``files`` manifest.
+_FEEDS_COLUMNS = {4: _SCHEMA_COLUMNS, 5: _SCHEMA_COLUMNS | {"files"}}
+
+# The columns an edges table carries, unchanged from schema_version 4 through 5.
 _EDGES_COLUMNS = frozenset(
     {
         "place_id",
@@ -124,7 +130,8 @@ _EDGES_COLUMNS = frozenset(
     }
 )
 
-# The columns a schema_version 4 places table carries, geometry included.
+# The columns a places table carries, geometry included; unchanged from
+# schema_version 4 through 5.
 _PLACES_COLUMNS = frozenset(
     {
         "place_id",
@@ -354,7 +361,7 @@ def read_index(path):
             f"{path / FEEDS_FILE}: does not match the snapshot's feeds_sha256"
         )
     feeds = _load_table(pandas.read_parquet, data, path / FEEDS_FILE, "feeds")
-    _check_columns(feeds, _SCHEMA_COLUMNS, path / FEEDS_FILE, version, "feeds")
+    _check_columns(feeds, _FEEDS_COLUMNS[version], path / FEEDS_FILE, version, "feeds")
     _check_snapshot_column(feeds, snapshot, path / FEEDS_FILE, "feeds")
     return Index(
         snapshot,
@@ -452,8 +459,8 @@ def _version_key(version):
 
 
 def _check_reader_range(snapshot, path):
-    """A schema-4 manifest names the discovery semantics it was built under
-    and the transitio version that introduced its schema; a reader older
+    """A supported-schema manifest names the discovery semantics it was built
+    under and the transitio version that introduced its schema; a reader older
     than that refuses rather than misreads, and a manifest without them is
     incomplete."""
     semantics = snapshot.get("discovery_semantics_version")
