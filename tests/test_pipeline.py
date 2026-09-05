@@ -319,3 +319,397 @@ def test_to_pyrosm_opens_extract(tmp_path, monkeypatch):
     assert isinstance(reader, FakeOSM)
     assert opened["filepath"] == str(pbf)
     assert opened["options"] == {"bounding_box": [24.6, 60.1, 25.2, 60.4]}
+
+
+def test_fetch_requires_exactly_one_of_aoi_or_place():
+    with pytest.raises(ValueError, match="exactly one of aoi= or place="):
+        fetch()
+    with pytest.raises(ValueError, match="exactly one of aoi= or place="):
+        fetch((0, 0, 1, 1), place="X")
+
+
+def test_download_indexed_prefers_mdb_then_atlas(tmp_path):
+    from transitio.exceptions import DownloadError
+    from transitio.pipeline._fetch import _download_indexed
+
+    class _FakeFeed:
+        def __init__(self, feed_id, mdb=None, atlas=None):
+            self.feed_id = feed_id
+            self._row = {"mdb": mdb, "atlas": atlas}
+
+    class _RecordingDB:
+        def __init__(self):
+            self.calls = []
+
+        def download_latest(self, feed, directory=None):
+            self.calls.append(feed.latest_dataset_url)
+            return tmp_path / "mdb.zip"
+
+    class _RecordingAtlas:
+        def __init__(self):
+            self.calls = []
+
+        def download(self, feed, directory=None):
+            self.calls.append(feed.static_url)
+            return tmp_path / "atlas.zip"
+
+    db, atlas = _RecordingDB(), _RecordingAtlas()
+    both = _FakeFeed(
+        "f-a",
+        mdb={"urls": {"direct_download": "https://m/a.zip"}},
+        atlas={"urls": {"static_current": "https://a/a.zip"}},
+    )
+    assert _download_indexed(both, db, atlas, tmp_path).name == "mdb.zip"
+    assert db.calls == ["https://m/a.zip"] and atlas.calls == []
+    only = _FakeFeed("f-b", atlas={"urls": {"static_current": "https://a/b.zip"}})
+    assert _download_indexed(only, db, atlas, tmp_path).name == "atlas.zip"
+    assert atlas.calls == ["https://a/b.zip"]
+    with pytest.raises(DownloadError, match="no downloadable url"):
+        _download_indexed(_FakeFeed("f-c"), db, atlas, tmp_path)
+
+    class _FailingDB:
+        def download_latest(self, feed, directory=None):
+            raise RuntimeError("boom")
+
+    class _FailingAtlas:
+        def download(self, feed, directory=None):
+            raise RuntimeError("nope")
+
+    # MDB present but failing falls back to Atlas.
+    both_urls = _FakeFeed(
+        "f-d",
+        mdb={"urls": {"direct_download": "https://m/d.zip"}},
+        atlas={"urls": {"static_current": "https://a/d.zip"}},
+    )
+    fallback_atlas = _RecordingAtlas()
+    assert (
+        _download_indexed(both_urls, _FailingDB(), fallback_atlas, tmp_path).name
+        == "atlas.zip"
+    )
+    assert fallback_atlas.calls == ["https://a/d.zip"]
+    # Both sources failing reports both.
+    with pytest.raises(DownloadError, match="mdb.*atlas"):
+        _download_indexed(both_urls, _FailingDB(), _FailingAtlas(), tmp_path)
+
+
+def test_fetch_place_selects_downloads_and_processes(tmp_path, monkeypatch):
+    import io as _io
+    import sys as _sys
+
+    _sys.path.insert(
+        0, str(__import__("pathlib").Path(__file__).resolve().parent.parent / "scripts")
+    )
+    import transitio.index as transitio_index
+    from index_build import licensing, publish
+    from test_index_license import HULL, _cache
+    from test_index_publish import _covered_feed, _edge
+
+    feeds = [
+        {
+            **_covered_feed("f-a", coverage_source="crawl"),
+            "coverage": HULL,
+            "atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}},
+        }
+    ]
+    edges = [_edge("Q1757", "f-a", tier="local")]
+    cache = _cache(tmp_path, feeds, edges)
+    licensing.license_index(cache)
+    publish.publish(cache)
+    index = transitio_index.read_index(cache / "index")
+
+    buffer = _io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, content in GTFS.items():
+            archive.writestr(name, content)
+    payload = buffer.getvalue()
+
+    def fake_download(self, feed, directory=None):
+        base = __import__("pathlib").Path(directory) if directory else tmp_path
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / "latest.zip"
+        path.write_bytes(payload)
+        return path
+
+    fake_pbf = tmp_path / "aoi.osm.pbf"
+    fake_pbf.write_bytes(b"\x00fake")
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas.download", fake_download)
+    monkeypatch.setattr("transitio.osm.fetch_pbf", lambda *a, **k: fake_pbf)
+    monkeypatch.setattr("transitio.osm._fetch.fetch_pbf", lambda *a, **k: fake_pbf)
+
+    result = fetch(
+        place="Q1757",
+        index=index,
+        directory=tmp_path / "out",
+        crop=False,
+        reference_date="20260601",
+    )
+    assert result.osm_pbf == fake_pbf
+    assert [p.name for p in result.feeds] == ["latest.zip"]
+    assert result.skipped == []
+    assert result.selections == []
+
+
+def test_fetch_aoi_rejects_place_only_arguments():
+    for kwargs in (
+        {"exclude": ["national"]},
+        {"tiers": ["local"]},
+        {"on_unknown": "exclude"},
+    ):
+        with pytest.raises(ValueError, match="apply only with place="):
+            fetch((0, 0, 1, 1), **kwargs)
+
+
+def test_fetch_place_rejects_country_code():
+    with pytest.raises(ValueError, match="country_code= applies only with aoi="):
+        fetch(place="X", country_code="FI")
+
+
+def _place_index(tmp_path, feed):
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "scripts"))
+    import transitio.index as transitio_index
+    from index_build import licensing, publish
+    from test_index_license import HULL, _cache
+    from test_index_publish import _covered_feed, _edge
+
+    feeds = [
+        {**_covered_feed("f-a", coverage_source="crawl"), "coverage": HULL, **feed}
+    ]
+    cache = _cache(tmp_path, feeds, [_edge("Q1757", "f-a", tier="local")])
+    licensing.license_index(cache)
+    publish.publish(cache)
+    return transitio_index.read_index(cache / "index")
+
+
+def _gtfs_payload():
+    import io as _io
+
+    buffer = _io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, content in GTFS.items():
+            archive.writestr(name, content)
+    return buffer.getvalue()
+
+
+def _stub_pbf_and_atlas(monkeypatch, tmp_path, payload):
+    from pathlib import Path as _Path
+
+    def fake_download(self, feed, directory=None):
+        base = _Path(directory) if directory else tmp_path
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / "latest.zip"
+        path.write_bytes(payload)
+        return path
+
+    fake_pbf = tmp_path / "aoi.osm.pbf"
+    fake_pbf.write_bytes(b"\x00fake")
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas.download", fake_download)
+    monkeypatch.setattr("transitio.osm.fetch_pbf", lambda *a, **k: fake_pbf)
+    monkeypatch.setattr("transitio.osm._fetch.fetch_pbf", lambda *a, **k: fake_pbf)
+    return fake_pbf
+
+
+def test_fetch_place_when_without_token_warns(tmp_path, monkeypatch):
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    index = _place_index(
+        tmp_path, {"atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}}}
+    )
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, _gtfs_payload())
+    with pytest.warns(UserWarning, match="cannot select"):
+        result = fetch(
+            place="Q1757",
+            index=index,
+            directory=tmp_path / "out",
+            crop=False,
+            when="2026-06-01",
+        )
+    assert [p.name for p in result.feeds] == ["latest.zip"]
+
+
+def test_fetch_place_with_token_selects_the_covering_dataset(tmp_path, monkeypatch):
+    from pathlib import Path as _Path
+
+    from transitio.catalog._models import Dataset
+
+    index = _place_index(
+        tmp_path, {"mdb": {"mdb_id": "mdb-9", "urls": {"latest": "u"}}}
+    )
+    payload = _gtfs_payload()
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, payload)
+    picked = Dataset.from_api(
+        {"id": "mdb-9-2026", "feed_id": "mdb-9", "hosted_url": "https://x/z.zip"}
+    )
+    monkeypatch.setattr(
+        "transitio.catalog.MobilityDatabase.dataset_for",
+        lambda self, feed, when: picked,
+    )
+
+    def fake_dataset_download(self, dataset, directory=None):
+        base = _Path(directory) if directory else tmp_path
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / f"{dataset.id}.zip"
+        path.write_bytes(payload)
+        return path
+
+    monkeypatch.setattr(
+        "transitio.catalog.MobilityDatabase.download", fake_dataset_download
+    )
+    result = fetch(
+        place="Q1757",
+        index=index,
+        directory=tmp_path / "out",
+        crop=False,
+        when="2026-06-01",
+        refresh_token="tok",
+    )
+    assert [p.name for p in result.feeds] == ["mdb-9-2026.zip"]
+
+
+def test_fetch_place_records_index_provenance(tmp_path, monkeypatch):
+    index = _place_index(
+        tmp_path, {"atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}}}
+    )
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, _gtfs_payload())
+    result = fetch(place="Q1757", index=index, directory=tmp_path / "out", crop=False)
+    assert result.provenance["snapshot"] == index.snapshot_id
+    assert result.provenance["discovery_semantics_version"] == 1
+    assert result.provenance["transitio_version"]
+
+
+def test_fetch_place_falls_back_to_atlas_when_the_dataset_download_fails(
+    tmp_path, monkeypatch
+):
+    from transitio.catalog._models import Dataset
+
+    index = _place_index(
+        tmp_path,
+        {
+            "mdb": {"mdb_id": "mdb-9", "urls": {"latest": "u"}},
+            "atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}},
+        },
+    )
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, _gtfs_payload())
+    picked = Dataset.from_api(
+        {"id": "mdb-9-2026", "feed_id": "mdb-9", "hosted_url": "https://x/z.zip"}
+    )
+    monkeypatch.setattr(
+        "transitio.catalog.MobilityDatabase.dataset_for",
+        lambda self, feed, when: picked,
+    )
+
+    def failing(self, dataset, directory=None):
+        raise RuntimeError("dataset download boom")
+
+    monkeypatch.setattr("transitio.catalog.MobilityDatabase.download", failing)
+    result = fetch(
+        place="Q1757",
+        index=index,
+        directory=tmp_path / "out",
+        crop=False,
+        when="2026-06-01",
+        refresh_token="tok",
+    )
+    # The dataset download failed, so the Atlas fallback delivered latest.zip.
+    assert [p.name for p in result.feeds] == ["latest.zip"]
+    assert result.skipped == []
+
+
+def test_fetch_place_from_a_bound_index_uses_its_snapshot(tmp_path, monkeypatch):
+    import transitio
+
+    index = _place_index(
+        tmp_path, {"atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}}}
+    )
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, _gtfs_payload())
+    place_obj = transitio.place("Q1757", index=index)
+    result = fetch(place=place_obj, directory=tmp_path / "out", crop=False)
+    assert result.provenance["snapshot"] == index.snapshot_id
+    assert [p.name for p in result.feeds] == ["latest.zip"]
+
+
+def test_fetch_place_with_token_and_no_date_uses_the_newest_dataset(
+    tmp_path, monkeypatch
+):
+    from pathlib import Path as _Path
+
+    from transitio.catalog._models import Dataset
+
+    index = _place_index(
+        tmp_path, {"mdb": {"mdb_id": "mdb-9", "urls": {"latest": "u"}}}
+    )
+    payload = _gtfs_payload()
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, payload)
+    newest = Dataset.from_api(
+        {"id": "mdb-9-newest", "feed_id": "mdb-9", "hosted_url": "https://x/z.zip"}
+    )
+    monkeypatch.setattr(
+        "transitio.catalog.MobilityDatabase.datasets", lambda self, feed: [newest]
+    )
+    monkeypatch.setattr(
+        "transitio.catalog.MobilityDatabase.validation_report",
+        lambda self, dataset: {"summary": {"validatorVersion": "6.0.0"}, "notices": []},
+    )
+
+    def dataset_download(self, dataset, directory=None):
+        base = _Path(directory) if directory else tmp_path
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / f"{dataset.id}.zip"
+        path.write_bytes(payload)
+        return path
+
+    monkeypatch.setattr("transitio.catalog.MobilityDatabase.download", dataset_download)
+    result = fetch(
+        place="Q1757",
+        index=index,
+        directory=tmp_path / "out",
+        crop=False,
+        refresh_token="tok",
+    )
+    assert [p.name for p in result.feeds] == ["mdb-9-newest.zip"]
+
+
+def test_fetch_place_dataset_selection_failure_falls_back(tmp_path, monkeypatch):
+    index = _place_index(
+        tmp_path,
+        {
+            "mdb": {"mdb_id": "mdb-9", "urls": {"latest": "u"}},
+            "atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}},
+        },
+    )
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, _gtfs_payload())
+
+    def boom(self, feed):
+        raise RuntimeError("catalogue down")
+
+    monkeypatch.setattr("transitio.catalog.MobilityDatabase.datasets", boom)
+    result = fetch(
+        place="Q1757",
+        index=index,
+        directory=tmp_path / "out",
+        crop=False,
+        refresh_token="tok",
+    )
+    # The catalogue lookup failed, but the Atlas url still delivered the feed.
+    assert [p.name for p in result.feeds] == ["latest.zip"]
+    assert result.skipped == []
+
+
+def test_fetch_place_output_names_differ_by_geometry(tmp_path, monkeypatch):
+    # The same place id with different geometry must not share an output name,
+    # or one fetch would overwrite the other's differently-cropped feed.
+    import shapely
+
+    import transitio
+
+    index = _place_index(
+        tmp_path, {"atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}}}
+    )
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, _gtfs_payload())
+    out = tmp_path / "out"
+    place_obj = transitio.place("Q1757", index=index)
+    first = fetch(place=place_obj, directory=out)
+    place_obj._record["geometry"] = shapely.box(10.0, 50.0, 10.2, 50.2)
+    second = fetch(place=place_obj, directory=out)
+    assert first.feeds[0].name != second.feeds[0].name

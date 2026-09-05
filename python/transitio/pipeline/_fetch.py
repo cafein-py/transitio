@@ -39,6 +39,8 @@ class FetchResult:
     reports: list
     repairs: list
     skipped: list
+    selections: list = dataclasses.field(default_factory=list)
+    provenance: dict = None
 
     def __iter__(self):  # convenient (pbf, feeds) unpacking
         return iter((self.osm_pbf, self.feeds))
@@ -149,10 +151,103 @@ def _covers(service_window, ymd):
     return start <= ymd <= end
 
 
+class _SkipFeed(Exception):
+    """A per-feed reason to skip, carried out of the shared processing."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _process_feed(
+    path, *, geometry, tag, repair, crop, modes, when_ymd, hosted, budgets
+):
+    """Repair, crop, mode-filter, validate and report one downloaded feed.
+
+    Returns ``(path, report, fixes)``; raises :class:`_SkipFeed` with a reason
+    when the feed drops out. Shared by the AOI and the place paths.
+    """
+    from transitio.gtfs import crop_feed
+    from transitio.repair import repair_feed
+    from transitio.report import build_report
+    from transitio.validate import validate_feed
+
+    provenance = None
+    sidecar = path.with_suffix(".provenance.json")
+    if sidecar.exists():
+        provenance = json.loads(sidecar.read_text())
+    fixes = []
+    if repair:
+        repaired = path.with_name(f"{path.stem}-repaired-{tag}.zip")
+        fixes = repair_feed(path, repaired, **budgets)["fixes"]
+        path = repaired
+    if crop:
+        cropped = path.with_name(f"{path.stem}-cropped-{tag}.zip")
+        crop_feed(path, cropped, aoi=geometry, **budgets)
+        path = cropped
+    if modes is not None:
+        served = _feed_modes(path)
+        if served is None:
+            raise _SkipFeed("could not read routes.txt for mode filtering")
+        if not served & modes:
+            raise _SkipFeed(f"serves {sorted(served)}, not {sorted(modes)}")
+    validation = validate_feed(path, **budgets)
+    if when_ymd and not _covers(validation["service_window"], when_ymd):
+        window = validation["service_window"]
+        raise _SkipFeed(
+            "no service on the requested day (actual window "
+            f"{window[0]}..{window[1]})"
+        )
+    report = build_report(validation, hosted=hosted, provenance=provenance)
+    return path, report, fixes
+
+
+def _download_indexed(feed, db, atlas, base_dir):
+    """Download an indexed feed, preferring its Mobility Database URL over its
+    Transitland Atlas URL (decision I: MDB wins where a feed has both), and
+    falling back to Atlas when the MDB download fails. Each feed lands in its
+    own digest-named directory under ``base_dir``, so several never collide."""
+    from transitio.catalog import AtlasFeed, Feed
+    from transitio.catalog._atlas import _feed_dir
+    from transitio.exceptions import DownloadError
+    from transitio.index.feeds import _parse
+
+    mdb = _parse(feed._row.get("mdb")) or {}
+    mdb_urls = mdb.get("urls") or {}
+    mdb_url = mdb_urls.get("direct_download") or mdb_urls.get("latest")
+    atlas_feed = AtlasFeed.from_record(
+        _parse(feed._row.get("atlas")) or {}, feed_id=feed.feed_id
+    )
+    errors = []
+    if mdb_url:
+        try:
+            proxy = Feed.from_api(
+                {"id": feed.feed_id, "latest_dataset": {"hosted_url": mdb_url}}
+            )
+            return db.download_latest(
+                proxy, directory=base_dir / _feed_dir(feed.feed_id)
+            )
+        except Exception as error:  # noqa: B902 — fall through to the fallback
+            errors.append(f"mdb: {error}")
+    if atlas_feed.static_url:
+        try:
+            return atlas.download(atlas_feed, directory=base_dir)
+        except Exception as error:  # noqa: B902
+            errors.append(f"atlas: {error}")
+    if errors:
+        raise DownloadError("; ".join(errors))
+    raise DownloadError(f"feed {feed.feed_id} has no downloadable url")
+
+
 def fetch(
-    aoi,
+    aoi=None,
     when=None,
     *,
+    place=None,
+    tiers=None,
+    exclude=None,
+    on_unknown="include",
+    index=None,
     modes=None,
     repair=False,
     crop=True,
@@ -162,11 +257,19 @@ def fetch(
     country_code=None,
     **budgets,
 ):
-    """Fetch everything cafein needs for an AOI in one call.
+    """Fetch everything cafein needs for an area in one call.
 
-    Resolves and crops the OSM extract, discovers all GTFS feeds
-    overlapping the AOI, downloads each feed, validates it, optionally
-    repairs and spatially crops it, and builds a merged report per feed.
+    Pass exactly one of ``aoi`` (a geometry, bbox or place name geocoded for
+    the OSM stage) or ``place`` (a place name, QID or :class:`Place`). With
+    ``place``, feeds are selected from the built index by tier -- ``tiers``,
+    ``exclude`` and ``on_unknown`` filter the edges -- and the place geometry
+    supplies the AOI; ``tiers``, ``exclude``, ``on_unknown`` and ``index``
+    apply only with ``place``, and ``country_code`` only with ``aoi``.
+
+    Resolves and crops the OSM extract, discovers the GTFS feeds (overlapping
+    the AOI, or the place's indexed feeds), downloads each feed, validates it,
+    optionally repairs and spatially crops it, and builds a merged report per
+    feed.
     With an API token, downloads come from catalogued dataset versions
     (checksum-verified, with the hosted canonical-validator report);
     without one, the unversioned latest hosted zip is fetched — a moving
@@ -212,14 +315,22 @@ def fetch(
         side describes the pre-transform original.
     """
     from transitio.catalog import MobilityDatabase
-    from transitio.gtfs import crop_feed
     from transitio.osm import fetch_pbf
     from transitio.osm._fetch import _as_geometry
-    from transitio.repair import repair_feed
-    from transitio.report import build_report
-    from transitio.validate import validate_feed
 
-    geometry = _as_geometry(aoi)
+    if (aoi is None) == (place is None):
+        raise ValueError("pass exactly one of aoi= or place=")
+    if aoi is not None and (
+        tiers is not None
+        or exclude is not None
+        or index is not None
+        or on_unknown != "include"
+    ):
+        raise ValueError(
+            "tiers=, exclude=, on_unknown= and index= apply only with place="
+        )
+    if place is not None and country_code is not None:
+        raise ValueError("country_code= applies only with aoi=")
 
     if modes is not None:
         if isinstance(modes, str):
@@ -231,6 +342,25 @@ def fetch(
                 f"unknown modes {sorted(unknown)}; "
                 f"valid modes are {sorted(_MODE_TYPES)}"
             )
+
+    if place is not None:
+        return _fetch_place(
+            place,
+            tiers=tiers,
+            exclude=exclude,
+            on_unknown=on_unknown,
+            index=index,
+            when=when,
+            modes=modes,
+            repair=repair,
+            crop=crop,
+            refresh_token=refresh_token,
+            cache_dir=cache_dir,
+            directory=directory,
+            budgets=budgets,
+        )
+
+    geometry = _as_geometry(aoi)
 
     when_ymd = None
     if when is not None:
@@ -300,49 +430,23 @@ def fetch(
                     hosted = None
 
             try:
-                provenance = None
-                sidecar = path.with_suffix(".provenance.json")
-                if sidecar.exists():
-                    provenance = json.loads(sidecar.read_text())
-
-                fixes = []
-                if repair:
-                    repaired = path.with_name(f"{path.stem}-repaired-{tag}.zip")
-                    fixes = repair_feed(path, repaired, **budgets)["fixes"]
-                    path = repaired
-                if crop:
-                    cropped = path.with_name(f"{path.stem}-cropped-{tag}.zip")
-                    crop_feed(path, cropped, aoi=geometry, **budgets)
-                    path = cropped
-
-                # Modes are read from the delivered feed, after cropping,
-                # so an aggregate serving buses only outside the AOI does
-                # not pass a bus filter.
-                if modes is not None:
-                    served = _feed_modes(path)
-                    if served is None:
-                        skipped.append(
-                            (feed.id, "could not read routes.txt for mode filtering")
-                        )
-                        continue
-                    if not served & modes:
-                        skipped.append(
-                            (feed.id, f"serves {sorted(served)}, not {sorted(modes)}")
-                        )
-                        continue
-
-                validation = validate_feed(path, **budgets)
-                if when_ymd and not _covers(validation["service_window"], when_ymd):
-                    window = validation["service_window"]
-                    skipped.append(
-                        (
-                            feed.id,
-                            "no service on the requested day (actual window "
-                            f"{window[0]}..{window[1]})",
-                        )
-                    )
-                    continue
-                report = build_report(validation, hosted=hosted, provenance=provenance)
+                # Modes are read from the delivered feed, after cropping, so an
+                # aggregate serving buses only outside the AOI does not pass a
+                # bus filter.
+                path, report, fixes = _process_feed(
+                    path,
+                    geometry=geometry,
+                    tag=tag,
+                    repair=repair,
+                    crop=crop,
+                    modes=modes,
+                    when_ymd=when_ymd,
+                    hosted=hosted,
+                    budgets=budgets,
+                )
+            except _SkipFeed as skip:
+                skipped.append((feed.id, skip.reason))
+                continue
             except Exception as error:  # noqa: B902 — isolate per-feed failures
                 skipped.append((feed.id, f"processing failed: {error}"))
                 continue
@@ -356,4 +460,185 @@ def fetch(
         reports=reports,
         repairs=repairs,
         skipped=skipped,
+    )
+
+
+def _fetch_place(
+    place,
+    *,
+    tiers,
+    exclude,
+    on_unknown,
+    index,
+    when,
+    modes,
+    repair,
+    crop,
+    refresh_token,
+    cache_dir,
+    directory,
+    budgets,
+):
+    """The ``fetch(place=...)`` path: the place geometry is the AOI, feeds come
+    from the index by tier, and each is downloaded MDB-then-Atlas (decision I).
+    Route filtering to the selected tiers is a later slice; feeds are delivered
+    whole here and ``selections`` is empty."""
+    import shapely
+
+    from transitio import __version__
+    from transitio.catalog import Feed, MobilityDatabase, TransitlandAtlas
+    from transitio.catalog._atlas import _feed_dir
+    from transitio.index import (
+        DISCOVERY_SEMANTICS_VERSION,
+        Place,
+        _coerce_index,
+        place as resolve_place,
+    )
+    from transitio.index.feeds import _parse
+    from transitio.osm import fetch_pbf
+
+    if isinstance(place, Place):
+        place_obj = place
+        resolved_index = place._lookup._index
+    else:
+        resolved_index = _coerce_index(index)
+        place_obj = resolve_place(place, index=resolved_index)
+    provenance = {
+        "snapshot": None if resolved_index is None else resolved_index.snapshot_id,
+        "discovery_semantics_version": DISCOVERY_SEMANTICS_VERSION,
+        "transitio_version": __version__,
+    }
+    geometry = place_obj.geometry
+    if geometry is None:
+        raise ValueError(f"place {place_obj.id} has no geometry to fetch for")
+    if isinstance(geometry, (bytes, bytearray)):
+        geometry = shapely.from_wkb(bytes(geometry))
+
+    when_ymd = None
+    if when is not None:
+        from transitio.catalog._models import as_date
+
+        when_ymd = as_date(when).strftime("%Y%m%d")
+    budgets.setdefault("reference_date", when_ymd)
+
+    tag = hashlib.sha256(
+        json.dumps(
+            {
+                "place": place_obj.id,
+                "snapshot": provenance["snapshot"],
+                "bounds": [round(v, 6) for v in geometry.bounds],
+                "reference_date": budgets.get("reference_date"),
+            },
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()[:16]
+
+    osm_pbf = fetch_pbf(geometry, cache_dir=cache_dir, directory=directory)
+
+    kept = place_obj.feeds(tiers=tiers, exclude=exclude, on_unknown=on_unknown)
+    feeds, reports, repairs, skipped, selections = [], [], [], [], []
+    if on_unknown == "exclude":
+        included = place_obj.feeds(tiers=tiers, exclude=exclude, on_unknown="include")
+        for dropped in {f.feed_id for f in included} - {f.feed_id for f in kept}:
+            skipped.append((dropped, "only unknown-tier edges"))
+
+    import platformdirs
+
+    base_dir = (
+        pathlib.Path(directory)
+        if directory
+        else pathlib.Path(cache_dir or platformdirs.user_cache_dir("transitio"))
+        / "gtfs"
+    )
+    with (
+        MobilityDatabase(refresh_token, cache_dir=cache_dir) as db,
+        TransitlandAtlas(cache_dir=cache_dir) as atlas,
+    ):
+        if when is not None and not db._refresh_token:
+            warnings.warn(
+                "no Mobility Database API token: 'when' cannot select "
+                "historical datasets, using the latest hosted datasets",
+                UserWarning,
+                stacklevel=2,
+            )
+        for feed in kept:
+            dataset = None
+            errors = []
+            if db._refresh_token:
+                mdb_id = (_parse(feed._row.get("mdb")) or {}).get("mdb_id")
+                if mdb_id:
+                    try:
+                        mdb_feed = Feed.from_api({"id": mdb_id})
+                        if when is not None:
+                            dataset = db.dataset_for(mdb_feed, when)
+                            if dataset is None:
+                                skipped.append(
+                                    (
+                                        feed.feed_id,
+                                        "no dataset covers the requested day",
+                                    )
+                                )
+                                continue
+                        else:
+                            versions = db.datasets(mdb_feed)
+                            dataset = versions[0] if versions else None
+                    except Exception as error:  # noqa: B902 — fall back to the urls
+                        errors.append(f"dataset selection: {error}")
+            # The hosted validation report only describes the dataset's own
+            # bytes, so it is attached only when the dataset supplied them.
+            path = None
+            from_dataset = False
+            if dataset is not None:
+                try:
+                    path = db.download(
+                        dataset, directory=base_dir / _feed_dir(feed.feed_id)
+                    )
+                    from_dataset = True
+                except Exception as error:  # noqa: B902 — try the fallback next
+                    errors.append(f"mdb dataset: {error}")
+            if path is None:
+                try:
+                    path = _download_indexed(feed, db, atlas, base_dir)
+                except Exception as error:  # noqa: B902
+                    errors.append(str(error))
+            if path is None:
+                joined = "; ".join(e for e in errors if e)
+                skipped.append((feed.feed_id, f"download failed: {joined}"))
+                continue
+            hosted = None
+            if from_dataset:
+                try:
+                    hosted = db.validation_report(dataset)
+                except Exception:  # noqa: B902 — the hosted report is optional
+                    hosted = None
+            try:
+                path, report, fixes = _process_feed(
+                    path,
+                    geometry=geometry,
+                    tag=tag,
+                    repair=repair,
+                    crop=crop,
+                    modes=modes,
+                    when_ymd=when_ymd,
+                    hosted=hosted,
+                    budgets=budgets,
+                )
+            except _SkipFeed as skip:
+                skipped.append((feed.feed_id, skip.reason))
+                continue
+            except Exception as error:  # noqa: B902 — isolate per-feed failures
+                skipped.append((feed.feed_id, f"processing failed: {error}"))
+                continue
+            reports.append(report)
+            repairs.append(fixes)
+            feeds.append(path)
+
+    return FetchResult(
+        osm_pbf=osm_pbf,
+        feeds=feeds,
+        reports=reports,
+        repairs=repairs,
+        skipped=skipped,
+        selections=selections,
+        provenance=provenance,
     )
