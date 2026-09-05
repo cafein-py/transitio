@@ -43,6 +43,8 @@ def _feed_row(feed_id, **kw):
         "coverage_source": kw.get("coverage_source", "declared"),
         "atlas": kw.get("atlas"),
         "snapshot": "snap-1",
+        # Absent by default, as a pre-manifest (schema 4) row is.
+        **({"files": kw["files"]} if "files" in kw else {}),
     }
 
 
@@ -80,9 +82,20 @@ PLACES = [
 ]
 
 LICENSE = {"spdx_identifier": "CC0-1.0", "redistribution_allowed": True}
+# f-mix carries a schema-5 manifest (with shapes and a v1 fare file); the others
+# are pre-manifest rows, so their manifest reads as empty.
+MIX_FILES = [
+    "agency.txt",
+    "fare_attributes.txt",
+    "routes.txt",
+    "shapes.txt",
+    "stop_times.txt",
+    "stops.txt",
+    "trips.txt",
+]
 FEEDS = [
     _feed_row("f-city", atlas=json.dumps({"license": LICENSE})),
-    _feed_row("f-mix"),
+    _feed_row("f-mix", files=MIX_FILES),
     _feed_row("f-nat"),
     _feed_row("f-bike", spec="gbfs"),
 ]
@@ -254,12 +267,72 @@ def test_to_geodataframe_tabulates_the_feeds(idx):
     frame = metro.feeds().to_geodataframe()
     assert len(frame) == 3
     assert set(frame["feed_id"]) == {"f-city", "f-mix", "f-nat"}
-    assert frame.set_index("feed_id").loc["f-mix", "departures_per_day"] == 400.0
+    by_id = frame.set_index("feed_id")
+    assert by_id.loc["f-mix", "departures_per_day"] == 400.0
+    # The manifest tabulates too; a pre-manifest feed shows an empty list.
+    assert by_id.loc["f-mix", "files"] == MIX_FILES
+    assert by_id.loc["f-city", "files"] == []
     # An empty result keeps the documented columns.
     empty = metro.feeds(spec=["nonexistent"]).to_geodataframe()
     assert len(empty) == 0
     assert "feed_id" in empty.columns
     assert "departures_per_day" in empty.columns
+    assert "files" in empty.columns
+
+
+def test_the_manifest_exposes_capability_hints(idx):
+    metro = transitio_index.place("Q102", index=idx)
+    feeds = {feed.feed_id: feed for feed in metro.feeds()}
+    mix, city = feeds["f-mix"], feeds["f-city"]
+    assert mix.files == frozenset(MIX_FILES)
+    assert mix.has_shapes is True and mix.has_fares is True
+    # A pre-manifest row (no ``files`` column) reads as an empty manifest.
+    assert city.files == frozenset()
+    assert city.has_shapes is False and city.has_fares is False
+
+
+@pytest.mark.parametrize(
+    ("files", "expected"),
+    [
+        (["fare_attributes.txt", "fare_rules.txt"], True),  # Fares v1
+        (["fare_products.txt", "fare_leg_rules.txt"], True),  # Fares v2 core
+        (["fare_transfer_rules.txt"], True),  # any v2 rule file suffices
+        # Companion tables support a product or rule but define no fare, so a
+        # feed shipping only them is not fare-bearing: the zone/network tables
+        # and the media, rider-category and timeframe tables alike.
+        (["areas.txt", "stop_areas.txt", "networks.txt", "route_networks.txt"], False),
+        (["fare_media.txt", "rider_categories.txt", "timeframes.txt"], False),
+        (["stops.txt", "routes.txt"], False),
+    ],
+)
+def test_has_fares_means_a_fare_product_or_rule_file(files, expected):
+    feed = transitio_index.IndexedFeed({"feed_id": "f", "files": files}, {})
+    assert feed.has_fares is expected
+
+
+@pytest.mark.parametrize(
+    ("requires", "expected"),
+    [
+        (None, ["f-city", "f-mix", "f-nat"]),  # no requirement: a no-op
+        ([], ["f-city", "f-mix", "f-nat"]),  # an empty requirement too
+        ("shapes.txt", ["f-mix"]),  # a bare string names one file
+        (["shapes.txt", "fare_attributes.txt"], ["f-mix"]),  # all must be present
+        (["pathways.txt"], []),  # nothing carries it
+    ],
+)
+def test_requires_keeps_only_feeds_whose_manifest_has_the_files(
+    idx, requires, expected
+):
+    # Pre-manifest feeds (empty manifest) can never satisfy a requirement: the
+    # fail-closed reading of "must have this capability".
+    metro = transitio_index.place("Q102", index=idx)
+    assert [f.feed_id for f in metro.feeds(requires=requires)] == expected
+
+
+def test_requires_refuses_non_string_names(idx):
+    metro = transitio_index.place("Q102", index=idx)
+    with pytest.raises(ValueError, match="requires"):
+        metro.feeds(requires=["shapes.txt", 3])
 
 
 def test_a_bare_city_name_promotes_and_finds_the_declared_feed(idx):

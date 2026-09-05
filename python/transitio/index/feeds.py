@@ -21,6 +21,23 @@ import math
 
 __all__ = ["IndexedFeed", "PlaceService", "Selector", "ServiceLevel", "TierEdge"]
 
+# The files that define a fare: GTFS-Fares v1 (attributes/rules) and the v2
+# fare products and leg/transfer/join rules. Companion tables are deliberately
+# absent — the v2 zone and network tables (areas, stop_areas, networks,
+# route_networks) and the fare_media, rider_categories and timeframes tables —
+# since each only supports a product or rule and can ship without one, so
+# counting them would call a feed with no priceable fare fare-bearing.
+FARE_FILES = frozenset(
+    {
+        "fare_attributes.txt",
+        "fare_rules.txt",
+        "fare_products.txt",
+        "fare_leg_rules.txt",
+        "fare_leg_join_rules.txt",
+        "fare_transfer_rules.txt",
+    }
+)
+
 
 def _parse(value):
     """A JSON-string column value as Python, passing dicts/None through."""
@@ -197,6 +214,29 @@ class IndexedFeed:
         return (atlas or {}).get("license")
 
     @property
+    def files(self):
+        """The GTFS files the feed's archive carries, as a frozenset of root
+        file names — a capability hint recorded by the crawl (schema 5), empty
+        for a snapshot that predates it or a feed the crawl never read."""
+        value = self._row.get("files")
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return frozenset()
+        return frozenset(str(name) for name in value)
+
+    @property
+    def has_shapes(self):
+        """Whether the feed publishes route geometry (``shapes.txt``)."""
+        return "shapes.txt" in self.files
+
+    @property
+    def has_fares(self):
+        """Whether the feed defines a fare: a GTFS-Fares v1 attributes/rules
+        file or a v2 product or rule file (see :data:`FARE_FILES`). Companion
+        tables alone — zones, networks, media, rider categories, timeframes —
+        do not count."""
+        return not self.files.isdisjoint(FARE_FILES)
+
+    @property
     def tiers(self):
         return frozenset(self.edges)
 
@@ -266,6 +306,7 @@ class FeedList(list):
             "departures_per_day",
             "needs_review",
             "selector_state",
+            "files",
         )
         rows = [
             {
@@ -280,6 +321,7 @@ class FeedList(list):
                 "departures_per_day": feed.service.departures_per_day,
                 "needs_review": feed.needs_review,
                 "selector_state": feed.selector.state,
+                "files": sorted(feed.files),
             }
             for feed in self
         ]
@@ -315,17 +357,28 @@ def feeds_for_place(
     exclude=None,
     spec="gtfs",
     on_unknown="include",
+    requires=None,
 ):
     """The :class:`IndexedFeed` list for ``place``, filtered by the query.
 
     A feed is returned when its spec is selected — ``spec="gtfs"`` by default,
     ``spec=None`` for everything, a list to narrow — and at least one of its
     edges to the place survives the query; a feed whose every edge is excluded
-    (or unknown under ``on_unknown="exclude"``) is dropped. Feeds come back
-    sorted by id.
+    (or unknown under ``on_unknown="exclude"``) is dropped. ``requires`` names
+    GTFS files the feed's manifest must carry (``"shapes.txt"``, or several);
+    a feed whose recorded manifest lacks one — including a feed from a snapshot
+    that predates the manifest, whose manifest is empty — is dropped, the
+    fail-closed reading of "must have this capability". Feeds come back sorted
+    by id.
     """
     if on_unknown not in ("include", "exclude"):
         raise ValueError("on_unknown must be 'include' or 'exclude'")
+    if requires is None:
+        needed = frozenset()
+    else:
+        needed = frozenset([requires] if isinstance(requires, str) else requires)
+        if not all(isinstance(name, str) for name in needed):
+            raise ValueError("requires must name GTFS files as strings")
     allowed = None if spec is None else {spec} if isinstance(spec, str) else set(spec)
     if index.edges is None:
         return FeedList()
@@ -342,6 +395,9 @@ def feeds_for_place(
         if allowed is not None and row.get("spec") not in allowed:
             continue
         matched = _matched(by_feed[feed_id], tiers, exclude, on_unknown)
-        if matched:
-            found.append(IndexedFeed(row, matched))
+        if not matched:
+            continue
+        feed = IndexedFeed(row, matched)
+        if needed <= feed.files:
+            found.append(feed)
     return found

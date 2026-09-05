@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `IndexedFeed.files` exposes the GTFS files a feed's archive carries (the
+  manifest the crawl records under index schema 5; empty for an older
+  snapshot), with `has_shapes` and `has_fares` as capability hints over it, and
+  `Place.feeds(requires=...)` keeps only feeds whose manifest carries the named
+  files — a feed whose manifest is empty cannot satisfy a requirement. The
+  tabular export gains a `files` column.
+
 - `fetch(place=...)` validates each selector against the feed it is applied to
   before filtering: the edge's `classification_fingerprint` is recomputed from
   the download by its `fingerprint_kind` and compared, and every selected route
