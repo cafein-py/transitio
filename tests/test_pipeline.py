@@ -7,6 +7,7 @@ pytest.importorskip("transitio._core")
 
 import transitio.catalog  # noqa: E402
 import transitio.osm  # noqa: E402
+from transitio.exceptions import StaleSelectorError  # noqa: E402
 from transitio.pipeline import fetch  # noqa: E402
 
 GTFS = {
@@ -736,17 +737,22 @@ def _multi_route_gtfs(routes=_ROUTE_SPECS):
         + "".join(f"{s},{s},60.18,24.95\n" for _, _, s, _, _ in routes),
         "routes.txt": "route_id,agency_id,route_short_name,route_type\n"
         + "".join(f"{r},{a},{r},{rt}\n" for r, a, _, _, rt in routes),
-        "trips.txt": "route_id,service_id,trip_id\n"
-        + "".join(f"{r},wk,{tr}\n" for r, _, _, tr, _ in routes),
+        # Per-route service and shape so calendar, calendar_dates and shapes
+        # cascade with the routes the selector removes.
+        "trips.txt": "route_id,service_id,trip_id,shape_id\n"
+        + "".join(f"{r},wk-{r},{tr},sh-{r}\n" for r, _, _, tr, _ in routes),
         "stop_times.txt": "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
         + "".join(
             f"{tr},08:0{i}:00,08:0{i}:00,{s},1\n{tr},08:1{i}:00,08:1{i}:00,hub,2\n"
             for i, (_, _, s, tr, _) in enumerate(routes)
         ),
-        "calendar.txt": (
-            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
-            "start_date,end_date\nwk,1,1,1,1,1,0,0,20260101,20261231\n"
-        ),
+        "calendar.txt": "service_id,monday,tuesday,wednesday,thursday,friday,"
+        "saturday,sunday,start_date,end_date\n"
+        + "".join(f"wk-{r},1,1,1,1,1,0,0,20260101,20261231\n" for r, *_ in routes),
+        "calendar_dates.txt": "service_id,date,exception_type\n"
+        + "".join(f"wk-{r},20260102,2\n" for r, *_ in routes),
+        "shapes.txt": "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence\n"
+        + "".join(f"sh-{r},60.18,24.95,1\nsh-{r},60.17,24.94,2\n" for r, *_ in routes),
     }
     import io as _io
 
@@ -755,6 +761,21 @@ def _multi_route_gtfs(routes=_ROUTE_SPECS):
         for n, c in members.items():
             z.writestr(n, c)
     return buf.getvalue()
+
+
+def _stamp_fingerprint(edges, payload, kind="route_stops"):
+    # Stamp the real fingerprint of the stubbed download onto complete-selector
+    # edges so fetch-time validation trusts them (build and download agree).
+    import io as _io
+
+    from transitio.index import fingerprint
+
+    digest = fingerprint.from_feed(_io.BytesIO(payload), kind)[0]
+    for edge in edges:
+        if edge.get("selector_state") == "complete":
+            edge["fingerprint_kind"] = kind
+            edge["classification_fingerprint"] = digest
+    return edges
 
 
 def _feed_tables(path):
@@ -808,7 +829,10 @@ def _selector_index(tmp_path, edges):
     return transitio_index.read_index(cache / "index")
 
 
-def test_fetch_place_crops_bundles_to_the_selected_routes(tmp_path, monkeypatch):
+@pytest.mark.parametrize("repair", [False, True])
+def test_fetch_place_crops_bundles_to_the_selected_routes(
+    tmp_path, monkeypatch, repair
+):
     import sys as _sys
     from pathlib import Path as _Path
 
@@ -825,19 +849,26 @@ def test_fetch_place_crops_bundles_to_the_selected_routes(tmp_path, monkeypatch)
             "needs_review": False,
         }
 
-    edges = [
-        sel_edge("local", "r-local"),
-        sel_edge("regional", "r-reg"),
-        sel_edge("national", "r-nat"),
-    ]
+    payload = _multi_route_gtfs()
+    edges = _stamp_fingerprint(
+        [
+            sel_edge("local", "r-local"),
+            sel_edge("regional", "r-reg"),
+            sel_edge("national", "r-nat"),
+        ],
+        payload,
+    )
     index = _selector_index(tmp_path, edges)
-    _stub_pbf_and_atlas(monkeypatch, tmp_path, _multi_route_gtfs())
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, payload)
 
+    # repair=True rewrites the feed before the crop; the selector is validated
+    # against the download and still cropped correctly on the repaired bytes.
     result = fetch(
         place="Q1757",
         index=index,
         directory=tmp_path / "out",
         crop=False,
+        repair=repair,
         tiers=["local", "regional"],
         exclude=["national"],
     )
@@ -849,11 +880,22 @@ def test_fetch_place_crops_bundles_to_the_selected_routes(tmp_path, monkeypatch)
     assert {s["stop_id"] for s in tables["stops.txt"]} == {"s-local", "s-reg", "hub"}
     # a2 served only r-nat/r-unknown, so it cascades away.
     assert {a["agency_id"] for a in tables["agency.txt"]} == {"a1"}
+    # Shapes and services (calendar and calendar_dates) cascade with the routes.
+    assert {sh["shape_id"] for sh in tables["shapes.txt"]} == {"sh-r-local", "sh-r-reg"}
+    assert {c["service_id"] for c in tables["calendar.txt"]} == {
+        "wk-r-local",
+        "wk-r-reg",
+    }
+    assert {d["service_id"] for d in tables["calendar_dates.txt"]} == {
+        "wk-r-local",
+        "wk-r-reg",
+    }
     # The delivered feed is referentially consistent (no validation errors).
     assert result.reports[0]["summary"]["counts"]["errors"] == 0
     (selection,) = result.selections
     assert selection["feed_id"] == "f-a"
     assert selection["selector_state"] == "complete"
+    assert selection["trusted"] is True and selection["reason"] is None
     assert selection["kept"] == ["r-local", "r-reg"]
     assert selection["dropped"] == ["r-nat", "r-unknown"]
     # The audit names the contributing per-tier edges.
@@ -878,15 +920,19 @@ def test_fetch_place_output_names_differ_by_selected_routes(tmp_path, monkeypatc
             "needs_review": False,
         }
 
+    payload = _multi_route_gtfs()
     index = _selector_index(
         tmp_path,
-        [
-            sel_edge("local", "r-local"),
-            sel_edge("regional", "r-reg"),
-            sel_edge("national", "r-nat"),
-        ],
+        _stamp_fingerprint(
+            [
+                sel_edge("local", "r-local"),
+                sel_edge("regional", "r-reg"),
+                sel_edge("national", "r-nat"),
+            ],
+            payload,
+        ),
     )
-    _stub_pbf_and_atlas(monkeypatch, tmp_path, _multi_route_gtfs())
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, payload)
     out = tmp_path / "out"
     a = fetch(place="Q1757", index=index, directory=out, crop=False, tiers=["local"])
     b = fetch(place="Q1757", index=index, directory=out, crop=False, tiers=["regional"])
@@ -902,31 +948,41 @@ def test_fetch_place_on_unknown_governs_bundle_routes(tmp_path, monkeypatch):
     from test_index_publish import _edge
 
     service = {"stops": 1, "routes": 1, "departures_per_day": 1.0}
-    edges = [
-        {
-            **_edge("Q1757", "f-a", tier="local", service=service),
-            "selector_state": "complete",
-            "selector": {"route_id": ["r-local"]},
-            "needs_review": False,
-        },
-        {
-            **_edge("Q1757", "f-a", tier="regional", service=service),
-            "selector_state": "complete",
-            "selector": {"route_id": ["r-reg"]},
-            "needs_review": False,
-        },
-        # An unknown-tier edge: no route evidence, so the aggregate is unavailable.
-        {**_edge("Q1757", "f-a", tier="unknown", service=service)},
-    ]
-    index = _selector_index(tmp_path, edges)
     specs = (
         ("r-local", "a1", "s-local", "t1", 3),
         ("r-reg", "a1", "s-reg", "t2", 2),
         ("r-unknown", "a2", "s-unknown", "t3", 3),
     )
+    payload = _multi_route_gtfs(specs)
+    edges = _stamp_fingerprint(
+        [
+            {
+                **_edge("Q1757", "f-a", tier="local", service=service),
+                "selector_state": "complete",
+                "selector": {"route_id": ["r-local"]},
+                "needs_review": False,
+            },
+            {
+                **_edge("Q1757", "f-a", tier="regional", service=service),
+                "selector_state": "complete",
+                "selector": {"route_id": ["r-reg"]},
+                "needs_review": False,
+            },
+            # A complete unknown-tier edge: its route joins the selector union
+            # under include and is dropped from it under exclude.
+            {
+                **_edge("Q1757", "f-a", tier="unknown", service=service),
+                "selector_state": "complete",
+                "selector": {"route_id": ["r-unknown"]},
+                "needs_review": False,
+            },
+        ],
+        payload,
+    )
+    index = _selector_index(tmp_path, edges)
 
     def run(on_unknown):
-        _stub_pbf_and_atlas(monkeypatch, tmp_path, _multi_route_gtfs(specs))
+        _stub_pbf_and_atlas(monkeypatch, tmp_path, payload)
         return fetch(
             place="Q1757",
             index=index,
@@ -936,13 +992,132 @@ def test_fetch_place_on_unknown_governs_bundle_routes(tmp_path, monkeypatch):
             on_unknown=on_unknown,
         )
 
-    # include: the unknown edge is matched, the aggregate is unavailable, so the
-    # whole feed is delivered and its unknown route survives.
-    kept_in = _feed_tables(run("include").feeds[0])["routes.txt"]
-    assert "r-unknown" in {r["route_id"] for r in kept_in}
-    # exclude: the unknown edge is dropped, the aggregate is complete, so only
-    # the unknown route is cropped out while the bundle stays.
+    # include: the unknown route joins the trusted union, so the bundle keeps it.
+    kept_in = {
+        r["route_id"] for r in _feed_tables(run("include").feeds[0])["routes.txt"]
+    }
+    assert kept_in == {"r-local", "r-reg", "r-unknown"}
+    # exclude: the unknown edge leaves the union, so only its route is cropped
+    # out while the bundle stays.
     dropped_out = run("exclude")
     kept_out = {r["route_id"] for r in _feed_tables(dropped_out.feeds[0])["routes.txt"]}
     assert kept_out == {"r-local", "r-reg"}
-    assert dropped_out.feeds  # the bundle itself is still delivered
+    assert dropped_out.selections[0]["dropped"] == ["r-unknown"]
+
+
+def test_fetch_place_stale_selector_follows_on_untrusted_selector(
+    tmp_path, monkeypatch
+):
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "scripts"))
+    from test_index_publish import _edge
+
+    service = {"stops": 1, "routes": 1, "departures_per_day": 1.0}
+
+    def stale_edge(tier, route):
+        # A route_stops fingerprint that never matches the download: the
+        # selector is derived, but the feed it describes has since changed.
+        return {
+            **_edge("Q1757", "f-a", tier=tier, service=service),
+            "selector_state": "complete",
+            "selector": {"route_id": [route]},
+            "fingerprint_kind": "route_stops",
+            "classification_fingerprint": "0" * 64,
+            "needs_review": False,
+        }
+
+    index = _selector_index(
+        tmp_path,
+        [stale_edge("local", "r-local"), stale_edge("national", "r-nat")],
+    )
+    payload = _multi_route_gtfs()
+
+    # auto + tiers only: an untrustworthy selector is never silently filtered,
+    # so the whole feed is delivered and the outcome is recorded.
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, payload)
+    whole = fetch(
+        place="Q1757",
+        index=index,
+        directory=tmp_path / "w",
+        crop=False,
+        tiers=["local"],
+    )
+    assert {r["route_id"] for r in _feed_tables(whole.feeds[0])["routes.txt"]} == {
+        "r-local",
+        "r-reg",
+        "r-nat",
+        "r-unknown",
+    }
+    (sel,) = whole.selections
+    assert sel["trusted"] is False and sel["reason"] == "stale" and sel["kept"] is None
+
+    # auto + exclude: the exclusion is a hard constraint, so the feed is skipped.
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, payload)
+    excl = fetch(
+        place="Q1757",
+        index=index,
+        directory=tmp_path / "e",
+        crop=False,
+        tiers=["local"],
+        exclude=["national"],
+    )
+    assert excl.feeds == []
+    assert any("untrustworthy selector" in reason for _, reason in excl.skipped)
+
+    # error policy: an untrustworthy selector raises rather than guessing.
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, payload)
+    with pytest.raises(StaleSelectorError):
+        fetch(
+            place="Q1757",
+            index=index,
+            directory=tmp_path / "x",
+            crop=False,
+            tiers=["local"],
+            on_untrusted_selector="error",
+        )
+
+
+@pytest.mark.parametrize(
+    ("policy", "exclude", "on_unknown", "expected"),
+    [
+        ("auto", None, "include", "whole"),
+        ("auto", [], "include", "whole"),  # empty exclude is not a constraint
+        ("auto", (), "exclude", "skip"),  # on_unknown decides
+        ("auto", ["national"], "include", "skip"),
+        ("auto", None, "exclude", "skip"),
+        ("whole", ["national"], "include", "whole"),
+        ("drop", None, "include", "skip"),
+        ("error", None, "include", "error"),
+    ],
+)
+def test_untrusted_action_maps_the_policy(policy, exclude, on_unknown, expected):
+    from transitio.pipeline._fetch import _untrusted_action
+
+    assert _untrusted_action(policy, exclude, on_unknown) == expected
+
+
+def test_fetch_place_excludes_an_unknown_only_feed(tmp_path, monkeypatch):
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "scripts"))
+    from test_index_publish import _edge
+
+    service = {"stops": 1, "routes": 1, "departures_per_day": 1.0}
+    # A feed whose only matching edge is unknown-tier moves to skipped, not
+    # delivered, under on_unknown="exclude".
+    index = _selector_index(
+        tmp_path, [_edge("Q1757", "f-a", tier="unknown", service=service)]
+    )
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, _multi_route_gtfs())
+    result = fetch(
+        place="Q1757",
+        index=index,
+        directory=tmp_path / "out",
+        crop=False,
+        on_unknown="exclude",
+    )
+    assert result.feeds == []
+    assert result.skipped == [("f-a", "only unknown-tier edges")]

@@ -26,6 +26,18 @@ class AmbiguousPlaceError(TransitioError):
     candidates = ()
 
 
+class StaleSelectorError(TransitioError):
+    """A feed's selector no longer matches the downloaded feed.
+
+    Raised under ``on_untrusted_selector="error"`` when the selector has no
+    route evidence to trust (``unavailable``), the fingerprint it was built
+    from does not recompute from the download, or a selected route id is
+    absent from it. The feed id is :attr:`feed_id`.
+    """
+
+    feed_id = None
+
+
 class DownloadError(TransitioError):
     """A dataset cannot be downloaded or fails checksum verification."""
 

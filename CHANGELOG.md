@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `fetch(place=...)` validates each selector against the feed it is applied to
+  before filtering: the edge's `classification_fingerprint` is recomputed from
+  the download by its `fingerprint_kind` and compared, and every selected route
+  id must be present. An untrustworthy selector -- unavailable at build time, a
+  fingerprint that no longer matches, or a missing route -- is never silently
+  filtered; `on_untrusted_selector=` (`"auto"` default, `"whole"`, `"drop"`,
+  `"error"`) decides its fate, `"auto"` skipping the feed when an `exclude` was
+  asked for and otherwise delivering it whole with its tier treated as unknown.
+  `StaleSelectorError` is raised under `"error"`, and every outcome is recorded
+  in `FetchResult.selections`.
+
 - `crop_feed(routes=...)` keeps only trips whose route is in the given set, and
   `fetch(place=..., tiers=...)` uses it to crop each bundled feed to the routes
   its matched tiers select; every dropped route and the selecting edge's state

@@ -106,6 +106,8 @@ class TierEdge:
         self.method = record["method"]
         self.needs_review = bool(record["needs_review"])
         self.selector_state = record["selector_state"]
+        self.classification_fingerprint = record.get("classification_fingerprint")
+        self.fingerprint_kind = record.get("fingerprint_kind")
         self.selector = _parse(record.get("selector"))
         self.evidence = _parse(record.get("evidence"))
         self.service = ServiceLevel(_parse(record.get("service")))
