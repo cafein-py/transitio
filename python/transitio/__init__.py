@@ -7,9 +7,11 @@ __all__ = [
     "FeedEditor",
     "OsmEditor",
     "FetchResult",
+    "AtlasFeed",
     "IndexedFeed",
     "MobilityDatabase",
     "Place",
+    "TransitlandAtlas",
     "exceptions",
     "build_feed",
     "compare_feed_history",
@@ -39,7 +41,7 @@ __all__ = [
 
 
 def __getattr__(name):
-    if name in ("Dataset", "Feed", "MobilityDatabase"):
+    if name in ("AtlasFeed", "Dataset", "Feed", "MobilityDatabase", "TransitlandAtlas"):
         from transitio import catalog
 
         return getattr(catalog, name)

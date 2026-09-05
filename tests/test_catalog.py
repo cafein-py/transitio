@@ -6,7 +6,12 @@ import httpx
 import pytest
 from shapely.geometry import box
 
-from transitio.catalog import TOKEN_ENV_VAR, MobilityDatabase
+from transitio.catalog import (
+    TOKEN_ENV_VAR,
+    AtlasFeed,
+    MobilityDatabase,
+    TransitlandAtlas,
+)
 from transitio.catalog._client import _bounds
 from transitio.catalog._models import Dataset, Feed
 from transitio.exceptions import DownloadError, MissingTokenError
@@ -448,3 +453,118 @@ def test_expired_access_token_is_refreshed_once(tmp_path):
         feeds = db.search_feeds(country_code="FI")
     assert len(feeds) == 1
     assert len(api_requests(requests, "/v1/tokens")) == 2
+
+
+ATLAS_RECORD = {
+    "onestop_id": "f-dr5r-nyctsubway",
+    "name": "MTA Subway",
+    "spec": "gtfs",
+    "urls": {"static_current": "https://feeds.example.com/nyct.zip"},
+    "authorization": {"type": "header"},
+}
+
+
+def test_atlas_feed_from_record_parses_the_block():
+    feed = AtlasFeed.from_record(ATLAS_RECORD, feed_id="f-dr5r-nyctsubway")
+    assert feed.feed_id == "f-dr5r-nyctsubway"
+    assert feed.onestop_id == "f-dr5r-nyctsubway"
+    assert feed.static_url == "https://feeds.example.com/nyct.zip"
+    assert feed.spec == "gtfs" and feed.name == "MTA Subway"
+    assert feed.requires_auth is True
+    # The feed id falls back to the onestop id; a record with neither is refused.
+    assert AtlasFeed.from_record({"onestop_id": "f-x", "urls": {}}).feed_id == "f-x"
+    with pytest.raises(DownloadError, match="no feed id or onestop id"):
+        AtlasFeed.from_record({"urls": {}})
+
+
+def test_atlas_download_writes_the_gtfs_and_provenance(tmp_path):
+    payload = b"PK\x03\x04 fake atlas gtfs"
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, content=payload)
+
+    transport = httpx.MockTransport(handler)
+    feed = AtlasFeed.from_record(ATLAS_RECORD, feed_id="f-dr5r-nyctsubway")
+    with TransitlandAtlas(cache_dir=tmp_path, transport=transport) as atlas:
+        path = atlas.download(feed)
+        assert path.read_bytes() == payload
+        provenance = json.loads(path.with_suffix(".provenance.json").read_text())
+        assert provenance["feed_id"] == "f-dr5r-nyctsubway"
+        assert provenance["onestop_id"] == "f-dr5r-nyctsubway"
+        assert provenance["source"] == "atlas"
+        assert provenance["source_url"] == feed.static_url
+        assert provenance["sha256"] == hashlib.sha256(payload).hexdigest()
+        # No upstream checksum, so the moving target is re-fetched every call.
+        assert atlas.download(feed) == path
+    assert len(requests) == 2
+    assert not list(tmp_path.rglob("*.part"))
+
+
+def test_atlas_download_refuses_a_feed_without_a_url(tmp_path):
+    with TransitlandAtlas(cache_dir=tmp_path) as atlas:
+        no_url = AtlasFeed.from_record({"onestop_id": "f-x", "urls": {}})
+        with pytest.raises(DownloadError, match="no static download url"):
+            atlas.download(no_url)
+
+
+def test_atlas_download_handles_tilde_and_unicode_ids(tmp_path):
+    # The cache dir is a digest, so a normal tilde id or a Unicode id -- which
+    # an ASCII filesystem-id check would reject -- downloads and keeps its real
+    # id in the provenance sidecar.
+    payload = b"PK\x03\x04"
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=payload)
+    )
+    with TransitlandAtlas(cache_dir=tmp_path, transport=transport) as atlas:
+        for onestop_id in ("f-dr7-mtanyc~metro~north", "f-台東区"):
+            feed = AtlasFeed.from_record(
+                {"onestop_id": onestop_id, "urls": {"static_current": "https://x/z"}}
+            )
+            path = atlas.download(feed)
+            assert path.read_bytes() == payload
+            provenance = json.loads(path.with_suffix(".provenance.json").read_text())
+            assert provenance["feed_id"] == onestop_id
+
+
+def test_provenance_sidecar_is_not_written_through_a_symlink(tmp_path):
+    payload = b"PK\x03\x04 atlas"
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=payload)
+    )
+    feed = AtlasFeed.from_record(ATLAS_RECORD, feed_id="f-dr5r-nyctsubway")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("do not clobber")
+    with TransitlandAtlas(cache_dir=tmp_path, transport=transport) as atlas:
+        path = atlas.download(feed)
+        sidecar = path.with_suffix(".provenance.json")
+        # A hostile symlink pre-placed at the sidecar path before a re-download.
+        sidecar.unlink()
+        sidecar.symlink_to(outside)
+        atlas.download(feed)
+    # The write replaced the symlink with a real file; the target is untouched.
+    assert not sidecar.is_symlink()
+    assert json.loads(sidecar.read_text())["feed_id"] == "f-dr5r-nyctsubway"
+    assert outside.read_text() == "do not clobber"
+
+
+def test_atlas_download_namespaces_feeds_in_a_shared_directory(tmp_path):
+    # Several feeds downloaded into one directory never collide on latest.zip.
+    payloads = {"/a.zip": b"AAAA", "/b.zip": b"BBBB"}
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=payloads[request.url.path])
+    )
+    out = tmp_path / "out"
+    feed_a = AtlasFeed.from_record(
+        {"onestop_id": "f-a", "urls": {"static_current": "https://x/a.zip"}}
+    )
+    feed_b = AtlasFeed.from_record(
+        {"onestop_id": "f-b", "urls": {"static_current": "https://x/b.zip"}}
+    )
+    with TransitlandAtlas(cache_dir=tmp_path, transport=transport) as atlas:
+        path_a = atlas.download(feed_a, directory=out)
+        path_b = atlas.download(feed_b, directory=out)
+    assert path_a != path_b
+    assert path_a.read_bytes() == b"AAAA"
+    assert path_b.read_bytes() == b"BBBB"

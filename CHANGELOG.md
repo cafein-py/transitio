@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `TransitlandAtlas`, a fallback download client for Transitland Atlas feeds,
+  mirroring `MobilityDatabase` without a token: `download(feed)` streams the
+  feed's static GTFS zip with a provenance sidecar recording the source URL,
+  checksum and retrieval time. `AtlasFeed` carries a feed's Atlas identity and
+  download URL, built from an Atlas record with `AtlasFeed.from_record`.
+
 - `active_index()` falls back to an index bundled in the wheel when no
   snapshot is installed and none is pinned, after the `use()` selection,
   the `TRANSITIO_INDEX_SNAPSHOT` pin and the platformdirs cache. The
