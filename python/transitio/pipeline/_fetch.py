@@ -41,6 +41,9 @@ class FetchResult:
     skipped: list
     selections: list = dataclasses.field(default_factory=list)
     provenance: dict = None
+    # The index snapshot the feeds were discovered from; None for the AOI path,
+    # which discovers by bounding box and has no snapshot.
+    snapshot: str = None
 
     def __iter__(self):  # convenient (pbf, feeds) unpacking
         return iter((self.osm_pbf, self.feeds))
@@ -260,6 +263,7 @@ def fetch(
     tiers=None,
     exclude=None,
     on_unknown="include",
+    on_untrusted_selector="auto",
     index=None,
     modes=None,
     repair=False,
@@ -276,8 +280,15 @@ def fetch(
     the OSM stage) or ``place`` (a place name, QID or :class:`Place`). With
     ``place``, feeds are selected from the built index by tier -- ``tiers``,
     ``exclude`` and ``on_unknown`` filter the edges -- and the place geometry
-    supplies the AOI; ``tiers``, ``exclude``, ``on_unknown`` and ``index``
-    apply only with ``place``, and ``country_code`` only with ``aoi``.
+    supplies the AOI; ``tiers``, ``exclude``, ``on_unknown``,
+    ``on_untrusted_selector`` and ``index`` apply only with ``place``, and
+    ``country_code`` only with ``aoi``. When a selector cannot be trusted --
+    its evidence was missing at build time, or its fingerprint no longer
+    matches the download -- ``on_untrusted_selector`` decides the outcome:
+    ``"auto"`` (default) skips the feed when an ``exclude`` was asked for and
+    otherwise delivers it whole with its tier treated as ``unknown``;
+    ``"whole"`` always delivers it whole; ``"drop"`` always skips it;
+    ``"error"`` raises :class:`~transitio.exceptions.StaleSelectorError`.
 
     Resolves and crops the OSM extract, discovers the GTFS feeds (overlapping
     the AOI, or the place's indexed feeds), downloads each feed, validates it,
@@ -338,12 +349,18 @@ def fetch(
         or exclude is not None
         or index is not None
         or on_unknown != "include"
+        or on_untrusted_selector != "auto"
     ):
         raise ValueError(
-            "tiers=, exclude=, on_unknown= and index= apply only with place="
+            "tiers=, exclude=, on_unknown=, on_untrusted_selector= and index= "
+            "apply only with place="
         )
     if place is not None and country_code is not None:
         raise ValueError("country_code= applies only with aoi=")
+    if on_untrusted_selector not in ("auto", "whole", "drop", "error"):
+        raise ValueError(
+            "on_untrusted_selector= must be 'auto', 'whole', 'drop' or 'error'"
+        )
 
     if modes is not None:
         if isinstance(modes, str):
@@ -362,6 +379,7 @@ def fetch(
             tiers=tiers,
             exclude=exclude,
             on_unknown=on_unknown,
+            on_untrusted_selector=on_untrusted_selector,
             index=index,
             when=when,
             modes=modes,
@@ -477,12 +495,65 @@ def fetch(
     )
 
 
+def _selector_trusted(path, feed, sel):
+    """``(trusted, reason, route_ids)`` for a feed's aggregated selector
+    validated against the downloaded feed at ``path``.
+
+    An ``unavailable`` selector is untrustworthy without validation -- it has
+    no fingerprint to check. Otherwise every matched edge's stored fingerprint
+    must recompute from the download by its own kind; the first that does not
+    marks the selector stale. ``route_ids`` is the set the download carries,
+    for the caller's route-presence check (each fingerprint kind reads the
+    same ``routes.txt``, so the set is complete once any edge validated).
+    """
+    from transitio.index import fingerprint
+
+    if sel.state == "unavailable":
+        return False, "unavailable", set()
+    recomputed = {}
+    in_feed = set()
+    for edge in feed.edges.values():
+        kind = edge.fingerprint_kind
+        stored = edge.classification_fingerprint
+        if kind not in fingerprint.KINDS or not stored:
+            return False, "unavailable", in_feed
+        if kind not in recomputed:
+            recomputed[kind] = fingerprint.from_feed(path, kind)
+        digest, routes = recomputed[kind]
+        in_feed |= routes
+        if digest is None or digest != stored:
+            return False, "stale", in_feed
+    return True, None, in_feed
+
+
+def _untrusted_action(policy, exclude, on_unknown):
+    """Map an untrustworthy selector to ``"skip"``, ``"whole"`` or ``"error"``
+    under ``on_untrusted_selector``.
+
+    Under ``"auto"`` an explicit ``exclude`` is a hard constraint that cannot
+    be honoured, so the feed is skipped; otherwise it is delivered whole with
+    its tier treated as ``unknown``, and ``on_unknown`` decides its fate.
+    """
+    if policy == "error":
+        return "error"
+    if policy == "drop":
+        return "skip"
+    if policy == "whole":
+        return "whole"
+    # A truthy exclude names tiers to drop; an empty one excludes nothing, as
+    # edge matching treats it, so it is not a hard constraint.
+    if exclude:
+        return "skip"
+    return "skip" if on_unknown == "exclude" else "whole"
+
+
 def _fetch_place(
     place,
     *,
     tiers,
     exclude,
     on_unknown,
+    on_untrusted_selector,
     index,
     when,
     modes,
@@ -502,6 +573,7 @@ def _fetch_place(
     from transitio import __version__
     from transitio.catalog import Feed, MobilityDatabase, TransitlandAtlas
     from transitio.catalog._atlas import _feed_dir
+    from transitio.exceptions import StaleSelectorError
     from transitio.index import (
         DISCOVERY_SEMANTICS_VERSION,
         Place,
@@ -626,11 +698,15 @@ def _fetch_place(
                     hosted = db.validation_report(dataset)
                 except Exception:  # noqa: B902 — the hosted report is optional
                     hosted = None
-            # Route selection: when the query names tiers, a bundled feed is
-            # cropped to the routes its matched tiers select and the drop is
-            # recorded. A whole-feed or unavailable selector filters nothing.
-            # on_unknown="exclude" is itself an edge filter, so it activates
-            # route selection even without an explicit tiers/exclude query.
+            # Route selection: a bundled feed whose matched tiers name a
+            # trustworthy complete selector is cropped to those routes; a
+            # whole-feed selector filters nothing. Every applied selector is
+            # first validated against the download -- its build-time
+            # fingerprint must recompute and every selected route id must be
+            # present -- and an untrustworthy or unavailable selector routes
+            # through on_untrusted_selector rather than filtering silently.
+            # on_unknown="exclude" is itself an edge filter, so this activates
+            # even without an explicit tiers/exclude query.
             routes = None
             selection = None
             if tiers is not None or exclude is not None or on_unknown != "include":
@@ -645,12 +721,45 @@ def _fetch_place(
                     }
                     for edge in feed.edges.values()
                 ]
-                if sel.state == "complete":
+                trusted, reason, in_feed = _selector_trusted(path, feed, sel)
+                if trusted and sel.state == "complete" and set(sel.route_ids) - in_feed:
+                    trusted, reason = False, "route_absent"
+                if not trusted:
+                    action = _untrusted_action(
+                        on_untrusted_selector, exclude, on_unknown
+                    )
+                    if action == "error":
+                        error = StaleSelectorError(
+                            f"{feed.feed_id}: selector untrustworthy ({reason})"
+                        )
+                        error.feed_id = feed.feed_id
+                        raise error
+                    selection = {
+                        "feed_id": feed.feed_id,
+                        "selector_state": sel.state,
+                        "trusted": False,
+                        "reason": reason,
+                        "kept": None,
+                        "dropped": None,
+                        "declared_as": None,
+                        "selected_by": selected_by,
+                    }
+                    if action == "skip":
+                        skipped.append(
+                            (feed.feed_id, f"untrustworthy selector ({reason})")
+                        )
+                        selections.append(selection)
+                        continue
+                    # action == "whole": deliver unfiltered (routes stays None),
+                    # the selection recording why it was not filtered.
+                elif sel.state == "complete":
                     routes = set(sel.route_ids)
                     selection = {
                         "feed_id": feed.feed_id,
                         "selector_state": "complete",
-                        "kept": sorted(routes),
+                        "trusted": True,
+                        "reason": None,
+                        "kept": None,  # filled from the delivered feed below
                         "dropped": None,
                         "declared_as": sel.declared_as,
                         "selected_by": selected_by,
@@ -659,6 +768,8 @@ def _fetch_place(
                     selection = {
                         "feed_id": feed.feed_id,
                         "selector_state": sel.state,
+                        "trusted": True,
+                        "reason": None,
                         "kept": None,
                         "dropped": [],
                         "declared_as": None,
@@ -688,14 +799,26 @@ def _fetch_place(
                 )
             except _SkipFeed as skip:
                 skipped.append((feed.feed_id, skip.reason))
+                if selection is not None:
+                    selections.append(selection)
                 continue
             except Exception as error:  # noqa: B902 — isolate per-feed failures
                 skipped.append((feed.feed_id, f"processing failed: {error}"))
+                if selection is not None:
+                    selections.append(selection)
                 continue
-            # ``present`` is the routes.txt the crop consumed (post-repair): the
-            # dropped set is what it held minus the selected routes, or None
-            # (undetermined) when its routes.txt could not be read.
-            if selection is not None and selection["selector_state"] == "complete":
+            # ``present`` is the routes.txt the crop scanned (post-repair): the
+            # audit is the selector's own action over the feed's routes -- the
+            # selected routes it carried (``kept``) and the rest it held that
+            # the selector removed (``dropped``). A selected route repair had
+            # already removed is in neither, and any later spatial crop is a
+            # separate transform reported in ``reports``, not here. Both are
+            # None (undetermined) when routes.txt could not be read. Only a
+            # trusted complete selector was cropped (``routes`` is set).
+            if selection is not None and routes is not None:
+                selection["kept"] = (
+                    None if present is None else sorted(present & routes)
+                )
                 selection["dropped"] = (
                     None if present is None else sorted(present - routes)
                 )
@@ -713,4 +836,5 @@ def _fetch_place(
         skipped=skipped,
         selections=selections,
         provenance=provenance,
+        snapshot=provenance["snapshot"],
     )
