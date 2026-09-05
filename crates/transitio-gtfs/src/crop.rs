@@ -31,11 +31,20 @@ pub struct CropOptions {
     /// (stricter); the default keeps any trip serving at least one inside
     /// stop, with its full stop sequence.
     pub full_trips_only: bool,
+    /// Retain only trips whose ``route_id`` is in this set; None keeps every
+    /// route. Applied alongside the spatial and temporal crops (all AND).
+    pub routes: Option<HashSet<String>>,
 }
 
 pub struct CropResult {
     pub row_counts: BTreeMap<String, usize>,
     pub validation: ScanResult,
+    /// The distinct ``route_id`` values in routes.txt before retention, from
+    /// the same scan the crop runs on — so a caller auditing what a route
+    /// filter dropped shares one snapshot with the crop rather than re-reading.
+    /// ``None`` when routes.txt or its ``route_id`` column is absent (the drop
+    /// is then undetermined), never an empty vector standing in for it.
+    pub source_routes: Option<Vec<String>>,
 }
 
 pub fn crop(
@@ -82,6 +91,17 @@ pub fn crop(
         }
     }
 
+    let source_routes: Option<Vec<String>> = result.tables.get("routes.txt").and_then(|table| {
+        column(table, "route_id").map(|i| {
+            table
+                .rows
+                .iter()
+                .map(|row| row.fields[i].clone())
+                .collect::<std::collections::BTreeSet<String>>()
+                .into_iter()
+                .collect()
+        })
+    });
     let kept_trips = select_trips(&result, options, crop_options, area.as_deref())?;
     retain(
         &mut result,
@@ -129,6 +149,7 @@ pub fn crop(
     Ok(CropResult {
         row_counts,
         validation,
+        source_routes,
     })
 }
 
@@ -288,6 +309,7 @@ fn select_trips(
         .ok_or("feed has no usable trips.txt")?;
     let trip_index = column(trips_table, "trip_id").ok_or("trips.txt has no trip_id column")?;
     let service_index = column(trips_table, "service_id");
+    let route_index = column(trips_table, "route_id");
 
     // Spatial selection over stop coordinates: a box, or the polygon
     // parts (pre-filtered by their own bounds) when one was given.
@@ -375,6 +397,12 @@ fn select_trips(
     let mut kept = HashSet::new();
     for row in &trips_table.rows {
         let trip_id = &row.fields[trip_index];
+        if let Some(routes) = &crop_options.routes {
+            let route = route_index.map(|i| row.fields[i].as_str()).unwrap_or("");
+            if !routes.contains(route) {
+                continue;
+            }
+        }
         if let Some(active) = &active_services {
             let service = service_index.map(|i| row.fields[i].as_str()).unwrap_or("");
             if !active.contains(service) {
@@ -688,6 +716,7 @@ mod tests {
             start_date: None,
             end_date: None,
             full_trips_only: false,
+            routes: None,
         };
         let error = match crop(
             Path::new("does-not-matter.zip"),

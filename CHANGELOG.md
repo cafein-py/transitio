@@ -9,13 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `crop_feed(routes=...)` keeps only trips whose route is in the given set, and
+  `fetch(place=..., tiers=...)` uses it to crop each bundled feed to the routes
+  its matched tiers select; every dropped route and the selecting edge's state
+  are recorded in `FetchResult.selections`. A whole-feed or unavailable selector
+  filters nothing.
+
 - `fetch(place=...)` selects feeds from the index by place and tier rather than
   by bounding box: it takes `place=` (a name, QID or `Place`, mutually exclusive
   with `aoi=`), `tiers=`, `exclude=` and `on_unknown=`, uses the place geometry
   as the AOI for the OSM extract, and downloads each feed preferring its
   Mobility Database URL over its Transitland Atlas URL (decision I).
-  `FetchResult` gains `selections` (route-level filtering follows in a later
-  slice; feeds are delivered whole here).
+  `FetchResult` gains `selections` and `provenance`.
 
 - `TransitlandAtlas`, a fallback download client for Transitland Atlas feeds,
   mirroring `MobilityDatabase` without a token: `download(feed)` streams the

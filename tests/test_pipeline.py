@@ -713,3 +713,236 @@ def test_fetch_place_output_names_differ_by_geometry(tmp_path, monkeypatch):
     place_obj._record["geometry"] = shapely.box(10.0, 50.0, 10.2, 50.2)
     second = fetch(place=place_obj, directory=out)
     assert first.feeds[0].name != second.feeds[0].name
+
+
+# route -> (agency, stop, trip, route_type); a1 carries local+regional.
+_ROUTE_SPECS = (
+    ("r-local", "a1", "s-local", "t1", 3),
+    ("r-reg", "a1", "s-reg", "t2", 2),
+    ("r-nat", "a2", "s-nat", "t3", 2),
+    ("r-unknown", "a2", "s-unknown", "t4", 3),
+)
+
+
+def _multi_route_gtfs(routes=_ROUTE_SPECS):
+    # One route per agency/stop/trip so the crop cascade is observable per route.
+    members = {
+        "agency.txt": (
+            "agency_id,agency_name,agency_url,agency_timezone\n"
+            "a1,A1,https://a1,Europe/Helsinki\na2,A2,https://a2,Europe/Helsinki\n"
+        ),
+        # A shared hub as each trip's second stop makes every trip usable.
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\nhub,Hub,60.17,24.94\n"
+        + "".join(f"{s},{s},60.18,24.95\n" for _, _, s, _, _ in routes),
+        "routes.txt": "route_id,agency_id,route_short_name,route_type\n"
+        + "".join(f"{r},{a},{r},{rt}\n" for r, a, _, _, rt in routes),
+        "trips.txt": "route_id,service_id,trip_id\n"
+        + "".join(f"{r},wk,{tr}\n" for r, _, _, tr, _ in routes),
+        "stop_times.txt": "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        + "".join(
+            f"{tr},08:0{i}:00,08:0{i}:00,{s},1\n{tr},08:1{i}:00,08:1{i}:00,hub,2\n"
+            for i, (_, _, s, tr, _) in enumerate(routes)
+        ),
+        "calendar.txt": (
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+            "start_date,end_date\nwk,1,1,1,1,1,0,0,20260101,20261231\n"
+        ),
+    }
+    import io as _io
+
+    buf = _io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for n, c in members.items():
+            z.writestr(n, c)
+    return buf.getvalue()
+
+
+def _feed_tables(path):
+    import csv as _csv
+
+    out = {}
+    with zipfile.ZipFile(path) as z:
+        for name in z.namelist():
+            out[name] = list(_csv.DictReader(z.read(name).decode().splitlines()))
+    return out
+
+
+def _selector_index(tmp_path, edges):
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "scripts"))
+    import transitio.index as transitio_index
+    from index_build import licensing, publish, store
+    from test_index_license import HULL, _cache
+    from test_index_publish import _covered_feed, _edge
+
+    feed = {
+        **_covered_feed("f-a", coverage_source="crawl"),
+        "coverage": HULL,
+        "atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}},
+    }
+    cache = _cache(tmp_path, [feed], [_edge("Q1757", "f-a", tier="local")])
+    # Re-publish the classify generation with hand-crafted per-tier selectors,
+    # keeping its lineage so licensing/publish accept it.
+    feeds_classified, manifest = store.read_jsonl(
+        cache / "classify", "edges.json", "feeds_classified.jsonl"
+    )
+    directory = store.open_subdir(cache, "classify")
+    try:
+        with store.exclusive_writer(directory):
+            store.publish(
+                cache / "classify",
+                "edges.json",
+                {
+                    "feeds_classified.jsonl": store.jsonl_chunks(feeds_classified),
+                    "edges.jsonl": store.jsonl_chunks(edges),
+                },
+                {**manifest, "edges": len(edges)},
+                held=directory,
+            )
+    finally:
+        directory.close()
+    licensing.license_index(cache)
+    publish.publish(cache)
+    return transitio_index.read_index(cache / "index")
+
+
+def test_fetch_place_crops_bundles_to_the_selected_routes(tmp_path, monkeypatch):
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "scripts"))
+    from test_index_publish import _edge
+
+    service = {"stops": 1, "routes": 1, "departures_per_day": 1.0}
+
+    def sel_edge(tier, route):
+        return {
+            **_edge("Q1757", "f-a", tier=tier, service=service),
+            "selector_state": "complete",
+            "selector": {"route_id": [route]},
+            "needs_review": False,
+        }
+
+    edges = [
+        sel_edge("local", "r-local"),
+        sel_edge("regional", "r-reg"),
+        sel_edge("national", "r-nat"),
+    ]
+    index = _selector_index(tmp_path, edges)
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, _multi_route_gtfs())
+
+    result = fetch(
+        place="Q1757",
+        index=index,
+        directory=tmp_path / "out",
+        crop=False,
+        tiers=["local", "regional"],
+        exclude=["national"],
+    )
+    # The delivered feed keeps only the selected tiers' routes, and the crop
+    # cascade drops the entities only the removed routes referenced.
+    tables = _feed_tables(result.feeds[0])
+    assert {r["route_id"] for r in tables["routes.txt"]} == {"r-local", "r-reg"}
+    assert {t_["trip_id"] for t_ in tables["trips.txt"]} == {"t1", "t2"}
+    assert {s["stop_id"] for s in tables["stops.txt"]} == {"s-local", "s-reg", "hub"}
+    # a2 served only r-nat/r-unknown, so it cascades away.
+    assert {a["agency_id"] for a in tables["agency.txt"]} == {"a1"}
+    # The delivered feed is referentially consistent (no validation errors).
+    assert result.reports[0]["summary"]["counts"]["errors"] == 0
+    (selection,) = result.selections
+    assert selection["feed_id"] == "f-a"
+    assert selection["selector_state"] == "complete"
+    assert selection["kept"] == ["r-local", "r-reg"]
+    assert selection["dropped"] == ["r-nat", "r-unknown"]
+    # The audit names the contributing per-tier edges.
+    by_tier = {e["tier"]: e["route_ids"] for e in selection["selected_by"]}
+    assert by_tier == {"local": ["r-local"], "regional": ["r-reg"]}
+
+
+def test_fetch_place_output_names_differ_by_selected_routes(tmp_path, monkeypatch):
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "scripts"))
+    from test_index_publish import _edge
+
+    service = {"stops": 1, "routes": 1, "departures_per_day": 1.0}
+
+    def sel_edge(tier, route):
+        return {
+            **_edge("Q1757", "f-a", tier=tier, service=service),
+            "selector_state": "complete",
+            "selector": {"route_id": [route]},
+            "needs_review": False,
+        }
+
+    index = _selector_index(
+        tmp_path,
+        [
+            sel_edge("local", "r-local"),
+            sel_edge("regional", "r-reg"),
+            sel_edge("national", "r-nat"),
+        ],
+    )
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, _multi_route_gtfs())
+    out = tmp_path / "out"
+    a = fetch(place="Q1757", index=index, directory=out, crop=False, tiers=["local"])
+    b = fetch(place="Q1757", index=index, directory=out, crop=False, tiers=["regional"])
+    # Different tier selections must not overwrite each other's cropped feed.
+    assert a.feeds[0].name != b.feeds[0].name
+
+
+def test_fetch_place_on_unknown_governs_bundle_routes(tmp_path, monkeypatch):
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "scripts"))
+    from test_index_publish import _edge
+
+    service = {"stops": 1, "routes": 1, "departures_per_day": 1.0}
+    edges = [
+        {
+            **_edge("Q1757", "f-a", tier="local", service=service),
+            "selector_state": "complete",
+            "selector": {"route_id": ["r-local"]},
+            "needs_review": False,
+        },
+        {
+            **_edge("Q1757", "f-a", tier="regional", service=service),
+            "selector_state": "complete",
+            "selector": {"route_id": ["r-reg"]},
+            "needs_review": False,
+        },
+        # An unknown-tier edge: no route evidence, so the aggregate is unavailable.
+        {**_edge("Q1757", "f-a", tier="unknown", service=service)},
+    ]
+    index = _selector_index(tmp_path, edges)
+    specs = (
+        ("r-local", "a1", "s-local", "t1", 3),
+        ("r-reg", "a1", "s-reg", "t2", 2),
+        ("r-unknown", "a2", "s-unknown", "t3", 3),
+    )
+
+    def run(on_unknown):
+        _stub_pbf_and_atlas(monkeypatch, tmp_path, _multi_route_gtfs(specs))
+        return fetch(
+            place="Q1757",
+            index=index,
+            directory=tmp_path / f"out-{on_unknown}",
+            crop=False,
+            tiers=["local", "regional"],
+            on_unknown=on_unknown,
+        )
+
+    # include: the unknown edge is matched, the aggregate is unavailable, so the
+    # whole feed is delivered and its unknown route survives.
+    kept_in = _feed_tables(run("include").feeds[0])["routes.txt"]
+    assert "r-unknown" in {r["route_id"] for r in kept_in}
+    # exclude: the unknown edge is dropped, the aggregate is complete, so only
+    # the unknown route is cropped out while the bundle stays.
+    dropped_out = run("exclude")
+    kept_out = {r["route_id"] for r in _feed_tables(dropped_out.feeds[0])["routes.txt"]}
+    assert kept_out == {"r-local", "r-reg"}
+    assert dropped_out.feeds  # the bundle itself is still delivered
