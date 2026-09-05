@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 import time
 import warnings
 from pathlib import Path
@@ -65,15 +66,51 @@ def _stream_download(client, url, path):
     """Stream a URL to ``path`` via a partial file; return the SHA-256 hex."""
     path.parent.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256()
-    partial = path.parent / (path.name + ".part")
-    with client.stream("GET", url) as response:
-        response.raise_for_status()
-        with open(partial, "wb") as handle:
-            for chunk in response.iter_bytes():
-                digest.update(chunk)
-                handle.write(chunk)
-    partial.replace(path)
+    fd, partial = tempfile.mkstemp(
+        dir=path.parent, prefix=path.name + ".", suffix=".part"
+    )
+    try:
+        # The descriptor is wrapped before the request, so a connection or
+        # HTTP failure closes it rather than leaking it (and lets Windows
+        # unlink the temp).
+        with os.fdopen(fd, "wb") as handle:
+            with client.stream("GET", url) as response:
+                response.raise_for_status()
+                for chunk in response.iter_bytes():
+                    digest.update(chunk)
+                    handle.write(chunk)
+        os.replace(partial, path)
+    except BaseException:
+        _discard(partial)
+        raise
     return digest.hexdigest()
+
+
+def _discard(path):
+    """Remove a temporary file, tolerant of its already being gone."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _write_provenance(path, data):
+    """Write a provenance sidecar atomically and without following a symlink
+    at the target: a partial write cannot leave truncated JSON beside the
+    artefact it describes, and a symlink cannot redirect the write elsewhere.
+    Portable -- the fresh unique temp name needs no ``O_NOFOLLOW``, and
+    ``os.replace`` swaps it in without following a symlink at the target."""
+    body = json.dumps(data, indent=2).encode("utf-8")
+    fd, partial = tempfile.mkstemp(
+        dir=path.parent, prefix=path.name + ".", suffix=".part"
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(body)
+        os.replace(partial, path)
+    except BaseException:
+        _discard(partial)
+        raise
 
 
 class MobilityDatabase:
@@ -401,9 +438,7 @@ class MobilityDatabase:
             ],
             "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
-        path.with_suffix(".provenance.json").write_text(
-            json.dumps(provenance, indent=2)
-        )
+        _write_provenance(path.with_suffix(".provenance.json"), provenance)
         return path
 
     def download_latest(self, feed, directory=None):
@@ -442,9 +477,7 @@ class MobilityDatabase:
             "sha256": digest,
             "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
-        path.with_suffix(".provenance.json").write_text(
-            json.dumps(provenance, indent=2)
-        )
+        _write_provenance(path.with_suffix(".provenance.json"), provenance)
         return path
 
     def validation_report(self, dataset):
