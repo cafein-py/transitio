@@ -65,6 +65,7 @@ def crop_feed(
     start_date=None,
     end_date=None,
     full_trips_only=False,
+    routes=None,
     **options,
 ):
     """Crop a GTFS zip to an area of interest and/or a date window.
@@ -92,6 +93,9 @@ def crop_feed(
         its bounding box.
     start_date, end_date : str, optional
         ``YYYYMMDD`` inclusive service-window bounds.
+    routes : iterable of str, optional
+        Keep only trips whose ``route_id`` is in this set (applied alongside
+        the area/date crop); ``None`` keeps every route.
     full_trips_only : bool, default False
         Keep only trips whose every stop lies inside the AOI.
     **options
@@ -101,11 +105,16 @@ def crop_feed(
     Returns
     -------
     dict
-        ``{"row_counts": ..., "remaining_notices": [...],
-        "service_window": ...}`` for the cropped feed.
+        ``{"row_counts": ..., "source_routes": [...] or None,
+        "remaining_notices": [...], "service_window": ...}`` for the cropped
+        feed. ``source_routes`` is the distinct ``route_id`` values in the
+        source routes.txt (before the crop), or ``None`` when it has no
+        route_id column, so a caller can tell what a ``routes`` filter dropped.
     """
-    if aoi is None and start_date is None and end_date is None:
-        raise ValueError("nothing to crop: pass aoi and/or a date window")
+    if aoi is None and start_date is None and end_date is None and routes is None:
+        raise ValueError("nothing to crop: pass aoi, a date window and/or routes")
+    if isinstance(routes, str):
+        routes = [routes]
     bbox = None
     polygon = None
     if aoi is not None:
@@ -125,6 +134,7 @@ def crop_feed(
             start_date=start_date,
             end_date=end_date,
             full_trips_only=full_trips_only,
+            routes=None if routes is None else [str(r) for r in routes],
             **options,
         )
     )

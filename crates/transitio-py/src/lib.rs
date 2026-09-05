@@ -188,7 +188,7 @@ fn repair_feed(
 
 /// Crop a feed spatially and/or temporally into `output`.
 #[pyfunction]
-#[pyo3(signature = (path, output, *, bbox=None, polygon=None, start_date=None, end_date=None, full_trips_only=false, max_entry_bytes=None, max_total_bytes=None, max_rows=None, max_columns=None, max_notices_per_file=None, reference_date=None, reference_time=None))]
+#[pyo3(signature = (path, output, *, bbox=None, polygon=None, start_date=None, end_date=None, full_trips_only=false, routes=None, max_entry_bytes=None, max_total_bytes=None, max_rows=None, max_columns=None, max_notices_per_file=None, reference_date=None, reference_time=None))]
 #[allow(clippy::too_many_arguments)]
 fn crop_feed(
     py: Python<'_>,
@@ -199,6 +199,7 @@ fn crop_feed(
     start_date: Option<String>,
     end_date: Option<String>,
     full_trips_only: bool,
+    routes: Option<Vec<String>>,
     max_entry_bytes: Option<u64>,
     max_total_bytes: Option<u64>,
     max_rows: Option<u64>,
@@ -207,9 +208,14 @@ fn crop_feed(
     reference_date: Option<&str>,
     reference_time: Option<&str>,
 ) -> PyResult<String> {
-    if bbox.is_none() && polygon.is_none() && start_date.is_none() && end_date.is_none() {
+    if bbox.is_none()
+        && polygon.is_none()
+        && start_date.is_none()
+        && end_date.is_none()
+        && routes.is_none()
+    {
         return Err(PyValueError::new_err(
-            "nothing to crop: pass an area and/or a date window",
+            "nothing to crop: pass an area, a date window and/or routes",
         ));
     }
     if bbox.is_some() && polygon.is_some() {
@@ -243,11 +249,13 @@ fn crop_feed(
         start_date,
         end_date,
         full_trips_only,
+        routes: routes.map(|r| r.into_iter().collect()),
     };
     py.allow_threads(move || {
         let result = transitio_gtfs::crop(&path, &output, options, &crop_options)?;
         let report = serde_json::json!({
             "row_counts": result.row_counts,
+            "source_routes": result.source_routes,
             "remaining_notices": result.validation.notices,
             "service_window": result.validation.service_window,
         });

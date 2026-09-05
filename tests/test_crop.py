@@ -354,3 +354,56 @@ def test_stop_associations_follow_their_stops(tmp_path):
             assert {row.split(",")[1] for row in rows} == inside, name
     check = validate_feed(output, reference_date="20260601")
     assert not [n for n in check["notices"] if n["severity"] == "ERROR"]
+
+
+def test_route_crop_keeps_only_selected_routes(tmp_path):
+    source = write_zip(tmp_path / "in.zip", FEED)
+    output = tmp_path / "out.zip"
+    crop_feed(source, output, routes=["r-in"])
+    with zipfile.ZipFile(output) as archive:
+        routes = archive.read("routes.txt").decode()
+        trips = archive.read("trips.txt").decode()
+        stops = archive.read("stops.txt").decode()
+    # Only r-in's routes/trips survive, and the cascade drops r-out's stop.
+    assert "r-in" in routes and "r-out" not in routes
+    assert "t-in" in trips and "t-out" not in trips and "t-old" in trips
+    assert "out1" not in stops and "in1" in stops
+
+
+def test_route_crop_combines_with_the_area(tmp_path):
+    source = write_zip(tmp_path / "in.zip", FEED)
+    output = tmp_path / "out.zip"
+    # r-out is selected but serves no stop in the city, so nothing survives it.
+    crop_feed(source, output, aoi=CITY_BBOX, routes=["r-out"])
+    with zipfile.ZipFile(output) as archive:
+        trips = archive.read("trips.txt").decode()
+    assert "t-out" not in trips and "t-in" not in trips
+
+
+def test_nothing_to_crop_is_refused(tmp_path):
+    source = write_zip(tmp_path / "in.zip", FEED)
+    with pytest.raises(ValueError, match="nothing to crop"):
+        crop_feed(source, tmp_path / "x.zip")
+
+
+def test_route_crop_accepts_a_single_string(tmp_path):
+    source = write_zip(tmp_path / "in.zip", FEED)
+    output = tmp_path / "out.zip"
+    crop_feed(source, output, routes="r-in")
+    with zipfile.ZipFile(output) as archive:
+        routes = archive.read("routes.txt").decode()
+    # A bare string is one route id, not an iterable of characters.
+    assert "r-in" in routes and "r-out" not in routes
+
+
+def test_route_crop_source_routes_distinguishes_absent_from_empty(tmp_path):
+    # With routes.txt the report lists its route ids; without it, source_routes
+    # is None (undetermined), never an empty list standing in for absent.
+    source = write_zip(tmp_path / "in.zip", FEED)
+    report = crop_feed(source, tmp_path / "out.zip", routes=["r-in"])
+    assert sorted(report["source_routes"]) == ["r-in", "r-out"]
+
+    no_routes = {k: v for k, v in FEED.items() if k != "routes.txt"}
+    source2 = write_zip(tmp_path / "in2.zip", no_routes)
+    report2 = crop_feed(source2, tmp_path / "out2.zip", routes=["r-in"])
+    assert report2["source_routes"] is None

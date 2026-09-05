@@ -160,12 +160,16 @@ class _SkipFeed(Exception):
 
 
 def _process_feed(
-    path, *, geometry, tag, repair, crop, modes, when_ymd, hosted, budgets
+    path, *, geometry, tag, repair, crop, modes, when_ymd, hosted, budgets, routes=None
 ):
     """Repair, crop, mode-filter, validate and report one downloaded feed.
 
-    Returns ``(path, report, fixes)``; raises :class:`_SkipFeed` with a reason
-    when the feed drops out. Shared by the AOI and the place paths.
+    Returns ``(path, report, fixes, present_routes)``; ``present_routes`` is the
+    set of ``route_id`` values in the feed as it enters the route crop (after
+    any repair), or ``None`` when a ``routes`` filter is not applied or that
+    feed's routes.txt cannot be read — so a caller records an *undetermined*
+    drop rather than a false empty one. Raises :class:`_SkipFeed` when the feed
+    drops out. Shared by the AOI and the place paths.
     """
     from transitio.gtfs import crop_feed
     from transitio.repair import repair_feed
@@ -181,9 +185,18 @@ def _process_feed(
         repaired = path.with_name(f"{path.stem}-repaired-{tag}.zip")
         fixes = repair_feed(path, repaired, **budgets)["fixes"]
         path = repaired
-    if crop:
+    present_routes = None
+    if crop or routes is not None:
         cropped = path.with_name(f"{path.stem}-cropped-{tag}.zip")
-        crop_feed(path, cropped, aoi=geometry, **budgets)
+        report = crop_feed(
+            path, cropped, aoi=geometry if crop else None, routes=routes, **budgets
+        )
+        if routes is not None:
+            # From the crop's own scan of this feed, so the drop audit and the
+            # crop describe the same bytes (no second read to race). ``None``
+            # (routes.txt or its column absent) stays undetermined, not empty.
+            source = report.get("source_routes")
+            present_routes = None if source is None else set(source)
         path = cropped
     if modes is not None:
         served = _feed_modes(path)
@@ -199,7 +212,7 @@ def _process_feed(
             f"{window[0]}..{window[1]})"
         )
     report = build_report(validation, hosted=hosted, provenance=provenance)
-    return path, report, fixes
+    return path, report, fixes, present_routes
 
 
 def _download_indexed(feed, db, atlas, base_dir):
@@ -376,6 +389,7 @@ def fetch(
             {
                 "bounds": [round(v, 6) for v in geometry.bounds],
                 "reference_date": budgets.get("reference_date"),
+                "crop": crop,
             },
             sort_keys=True,
         ).encode()
@@ -433,7 +447,7 @@ def fetch(
                 # Modes are read from the delivered feed, after cropping, so an
                 # aggregate serving buses only outside the AOI does not pass a
                 # bus filter.
-                path, report, fixes = _process_feed(
+                path, report, fixes, _ = _process_feed(
                     path,
                     geometry=geometry,
                     tag=tag,
@@ -480,9 +494,9 @@ def _fetch_place(
     budgets,
 ):
     """The ``fetch(place=...)`` path: the place geometry is the AOI, feeds come
-    from the index by tier, and each is downloaded MDB-then-Atlas (decision I).
-    Route filtering to the selected tiers is a later slice; feeds are delivered
-    whole here and ``selections`` is empty."""
+    from the index by tier, each is downloaded MDB-then-Atlas (decision I), and
+    a bundled feed is cropped to the routes its matched tiers select, the drop
+    recorded in ``selections``."""
     import shapely
 
     from transitio import __version__
@@ -528,6 +542,7 @@ def _fetch_place(
                 "snapshot": provenance["snapshot"],
                 "bounds": [round(v, 6) for v in geometry.bounds],
                 "reference_date": budgets.get("reference_date"),
+                "crop": crop,
             },
             sort_keys=True,
         ).encode()
@@ -611,17 +626,65 @@ def _fetch_place(
                     hosted = db.validation_report(dataset)
                 except Exception:  # noqa: B902 — the hosted report is optional
                     hosted = None
+            # Route selection: when the query names tiers, a bundled feed is
+            # cropped to the routes its matched tiers select and the drop is
+            # recorded. A whole-feed or unavailable selector filters nothing.
+            # on_unknown="exclude" is itself an edge filter, so it activates
+            # route selection even without an explicit tiers/exclude query.
+            routes = None
+            selection = None
+            if tiers is not None or exclude is not None or on_unknown != "include":
+                sel = feed.selector
+                selected_by = [
+                    {
+                        "tier": edge.tier,
+                        "selector_state": edge.selector_state,
+                        "route_ids": sorted(
+                            (edge.selector or {}).get("route_id") or []
+                        ),
+                    }
+                    for edge in feed.edges.values()
+                ]
+                if sel.state == "complete":
+                    routes = set(sel.route_ids)
+                    selection = {
+                        "feed_id": feed.feed_id,
+                        "selector_state": "complete",
+                        "kept": sorted(routes),
+                        "dropped": None,
+                        "declared_as": sel.declared_as,
+                        "selected_by": selected_by,
+                    }
+                else:
+                    selection = {
+                        "feed_id": feed.feed_id,
+                        "selector_state": sel.state,
+                        "kept": None,
+                        "dropped": [],
+                        "declared_as": None,
+                        "selected_by": selected_by,
+                    }
+            # A per-feed tag folds in the selected routes so the same feed
+            # fetched under different tiers never overwrites an earlier output.
+            feed_tag = tag
+            if routes is not None:
+                feed_tag = hashlib.sha256(
+                    json.dumps(
+                        {"tag": tag, "routes": sorted(routes)}, sort_keys=True
+                    ).encode()
+                ).hexdigest()[:16]
             try:
-                path, report, fixes = _process_feed(
+                path, report, fixes, present = _process_feed(
                     path,
                     geometry=geometry,
-                    tag=tag,
+                    tag=feed_tag,
                     repair=repair,
                     crop=crop,
                     modes=modes,
                     when_ymd=when_ymd,
                     hosted=hosted,
                     budgets=budgets,
+                    routes=routes,
                 )
             except _SkipFeed as skip:
                 skipped.append((feed.feed_id, skip.reason))
@@ -629,9 +692,18 @@ def _fetch_place(
             except Exception as error:  # noqa: B902 — isolate per-feed failures
                 skipped.append((feed.feed_id, f"processing failed: {error}"))
                 continue
+            # ``present`` is the routes.txt the crop consumed (post-repair): the
+            # dropped set is what it held minus the selected routes, or None
+            # (undetermined) when its routes.txt could not be read.
+            if selection is not None and selection["selector_state"] == "complete":
+                selection["dropped"] = (
+                    None if present is None else sorted(present - routes)
+                )
             reports.append(report)
             repairs.append(fixes)
             feeds.append(path)
+            if selection is not None:
+                selections.append(selection)
 
     return FetchResult(
         osm_pbf=osm_pbf,
