@@ -178,13 +178,16 @@ class Place:
         exclude=None,
         spec="gtfs",
         on_unknown="include",
+        requires=None,
     ):
         """The feeds serving this place, as :class:`IndexedFeed` objects.
 
         ``tiers`` keeps only edges of those tiers, ``exclude`` drops edges of
         the named tiers (a feed with nothing left is dropped), ``spec`` selects
         the feed kind (static GTFS by default; ``None`` for everything, a list
-        to narrow) and ``on_unknown`` governs unknown-tier edges. See
+        to narrow), ``on_unknown`` governs unknown-tier edges and ``requires``
+        keeps only feeds whose manifest carries the named GTFS files (for
+        example ``"shapes.txt"``). See
         :func:`transitio.index.feeds.feeds_for_place`.
         """
         return self._lookup.feeds(
@@ -193,6 +196,7 @@ class Place:
             exclude=exclude,
             spec=spec,
             on_unknown=on_unknown,
+            requires=requires,
         )
 
     def __eq__(self, other):
