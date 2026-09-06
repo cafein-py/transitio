@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assignment by containment of its Overture representative point; no build
   stage uses the module yet.
 
+- `places.yaml` gains the `set_statistical_area` operation — a curated
+  crosswalk from a metro QID to a statistical scheme's code (`eurostat_metro`),
+  bound by `evidence_hash` to the derived member list it confirms — and the
+  Wikidata client a `metro_candidates` lookup (the P8138 metropolitan-area and
+  functional-urban-area entities of a city) for curators to pick that QID from.
+
 - `IndexedFeed.files` exposes the GTFS files a feed's archive carries (the
   manifest the crawl records under index schema 5; empty for an older
   snapshot), with `has_shapes` and `has_fares` as capability hints over it, and
