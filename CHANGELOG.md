@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Wikidata client a `metro_candidates` lookup (the P8138 metropolitan-area and
   functional-urban-area entities of a city) for curators to pick that QID from.
 
+- The licence inventory gains a `use` column (`geometry` or `derived`) and
+  a `DERIVED_SOURCE_ALLOWLIST` for sources that may contribute build-time
+  derived data; an earlier stage's derived-input rows flow into the inventory
+  and their credits into NOTICE. Metro report rows name their `branch`.
+
 - `IndexedFeed.files` exposes the GTFS files a feed's archive carries (the
   manifest the crawl records under index schema 5; empty for an older
   snapshot), with `has_shapes` and `has_fares` as capability hints over it, and
