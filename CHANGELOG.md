@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The geometry stage gives any metro without geometry the union of its
+  member cities' shipped polygons (`geometry_source = "member_union"`),
+  simplified and validated like every other place; a member without
+  shipped geometry, or a metro without members, leaves it without one.
+
 - `scripts/index_build/eurostat.py` pins Eurostat's metropolitan-regions
   composition table (NUTS 2021) and the GISCO NUTS-3 boundaries by checksum,
   publishes them as a verified `raw/eurostat.json` generation, reads them
