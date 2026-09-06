@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `scripts/index_build/eurostat.py` pins Eurostat's metropolitan-regions
+  composition table (NUTS 2021) and the GISCO NUTS-3 boundaries by checksum,
+  publishes them as a verified `raw/eurostat.json` generation; no build stage
+  uses the module yet.
+
 - `IndexedFeed.files` exposes the GTFS files a feed's archive carries (the
   manifest the crawl records under index schema 5; empty for an older
   snapshot), with `has_shapes` and `has_fares` as capability hints over it, and
