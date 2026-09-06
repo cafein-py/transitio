@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `scripts/index_build/pinned.py` holds the pinned-input machinery (fetch or
+  local files, SHA-256 verification, one verified `raw` generation, reuse,
+  pin-checked resolve) that `eurostat.py` now delegates to, so further pinned
+  sources share it.
+
 - The geometry stage gives any metro without geometry the union of its
   member cities' shipped polygons (`geometry_source = "member_union"`),
   simplified and validated like every other place; a member without
