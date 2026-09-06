@@ -30,8 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   city of a country the pinned composition covers and records it in
   `metro_assignments.jsonl`; a Eurostat metro publishes only through a
   `set_statistical_area` crosswalk and only while its derived inputs are
-  allowlisted, otherwise it is reported. Cities the expand stage discovers
-  get their Eurostat membership on the next build.
+  allowlisted, otherwise it is reported with the Wikidata candidates its
+  member cities link to; the derived-input rows reach the licence inventory
+  and NOTICE. Cities the expand stage discovers get their Eurostat membership
+  on the next build.
 
 - `IndexedFeed.files` exposes the GTFS files a feed's archive carries (the
   manifest the crawl records under index schema 5; empty for an older
