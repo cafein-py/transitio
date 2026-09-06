@@ -13,8 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   composition table (NUTS 2021) and the GISCO NUTS-3 boundaries by checksum,
   publishes them as a verified `raw/eurostat.json` generation, reads them
   under an asserted input contract and derives each city's Eurostat metro
-  assignment by containment of its Overture representative point; no build
-  stage uses the module yet.
+  assignment by containment of its Overture representative point.
 
 - `places.yaml` gains the `set_statistical_area` operation — a curated
   crosswalk from a metro QID to a statistical scheme's code (`eurostat_metro`),
@@ -26,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a `DERIVED_SOURCE_ALLOWLIST` for sources that may contribute build-time
   derived data; an earlier stage's derived-input rows flow into the inventory
   and their credits into NOTICE. Metro report rows name their `branch`.
+
+- The metros stage derives Eurostat metropolitan-region membership for every
+  city of a country the pinned composition covers and records it in
+  `metro_assignments.jsonl`; a Eurostat metro publishes only through a
+  `set_statistical_area` crosswalk and only while its derived inputs are
+  allowlisted, otherwise it is reported. Cities the expand stage discovers
+  get their Eurostat membership on the next build.
 
 - `IndexedFeed.files` exposes the GTFS files a feed's archive carries (the
   manifest the crawl records under index schema 5; empty for an older
