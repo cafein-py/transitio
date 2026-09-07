@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `scripts/index_build/registry.py` reads the place registry, the index's
+  own place ids and their concordances: a committed JSON Lines file with a
+  header counter and one row per id, loaded under validation (exact header
+  types, unique JSON keys, ordered ids below the counter, known namespaces,
+  well-formed QIDs, merge targets live, a concordance value on one place
+  only) and read through `resolve` — an own id, a bare QID or
+  `namespace:value`, merges followed and retirements refused — with the
+  first QID of a live place canonical. Nothing writes to it or mints
+  through it yet.
+
 - `store.publish(..., staged=True)` writes a generation that no pointer
   names, `store.resolve_generation` verifies one by name, and pruning keeps
   every generation a run manifest lists under `generations`, so a gazetteer
