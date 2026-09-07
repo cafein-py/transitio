@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `pinned.derive` holds the compute-once step for artifacts derived from
+  verified inputs (reused while the manifest's `sources` equal the inputs'
+  digests), which the FAO patches conversion now uses; `fao.read_zipped` and
+  `fao.integer_ids` are the shared zipped-geodata and exact-id readers.
+
 - The gazetteer gains an FAO city-regions stage (`scripts/index_build/fao.py`):
   the pinned 1-hour patches and regions (Zenodo 10.5281/zenodo.11187634,
   CC BY 4.0) are converted once to GeoParquet, and cities with no metro and
