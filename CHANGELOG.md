@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The reader understands index schema 6, which keys places by the index's
+  own `tp_` id: the places table gains `wikidata_id` (nullable),
+  `concordances` (ids per namespace) and `former_ids`; `Place.wikidata_id`,
+  `Place.concordances` and `Place.former_ids` expose them (a pre-6 index
+  reports its QID key as both), and a place resolves by its own id, any QID
+  it carries — a merged-away one included — or a former id. Nothing
+  publishes schema 6 yet.
 - Override references resolve through the place registry: `places.yaml`
   (`place`, `parent_id`, `member_ids`, `set_place_members`), `edges.yaml`
   places, `set_coverage` place ids and golden membership lists accept a

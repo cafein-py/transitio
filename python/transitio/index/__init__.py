@@ -45,12 +45,13 @@ __all__ = [
 
 # The index schema versions this reader understands. A snapshot outside the set
 # is refused rather than read against columns that may have moved.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({4, 5})
+SUPPORTED_SCHEMA_VERSIONS = frozenset({4, 5, 6})
 
 # The oldest transitio that reads each schema version: what a snapshot records
 # as its reader floor, fixed per schema rather than taken from the build.
-# Schema 5 adds the per-feed ``files`` manifest; both ship first in 0.11.0.
-MIN_READER_VERSIONS = {4: "0.11.0", 5: "0.11.0"}
+# Schema 5 adds the per-feed ``files`` manifest and schema 6 keys places by
+# their own id, with the QID beside it; all three ship first in 0.11.0.
+MIN_READER_VERSIONS = {4: "0.11.0", 5: "0.11.0", 6: "0.11.0"}
 
 # Bumped whenever name resolution, ranking, promotion or filtering changes:
 # the snapshot pins the data, this pins how the reader interprets it, and a
@@ -104,8 +105,13 @@ _SCHEMA_COLUMNS = frozenset(
     }
 )
 
-# The feeds columns per schema version: schema 5 adds the ``files`` manifest.
-_FEEDS_COLUMNS = {4: _SCHEMA_COLUMNS, 5: _SCHEMA_COLUMNS | {"files"}}
+# The feeds columns per schema version: schema 5 adds the ``files`` manifest,
+# and schema 6 (which changes only the places table) keeps them.
+_FEEDS_COLUMNS = {
+    4: _SCHEMA_COLUMNS,
+    5: _SCHEMA_COLUMNS | {"files"},
+    6: _SCHEMA_COLUMNS | {"files"},
+}
 
 # The columns an edges table carries, unchanged from schema_version 4 through 5.
 _EDGES_COLUMNS = frozenset(
@@ -131,8 +137,10 @@ _EDGES_COLUMNS = frozenset(
 )
 
 # The columns a places table carries, geometry included; unchanged from
-# schema_version 4 through 5.
-_PLACES_COLUMNS = frozenset(
+# schema_version 4 through 5. Schema 6 keys ``place_id`` by the index's own id
+# and adds the nullable ``wikidata_id``, the ``concordances`` block of ids per
+# namespace and the ``former_ids`` an alias row was merged from.
+_PLACES_SCHEMA_COLUMNS = frozenset(
     {
         "place_id",
         "kind",
@@ -157,6 +165,11 @@ _PLACES_COLUMNS = frozenset(
         "geometry",
     }
 )
+_PLACES_COLUMNS = {
+    4: _PLACES_SCHEMA_COLUMNS,
+    5: _PLACES_SCHEMA_COLUMNS,
+    6: _PLACES_SCHEMA_COLUMNS | {"wikidata_id", "concordances", "former_ids"},
+}
 
 
 # What a table may declare before it is materialised: the on-disk ceiling
@@ -393,7 +406,9 @@ def _read_places(path, snapshot, version):
             f"{path / PLACES_FILE}: does not match the snapshot's places_sha256"
         )
     places = _load_table(geopandas.read_parquet, data, path / PLACES_FILE, "places")
-    _check_columns(places, _PLACES_COLUMNS, path / PLACES_FILE, version, "places")
+    _check_columns(
+        places, _PLACES_COLUMNS[version], path / PLACES_FILE, version, "places"
+    )
     _check_snapshot_column(places, snapshot, path / PLACES_FILE, "places")
     return places
 
@@ -525,8 +540,10 @@ def _lookup_for(index):
 def place(query, *, kind=None, index=None):
     """Resolve ``query`` to a single :class:`Place`, or raise.
 
-    ``query`` is a name, a QID, or a :class:`Place`. A bare city name promotes to
-    its default metro; ``kind`` pins the scope and suppresses promotion. Raises
+    ``query`` is a name, a QID, an own ``tp_`` id, or a :class:`Place`; an id
+    resolves through the place's former ids and the QIDs it carries. A bare
+    city name promotes to its default metro; ``kind`` pins the scope and
+    suppresses promotion. Raises
     :class:`~transitio.exceptions.PlaceNotFoundError` or
     :class:`~transitio.exceptions.AmbiguousPlaceError`.
     """
