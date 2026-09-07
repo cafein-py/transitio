@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The gazetteer run is one transaction: its stages publish staged
+  generations under the cache's run lock, the registry is saved once after
+  the last stage, and a run manifest (`gazetteer/run.json`) published last
+  names the generation each stage pointer stands for. The store resolves a
+  pointer the run manifest names to that generation, so consumers see a
+  complete set or the previous one, never a mixture; a failure before the
+  save leaves the registry and the previous set untouched, a crash after it
+  leaves rows a rerun reproduces, and a corrupt manifest or pointer is an
+  error rather than an absence. Later commands refuse a run whose registry
+  is no longer the file on disk until the gazetteer runs again.
 - The gazetteer run opens one place-registry session (`--registry`,
   default `places_registry.jsonl` in the overrides directory;
   `--registry-read-only` refuses any mint or enrichment): the seed
