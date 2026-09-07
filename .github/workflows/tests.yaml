@@ -54,3 +54,26 @@ jobs:
       - run: pytest --cov=transitio --cov-report=term-missing
         env:
           TRANSITIO_REQUIRE_TEST_DATA: "1"
+
+  registry:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compare the place registry with the base branch
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          git cat-file -e "$base^{commit}"
+          if git cat-file -e "$base:overrides/places_registry.jsonl" 2>/dev/null; then
+            git show "$base:overrides/places_registry.jsonl" > /tmp/base_registry.jsonl
+            echo "base registry from $base"
+          else
+            rm -f /tmp/base_registry.jsonl
+            echo "no registry on the base commit: comparing against the header-only registry"
+          fi
+          python scripts/check_registry_history.py /tmp/base_registry.jsonl overrides/places_registry.jsonl

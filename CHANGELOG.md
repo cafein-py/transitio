@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The place registry identifies places: `Registry.identify` finds the one
+  place a candidate's concordances name, records any it lacked, refuses a
+  candidate naming several places, one carrying a value a curator detached
+  from that place, or one without any concordance, and otherwise mints the
+  next id from the header counter; a read-only session refuses a mint or
+  an enrichment at the point of discovery. Rows carry `detached` entries
+  (a value kept in history but dropped from every lookup, re-attachable
+  elsewhere) and every lookup uses that effective view. The committed
+  registry starts as the header-only `overrides/places_registry.jsonl`,
+  and a CI job checks every pull request's change to it against the
+  registry's history rules.
+
+- The place registry gains its session and save: `registry.session` holds
+  the writer lock beside the file for as long as the block runs (a second
+  writer is refused), the registry it yields is the only one that can write
+  and loses that ability when the session ends, and `save` replaces the
+  file atomically in canonical order — only when something changed, refused
+  when the file is no longer the one the session last saw, and never in a
+  read-only session — recording the digest loaded beside the digest written
+  in its manifest. Nothing mints through it yet.
+
 - `scripts/index_build/registry.py` reads the place registry, the index's
   own place ids and their concordances: a committed JSON Lines file with a
   header counter and one row per id, loaded under validation (exact header
