@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The gazetteer run opens one place-registry session (`--registry`,
+  default `places_registry.jsonl` in the overrides directory;
+  `--registry-read-only` refuses any mint or enrichment): the seed
+  identifies every place by its QID, Overture id and OSM relation and
+  records `tp_id` and `wikidata_id` on the row, the metros stage does the
+  same for metro rows with their CBSA or Eurostat code, and the registry is
+  saved once after the last stage. The QID stays the place key.
+
 - The place registry identifies places: `Registry.identify` finds the one
   place a candidate's concordances name, records any it lacked, refuses a
   candidate naming several places, one carrying a value a curator detached
@@ -28,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file atomically in canonical order — only when something changed, refused
   when the file is no longer the one the session last saw, and never in a
   read-only session — recording the digest loaded beside the digest written
-  in its manifest. Nothing mints through it yet.
+  in its manifest.
 
 - `scripts/index_build/registry.py` reads the place registry, the index's
   own place ids and their concordances: a committed JSON Lines file with a
@@ -37,8 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   well-formed QIDs, merge targets live, a concordance value on one place
   only) and read through `resolve` — an own id, a bare QID or
   `namespace:value`, merges followed and retirements refused — with the
-  first QID of a live place canonical. Nothing writes to it or mints
-  through it yet.
+  first QID of a live place canonical.
 
 - `store.publish(..., staged=True)` writes a generation that no pointer
   names, `store.resolve_generation` verifies one by name, and pruning keeps
