@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The FAO suggestion report names each city-region after its urban centre's
+  GHS-UCDB match: entries carry `name`, `name_ambiguous` and
+  `name_candidates`, the pasteable `add_place` line is prefilled with the
+  name, the UCDB credit joins the per-entry provenance and the manifest
+  counts named entries; names attach only while `GHS-UCDB R2024A` is in the
+  derived allowlist, and the report says so either way.
+
 - `scripts/index_build/ucdb.py` pins the FAO urban centres and the GHS Urban
   Centre Database 2025 general-characteristics table (JRC, CC BY 4.0) and
   names each FAO centre after the UCDB centre covering the largest share of
