@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `store.publish(..., staged=True)` writes a generation that no pointer
+  names, `store.resolve_generation` verifies one by name, and pruning keeps
+  every generation a run manifest lists under `generations`, so a gazetteer
+  run can stage its stages' outputs and make them visible together.
+
 - The FAO suggestion report names each city-region after its urban centre's
   GHS-UCDB match: entries carry `name`, `name_ambiguous` and
   `name_candidates`, the pasteable `add_place` line is prefilled with the
