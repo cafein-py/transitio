@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `scripts/index_build/fao.py` pins the FAO multi-tier city-regions inputs at
+  the 1-hour cutoff (Zenodo 10.5281/zenodo.11187634, CC BY 4.0), converts
+  the patches shapefile once to a verified GeoParquet generation, and reads
+  patches and regions under the verified nested-region contract.
+
 - `scripts/index_build/pinned.py` holds the pinned-input machinery (fetch or
   local files, SHA-256 verification, one verified `raw` generation, reuse,
   pin-checked resolve) that `eurostat.py` now delegates to, so further pinned
