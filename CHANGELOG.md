@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `scripts/index_build/ucdb.py` pins the FAO urban centres and the GHS Urban
+  Centre Database 2025 general-characteristics table (JRC, CC BY 4.0) and
+  names each FAO centre after the UCDB centre covering the largest share of
+  its area (at least a tenth; a runner-up within half of it flags the match
+  ambiguous), matched once into `raw/fao-names.json`; `GHS-UCDB R2024A` joins
+  the derived-source registry and allowlist. Nothing consumes the names yet.
+
 - `pinned.derive` holds the compute-once step for artifacts derived from
   verified inputs (reused while the manifest's `sources` equal the inputs'
   digests), which the FAO patches conversion now uses; `fao.read_zipped` and
