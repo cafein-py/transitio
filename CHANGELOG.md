@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Override references resolve through the place registry: `places.yaml`
+  (`place`, `parent_id`, `member_ids`, `set_place_members`), `edges.yaml`
+  places, `set_coverage` place ids and golden membership lists accept a
+  `tp_` id, a bare QID or `namespace:value` for any registered place, each
+  resolved to the registry's current key for that place; a bare QID no row
+  carries yet still names a place to be minted, and any other unknown
+  reference is an error.
 - The gazetteer run is one transaction: its stages publish staged
   generations under the cache's run lock, the registry is saved once after
   the last stage, and a run manifest (`gazetteer/run.json`) published last
