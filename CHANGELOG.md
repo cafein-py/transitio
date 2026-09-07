@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The gazetteer gains an FAO city-regions stage (`scripts/index_build/fao.py`):
+  the pinned 1-hour patches and regions (Zenodo 10.5281/zenodo.11187634,
+  CC BY 4.0) are converted once to GeoParquet, and cities with no metro and
+  no known official assignment are grouped by the city-region of their
+  patch's highest-tier centre into `suggested_metros_report.jsonl`, each
+  entry with a ready-to-paste override pair; nothing is published.
+
 - `scripts/index_build/fao.py` pins the FAO multi-tier city-regions inputs at
   the 1-hour cutoff (Zenodo 10.5281/zenodo.11187634, CC BY 4.0), converts
   the patches shapefile once to a verified GeoParquet generation, and reads
