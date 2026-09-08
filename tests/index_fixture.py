@@ -1,24 +1,32 @@
-"""A published feed index, written in the reader's shape.
+"""A published feed index and its release, written in the reader's shape.
 
-The reader's tests and the pipeline's need an index to read. This module
-writes one directly -- the members of a release in the layout
-``transitio.index`` reads -- so those tests depend on the reader alone,
-never on the build that produces real indexes. The row shapes mirror the
-build's publish stage column for column; a test in the build's suite checks
-the two stay in step.
+The reader's tests and the pipeline's need an index to read, install and
+refresh. This module writes one directly -- the members of a release in the
+layout ``transitio.index`` reads and ``transitio.index.release`` describes --
+so those tests depend on the reader alone, never on the build that produces
+real indexes. The row shapes mirror the build's publish stage column for
+column; a test in the build's suite checks the two stay in step.
 """
 
+import gzip
 import hashlib
 import io
 import json
 import re
+import tarfile
 
+import httpx
 import pyarrow as pa
 import pyarrow.parquet as pq
 import shapely
 
 import transitio
 import transitio.index as reader
+from transitio.index import release as contract
+
+API = "https://api.example"
+UPLOADS = "https://uploads.example"
+DOWNLOADS = "https://objects.example"
 
 # The tables below declare the schema-6 columns, so the fixture is pinned to
 # that version rather than to whatever a newer reader supports.
@@ -226,6 +234,28 @@ def _feed_row(record, snapshot_id):
     }
 
 
+def _service_by_place(edges):
+    """Each place's service summed over the feeds serving it, pairs counted
+    once; a number stays null while no feed reports it. Mirrors the publish
+    stage's helper so the fixture's place rows match what the build emits."""
+    per_pair = {}
+    for record in edges:
+        per_pair.setdefault(
+            (record["place_id"], record["feed_id"]), record.get("service")
+        )
+    totals = {}
+    for (place_id, _), service in per_pair.items():
+        total = totals.setdefault(
+            place_id,
+            {"feeds": 0, "stops": None, "routes": None, "departures_per_day": None},
+        )
+        total["feeds"] += 1
+        for field in ("stops", "routes", "departures_per_day"):
+            if (service or {}).get(field) is not None:
+                total[field] = (total[field] or 0) + service[field]
+    return totals
+
+
 def _place_row(record, snapshot_id, service=None):
     # A row keyed by its QID states its identity; any other key is a
     # fixture's and states none.
@@ -308,41 +338,266 @@ def _sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def write_index(directory, *, feeds=None, edges=None, places=None):
+def write_index(
+    directory,
+    *,
+    feeds=None,
+    edges=None,
+    places=None,
+    snapshot_id=SNAPSHOT_ID,
+    notice=NOTICE,
+    feeds_only=False,
+):
     """Write a published index under ``directory`` and return it.
 
     The defaults are one declared feed serving Helsinki and its metro, all
-    five release members present and the index licensed.
+    five release members present and the index licensed. With ``feeds_only``
+    the index carries neither places nor edges, as a build without a
+    gazetteer publishes; ``notice=None`` publishes it unlicensed.
     """
     feeds = [covered_feed("f-a")] if feeds is None else feeds
     edges = [edge("Q1757", "f-a")] if edges is None else edges
     places = PLACES if places is None else places
     directory.mkdir(parents=True, exist_ok=True)
-    feeds_data = _parquet([_feed_row(r, SNAPSHOT_ID) for r in feeds], FEEDS_SCHEMA)
-    places_data = _parquet(
-        [_place_row(r, SNAPSHOT_ID) for r in places],
-        PLACES_SCHEMA.with_metadata({b"geo": _geo_metadata()}),
-    )
-    edges_data = _parquet([_edge_row(r, SNAPSHOT_ID) for r in edges], EDGES_SCHEMA)
+    feeds_data = _parquet([_feed_row(r, snapshot_id) for r in feeds], FEEDS_SCHEMA)
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "discovery_semantics_version": reader.DISCOVERY_SEMANTICS_VERSION,
         "min_reader_version": reader.MIN_READER_VERSIONS[SCHEMA_VERSION],
         "built_with": transitio.__version__,
-        "snapshot_id": SNAPSHOT_ID,
+        "snapshot_id": snapshot_id,
         "built_at": "2026-09-01T00:00:00+00:00",
-        "counts": {"feeds": len(feeds), "places": len(places), "edges": len(edges)},
+        "counts": {"feeds": len(feeds)},
         "feeds_sha256": _sha256(feeds_data),
-        "places_sha256": _sha256(places_data),
-        "edges_sha256": _sha256(edges_data),
-        "licensed": True,
-        "notice_sha256": _sha256(NOTICE),
+        "licensed": notice is not None,
+        "notice_sha256": None if notice is None else _sha256(notice),
     }
     (directory / reader.FEEDS_FILE).write_bytes(feeds_data)
-    (directory / reader.PLACES_FILE).write_bytes(places_data)
-    (directory / reader.EDGES_FILE).write_bytes(edges_data)
-    (directory / "NOTICE").write_bytes(NOTICE)
+    if not feeds_only:
+        service = _service_by_place(edges)
+        places_data = _parquet(
+            [_place_row(r, snapshot_id, service.get(r["place_id"])) for r in places],
+            PLACES_SCHEMA.with_metadata({b"geo": _geo_metadata()}),
+        )
+        edges_data = _parquet([_edge_row(r, snapshot_id) for r in edges], EDGES_SCHEMA)
+        manifest["places_sha256"] = _sha256(places_data)
+        manifest["edges_sha256"] = _sha256(edges_data)
+        manifest["counts"].update(places=len(places), edges=len(edges))
+        (directory / reader.PLACES_FILE).write_bytes(places_data)
+        (directory / reader.EDGES_FILE).write_bytes(edges_data)
+    if notice is not None:
+        (directory / "NOTICE").write_bytes(notice)
     (directory / reader.SNAPSHOT_FILE).write_text(
         json.dumps(manifest, indent=2, sort_keys=True)
     )
     return directory
+
+
+def index(tmp_path):
+    """The default index, under ``tmp_path / "index"``."""
+    return write_index(tmp_path / "index")
+
+
+def manifest_bytes(**fields):
+    manifest = {
+        "snapshot_id": SNAPSHOT_ID,
+        "schema_version": 4,
+        "min_reader_version": "0.11.0",
+        **fields,
+    }
+    return json.dumps(manifest).encode()
+
+
+def pack(directory):
+    """The release assets of the index at ``directory``, in the contract's
+    shape: the archive of its members, the archive's checksum and the
+    manifest a client reads before downloading anything."""
+    members = [(name, (directory / name).read_bytes()) for name in contract.MEMBERS]
+    snapshot = json.loads(dict(members)[reader.SNAPSHOT_FILE])
+    snapshot_id = snapshot["snapshot_id"]
+    name = contract.archive_name(snapshot_id)
+    archive = _archive(members)
+    manifest = {
+        "snapshot_id": snapshot_id,
+        "schema_version": snapshot["schema_version"],
+        "discovery_semantics_version": snapshot.get("discovery_semantics_version"),
+        "min_reader_version": snapshot.get("min_reader_version"),
+        "built_with": snapshot.get("built_with"),
+        "built_at": snapshot.get("built_at"),
+        "counts": snapshot.get("counts"),
+        "archive": {"name": name, "sha256": _sha256(archive), "bytes": len(archive)},
+        "members": {member: _sha256(data) for member, data in members},
+    }
+    return {
+        name: archive,
+        name + contract.CHECKSUM_SUFFIX: f"{_sha256(archive)}  {name}\n".encode(),
+        contract.MANIFEST_NAME: (
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        ).encode(),
+    }
+
+
+def _archive(members):
+    stream = io.BytesIO()
+    with gzip.GzipFile(fileobj=stream, mode="wb", mtime=0) as compressed:
+        with tarfile.open(
+            fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT
+        ) as archive:
+            for name, data in members:
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                info.mode = 0o644
+                info.uname = info.gname = ""
+                archive.addfile(info, io.BytesIO(data))
+    return stream.getvalue()
+
+
+def release(fake, directory):
+    """Publish the index at ``directory`` into ``fake`` the way a release is
+    published, and return its snapshot id."""
+    assets = pack(directory)
+    snapshot_id = json.loads(assets[contract.MANIFEST_NAME])["snapshot_id"]
+    fake.seed(contract.release_tag(snapshot_id), assets)
+    return snapshot_id
+
+
+class FakeGitHub:
+    """The slice of the Releases API the publisher and a client touch, with
+    GitHub's visibility rules: drafts and their assets need the token."""
+
+    def __init__(self, *, corrupt=None, lose_publish_response=False, on_upload=None):
+        self.releases = {}
+        self.assets = {}
+        self.blobs = {}
+        self.corrupt = corrupt
+        self.lose_publish_response = lose_publish_response
+        self.on_upload = on_upload
+        self.clock = 0
+        self.published = 0
+        self.latest = None
+
+    def transport(self):
+        return httpx.MockTransport(self.handle)
+
+    def seed(self, tag, assets, *, draft=False):
+        """A release that exists before the publisher runs; index releases
+        were published the way the publisher does, never as latest."""
+        make_latest = "false" if tag.startswith(contract.TAG_PREFIX) else "true"
+        release = self._create(tag, draft, make_latest)
+        for name, data in assets.items():
+            self._upload(release, name, data)
+        return release
+
+    def _create(self, tag, draft, make_latest="true"):
+        self.clock += 1
+        release_id = 100 + self.clock
+        if not draft and make_latest != "false":
+            self.latest = release_id
+        if not draft:
+            self.published += 1
+        release = {
+            "id": release_id,
+            "tag_name": tag,
+            "draft": draft,
+            "prerelease": False,
+            "created_at": f"2026-09-{self.clock:02d}T00:00:00Z",
+            "published_at": (
+                None if draft else f"2026-10-{self.published:02d}T00:00:00Z"
+            ),
+            "upload_url": f"{UPLOADS}/repos/o/r/releases/{release_id}/assets{{?name,label}}",
+            "assets": [],
+        }
+        self.releases[release_id] = release
+        return release
+
+    def _upload(self, release, name, data):
+        asset_id = 1000 + len(self.assets) + 1
+        stored = data[:-1] + b"?" if self.corrupt == name else data
+        self.blobs[asset_id] = stored
+        asset = {
+            "id": asset_id,
+            "name": name,
+            "size": len(stored),
+            "url": f"{API}/repos/o/r/releases/assets/{asset_id}",
+            "browser_download_url": f"{DOWNLOADS}/{release['tag_name']}/{name}",
+        }
+        self.assets[asset_id] = (release["id"], asset)
+        release["assets"].append(asset)
+        return asset
+
+    def handle(self, request):
+        authed = "Authorization" in request.headers
+        path = request.url.path
+        if path.startswith("/repos/old/r/"):
+            # A transferred repository: GitHub answers with its new home.
+            location = f"{API}/repos/o/r/" + path[len("/repos/old/r/") :]
+            return httpx.Response(301, headers={"Location": location})
+        # The token reaches the API and upload hosts only: never the object
+        # store the asset redirects lead to.
+        assert authed == (request.url.host != "objects.example") or (
+            request.url.host == "api.example" and not authed
+        )
+        if request.url.host == "objects.example":
+            # The API redirect is a signed capability URL; the browser URL
+            # of a draft's asset is not served to anyone.
+            if path.startswith("/signed/"):
+                return httpx.Response(
+                    200, content=self.blobs[int(path.rsplit("/", 1)[1])]
+                )
+            _, tag, name = path.split("/", 2)
+            for release_id, asset in self.assets.values():
+                release = self.releases[release_id]
+                if release["tag_name"] == tag and asset["name"] == name:
+                    if release["draft"]:
+                        return httpx.Response(404)
+                    return httpx.Response(200, content=self.blobs[asset["id"]])
+            return httpx.Response(404)
+        if request.url.host == "uploads.example" and request.method == "POST":
+            assert authed
+            if self.on_upload is not None:
+                self.on_upload()
+            release_id = int(path.split("/")[-2])
+            name = request.url.params["name"]
+            asset = self._upload(self.releases[release_id], name, request.content)
+            return httpx.Response(201, json=asset)
+        if request.method == "GET" and path.startswith("/repos/o/r/releases/tags/"):
+            tag = path.rsplit("/", 1)[1]
+            for release in self.releases.values():
+                if release["tag_name"] == tag and (authed or not release["draft"]):
+                    return httpx.Response(200, json=release)
+            return httpx.Response(404)
+        if request.method == "GET" and path.startswith("/repos/o/r/releases/assets/"):
+            asset_id = int(path.rsplit("/", 1)[1])
+            release_id, asset = self.assets[asset_id]
+            if self.releases[release_id]["draft"] and not authed:
+                return httpx.Response(404)
+            return httpx.Response(
+                302, headers={"Location": f"{DOWNLOADS}/signed/{asset_id}"}
+            )
+        if request.method == "POST" and path == "/repos/o/r/releases":
+            body = json.loads(request.content)
+            release = self._create(body["tag_name"], body["draft"])
+            return httpx.Response(201, json=release)
+        if request.method == "PATCH" and path.startswith("/repos/o/r/releases/"):
+            release = self.releases[int(path.rsplit("/", 1)[1])]
+            body = json.loads(request.content)
+            release["draft"] = body["draft"]
+            if not release["draft"] and body.get("make_latest") != "false":
+                self.latest = release["id"]
+            if not release["draft"] and release.get("published_at") is None:
+                self.published += 1
+                release["published_at"] = f"2026-10-{self.published:02d}T00:00:00Z"
+            if self.lose_publish_response:
+                # Applied, but the response never arrived.
+                return httpx.Response(502)
+            return httpx.Response(200, json=release)
+        if request.method == "GET" and path.startswith("/repos/o/r/releases/"):
+            release = self.releases.get(int(path.rsplit("/", 1)[1]))
+            if release is None or (release["draft"] and not authed):
+                return httpx.Response(404)
+            return httpx.Response(200, json=release)
+        if request.method == "GET" and path == "/repos/o/r/releases":
+            listing = [r for r in self.releases.values() if authed or not r["draft"]]
+            listing.sort(key=lambda r: r["created_at"], reverse=True)
+            return httpx.Response(200, json=listing)
+        return httpx.Response(404)
