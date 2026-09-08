@@ -1,16 +1,12 @@
 """The classification fingerprint's canonicalisation."""
 
 import io
-import sys
 import warnings
 import zipfile
-from pathlib import Path
 
 import pytest
 
 from transitio.index import fingerprint
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 
 def _feed_zip(members):
@@ -21,8 +17,8 @@ def _feed_zip(members):
     return buf.getvalue()
 
 
-# Edge cases the two extractions must agree on: unparsable route_type, a missing
-# agency id, an empty route/stop/trip id, an out-of-range coordinate, a
+# Edge cases the reader's extraction must handle: unparsable route_type, a
+# missing agency id, an empty route/stop/trip id, an out-of-range coordinate, a
 # duplicate stop (last row wins), a traversal-only stop-time (excluded), and a
 # trip naming a route the feed lacks.
 _MEMBERS = {
@@ -43,31 +39,13 @@ _MEMBERS = {
 }
 
 
-def _build_digest(data, kind):
-    # The build extraction, run on the same members, is the source of truth.
-    from index_build import classify, crawl
-
-    def read(name):
-        return io.BytesIO(zipfile.ZipFile(io.BytesIO(data)).read(name))
-
-    routes, _ = classify._read_routes(read("routes.txt"))
-    rows, _ = crawl.stop_rows(read("stops.txt"))
-    coords = {sid: (x, y) for sid, x, y in rows if sid}
-    served = None
-    if kind == "route_stops":
-        trip_routes, services, _ = classify._read_trips(read("trips.txt"), routes)
-        served, *_ = classify._read_stop_times(
-            read("stop_times.txt"), trip_routes, services, None
-        )
-    return fingerprint.compute(kind, routes, coords, served)
-
-
 @pytest.mark.parametrize("kind", ["route_stops", "feed_stops"])
-def test_from_feed_reproduces_the_build_digest(kind):
+def test_from_feed_reads_the_routes_and_reflects_the_stops(kind):
     data = _feed_zip(_MEMBERS)
     digest, present = fingerprint.from_feed(io.BytesIO(data), kind)
-    assert digest == _build_digest(data, kind)
     assert present == {"r1", "r2", "r3"}
+    # The same feed reads to the same digest.
+    assert fingerprint.from_feed(io.BytesIO(data), kind)[0] == digest
     # A moved stop goes stale; a member the kind needs being absent is a miss.
     moved = {**_MEMBERS, "stops.txt": _MEMBERS["stops.txt"].replace("60.2", "61.2")}
     assert fingerprint.from_feed(io.BytesIO(_feed_zip(moved)), kind)[0] != digest

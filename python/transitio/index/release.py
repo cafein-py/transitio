@@ -4,7 +4,7 @@ Each snapshot is its own GitHub release in the index repository
 (``transitio-dev/transitio-index``, the home of the build, never the code
 repository), tagged ``index-<snapshot_id>``, holding the archive
 ``transitio-index-<snapshot_id>.tar.gz``, its ``.sha256`` and an immutable
-``manifest.json``. The publisher (``scripts/publish_index.py``) writes them;
+``manifest.json``. The transitio-index publisher writes them;
 the refresh side lists releases and takes the newest one whose manifest
 declares a schema this reader supports. Both sides share the names, the
 selection rule and the HTTP helpers here, so they cannot drift apart.
