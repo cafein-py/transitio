@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Curated FAO city-region metros publish: `set_statistical_area` accepts
+  the `fao_city_region` scheme, and the metros stage resolves the code in
+  the pinned FAO regions table, derives the metro's members again exactly
+  as the suggestion report does (the eligible cities whose land areas lie
+  in the region), judges the curator's confirmation against that list, and
+  gives the metro the members and the region as its statistical identity
+  only with the FAO city-regions and Overture divisions both allowlisted as
+  derived inputs, credited in the derived inventory and the NOTICE; a stale
+  confirmation or a closed gate is reported and the metro stays report-only.
+  The suggestion report's pasteable pair is applicable as emitted.
 - A named Overture division of the kept subtypes is a place even when no
   QID resolves: the skeleton keeps it (resolution method `overture_id`),
   the seed and the expand stage key it by `overture:<id>` and the registry
