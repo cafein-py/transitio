@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The expand stage is a registry transaction of its own: it identifies
+  every place it discovers from crawled stops through the registry the
+  gazetteer ran with, saves the registry before its generation is
+  published, and records the digests loaded and saved in its manifest;
+  later commands expect the registry expand saved, refuse one changed
+  after it, and refuse expanded places not built on the run's registry;
+  a registry-backed expansion needs a committed gazetteer run. The registry's lock file beside `overrides/` is ignored by git.
 - The reader understands index schema 6, which keys places by the index's
   own `tp_` id: the places table gains `wikidata_id` (nullable),
   `concordances` (ids per namespace) and `former_ids`; `Place.wikidata_id`,
