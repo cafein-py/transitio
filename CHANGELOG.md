@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Places are keyed by the index's own `tp_` id from the stages that mint
+  them: the seed, the metros stage and the expand stage identify their rows
+  through the registry and re-key them — links, placements, assignments
+  and reports alike — with the QID beside the id (`wikidata_id`), and two
+  QIDs the registry has merged become one place under the survivor's id.
+  Override references resolve to own ids (the QID-keyed stages join on the
+  canonical QID), a curated `add_place` may be keyed by another
+  concordance and is minted from it, and the FAO report lists each city's
+  QID beside its id. Without a registry, rows keep their QID keys.
 - The expand stage is a registry transaction of its own: it identifies
   every place it discovers from crawled stops through the registry the
   gazetteer ran with, saves the registry before its generation is
