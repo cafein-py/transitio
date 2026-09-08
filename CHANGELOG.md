@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A named Overture division of the kept subtypes is a place even when no
+  QID resolves: the skeleton keeps it (resolution method `overture_id`),
+  the seed and the expand stage key it by `overture:<id>` and the registry
+  identifies it by that concordance, its `wikidata_id` is null, and the
+  resolution report holds only nameless divisions and conflicting signals.
 - The publisher writes index schema 6: the places table carries
   `wikidata_id` (the QID beside the own id, null without one),
   `concordances` (every id the place carries per namespace — the registry's
