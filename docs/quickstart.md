@@ -117,6 +117,26 @@ report = transitio.report.build_report(
 print(transitio.report.render_markdown(report))
 ```
 
+## Places in the feed index
+
+The feed index keys every place by its own id, a `tp_<n>` that never changes
+or gets reused, and keeps the external ids the place carries beside it:
+
+```python
+import transitio
+
+helsinki = transitio.place("Helsinki")        # by name, or by any id below
+helsinki.id            # "tp_1042"
+helsinki.wikidata_id   # "Q1757", or None for a place without a Wikidata item
+helsinki.concordances  # {"wikidata": ["Q1757", ...], "overture": ["..."], ...}
+helsinki.former_ids    # ids merged into this place; each still resolves to it
+```
+
+`transitio.place("Q1757")` resolves through the concordances, a QID merged
+into another place included, and `transitio.place("tp_…")` resolves a former
+id to its successor. An index published before schema 6 reads the same way:
+its QID is both the id and the only concordance.
+
 ## Reading the validation report
 
 Notices follow the canonical

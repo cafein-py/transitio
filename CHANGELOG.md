@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The publisher writes index schema 6: the places table carries
+  `wikidata_id` (the QID beside the own id, null without one),
+  `concordances` (every id the place carries per namespace — the registry's
+  effective view over the place and the rows merged into it, or the QID
+  alone without a registry) and `former_ids` (the ids merged into it), and
+  the manifest records the schema-6 reader floor.
 - The metros and expand stages resolve every QID a source names through
   the registry before joining metro rows, so a merged-away QID meets its
   survivor's row — and a different statistical code on it is a conflict,
