@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## 0.11.0 — 2026-09-08
 
 ### Added
 
@@ -272,20 +272,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the override-file digests it applied, and the publisher refuses an
   index they no longer describe.
 
-### Changed
-
-- Index schema version 4: `feeds.parquet` carries the crawl evidence
-  (`coverage` hull, `stop_count`, `etag`, `last_modified`, `last_crawled`,
-  `crawl_status`) and `redistribution_allowed`, and `snapshot.json` records the `discovery_semantics_version`
-  the build used, the oldest transitio that reads the schema
-  (`min_reader_version`) and the version that built it (`built_with`).
-  Every `IndexedFeed` exposes its `provenance` (the
-  snapshot id, the reader's discovery semantics version and the transitio
-  version) so a reproduction can say whether it is exact. Older snapshots are
-  refused with an upgrade message.
-
-### Added
-
 - `Place.feeds()` and the `IndexedFeed` object — the feeds serving a place,
   joined with their membership edges. `tiers=`/`exclude=` filter by tier and
   `on_unknown` governs unclassified edges; the aggregate `needs_review` is the
@@ -316,6 +302,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   understand is refused with `IncompatibleIndexError`.
 
 ### Changed
+
+- Index schema version 4: `feeds.parquet` carries the crawl evidence
+  (`coverage` hull, `stop_count`, `etag`, `last_modified`, `last_crawled`,
+  `crawl_status`) and `redistribution_allowed`, and `snapshot.json` records the `discovery_semantics_version`
+  the build used, the oldest transitio that reads the schema
+  (`min_reader_version`) and the version that built it (`built_with`).
+  Every `IndexedFeed` exposes its `provenance` (the
+  snapshot id, the reader's discovery semantics version and the transitio
+  version) so a reproduction can say whether it is exact. Older snapshots are
+  refused with an upgrade message.
 
 - `pyarrow` is now a required runtime dependency; it backs the Parquet feed
   index.
@@ -383,7 +379,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Circular patterns are supported: a route whose last stop returns to
   its first is a completed loop rather than a monotonicity failure,
   recognised only when the alignment itself closes.
-
 
 ## 0.9.0 — 2026-08-06
 
