@@ -395,28 +395,21 @@ def test_download_indexed_prefers_mdb_then_atlas(tmp_path):
 
 def test_fetch_place_selects_downloads_and_processes(tmp_path, monkeypatch):
     import io as _io
-    import sys as _sys
 
-    _sys.path.insert(
-        0, str(__import__("pathlib").Path(__file__).resolve().parent.parent / "scripts")
-    )
     import transitio.index as transitio_index
-    from index_build import licensing, publish
-    from test_index_license import HULL, _cache
-    from test_index_publish import _covered_feed, _edge
+    from index_fixture import HULL, covered_feed, edge, write_index
 
     feeds = [
         {
-            **_covered_feed("f-a", coverage_source="crawl"),
+            **covered_feed("f-a", coverage_source="crawl"),
             "coverage": HULL,
             "atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}},
         }
     ]
-    edges = [_edge("Q1757", "f-a", tier="local")]
-    cache = _cache(tmp_path, feeds, edges)
-    licensing.license_index(cache)
-    publish.publish(cache)
-    index = transitio_index.read_index(cache / "index")
+    edges = [edge("Q1757", "f-a", tier="local")]
+    index = transitio_index.read_index(
+        write_index(tmp_path / "index", feeds=feeds, edges=edges)
+    )
 
     buffer = _io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
@@ -466,22 +459,14 @@ def test_fetch_place_rejects_country_code():
 
 
 def _place_index(tmp_path, feed):
-    import sys as _sys
-    from pathlib import Path as _Path
-
-    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "scripts"))
     import transitio.index as transitio_index
-    from index_build import licensing, publish
-    from test_index_license import HULL, _cache
-    from test_index_publish import _covered_feed, _edge
+    from index_fixture import HULL, covered_feed, edge, write_index
 
-    feeds = [
-        {**_covered_feed("f-a", coverage_source="crawl"), "coverage": HULL, **feed}
-    ]
-    cache = _cache(tmp_path, feeds, [_edge("Q1757", "f-a", tier="local")])
-    licensing.license_index(cache)
-    publish.publish(cache)
-    return transitio_index.read_index(cache / "index")
+    feeds = [{**covered_feed("f-a", coverage_source="crawl"), "coverage": HULL, **feed}]
+    edges = [edge("Q1757", "f-a", tier="local")]
+    return transitio_index.read_index(
+        write_index(tmp_path / "index", feeds=feeds, edges=edges)
+    )
 
 
 def _gtfs_payload():
@@ -789,55 +774,24 @@ def _feed_tables(path):
 
 
 def _selector_index(tmp_path, edges):
-    import sys as _sys
-    from pathlib import Path as _Path
-
-    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "scripts"))
     import transitio.index as transitio_index
-    from index_build import licensing, publish, store
-    from test_index_license import HULL, _cache
-    from test_index_publish import _covered_feed, _edge
+    from index_fixture import HULL, covered_feed, write_index
 
     feed = {
-        **_covered_feed("f-a", coverage_source="crawl"),
+        **covered_feed("f-a", coverage_source="crawl"),
         "coverage": HULL,
         "atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}},
     }
-    cache = _cache(tmp_path, [feed], [_edge("Q1757", "f-a", tier="local")])
-    # Re-publish the classify generation with hand-crafted per-tier selectors,
-    # keeping its lineage so licensing/publish accept it.
-    feeds_classified, manifest = store.read_jsonl(
-        cache / "classify", "edges.json", "feeds_classified.jsonl"
+    return transitio_index.read_index(
+        write_index(tmp_path / "index", feeds=[feed], edges=edges)
     )
-    directory = store.open_subdir(cache, "classify")
-    try:
-        with store.exclusive_writer(directory):
-            store.publish(
-                cache / "classify",
-                "edges.json",
-                {
-                    "feeds_classified.jsonl": store.jsonl_chunks(feeds_classified),
-                    "edges.jsonl": store.jsonl_chunks(edges),
-                },
-                {**manifest, "edges": len(edges)},
-                held=directory,
-            )
-    finally:
-        directory.close()
-    licensing.license_index(cache)
-    publish.publish(cache)
-    return transitio_index.read_index(cache / "index")
 
 
 @pytest.mark.parametrize("repair", [False, True])
 def test_fetch_place_crops_bundles_to_the_selected_routes(
     tmp_path, monkeypatch, repair
 ):
-    import sys as _sys
-    from pathlib import Path as _Path
-
-    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "scripts"))
-    from test_index_publish import _edge
+    from index_fixture import edge as _edge
 
     service = {"stops": 1, "routes": 1, "departures_per_day": 1.0}
 
@@ -904,11 +858,7 @@ def test_fetch_place_crops_bundles_to_the_selected_routes(
 
 
 def test_fetch_place_output_names_differ_by_selected_routes(tmp_path, monkeypatch):
-    import sys as _sys
-    from pathlib import Path as _Path
-
-    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "scripts"))
-    from test_index_publish import _edge
+    from index_fixture import edge as _edge
 
     service = {"stops": 1, "routes": 1, "departures_per_day": 1.0}
 
@@ -941,11 +891,7 @@ def test_fetch_place_output_names_differ_by_selected_routes(tmp_path, monkeypatc
 
 
 def test_fetch_place_on_unknown_governs_bundle_routes(tmp_path, monkeypatch):
-    import sys as _sys
-    from pathlib import Path as _Path
-
-    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "scripts"))
-    from test_index_publish import _edge
+    from index_fixture import edge as _edge
 
     service = {"stops": 1, "routes": 1, "departures_per_day": 1.0}
     specs = (
@@ -1008,11 +954,7 @@ def test_fetch_place_on_unknown_governs_bundle_routes(tmp_path, monkeypatch):
 def test_fetch_place_stale_selector_follows_on_untrusted_selector(
     tmp_path, monkeypatch
 ):
-    import sys as _sys
-    from pathlib import Path as _Path
-
-    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "scripts"))
-    from test_index_publish import _edge
+    from index_fixture import edge as _edge
 
     service = {"stops": 1, "routes": 1, "departures_per_day": 1.0}
 
@@ -1099,11 +1041,7 @@ def test_untrusted_action_maps_the_policy(policy, exclude, on_unknown, expected)
 
 
 def test_fetch_place_excludes_an_unknown_only_feed(tmp_path, monkeypatch):
-    import sys as _sys
-    from pathlib import Path as _Path
-
-    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "scripts"))
-    from test_index_publish import _edge
+    from index_fixture import edge as _edge
 
     service = {"stops": 1, "routes": 1, "departures_per_day": 1.0}
     # A feed whose only matching edge is unknown-tier moves to skipped, not
