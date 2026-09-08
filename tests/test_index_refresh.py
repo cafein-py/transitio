@@ -2,23 +2,17 @@ import hashlib
 import io
 import json
 import shutil
-import sys
 import tarfile
-from pathlib import Path
 
 import httpx
 import pytest
+from index_fixture import API, FakeGitHub, index as _index, release, write_index
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "scripts"))
-
-import transitio.index as transitio_index  # noqa: E402
-from index_build import publisher  # noqa: E402
-from test_index_publisher import API, FakeGitHub, _index  # noqa: E402
-from transitio.exceptions import DownloadError, IncompatibleIndexError  # noqa: E402
-from transitio.exceptions import TransitioError  # noqa: E402
-from transitio.index import _refresh as client  # noqa: E402
-from transitio.index import release as contract  # noqa: E402
+import transitio.index as transitio_index
+from transitio.exceptions import DownloadError, IncompatibleIndexError
+from transitio.exceptions import TransitioError
+from transitio.index import _refresh as client
+from transitio.index import release as contract
 
 
 @pytest.fixture(autouse=True)
@@ -32,18 +26,10 @@ def _fresh_state(monkeypatch, tmp_path):
 
 
 def _published(tmp_path, fake=None):
-    """A fake GitHub holding one snapshot the real publisher released."""
+    """A fake GitHub holding one released snapshot."""
     fake = fake or FakeGitHub()
-    summary = publisher.publish_index(
-        _index(tmp_path),
-        cache_dir=tmp_path / "cache",
-        repository="o/r",
-        token="secret",
-        api_url=API,
-        out_dir=tmp_path / "out",
-        transport=fake.transport(),
-    )
-    return fake, summary["snapshot_id"]
+    snapshot_id = release(fake, _index(tmp_path))
+    return fake, snapshot_id
 
 
 def _refresh(fake, **kw):
@@ -304,11 +290,9 @@ def test_an_archive_that_expands_past_the_ceiling_is_refused(tmp_path, monkeypat
 
 
 def test_a_feeds_only_snapshot_is_not_an_installable_release(tmp_path):
-    from test_index_publish import _build_index
-
-    cache, _ = _build_index(tmp_path)
+    directory = write_index(tmp_path / "index", feeds_only=True)
     members = {
-        name: (cache / "index" / name).read_bytes()
+        name: (directory / name).read_bytes()
         for name in ("snapshot.json", "feeds.parquet")
     }
     members.update({"places.parquet": b"", "edges.parquet": b"", "NOTICE": b""})
