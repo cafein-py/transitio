@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The metros and expand stages resolve every QID a source names through
+  the registry before joining metro rows, so a merged-away QID meets its
+  survivor's row — and a different statistical code on it is a conflict,
+  not a second row — and the expand stage enriches its discoveries with
+  the labels of the QID each place carries after identification.
 - Places are keyed by the index's own `tp_` id from the stages that mint
   them: the seed, the metros stage and the expand stage identify their rows
   through the registry and re-key them — links, placements, assignments
