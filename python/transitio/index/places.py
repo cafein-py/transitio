@@ -1,7 +1,8 @@
 """Place name resolution over a published index's ``places`` table.
 
-A query — a name, a QID, or a :class:`Place` — resolves to one :class:`Place`
-through a defined ranking, never a guess: the query is normalised and matched
+A query — a name, a QID or own ``tp_`` id (a former id or a carried QID
+included), or a :class:`Place` — resolves to one :class:`Place` through a
+defined ranking, never a guess: the query is normalised and matched
 against every place's labels and aliases in every language, candidates score on
 match strength then ``kind`` precedence then feed count, and a winner is taken
 only when it is the sole exact match or beats the runner-up by the ambiguity
@@ -10,6 +11,7 @@ else raises :class:`AmbiguousPlaceError` with the candidates, or
 :class:`PlaceNotFoundError`.
 """
 
+import json
 import math
 import re
 import unicodedata
@@ -49,6 +51,20 @@ def _as_str(value):
     return value
 
 
+def _as_concordances(value):
+    """The ``{namespace: [ids]}`` block, whether stored as a mapping or as
+    its JSON text; anything else is an empty block."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return {}
+    return {
+        namespace: [str(v) for v in _as_list(ids)]
+        for namespace, ids in _as_dict(value).items()
+    }
+
+
 # Match strength, strongest first: an exact label/alias beats a prefix beats a
 # query whose tokens are a subset of the label's.
 _EXACT, _PREFIX, _SUBSET = 3, 2, 1
@@ -58,6 +74,9 @@ _EXACT, _PREFIX, _SUBSET = 3, 2, 1
 _KIND_ORDER = {"metro": 0, "city": 1, "region": 2, "country": 3}
 
 _QID = re.compile(r"\AQ[1-9][0-9]*\Z")
+# The index's own place id (schema 6); a query in this form is an id lookup.
+# The registry bounds the number; the reader accepts the form.
+_OWN_ID = re.compile(r"\Atp_[1-9][0-9]*\Z")
 
 # Slash and middot variants that, like every dash, join whole words.
 _SLASH_SEPARATORS = frozenset("/\\⁄∕·−")
@@ -120,6 +139,21 @@ class Place:
     @property
     def country_code(self):
         return self._record.get("country_code")
+
+    @property
+    def wikidata_id(self):
+        """The place's QID, or None: the id itself before schema 6."""
+        return self._record.get("wikidata_id")
+
+    @property
+    def concordances(self):
+        """``{namespace: [ids]}`` — every external id the place carries."""
+        return {k: list(v) for k, v in self._record.get("concordances", {}).items()}
+
+    @property
+    def former_ids(self):
+        """Own ids merged into this place; each still resolves to it."""
+        return list(self._record.get("former_ids") or [])
 
     @property
     def metro_ids(self):
@@ -218,17 +252,31 @@ class _PlaceLookup:
         self._records = {}
         self._labels = {}
         self._children = defaultdict(list)
+        # A former id or a QID the place carries resolves to it; a real id
+        # always wins over an alias of another place.
+        self._aliases = {}
         for record in places.to_dict("records"):
             record["names"] = _as_dict(record.get("names"))
-            for key in ("aliases", "metro_ids", "member_ids"):
+            for key in ("aliases", "metro_ids", "member_ids", "former_ids"):
                 record[key] = _as_list(record.get(key))
             for key in ("name", "parent_id", "default_metro_id", "country_code"):
                 record[key] = _as_str(record.get(key))
             place_id = record["place_id"]
+            record["concordances"] = _as_concordances(record.get("concordances"))
+            qid = _as_str(record.get("wikidata_id"))
+            if qid is None and _QID.match(place_id):
+                qid = place_id  # before schema 6 the QID is the id
+            record["wikidata_id"] = qid
+            qids = record["concordances"].get("wikidata", [])
+            if qid is not None and qid not in qids:
+                record["concordances"]["wikidata"] = [qid, *qids]
             self._records[place_id] = record
             self._labels[place_id] = self._normalized_labels(record)
             if record["parent_id"]:
                 self._children[record["parent_id"]].append(place_id)
+            qids = record["concordances"].get("wikidata", [])
+            for alias in [*record["former_ids"], *qids]:
+                self._aliases.setdefault(alias, place_id)
 
     @staticmethod
     def _normalized_labels(record):
@@ -241,7 +289,10 @@ class _PlaceLookup:
         return list(labels.items())
 
     def get(self, place_id):
+        """The place with this id, or the one a former id or QID names."""
         record = self._records.get(place_id)
+        if record is None and place_id in self._aliases:
+            record = self._records[self._aliases[place_id]]
         return Place(record, self) if record is not None else None
 
     def children(self, place_id):
@@ -296,7 +347,7 @@ class _PlaceLookup:
     def resolve(self, query, kind=None):
         if isinstance(query, Place):
             return query
-        if isinstance(query, str) and _QID.match(query):
+        if isinstance(query, str) and (_QID.match(query) or _OWN_ID.match(query)):
             place = self.get(query)
             if place is None:
                 raise PlaceNotFoundError(f"no place with id {query!r} in the index")

@@ -240,3 +240,40 @@ def test_the_coercion_helpers_handle_parquet_shapes():
     assert _as_dict(None) == {}
     assert _as_str(float("nan")) is None
     assert _as_str("Q1") == "Q1"
+
+
+def test_schema_6_places_resolve_by_own_id_and_every_alias():
+    records = [
+        {
+            **_p("tp_1", "city", "Helsinki", country_code="FI"),
+            "wikidata_id": "Q1757",
+            "concordances": {"wikidata": ["Q1757", "Q777"], "overture": ["ov-hel"]},
+            "former_ids": ["tp_7"],
+        },
+        {
+            **_p("tp_2", "metro", "Helsinki region", member_ids=["tp_1"]),
+            "wikidata_id": None,
+            "concordances": '{"cbsa": ["0"]}',  # the block as its JSON text
+            "former_ids": [],
+        },
+    ]
+    idx = _index(records)
+    helsinki = transitio.place("tp_1", index=idx)
+    assert helsinki.id == "tp_1" and helsinki.wikidata_id == "Q1757"
+    assert helsinki.concordances == {
+        "wikidata": ["Q1757", "Q777"],
+        "overture": ["ov-hel"],
+    }
+    assert helsinki.former_ids == ["tp_7"]
+    # The canonical QID, a merged-away QID and a former own id all resolve.
+    for alias in ("Q1757", "Q777", "tp_7"):
+        assert transitio.place(alias, index=idx) == helsinki
+    metro = transitio.place("tp_2", index=idx)
+    assert metro.wikidata_id is None and metro.concordances == {"cbsa": ["0"]}
+    assert metro.members == [helsinki]
+    with pytest.raises(PlaceNotFoundError):
+        transitio.place("tp_9", index=idx)
+    # Before schema 6 the QID is the id, and the only concordance.
+    old = transitio.place("Q1757", index=_index(RECORDS))
+    assert old.wikidata_id == "Q1757" and old.former_ids == []
+    assert old.concordances == {"wikidata": ["Q1757"]}

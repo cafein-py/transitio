@@ -38,3 +38,6 @@ CLAUDE.md
 .vscode/
 .idea/
 .DS_Store
+
+# The place registry's adjacent lock file
+overrides/*.lock

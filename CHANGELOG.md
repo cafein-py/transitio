@@ -9,6 +9,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A named Overture division of the kept subtypes is a place even when no
+  QID resolves: the skeleton keeps it (resolution method `overture_id`),
+  the seed and the expand stage key it by `overture:<id>` and the registry
+  identifies it by that concordance, its `wikidata_id` is null, and the
+  resolution report holds only nameless divisions and conflicting signals.
+- The publisher writes index schema 6: the places table carries
+  `wikidata_id` (the QID beside the own id, null without one),
+  `concordances` (every id the place carries per namespace — the registry's
+  effective view over the place and the rows merged into it, or the QID
+  alone without a registry) and `former_ids` (the ids merged into it), and
+  the manifest records the schema-6 reader floor.
+- The metros and expand stages resolve every QID a source names through
+  the registry before joining metro rows, so a merged-away QID meets its
+  survivor's row — and a different statistical code on it is a conflict,
+  not a second row — and the expand stage enriches its discoveries with
+  the labels of the QID each place carries after identification.
+- Places are keyed by the index's own `tp_` id from the stages that mint
+  them: the seed, the metros stage and the expand stage identify their rows
+  through the registry and re-key them — links, placements, assignments
+  and reports alike — with the QID beside the id (`wikidata_id`), and two
+  QIDs the registry has merged become one place under the survivor's id.
+  Override references resolve to own ids (the QID-keyed stages join on the
+  canonical QID), a curated `add_place` may be keyed by another
+  concordance and is minted from it, and the FAO report lists each city's
+  QID beside its id. Without a registry, rows keep their QID keys.
+- The expand stage is a registry transaction of its own: it identifies
+  every place it discovers from crawled stops through the registry the
+  gazetteer ran with, saves the registry before its generation is
+  published, and records the digests loaded and saved in its manifest;
+  later commands expect the registry expand saved, refuse one changed
+  after it, and refuse expanded places not built on the run's registry;
+  a registry-backed expansion needs a committed gazetteer run. The registry's lock file beside `overrides/` is ignored by git.
+- The reader understands index schema 6, which keys places by the index's
+  own `tp_` id: the places table gains `wikidata_id` (nullable),
+  `concordances` (ids per namespace) and `former_ids`; `Place.wikidata_id`,
+  `Place.concordances` and `Place.former_ids` expose them (a pre-6 index
+  reports its QID key as both), and a place resolves by its own id, any QID
+  it carries — a merged-away one included — or a former id. Nothing
+  publishes schema 6 yet.
+- Override references resolve through the place registry: `places.yaml`
+  (`place`, `parent_id`, `member_ids`, `set_place_members`), `edges.yaml`
+  places, `set_coverage` place ids and golden membership lists accept a
+  `tp_` id, a bare QID or `namespace:value` for any registered place, each
+  resolved to the registry's current key for that place; a bare QID no row
+  carries yet still names a place to be minted, and any other unknown
+  reference is an error.
+- The gazetteer run is one transaction: its stages publish staged
+  generations under the cache's run lock, the registry is saved once after
+  the last stage, and a run manifest (`gazetteer/run.json`) published last
+  names the generation each stage pointer stands for. The store resolves a
+  pointer the run manifest names to that generation, so consumers see a
+  complete set or the previous one, never a mixture; a failure before the
+  save leaves the registry and the previous set untouched, a crash after it
+  leaves rows a rerun reproduces, and a corrupt manifest or pointer is an
+  error rather than an absence. Later commands refuse a run whose registry
+  is no longer the file on disk until the gazetteer runs again.
 - The gazetteer run opens one place-registry session (`--registry`,
   default `places_registry.jsonl` in the overrides directory;
   `--registry-read-only` refuses any mint or enrichment): the seed
