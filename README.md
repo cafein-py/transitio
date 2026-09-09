@@ -10,6 +10,9 @@ cafein to brew into routing results.
 extracts), GTFS validation, repair and cropping are in place, tied together by
 the one-call `transitio.fetch` pipeline.
 
+The feed index that `transitio.index` reads is built in a separate repository,
+[transitio-dev/transitio-index](https://github.com/transitio-dev/transitio-index).
+
 ## Quick example
 
 ```python

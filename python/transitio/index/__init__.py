@@ -7,7 +7,7 @@ An index is a directory of ``feeds.parquet`` (one row per feed), an optional
 :class:`Index` exposing the manifest, the feeds as a DataFrame, the places as a
 GeoDataFrame and the edges as a DataFrame (``None`` for tables the build
 predates). Building an index is a maintainer step
-(``scripts/build_index.py --stage publish``).
+(the transitio-index build's publish stage).
 
 Only schema versions this transitio understands are accepted, so a newer index
 is refused with a clear upgrade message rather than misread. :func:`refresh`
