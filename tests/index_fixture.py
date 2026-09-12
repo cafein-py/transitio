@@ -260,7 +260,7 @@ def _service_by_place(edges):
     return totals
 
 
-def _place_row(record, snapshot_id, service=None):
+def _place_row(record, snapshot_id, service=None, validity=None, dated=False):
     # A row keyed by its QID states its identity; any other key is a
     # fixture's and states none.
     qid = record["place_id"] if _QID.match(record["place_id"]) else None
@@ -291,6 +291,7 @@ def _place_row(record, snapshot_id, service=None):
         "wikidata_id": qid,
         "concordances": json.dumps({"wikidata": [qid]} if qid else {}, sort_keys=True),
         "former_ids": [],
+        **({"validity": _json_block(validity)} if dated else {}),
         "geometry": None if geometry is None else bytes.fromhex(geometry),
     }
 
@@ -428,6 +429,15 @@ FEEDS_SCHEMA_8 = FEEDS_SCHEMA_8.insert(
     FEEDS_SCHEMA_8.get_field_index("snapshot"),
     pa.field("realtime_feed_ids", pa.list_(pa.string())),
 )
+# Schema 9: the feed service span, and the place's validity JSON.
+FEEDS_SCHEMA_9 = FEEDS_SCHEMA_8
+for _name in ("service_start", "service_end"):
+    FEEDS_SCHEMA_9 = FEEDS_SCHEMA_9.insert(
+        FEEDS_SCHEMA_9.get_field_index("snapshot"), pa.field(_name, pa.string())
+    )
+PLACES_SCHEMA_9 = PLACES_SCHEMA.insert(
+    PLACES_SCHEMA.get_field_index("geometry"), pa.field("validity", pa.string())
+)
 REALTIME_SCHEMA = pa.schema(
     [
         ("feed_id", pa.string()),
@@ -521,10 +531,12 @@ def _edge_row_7(record, snapshot_id, partition=None):
     return row
 
 
-def _counts(feeds, places, edges, realtime, home):
+def _counts(feeds, places, edges, realtime, home, version):
     """The manifest counts: from schema 8 the companions too, linked when
     their static feed is one of the index's."""
     counts = {"feeds": len(feeds), "places": len(places), "edges": len(edges)}
+    if version >= 9:
+        counts["feeds_dated"] = sum(1 for f in feeds if f.get("service_start"))
     if realtime is not None:
         linked = sum(1 for r in realtime if r.get("static_feed_id") in home)
         counts.update(
@@ -544,6 +556,7 @@ def write_partitioned_index(
     snapshot_id=SNAPSHOT_ID,
     notice=NOTICE,
     realtime=None,
+    validity=None,
 ):
     """Write a schema-7 index under ``directory``: feeds by ``home_country``
     (``international`` without one), places by ``country_code``, edges under
@@ -551,9 +564,15 @@ def write_partitioned_index(
     ``feed_partition``; the manifest lists every table's rows and digest.
     With ``realtime`` (GTFS-RT companion records) a schema-8 index: each
     companion under its static feed's partition (``international`` without
-    one in the index), each static feed naming its companions."""
+    one in the index), each static feed naming its companions. With
+    ``validity`` (``{place_id: validity record}``) a schema-9 index: the
+    feeds' ``service_start`` / ``service_end`` published, each listed place
+    carrying its validity JSON."""
     directory.mkdir(parents=True, exist_ok=True)
     version = PARTITIONED_SCHEMA_VERSION if realtime is None else 8
+    if validity is not None:  # ``{place_id: validity record}``: schema 9
+        version = 9
+        realtime = realtime or []
     home = {feed["feed_id"]: feed.get("home_country") for feed in feeds}
     country = {place["place_id"]: place["country_code"] for place in places}
     companions = {}
@@ -567,6 +586,9 @@ def write_partitioned_index(
         if version >= 8:
             del row["gbfs"]
             row["realtime_feed_ids"] = sorted(companions.get(feed["feed_id"], ()))
+        if version >= 9:
+            row["service_start"] = feed.get("service_start")
+            row["service_end"] = feed.get("service_end")
         parts.setdefault(home[feed["feed_id"]] or "international", {}).setdefault(
             "feeds", []
         ).append(row)
@@ -580,7 +602,15 @@ def write_partitioned_index(
     for place in places:
         parts.setdefault(country[place["place_id"]], {}).setdefault(
             "places", []
-        ).append(_place_row(place, snapshot_id, service.get(place["place_id"])))
+        ).append(
+            _place_row(
+                place,
+                snapshot_id,
+                service.get(place["place_id"]),
+                validity=(validity or {}).get(place["place_id"]),
+                dated=version >= 9,
+            )
+        )
     for record in edges:
         feed_home = home[record["feed_id"]]
         if feed_home is None or feed_home != country[record["place_id"]]:
@@ -596,15 +626,15 @@ def write_partitioned_index(
         listing[partition] = {}
         for table, rows in tables.items():
             if table == "feeds":
-                data = _parquet(
-                    rows, FEEDS_SCHEMA_8 if version >= 8 else FEEDS_SCHEMA_7
+                schema = {7: FEEDS_SCHEMA_7, 8: FEEDS_SCHEMA_8}.get(
+                    version, FEEDS_SCHEMA_9
                 )
+                data = _parquet(rows, schema)
             elif table == "realtime":
                 data = _parquet(rows, REALTIME_SCHEMA)
             elif table == "places":
-                data = _parquet(
-                    rows, PLACES_SCHEMA.with_metadata({b"geo": _geo_metadata()})
-                )
+                schema = PLACES_SCHEMA_9 if version >= 9 else PLACES_SCHEMA
+                data = _parquet(rows, schema.with_metadata({b"geo": _geo_metadata()}))
             else:
                 schema = LINKS_SCHEMA_7 if partition == "links" else EDGES_SCHEMA_7
                 data = _parquet(rows, schema)
@@ -617,7 +647,7 @@ def write_partitioned_index(
         "built_with": transitio.__version__,
         "snapshot_id": snapshot_id,
         "built_at": "2026-09-01T00:00:00+00:00",
-        "counts": _counts(feeds, places, edges, realtime, home),
+        "counts": _counts(feeds, places, edges, realtime, home, version),
         "partitions": listing,
         "licensed": notice is not None,
         "notice_sha256": None if notice is None else _sha256(notice),

@@ -362,3 +362,95 @@ def test_a_schema_8_index_carries_the_realtime_companions(tmp_path):
     staging.mkdir()
     _refresh._unpack(assets[contract.archive_name(SNAPSHOT_ID)], staging)
     assert len(reader.read_index(staging).realtime) == 4
+
+
+def test_a_schema_9_index_carries_the_feed_spans_and_place_validity(tmp_path):
+    import datetime
+
+    # HSL is dated and serves Helsinki and Turku; Tallinn's feeds are undated;
+    # Lahti has no feed at all.
+    feeds = [
+        {**FEEDS[0], "service_start": "2026-09-01", "service_end": "2026-09-14"},
+        *FEEDS[1:],
+    ]
+    span = {"start": "2026-09-01", "end": "2026-09-14", "feeds": 1}
+    validity = {
+        "hel": {
+            "feeds_dated": 1,
+            "feeds_undated": 2,
+            "start": "2026-09-01",
+            "end": "2026-09-14",
+            "windows": [span],
+            "best": span,
+        },
+        "tku": {
+            "feeds_dated": 1,
+            "feeds_undated": 0,
+            "start": "2026-09-01",
+            "end": "2026-09-14",
+            "windows": [span],
+            "best": span,
+        },
+        "tll": {
+            "feeds_dated": 0,
+            "feeds_undated": 2,
+            "start": None,
+            "end": None,
+            "windows": [],
+            "best": None,
+        },
+    }
+    places = [*PLACES, place("lah", "city", country_code="FI", name="Lahti")]
+    directory = write_partitioned_index(
+        tmp_path / "index", feeds=feeds, places=places, edges=EDGES, validity=validity
+    )
+    snapshot = json.loads((directory / "snapshot.json").read_text())
+    assert snapshot["counts"]["feeds_dated"] == 1
+    undated = write_partitioned_index(
+        tmp_path / "undated", feeds=FEEDS, places=PLACES, edges=EDGES, validity={}
+    )
+    assert (
+        json.loads((undated / "snapshot.json").read_text())["counts"]["feeds_dated"]
+        == 0
+    )
+    index = reader.read_index(directory)
+    assert index.schema_version == 9 and "validity" in index.places.columns
+    assert "service_start" in index.feeds.columns and len(index.realtime) == 0
+    # A feed's span as dates; a place's validity as a record with its windows.
+    helsinki = reader.place("hel", index=index)
+    (hsl,) = [f for f in helsinki.feeds(categories=None) if f.feed_id == "f-hsl"]
+    assert hsl.service_start == datetime.date(2026, 9, 1)
+    assert hsl.service_end == datetime.date(2026, 9, 14)
+    checked = helsinki.validity
+    assert checked.feeds_dated == 1 and checked.feeds_undated == 2
+    assert checked.start == datetime.date(2026, 9, 1)
+    assert checked.best.feeds == 1 and checked.best.end == datetime.date(2026, 9, 14)
+    assert [w.feeds for w in checked.windows] == [1]
+    assert checked.on(datetime.date(2026, 9, 7)) == 1
+    assert checked.on(datetime.date(2026, 10, 7)) == 0
+    assert reader.place("tku", index=index).validity.best.feeds == 1
+    tallinn = reader.place("tll", index=index).validity
+    assert tallinn.feeds_dated == 0 and tallinn.best is None and tallinn.start is None
+    assert tallinn.feeds_undated == 2 and tallinn.on(datetime.date(2026, 9, 7)) == 0
+    # A place no feed serves has no validity; a country load reads its own
+    # partition's columns like the whole index; schema 8 has no validity.
+    assert reader.place("lah", index=index).validity is None
+    finland = reader.read_index(directory, country="FI")
+    (hsl,) = [f for f in reader.place("hel", index=finland).feeds(categories=None)]
+    assert hsl.service_start == datetime.date(2026, 9, 1)
+    eight = reader.read_index(
+        write_partitioned_index(
+            tmp_path / "eight", feeds=FEEDS, places=PLACES, edges=EDGES, realtime=[]
+        )
+    )
+    assert eight.schema_version == 8 and "feeds_dated" not in eight.snapshot["counts"]
+    (hsl,) = [f for f in reader.place("hel", index=eight).feeds(categories=None)]
+    assert (
+        hsl.service_start is None and reader.place("hel", index=eight).validity is None
+    )
+    # The release members and the unpacker take the schema-9 tables as before.
+    assets = pack(directory)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    _refresh._unpack(assets[contract.archive_name(snapshot["snapshot_id"])], staging)
+    assert reader.read_index(staging).schema_version == 9

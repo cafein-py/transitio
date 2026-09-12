@@ -18,10 +18,20 @@ categories and shows unknown edges only when every category is asked for),
 and ``needs_review`` marks the tiers a person should check.
 """
 
+import datetime
 import json
 import math
 
-__all__ = ["IndexedFeed", "PlaceService", "Selector", "ServiceLevel", "TierEdge"]
+__all__ = [
+    "IndexedFeed",
+    "PlaceService",
+    "RealtimeFeed",
+    "Selector",
+    "ServiceLevel",
+    "TierEdge",
+    "Validity",
+    "Window",
+]
 
 # The files that define a fare: GTFS-Fares v1 (attributes/rules) and the v2
 # fare products and leg/transfer/join rules. Companion tables are deliberately
@@ -163,6 +173,59 @@ class TierEdge:
         )
 
 
+def _day(value):
+    """An ISO date string as a ``datetime.date``, None for anything else."""
+    value = _scalar(value)
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+class Window:
+    """A run of days over which a place has the same number of valid feeds."""
+
+    def __init__(self, record):
+        self.start = _day(record.get("start"))
+        self.end = _day(record.get("end"))
+        self.feeds = int(record.get("feeds") or 0)
+
+    def __repr__(self):
+        return f"Window({self.start}, {self.end}, feeds={self.feeds})"
+
+
+class Validity:
+    """The validity of a place's feeds (schema 9): how many are dated, the
+    earliest start and latest end among them, the windows of constant feed
+    count and the best window (most feeds, then the longest, then the
+    earliest)."""
+
+    def __init__(self, record):
+        record = record or {}
+        self.feeds_dated = int(record.get("feeds_dated") or 0)
+        self.feeds_undated = int(record.get("feeds_undated") or 0)
+        self.start = _day(record.get("start"))
+        self.end = _day(record.get("end"))
+        self.windows = [Window(w) for w in record.get("windows") or ()]
+        best = record.get("best")
+        self.best = Window(best) if best else None
+
+    def on(self, day):
+        """How many of the place's dated feeds are valid on ``day``."""
+        for window in self.windows:
+            if window.start and window.end and window.start <= day <= window.end:
+                return window.feeds
+        return 0
+
+    def __repr__(self):
+        return (
+            f"Validity(feeds_dated={self.feeds_dated}, start={self.start}, "
+            f"end={self.end}, best={self.best!r})"
+        )
+
+
 class RealtimeFeed:
     """A GTFS-RT companion of a static feed (schema 8): its identity, the
     static feed it describes and the endpoints the catalogues carry."""
@@ -215,6 +278,17 @@ class IndexedFeed:
     @property
     def spec(self):
         return self._row.get("spec")
+
+    @property
+    def service_start(self):
+        """The first date any of the feed's services runs (schema 9), a
+        ``datetime.date``; None when the feed has no dated calendar."""
+        return _day(self._row.get("service_start"))
+
+    @property
+    def service_end(self):
+        """The last date any of the feed's services runs (schema 9)."""
+        return _day(self._row.get("service_end"))
 
     @property
     def coverage_source(self):

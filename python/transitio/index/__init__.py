@@ -47,14 +47,22 @@ __all__ = [
 
 # The index schema versions this reader understands. A snapshot outside the set
 # is refused rather than read against columns that may have moved.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({4, 5, 6, 7, 8})
+SUPPORTED_SCHEMA_VERSIONS = frozenset({4, 5, 6, 7, 8, 9})
 
 # The oldest transitio that reads each schema version: what a snapshot records
 # as its reader floor, fixed per schema rather than taken from the build.
 # Schema 5 adds the per-feed ``files`` manifest and schema 6 keys places by
 # their own id, with the QID beside it; all three ship first in 0.11.0.
-# Schema 7 (partitions) and 8 (the GTFS-RT companion table) ship together.
-MIN_READER_VERSIONS = {4: "0.11.0", 5: "0.11.0", 6: "0.11.0", 7: "0.12.0", 8: "0.12.0"}
+# Schema 7 (partitions), 8 (the GTFS-RT companion table) and 9 (feed service
+# spans and place validity) ship together.
+MIN_READER_VERSIONS = {
+    4: "0.11.0",
+    5: "0.11.0",
+    6: "0.11.0",
+    7: "0.12.0",
+    8: "0.12.0",
+    9: "0.12.0",
+}
 
 # Bumped whenever name resolution, ranking, promotion or filtering changes:
 # the snapshot pins the data, this pins how the reader interprets it, and a
@@ -146,6 +154,8 @@ _FEEDS_COLUMNS = {
 # Schema 8: GTFS only, so the GBFS block goes; each static feed names its
 # GTFS-RT companions, which ride in the realtime table.
 _FEEDS_COLUMNS[8] = (_FEEDS_COLUMNS[7] - {"gbfs"}) | {"realtime_feed_ids"}
+# Schema 9: the first and last date the feed's services run.
+_FEEDS_COLUMNS[9] = _FEEDS_COLUMNS[8] | {"service_start", "service_end"}
 _REALTIME_COLUMNS = frozenset(
     {
         "feed_id",
@@ -227,6 +237,8 @@ _PLACES_COLUMNS = {
 }
 _PLACES_COLUMNS[7] = _PLACES_COLUMNS[6]
 _PLACES_COLUMNS[8] = _PLACES_COLUMNS[6]
+# Schema 9: the validity of the place's feeds and their overlap.
+_PLACES_COLUMNS[9] = _PLACES_COLUMNS[6] | {"validity"}
 # Schema 7 edges carry the rank stage's relevance; the links table also names
 # the partition holding each edge's feed.
 _RELEVANCE_COLUMNS = frozenset({"relevance_category", "relevance", "cross_border"})
@@ -235,6 +247,7 @@ _EDGES_COLUMNS_BY_VERSION = {
 }
 _EDGES_COLUMNS_BY_VERSION[7] = _EDGES_COLUMNS | _RELEVANCE_COLUMNS
 _EDGES_COLUMNS_BY_VERSION[8] = _EDGES_COLUMNS_BY_VERSION[7]
+_EDGES_COLUMNS_BY_VERSION[9] = _EDGES_COLUMNS_BY_VERSION[7]
 _LINKS_COLUMNS = _EDGES_COLUMNS_BY_VERSION[7] | {"feed_partition"}
 
 

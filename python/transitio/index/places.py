@@ -181,6 +181,17 @@ class Place:
         return PlaceService(_parse(self._record.get("service")))
 
     @property
+    def validity(self):
+        """The validity of the feeds serving this place (schema 9): a
+        :class:`transitio.index.feeds.Validity` with the dated feed count,
+        the span, the windows of constant feed count and the best window;
+        None when the index predates it or no feed serves the place."""
+        from transitio.index.feeds import Validity, _parse
+
+        record = _parse(self._record.get("validity"))
+        return None if record is None else Validity(record)
+
+    @property
     def geometry(self):
         return self._record.get("geometry")
 
