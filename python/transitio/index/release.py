@@ -45,8 +45,9 @@ TAG_PREFIX = "index-"
 MANIFEST_NAME = "manifest.json"
 CHECKSUM_SUFFIX = ".sha256"
 
-# What a released archive holds, every one required: a snapshot without
-# places or edges is a local build, not something a client should adopt.
+# What a released archive holds before schema 7, every one required: a
+# snapshot without places or edges is a local build, not something a client
+# should adopt.
 MEMBERS = (
     "snapshot.json",
     "feeds.parquet",
@@ -54,6 +55,47 @@ MEMBERS = (
     "edges.parquet",
     "NOTICE",
 )
+# A schema-7 archive holds the snapshot, every partition table the snapshot
+# lists (``<partition>/<table>.parquet``) and the NOTICE.
+PARTITION_NAME = re.compile(r"[A-Z]{2}|international|links")
+PARTITION_MEMBER = re.compile(
+    r"(?:[A-Z]{2}|international|links)/(?:feeds|places|edges)\.parquet"
+)
+TABLES = ("feeds", "places", "edges")
+# ``international`` holds feeds only and ``links`` edges only.
+PARTITION_TABLES = {"international": {"feeds"}, "links": {"edges"}}
+
+
+def members(snapshot):
+    """The members an archive of ``snapshot`` must hold, in packing order:
+    the flat five before schema 7, else the snapshot, every listed partition
+    table and the NOTICE. A schema-7 snapshot must list places and edges
+    somewhere, as the flat contract required them."""
+    version = snapshot.get("schema_version")
+    if not isinstance(version, int) or isinstance(version, bool) or version < 7:
+        # A malformed version is the reader's to refuse; the members owed
+        # are the flat five.
+        return list(MEMBERS)
+    listing = snapshot.get("partitions")
+    if not isinstance(listing, dict) or not listing:
+        raise ValueError("lists no partitions")
+    for partition, tables in listing.items():
+        if not isinstance(partition, str) or not PARTITION_NAME.fullmatch(partition):
+            raise ValueError(f"names a partition outside the layout: {partition!r}")
+        allowed = PARTITION_TABLES.get(partition, set(TABLES))
+        if not isinstance(tables, dict) or not tables or set(tables) - allowed:
+            raise ValueError(f"lists tables outside the layout for {partition!r}")
+    found = [
+        f"{partition}/{table}.parquet"
+        for partition, tables in sorted(listing.items())
+        for table in TABLES
+        if table in tables
+    ]
+    for table in ("places", "edges"):
+        if not any(name.endswith(f"/{table}.parquet") for name in found):
+            raise ValueError(f"the snapshot lists no {table} partition")
+    return ["snapshot.json", *found, "NOTICE"]
+
 
 _SNAPSHOT_ID = re.compile(r"[0-9a-f]{16}")
 

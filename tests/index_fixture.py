@@ -398,6 +398,115 @@ def index(tmp_path):
     return write_index(tmp_path / "index")
 
 
+PARTITIONED_SCHEMA_VERSION = 7
+FEEDS_SCHEMA_7 = FEEDS_SCHEMA.remove(FEEDS_SCHEMA.get_field_index("snapshot")).append(
+    pa.field("home_country", pa.string())
+)
+for _name, _type in (
+    ("country_shares", pa.string()),
+    ("scope", pa.string()),
+    ("declared_countries", pa.list_(pa.string())),
+    ("snapshot", pa.string()),
+):
+    FEEDS_SCHEMA_7 = FEEDS_SCHEMA_7.append(pa.field(_name, _type))
+EDGES_SCHEMA_7 = EDGES_SCHEMA
+for _name, _type in (
+    ("relevance_category", pa.string()),
+    ("relevance", pa.float64()),
+    ("cross_border", pa.bool_()),
+):
+    EDGES_SCHEMA_7 = EDGES_SCHEMA_7.append(pa.field(_name, _type))
+LINKS_SCHEMA_7 = EDGES_SCHEMA_7.append(pa.field("feed_partition", pa.string()))
+
+
+def _feed_row_7(record, snapshot_id):
+    row = _feed_row(record, snapshot_id)
+    row.update(
+        home_country=record.get("home_country"),
+        country_shares=_json_block(record.get("country_shares") or {}),
+        scope=record.get("scope", "declared"),
+        declared_countries=list(record.get("declared_countries") or []),
+    )
+    return row
+
+
+def _edge_row_7(record, snapshot_id, partition=None):
+    row = _edge_row(record, snapshot_id)
+    row.update(
+        relevance_category=record.get("relevance_category"),
+        relevance=record.get("relevance"),
+        cross_border=record.get("cross_border"),
+    )
+    if partition is not None:
+        row["feed_partition"] = partition
+    return row
+
+
+def write_partitioned_index(
+    directory, *, feeds, places, edges, snapshot_id=SNAPSHOT_ID, notice=NOTICE
+):
+    """Write a schema-7 index under ``directory``: feeds by ``home_country``
+    (``international`` without one), places by ``country_code``, edges under
+    the feed's home country when the place lies there, else in ``links`` with
+    ``feed_partition``; the manifest lists every table's rows and digest."""
+    directory.mkdir(parents=True, exist_ok=True)
+    home = {feed["feed_id"]: feed.get("home_country") for feed in feeds}
+    country = {place["place_id"]: place["country_code"] for place in places}
+    parts = {}
+    for feed in feeds:
+        parts.setdefault(home[feed["feed_id"]] or "international", {}).setdefault(
+            "feeds", []
+        ).append(_feed_row_7(feed, snapshot_id))
+    service = _service_by_place(edges)
+    for place in places:
+        parts.setdefault(country[place["place_id"]], {}).setdefault(
+            "places", []
+        ).append(_place_row(place, snapshot_id, service.get(place["place_id"])))
+    for record in edges:
+        feed_home = home[record["feed_id"]]
+        if feed_home is None or feed_home != country[record["place_id"]]:
+            row = _edge_row_7(record, snapshot_id, feed_home or "international")
+            parts.setdefault("links", {}).setdefault("edges", []).append(row)
+        else:
+            parts.setdefault(feed_home, {}).setdefault("edges", []).append(
+                _edge_row_7(record, snapshot_id)
+            )
+    listing = {}
+    for partition, tables in sorted(parts.items()):
+        (directory / partition).mkdir(exist_ok=True)
+        listing[partition] = {}
+        for table, rows in tables.items():
+            if table == "feeds":
+                data = _parquet(rows, FEEDS_SCHEMA_7)
+            elif table == "places":
+                data = _parquet(
+                    rows, PLACES_SCHEMA.with_metadata({b"geo": _geo_metadata()})
+                )
+            else:
+                schema = LINKS_SCHEMA_7 if partition == "links" else EDGES_SCHEMA_7
+                data = _parquet(rows, schema)
+            (directory / partition / f"{table}.parquet").write_bytes(data)
+            listing[partition][table] = {"rows": len(rows), "sha256": _sha256(data)}
+    manifest = {
+        "schema_version": PARTITIONED_SCHEMA_VERSION,
+        "discovery_semantics_version": reader.DISCOVERY_SEMANTICS_VERSION,
+        "min_reader_version": reader.MIN_READER_VERSIONS[PARTITIONED_SCHEMA_VERSION],
+        "built_with": transitio.__version__,
+        "snapshot_id": snapshot_id,
+        "built_at": "2026-09-01T00:00:00+00:00",
+        "counts": {"feeds": len(feeds), "places": len(places), "edges": len(edges)},
+        "partitions": listing,
+        "licensed": notice is not None,
+        "notice_sha256": None if notice is None else _sha256(notice),
+    }
+    if notice is not None:
+        (directory / "NOTICE").write_bytes(notice)
+    (directory / reader.SNAPSHOT_FILE).write_text(
+        json.dumps(manifest, indent=2, sort_keys=True)
+    )
+    return directory
+
+
 def manifest_bytes(**fields):
     manifest = {
         "snapshot_id": SNAPSHOT_ID,
@@ -412,8 +521,10 @@ def pack(directory):
     """The release assets of the index at ``directory``, in the contract's
     shape: the archive of its members, the archive's checksum and the
     manifest a client reads before downloading anything."""
-    members = [(name, (directory / name).read_bytes()) for name in contract.MEMBERS]
-    snapshot = json.loads(dict(members)[reader.SNAPSHOT_FILE])
+    snapshot = json.loads((directory / reader.SNAPSHOT_FILE).read_bytes())
+    members = [
+        (name, (directory / name).read_bytes()) for name in contract.members(snapshot)
+    ]
     snapshot_id = snapshot["snapshot_id"]
     name = contract.archive_name(snapshot_id)
     archive = _archive(members)

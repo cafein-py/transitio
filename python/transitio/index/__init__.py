@@ -1,6 +1,6 @@
 """The read layer over a published feed index.
 
-An index is a directory of ``feeds.parquet`` (one row per feed), an optional
+Before schema 7 an index is a directory of ``feeds.parquet`` (one row per feed), an optional
 ``places.parquet`` (one row per place, with boundary geometry), an optional
 ``edges.parquet`` (one membership row per place/feed/tier) and a
 ``snapshot.json`` manifest. :func:`read_index` loads one and returns an
@@ -33,6 +33,8 @@ __all__ = [
     "Place",
     "Selector",
     "read_index",
+    "load",
+    "links",
     "place",
     "places",
     "refresh",
@@ -45,13 +47,13 @@ __all__ = [
 
 # The index schema versions this reader understands. A snapshot outside the set
 # is refused rather than read against columns that may have moved.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({4, 5, 6})
+SUPPORTED_SCHEMA_VERSIONS = frozenset({4, 5, 6, 7})
 
 # The oldest transitio that reads each schema version: what a snapshot records
 # as its reader floor, fixed per schema rather than taken from the build.
 # Schema 5 adds the per-feed ``files`` manifest and schema 6 keys places by
 # their own id, with the QID beside it; all three ship first in 0.11.0.
-MIN_READER_VERSIONS = {4: "0.11.0", 5: "0.11.0", 6: "0.11.0"}
+MIN_READER_VERSIONS = {4: "0.11.0", 5: "0.11.0", 6: "0.11.0", 7: "0.12.0"}
 
 # Bumped whenever name resolution, ranking, promotion or filtering changes:
 # the snapshot pins the data, this pins how the reader interprets it, and a
@@ -62,6 +64,22 @@ FEEDS_FILE = "feeds.parquet"
 PLACES_FILE = "places.parquet"
 EDGES_FILE = "edges.parquet"
 SNAPSHOT_FILE = "snapshot.json"
+# Schema 7 is a directory of partitions: one per country code (its feeds by
+# home country, its places, their domestic edges), ``international`` (the
+# feeds without a home country) and ``links`` (every cross-border edge, with
+# ``feed_partition`` naming the partition holding the feed).
+INTERNATIONAL_PARTITION = "international"
+LINKS_PARTITION = "links"
+_TABLE_FILES = {"feeds": FEEDS_FILE, "places": PLACES_FILE, "edges": EDGES_FILE}
+_PARTITION_NAME = re.compile(r"[A-Z]{2}|international|links")
+# The tables each partition kind may carry; a country partition any of the
+# three. More partitions than countries, or more listed rows than one table
+# may hold, is refused before anything is read.
+_PARTITION_TABLES = {
+    INTERNATIONAL_PARTITION: {"feeds"},
+    LINKS_PARTITION: {"edges"},
+}
+_MAX_PARTITIONS = 300
 
 # Ceilings on what one index file may be, so a swapped-in or damaged file cannot
 # read an unbounded amount into memory. A real index is a few MB.
@@ -111,6 +129,9 @@ _FEEDS_COLUMNS = {
     4: _SCHEMA_COLUMNS,
     5: _SCHEMA_COLUMNS | {"files"},
     6: _SCHEMA_COLUMNS | {"files"},
+    # Schema 7 adds the classify stage's country fields.
+    7: _SCHEMA_COLUMNS
+    | {"files", "home_country", "country_shares", "scope", "declared_countries"},
 }
 
 # The columns an edges table carries, unchanged from schema_version 4 through 5.
@@ -170,6 +191,15 @@ _PLACES_COLUMNS = {
     5: _PLACES_SCHEMA_COLUMNS,
     6: _PLACES_SCHEMA_COLUMNS | {"wikidata_id", "concordances", "former_ids"},
 }
+_PLACES_COLUMNS[7] = _PLACES_COLUMNS[6]
+# Schema 7 edges carry the rank stage's relevance; the links table also names
+# the partition holding each edge's feed.
+_RELEVANCE_COLUMNS = frozenset({"relevance_category", "relevance", "cross_border"})
+_EDGES_COLUMNS_BY_VERSION = {
+    version: _EDGES_COLUMNS for version in SUPPORTED_SCHEMA_VERSIONS if version < 7
+}
+_EDGES_COLUMNS_BY_VERSION[7] = _EDGES_COLUMNS | _RELEVANCE_COLUMNS
+_LINKS_COLUMNS = _EDGES_COLUMNS_BY_VERSION[7] | {"feed_partition"}
 
 
 # What a table may declare before it is materialised: the on-disk ceiling
@@ -286,13 +316,51 @@ def _read_regular(path, limit):
 
 
 class Index:
-    """A resolved index: its manifest, feeds, and (if present) places and edges."""
+    """A resolved index: its manifest, feeds, and (if present) places and edges.
 
-    def __init__(self, snapshot, feeds, places=None, edges=None):
+    A schema-7 index read whole joins every partition into the flat tables;
+    read for one ``country`` it holds that partition alone. ``links`` is the
+    cross-border edge table (with ``feed_partition``), None before schema 7.
+    """
+
+    def __init__(
+        self,
+        snapshot,
+        feeds,
+        places=None,
+        edges=None,
+        *,
+        links=None,
+        country=None,
+        path=None,
+    ):
         self.snapshot = snapshot
         self.feeds = feeds
         self.places = places
         self.edges = edges
+        self.links = links
+        self.country = country
+        self._path = None if path is None else Path(path)
+        self._partition_feeds = {}
+
+    @property
+    def partitions(self):
+        """The partition listing of a schema-7 manifest, else an empty dict."""
+        return self.snapshot.get("partitions") or {}
+
+    def feeds_in(self, partition):
+        """The feeds table of one partition of a schema-7 index read from
+        disk — the feeds a link edge's ``feed_partition`` refers to — read
+        once and kept for the index's lifetime."""
+        if partition not in self._partition_feeds:
+            if self._path is None or "feeds" not in self.partitions.get(partition, {}):
+                raise IncompatibleIndexError(
+                    f"this index has no feeds partition {partition!r}"
+                )
+            self._partition_feeds[partition] = _read_partition_table(
+                self._path, self.snapshot, partition, "feeds"
+            )
+        return self._partition_feeds[partition]
 
     @property
     def snapshot_id(self):
@@ -317,8 +385,15 @@ class Index:
         )
 
 
-def read_index(path):
+def read_index(path, *, country=None):
     """Read the index at ``path``, or raise if it is unsupported or corrupt.
+
+    A schema-7 index is a directory of partitions: without ``country`` every
+    partition is read and joined into the flat feeds, places and edges tables
+    (the cross-border edges included, so nothing a flat index carried is
+    lost), and the ``links`` table is kept beside them; with ``country`` the
+    result holds that partition's feeds, places and domestic edges, and the
+    links whose place lies in it. ``country`` is refused for an older schema.
 
     ``pandas`` (and its ``pyarrow`` Parquet engine, a required dependency) reads
     ``feeds.parquet``. The manifest is read first, so an incompatible snapshot
@@ -335,7 +410,39 @@ def read_index(path):
     """
     import pandas
 
-    path = Path(path)
+    # Absolute, so the lazy partition reads of a country load stay put when
+    # the working directory moves.
+    path = Path(path).resolve()
+    snapshot = _read_manifest(path)
+    version = snapshot["schema_version"]
+    if version >= 7:
+        return _read_partitioned(path, snapshot, version, country)
+    if country is not None:
+        raise ValueError(f"schema_version {version} has no country partitions")
+    data = _read_regular(path / FEEDS_FILE, _MAX_FEEDS_BYTES)
+    expected = snapshot.get("feeds_sha256")
+    if not isinstance(expected, str):
+        raise IncompatibleIndexError(
+            f"{path / SNAPSHOT_FILE}: manifest declares no feeds_sha256"
+        )
+    if hashlib.sha256(data).hexdigest() != expected:
+        raise IncompatibleIndexError(
+            f"{path / FEEDS_FILE}: does not match the snapshot's feeds_sha256"
+        )
+    feeds = _load_table(pandas.read_parquet, data, path / FEEDS_FILE, "feeds")
+    _check_columns(feeds, _FEEDS_COLUMNS[version], path / FEEDS_FILE, version, "feeds")
+    _check_snapshot_column(feeds, snapshot, path / FEEDS_FILE, "feeds")
+    return Index(
+        snapshot,
+        feeds,
+        _read_places(path, snapshot, version),
+        _read_edges(path, snapshot, version),
+    )
+
+
+def _read_manifest(path):
+    """The manifest at ``path``, refused unless it is a JSON object of a
+    supported schema within this reader's range and names its snapshot."""
     try:
         snapshot = json.loads(
             _read_regular(path / SNAPSHOT_FILE, _MAX_SNAPSHOT_BYTES).decode("utf-8")
@@ -363,25 +470,7 @@ def read_index(path):
         raise IncompatibleIndexError(
             f"{path / SNAPSHOT_FILE}: manifest declares no snapshot_id"
         )
-    data = _read_regular(path / FEEDS_FILE, _MAX_FEEDS_BYTES)
-    expected = snapshot.get("feeds_sha256")
-    if not isinstance(expected, str):
-        raise IncompatibleIndexError(
-            f"{path / SNAPSHOT_FILE}: manifest declares no feeds_sha256"
-        )
-    if hashlib.sha256(data).hexdigest() != expected:
-        raise IncompatibleIndexError(
-            f"{path / FEEDS_FILE}: does not match the snapshot's feeds_sha256"
-        )
-    feeds = _load_table(pandas.read_parquet, data, path / FEEDS_FILE, "feeds")
-    _check_columns(feeds, _FEEDS_COLUMNS[version], path / FEEDS_FILE, version, "feeds")
-    _check_snapshot_column(feeds, snapshot, path / FEEDS_FILE, "feeds")
-    return Index(
-        snapshot,
-        feeds,
-        _read_places(path, snapshot, version),
-        _read_edges(path, snapshot, version),
-    )
+    return snapshot
 
 
 def _read_places(path, snapshot, version):
@@ -438,6 +527,180 @@ def _read_edges(path, snapshot, version):
     _check_columns(edges, _EDGES_COLUMNS, path / EDGES_FILE, version, "edges")
     _check_snapshot_column(edges, snapshot, path / EDGES_FILE, "edges")
     return edges
+
+
+def _partitions(snapshot, path):
+    """The manifest's partition listing, checked for shape: partition names
+    of the layout, each table an object with a digest."""
+    listing = snapshot.get("partitions")
+    if not isinstance(listing, dict) or not listing:
+        raise IncompatibleIndexError(
+            f"{path / SNAPSHOT_FILE}: manifest declares no partitions"
+        )
+    if len(listing) > _MAX_PARTITIONS:
+        raise IncompatibleIndexError(
+            f"{path / SNAPSHOT_FILE}: manifest lists more than {_MAX_PARTITIONS} "
+            "partitions"
+        )
+    rows = {table: 0 for table in _TABLE_FILES}
+    for name, tables in listing.items():
+        if not isinstance(name, str) or not _PARTITION_NAME.fullmatch(name):
+            raise IncompatibleIndexError(
+                f"{path / SNAPSHOT_FILE}: unexpected partition name {name!r}"
+            )
+        allowed = _PARTITION_TABLES.get(name, set(_TABLE_FILES))
+        if (
+            not isinstance(tables, dict)
+            or not tables
+            or not all(
+                table in allowed
+                and isinstance(entry, dict)
+                and isinstance(entry.get("sha256"), str)
+                and isinstance(entry.get("rows"), int)
+                and not isinstance(entry.get("rows"), bool)
+                and entry["rows"] >= 0
+                for table, entry in tables.items()
+            )
+        ):
+            raise IncompatibleIndexError(
+                f"{path / SNAPSHOT_FILE}: partition {name!r} lists tables outside "
+                "the layout"
+            )
+        for table, entry in tables.items():
+            rows[table] += entry["rows"]
+    if any(total > _MAX_TABLE_ROWS for total in rows.values()):
+        raise IncompatibleIndexError(
+            f"{path / SNAPSHOT_FILE}: the partitions list more than "
+            f"{_MAX_TABLE_ROWS} rows of one table"
+        )
+    return listing
+
+
+def _partition_directory(path, partition):
+    """The partition's directory, refused when it is not a plain directory
+    (a symlink or junction would lead the read outside the index)."""
+    directory = path / partition
+    try:
+        info = os.lstat(directory)
+    except OSError as error:
+        raise IncompatibleIndexError(f"{directory}: cannot read ({error.strerror})")
+    reparse = getattr(info, "st_file_attributes", 0) & getattr(
+        stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0
+    )
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or reparse:
+        raise IncompatibleIndexError(f"{directory}: not a plain directory")
+    return directory
+
+
+def _read_partition_table(path, snapshot, partition, table):
+    """One partition table, checked against its digest, columns and snapshot."""
+    import pandas
+
+    version = snapshot["schema_version"]
+    listing = _partitions(snapshot, path)
+    file = _partition_directory(path, partition) / _TABLE_FILES[table]
+    entry = listing[partition][table]
+    limits = {"feeds": _MAX_FEEDS_BYTES, "places": _MAX_PLACES_BYTES}
+    data = _read_regular(file, limits.get(table, _MAX_EDGES_BYTES))
+    if hashlib.sha256(data).hexdigest() != entry["sha256"]:
+        raise IncompatibleIndexError(f"{file}: does not match the snapshot's sha256")
+    if table == "places":
+        import geopandas
+
+        frame = _load_table(geopandas.read_parquet, data, file, table)
+        columns = _PLACES_COLUMNS[version]
+    else:
+        frame = _load_table(pandas.read_parquet, data, file, table)
+        if table == "feeds":
+            columns = _FEEDS_COLUMNS[version]
+        elif partition == LINKS_PARTITION:
+            columns = _LINKS_COLUMNS
+        else:
+            columns = _EDGES_COLUMNS_BY_VERSION[version]
+    _check_columns(frame, columns, file, version, table)
+    _check_snapshot_column(frame, snapshot, file, table)
+    if len(frame) != entry["rows"]:
+        raise IncompatibleIndexError(
+            f"{file}: {len(frame)} rows where the snapshot lists {entry['rows']}"
+        )
+    return frame
+
+
+def _concat(frames, geo=False):
+    import pandas
+
+    if not frames:
+        return None
+    joined = pandas.concat(frames, ignore_index=True)
+    if geo:
+        import geopandas
+
+        return geopandas.GeoDataFrame(joined, geometry="geometry", crs=frames[0].crs)
+    return joined
+
+
+def _read_partitioned(path, snapshot, version, country):
+    """A schema-7 index: every partition joined, or one country's."""
+    listing = _partitions(snapshot, path)
+    if country is not None:
+        if country not in listing or country in (
+            INTERNATIONAL_PARTITION,
+            LINKS_PARTITION,
+        ):
+            raise IncompatibleIndexError(f"{path}: no country partition {country!r}")
+        chosen = [country]
+    else:
+        chosen = [name for name in sorted(listing) if name != LINKS_PARTITION]
+    tables = {"feeds": [], "places": [], "edges": []}
+    for name in chosen:
+        for table in tables:
+            if table in listing[name]:
+                tables[table].append(_read_partition_table(path, snapshot, name, table))
+    links = None
+    if "edges" in listing.get(LINKS_PARTITION, {}):
+        links = _read_partition_table(path, snapshot, LINKS_PARTITION, "edges")
+        if country is not None:
+            places = tables["places"]
+            here = set(places[0]["place_id"]) if places else set()
+            links = links[links["place_id"].isin(here)].reset_index(drop=True)
+    feeds = _concat(tables["feeds"])
+    if feeds is None:
+        raise IncompatibleIndexError(f"{path}: the index carries no feeds table")
+    edges = _concat(tables["edges"])
+    if country is None and links is not None and len(links):
+        # The flat view: the domestic edges and the cross-border ones together.
+        flat_links = links.drop(columns=["feed_partition"])
+        edges = _concat([edges, flat_links] if edges is not None else [flat_links])
+    return Index(
+        snapshot,
+        feeds,
+        _concat(tables["places"], geo=True),
+        edges,
+        links=links,
+        country=country,
+        path=path,
+    )
+
+
+def load(path, *, country=None):
+    """:func:`read_index` under the plan's name: the whole index, or one
+    country partition of a schema-7 index."""
+    return read_index(path, country=country)
+
+
+def links(path):
+    """The cross-border edge table of the schema-7 index at ``path`` — every
+    edge whose feed has no home country or whose place lies outside it, with
+    ``feed_partition`` naming the partition holding the feed — or None when
+    the index has none. Only the manifest and the links table are read."""
+    path = Path(path).resolve()
+    snapshot = _read_manifest(path)
+    if snapshot["schema_version"] < 7:
+        return None
+    listing = _partitions(snapshot, path)
+    if "edges" not in listing.get(LINKS_PARTITION, {}):
+        return None
+    return _read_partition_table(path, snapshot, LINKS_PARTITION, "edges")
 
 
 # Version components are bounded: the manifest is an untrusted input and an
