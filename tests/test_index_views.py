@@ -136,7 +136,10 @@ def test_international_adds_the_cross_border_feeds(index, tmp_path):
     linked = helsinki.feeds(international=True, categories=["international"])
     assert _ids(linked) == ["f-ferry", "f-tlt"]
     assert linked[0].name == "f-ferry" and linked[1].name == "f-tlt"
-    assert set(finland._partition_feeds) == {"EE", "international"}
+    assert {p for p, t in finland._partition_tables if t == "feeds"} == {
+        "EE",
+        "international",
+    }
     assert linked[0].relevance == 0.3 and linked[1].relevance == 0.1
     # A country served only through links has no home feeds or domestic
     # edges, and still answers with them on request.

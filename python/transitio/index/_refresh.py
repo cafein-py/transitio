@@ -45,6 +45,7 @@ _MEMBER_LIMITS = {
     "snapshot.json": 8 * 1024 * 1024,
     "NOTICE": 8 * 1024 * 1024,
     "feeds.parquet": 512 * 1024 * 1024,
+    "realtime.parquet": 512 * 1024 * 1024,
     "places.parquet": 512 * 1024 * 1024,
     "edges.parquet": 512 * 1024 * 1024,
 }

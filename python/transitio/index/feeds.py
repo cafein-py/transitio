@@ -163,12 +163,42 @@ class TierEdge:
         )
 
 
-class IndexedFeed:
-    """A feed serving a place: its identity row plus the matched tier edges."""
+class RealtimeFeed:
+    """A GTFS-RT companion of a static feed (schema 8): its identity, the
+    static feed it describes and the endpoints the catalogues carry."""
 
-    def __init__(self, row, edges):
+    def __init__(self, record):
+        self._row = record
+        self.feed_id = record["feed_id"]
+        self.onestop_id = _scalar(record.get("onestop_id"))
+        self.name = _scalar(record.get("name"))
+        self.source = _scalar(record.get("source"))
+        self.static_feed_id = _scalar(record.get("static_feed_id"))
+        self.static_link_method = _scalar(record.get("static_link_method"))
+        self.urls = _parse(record.get("urls")) or {}
+        types = record.get("entity_types")
+        self.entity_types = [] if types is None else [str(t) for t in types]
+        allowed = record.get("redistribution_allowed")
+        self.redistribution_allowed = (
+            None if allowed is None or allowed != allowed else bool(allowed)
+        )
+        self.snapshot = _scalar(record.get("snapshot"))
+
+    def __repr__(self):
+        return (
+            f"RealtimeFeed({self.feed_id!r}, static_feed_id={self.static_feed_id!r}, "
+            f"entity_types={self.entity_types!r})"
+        )
+
+
+class IndexedFeed:
+    """A feed serving a place: its identity row plus the matched tier edges,
+    and on schema 8 its GTFS-RT companions."""
+
+    def __init__(self, row, edges, realtime=()):
         self._row = row
         self.edges = edges
+        self.realtime = list(realtime)
 
     @property
     def feed_id(self):
@@ -412,6 +442,19 @@ def _default_categories(place, tiers, categories, international):
     return frozenset(default) | ({"international"} if international else set())
 
 
+def _companions(index, feed_id, partition=None):
+    """The :class:`RealtimeFeed` companions naming ``feed_id`` as their
+    static feed: from the index's own realtime table, or from the partition
+    holding a feed that came through a link. Empty before schema 8."""
+    table = index.realtime
+    if partition is not None and partition != index.country:
+        table = index.realtime_in(partition)
+    if table is None or not len(table):
+        return []
+    mine = table[table["static_feed_id"] == feed_id]
+    return [RealtimeFeed(record) for record in mine.to_dict("records")]
+
+
 def _link_edges(index, place):
     """The cross-border edges to ``place`` a country load does not carry in
     its edges, with the rows of the feeds they name."""
@@ -422,7 +465,7 @@ def _link_edges(index, place):
     rows = {}
     for partition in sorted({r["feed_partition"] for r in records}):
         for row in index.feeds_in(partition).to_dict("records"):
-            rows[row["feed_id"]] = row
+            rows[row["feed_id"]] = {**row, "_partition": partition}
     return records, rows
 
 
@@ -456,6 +499,10 @@ def feeds_for_place(
     a feed whose recorded manifest lacks one — including a feed from a snapshot
     that predates the manifest, whose manifest is empty — is dropped, the
     fail-closed reading of "must have this capability".
+
+    On a schema-8 index the feeds table is GTFS only: ``spec="gtfs"`` and the
+    default return them all, another spec an empty list, and each feed's
+    GTFS-RT companions come as its ``realtime`` list.
 
     On a schema-7 index the place's default view applies: a city keeps its
     ``primary`` and ``secondary`` feeds, a region ``secondary`` and
@@ -509,7 +556,9 @@ def feeds_for_place(
         matched = _matched(by_feed[feed_id], tiers, exclude, on_unknown, wanted)
         if not matched:
             continue
-        feed = IndexedFeed(row, matched)
+        feed = IndexedFeed(
+            row, matched, _companions(index, feed_id, row.get("_partition"))
+        )
         if needed <= feed.files:
             found.append(feed)
     if ranked:

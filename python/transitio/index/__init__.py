@@ -47,13 +47,14 @@ __all__ = [
 
 # The index schema versions this reader understands. A snapshot outside the set
 # is refused rather than read against columns that may have moved.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({4, 5, 6, 7})
+SUPPORTED_SCHEMA_VERSIONS = frozenset({4, 5, 6, 7, 8})
 
 # The oldest transitio that reads each schema version: what a snapshot records
 # as its reader floor, fixed per schema rather than taken from the build.
 # Schema 5 adds the per-feed ``files`` manifest and schema 6 keys places by
 # their own id, with the QID beside it; all three ship first in 0.11.0.
-MIN_READER_VERSIONS = {4: "0.11.0", 5: "0.11.0", 6: "0.11.0", 7: "0.12.0"}
+# Schema 7 (partitions) and 8 (the GTFS-RT companion table) ship together.
+MIN_READER_VERSIONS = {4: "0.11.0", 5: "0.11.0", 6: "0.11.0", 7: "0.12.0", 8: "0.12.0"}
 
 # Bumped whenever name resolution, ranking, promotion or filtering changes:
 # the snapshot pins the data, this pins how the reader interprets it, and a
@@ -61,6 +62,7 @@ MIN_READER_VERSIONS = {4: "0.11.0", 5: "0.11.0", 6: "0.11.0", 7: "0.12.0"}
 DISCOVERY_SEMANTICS_VERSION = 1
 
 FEEDS_FILE = "feeds.parquet"
+REALTIME_FILE = "realtime.parquet"
 PLACES_FILE = "places.parquet"
 EDGES_FILE = "edges.parquet"
 SNAPSHOT_FILE = "snapshot.json"
@@ -68,15 +70,23 @@ SNAPSHOT_FILE = "snapshot.json"
 # home country, its places, their domestic edges), ``international`` (the
 # feeds without a home country) and ``links`` (every cross-border edge, with
 # ``feed_partition`` naming the partition holding the feed).
+# Schema 8 adds ``realtime.parquet`` beside a partition's feeds: the GTFS-RT
+# companions of its static feeds, keyed by ``static_feed_id``; the
+# ``international`` partition also holds the companions without one.
 INTERNATIONAL_PARTITION = "international"
 LINKS_PARTITION = "links"
-_TABLE_FILES = {"feeds": FEEDS_FILE, "places": PLACES_FILE, "edges": EDGES_FILE}
+_TABLE_FILES = {
+    "feeds": FEEDS_FILE,
+    "realtime": REALTIME_FILE,
+    "places": PLACES_FILE,
+    "edges": EDGES_FILE,
+}
 _PARTITION_NAME = re.compile(r"[A-Z]{2}|international|links")
-# The tables each partition kind may carry; a country partition any of the
-# three. More partitions than countries, or more listed rows than one table
+# The tables each partition kind may carry; a country partition any of
+# them. More partitions than countries, or more listed rows than one table
 # may hold, is refused before anything is read.
 _PARTITION_TABLES = {
-    INTERNATIONAL_PARTITION: {"feeds"},
+    INTERNATIONAL_PARTITION: {"feeds", "realtime"},
     LINKS_PARTITION: {"edges"},
 }
 _MAX_PARTITIONS = 300
@@ -133,6 +143,30 @@ _FEEDS_COLUMNS = {
     7: _SCHEMA_COLUMNS
     | {"files", "home_country", "country_shares", "scope", "declared_countries"},
 }
+# Schema 8: GTFS only, so the GBFS block goes; each static feed names its
+# GTFS-RT companions, which ride in the realtime table.
+_FEEDS_COLUMNS[8] = (_FEEDS_COLUMNS[7] - {"gbfs"}) | {"realtime_feed_ids"}
+_REALTIME_COLUMNS = frozenset(
+    {
+        "feed_id",
+        "onestop_id",
+        "mdb_id",
+        "id_minted",
+        "source",
+        "name",
+        "aliases",
+        "crosswalk_method",
+        "crosswalk_confidence",
+        "static_feed_id",
+        "static_link_method",
+        "urls",
+        "entity_types",
+        "atlas",
+        "mdb",
+        "redistribution_allowed",
+        "snapshot",
+    }
+)
 
 # The columns an edges table carries, unchanged from schema_version 4 through 5.
 _EDGES_COLUMNS = frozenset(
@@ -192,6 +226,7 @@ _PLACES_COLUMNS = {
     6: _PLACES_SCHEMA_COLUMNS | {"wikidata_id", "concordances", "former_ids"},
 }
 _PLACES_COLUMNS[7] = _PLACES_COLUMNS[6]
+_PLACES_COLUMNS[8] = _PLACES_COLUMNS[6]
 # Schema 7 edges carry the rank stage's relevance; the links table also names
 # the partition holding each edge's feed.
 _RELEVANCE_COLUMNS = frozenset({"relevance_category", "relevance", "cross_border"})
@@ -199,6 +234,7 @@ _EDGES_COLUMNS_BY_VERSION = {
     version: _EDGES_COLUMNS for version in SUPPORTED_SCHEMA_VERSIONS if version < 7
 }
 _EDGES_COLUMNS_BY_VERSION[7] = _EDGES_COLUMNS | _RELEVANCE_COLUMNS
+_EDGES_COLUMNS_BY_VERSION[8] = _EDGES_COLUMNS_BY_VERSION[7]
 _LINKS_COLUMNS = _EDGES_COLUMNS_BY_VERSION[7] | {"feed_partition"}
 
 
@@ -321,6 +357,8 @@ class Index:
     A schema-7 index read whole joins every partition into the flat tables;
     read for one ``country`` it holds that partition alone. ``links`` is the
     cross-border edge table (with ``feed_partition``), None before schema 7.
+    ``realtime`` is the GTFS-RT companion table of schema 8 (the whole
+    index's, or the country's), None before it.
     """
 
     def __init__(
@@ -333,34 +371,71 @@ class Index:
         links=None,
         country=None,
         path=None,
+        realtime=None,
     ):
         self.snapshot = snapshot
         self.feeds = feeds
         self.places = places
         self.edges = edges
         self.links = links
+        self.realtime = realtime
         self.country = country
         self._path = None if path is None else Path(path)
-        self._partition_feeds = {}
+        self._partition_tables = {}
 
     @property
     def partitions(self):
         """The partition listing of a schema-7 manifest, else an empty dict."""
         return self.snapshot.get("partitions") or {}
 
+    def _partition_table(self, partition, table):
+        """One partition table read from disk once and kept for the index's
+        lifetime; None when the partition lists no such table."""
+        key = (partition, table)
+        if key not in self._partition_tables:
+            if self._path is None or table not in self.partitions.get(partition, {}):
+                self._partition_tables[key] = None
+            else:
+                self._partition_tables[key] = _read_partition_table(
+                    self._path, self.snapshot, partition, table
+                )
+        return self._partition_tables[key]
+
     def feeds_in(self, partition):
         """The feeds table of one partition of a schema-7 index read from
         disk — the feeds a link edge's ``feed_partition`` refers to — read
         once and kept for the index's lifetime."""
-        if partition not in self._partition_feeds:
-            if self._path is None or "feeds" not in self.partitions.get(partition, {}):
-                raise IncompatibleIndexError(
-                    f"this index has no feeds partition {partition!r}"
-                )
-            self._partition_feeds[partition] = _read_partition_table(
-                self._path, self.snapshot, partition, "feeds"
+        feeds = self._partition_table(partition, "feeds")
+        if feeds is None:
+            raise IncompatibleIndexError(
+                f"this index has no feeds partition {partition!r}"
             )
-        return self._partition_feeds[partition]
+        return feeds
+
+    def realtime_in(self, partition):
+        """The realtime table of one partition of a schema-8 index (the
+        companions of the feeds held there), read once; None when the
+        partition has none."""
+        return self._partition_table(partition, "realtime")
+
+    def realtime_unlinked(self):
+        """The GTFS-RT companions the index could not tie to a static feed:
+        the rows of the ``international`` realtime table naming no feed, or a
+        feed the index does not carry. A companion of a static feed sits in
+        that feed's partition, so the check is against the partition's own
+        feeds. None before schema 8."""
+        if self.schema_version < 8:
+            return None
+        if self.country is None:
+            table, feeds = self.realtime, self.feeds
+        else:
+            table = self.realtime_in(INTERNATIONAL_PARTITION)
+            feeds = self._partition_table(INTERNATIONAL_PARTITION, "feeds")
+        if table is None:
+            return self.realtime.iloc[0:0]
+        known = set() if feeds is None else set(feeds["feed_id"])
+        static = table["static_feed_id"]
+        return table[static.isna() | ~static.isin(known)].reset_index(drop=True)
 
     @property
     def snapshot_id(self):
@@ -394,6 +469,8 @@ def read_index(path, *, country=None):
     lost), and the ``links`` table is kept beside them; with ``country`` the
     result holds that partition's feeds, places and domestic edges, and the
     links whose place lies in it. ``country`` is refused for an older schema.
+    A schema-8 index also carries its GTFS-RT companions in ``realtime``
+    (joined, or the country's own).
 
     ``pandas`` (and its ``pyarrow`` Parquet engine, a required dependency) reads
     ``feeds.parquet``. The manifest is read first, so an incompatible snapshot
@@ -543,12 +620,17 @@ def _partitions(snapshot, path):
             "partitions"
         )
     rows = {table: 0 for table in _TABLE_FILES}
+    # The realtime table arrives with schema 8; an older snapshot listing
+    # one is outside its layout.
+    known = set(_TABLE_FILES)
+    if snapshot["schema_version"] < 8:
+        known.discard("realtime")
     for name, tables in listing.items():
         if not isinstance(name, str) or not _PARTITION_NAME.fullmatch(name):
             raise IncompatibleIndexError(
                 f"{path / SNAPSHOT_FILE}: unexpected partition name {name!r}"
             )
-        allowed = _PARTITION_TABLES.get(name, set(_TABLE_FILES))
+        allowed = _PARTITION_TABLES.get(name, known) & known
         if (
             not isinstance(tables, dict)
             or not tables
@@ -600,7 +682,11 @@ def _read_partition_table(path, snapshot, partition, table):
     listing = _partitions(snapshot, path)
     file = _partition_directory(path, partition) / _TABLE_FILES[table]
     entry = listing[partition][table]
-    limits = {"feeds": _MAX_FEEDS_BYTES, "places": _MAX_PLACES_BYTES}
+    limits = {
+        "feeds": _MAX_FEEDS_BYTES,
+        "realtime": _MAX_FEEDS_BYTES,
+        "places": _MAX_PLACES_BYTES,
+    }
     data = _read_regular(file, limits.get(table, _MAX_EDGES_BYTES))
     if hashlib.sha256(data).hexdigest() != entry["sha256"]:
         raise IncompatibleIndexError(f"{file}: does not match the snapshot's sha256")
@@ -613,6 +699,8 @@ def _read_partition_table(path, snapshot, partition, table):
         frame = _load_table(pandas.read_parquet, data, file, table)
         if table == "feeds":
             columns = _FEEDS_COLUMNS[version]
+        elif table == "realtime":
+            columns = _REALTIME_COLUMNS
         elif partition == LINKS_PARTITION:
             columns = _LINKS_COLUMNS
         else:
@@ -651,7 +739,7 @@ def _read_partitioned(path, snapshot, version, country):
         chosen = [country]
     else:
         chosen = [name for name in sorted(listing) if name != LINKS_PARTITION]
-    tables = {"feeds": [], "places": [], "edges": []}
+    tables = {"feeds": [], "realtime": [], "places": [], "edges": []}
     for name in chosen:
         for table in tables:
             if table in listing[name]:
@@ -671,6 +759,12 @@ def _read_partitioned(path, snapshot, version, country):
         import pandas
 
         feeds = pandas.DataFrame(columns=sorted(_FEEDS_COLUMNS[version]))
+    realtime = _concat(tables["realtime"])
+    if realtime is None and version >= 8:
+        import pandas
+
+        # Schema 8 with no companions here: an empty table, not None.
+        realtime = pandas.DataFrame(columns=sorted(_REALTIME_COLUMNS))
     edges = _concat(tables["edges"])
     if country is None and links is not None and len(links):
         # The flat view: the domestic edges and the cross-border ones together.
@@ -684,6 +778,7 @@ def _read_partitioned(path, snapshot, version, country):
         links=links,
         country=country,
         path=path,
+        realtime=realtime,
     )
 
 

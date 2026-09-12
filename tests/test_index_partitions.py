@@ -12,10 +12,12 @@ from transitio import index as reader  # noqa: E402
 from transitio.exceptions import IncompatibleIndexError  # noqa: E402
 from transitio.index import _refresh, release as contract  # noqa: E402
 from index_fixture import (  # noqa: E402
+    SNAPSHOT_ID,
     covered_feed,
     edge,
     pack,
     place,
+    realtime_feed,
     write_index,
     write_partitioned_index,
 )
@@ -262,3 +264,101 @@ def test_the_release_members_follow_the_snapshot(tmp_path):
     (tmp_path / "s2").mkdir()
     with pytest.raises(Exception, match="does not list: SE/feeds.parquet"):
         _refresh._unpack(extra, tmp_path / "s2")
+
+
+REALTIME = [
+    realtime_feed("f-hsl-rt", "f-hsl"),  # with its static feed, in FI
+    realtime_feed("f-ferry-rt", "f-ferry", urls={"realtime_alerts": "https://a"}),
+    realtime_feed("f-lost-rt", None),  # no static feed: international, unlinked
+    realtime_feed("f-gone-rt", "f-vanished", method="inferred"),  # dangling
+]
+
+
+def test_a_schema_8_index_carries_the_realtime_companions(tmp_path):
+    directory = write_partitioned_index(
+        tmp_path / "index", feeds=FEEDS, places=PLACES, edges=EDGES, realtime=REALTIME
+    )
+    snapshot = json.loads((directory / "snapshot.json").read_text())
+    listing = snapshot["partitions"]
+    assert snapshot["counts"]["realtime"] == 4
+    assert snapshot["counts"]["realtime_linked"] == 2
+    assert listing["FI"]["realtime"]["rows"] == 1
+    assert listing["international"]["realtime"]["rows"] == 3
+    assert "realtime" not in listing["EE"] and "realtime" not in listing["links"]
+    # Whole: the feeds are GTFS only and name their companions; the realtime
+    # table is joined; the unlinked ones are those naming no feed of the index.
+    index = reader.read_index(directory)
+    assert index.schema_version == 8 and "gbfs" not in index.feeds.columns
+    named = dict(zip(index.feeds["feed_id"], index.feeds["realtime_feed_ids"]))
+    assert {k: list(v) for k, v in named.items()} == {
+        "f-hsl": ["f-hsl-rt"],
+        "f-tlt": [],
+        "f-ferry": ["f-ferry-rt"],
+    }
+    assert sorted(index.realtime["feed_id"]) == [
+        "f-ferry-rt",
+        "f-gone-rt",
+        "f-hsl-rt",
+        "f-lost-rt",
+    ]
+    assert sorted(index.realtime_unlinked()["feed_id"]) == ["f-gone-rt", "f-lost-rt"]
+    # A place's feeds carry their companions; a companion is reached through
+    # its static feed, never through the spec filter.
+    helsinki = reader.place("hel", index=index)
+    feeds = {f.feed_id: f for f in helsinki.feeds(categories=None, international=True)}
+    (rt,) = feeds["f-hsl"].realtime
+    assert rt.static_feed_id == "f-hsl" and rt.entity_types == ["trip_updates"]
+    assert rt.urls == {"realtime_trip_updates": "https://rt.example/f-hsl-rt"}
+    assert rt.static_link_method == "declared" and rt.redistribution_allowed is None
+    assert [c.feed_id for c in feeds["f-ferry"].realtime] == ["f-ferry-rt"]
+    assert feeds["f-tlt"].realtime == []
+    assert helsinki.feeds(spec="gtfs-rt", categories=None) == []
+    assert [f.feed_id for f in helsinki.feeds(categories=None)] == ["f-hsl"]
+    # One country: its own companions, the international ones on request,
+    # and a link feed's companions from the partition holding it.
+    finland = reader.read_index(directory, country="FI")
+    assert list(finland.realtime["feed_id"]) == ["f-hsl-rt"]
+    assert finland.realtime_in("EE") is None
+    assert len(finland.realtime_in("international")) == 3
+    assert sorted(finland.realtime_unlinked()["feed_id"]) == ["f-gone-rt", "f-lost-rt"]
+    finnish = reader.place("hel", index=finland)
+    linked = {f.feed_id: f for f in finnish.feeds(categories=None, international=True)}
+    assert [c.feed_id for c in linked["f-ferry"].realtime] == ["f-ferry-rt"]
+    assert linked["f-hsl"].realtime[0].feed_id == "f-hsl-rt"
+    # Schema 7 has no companions; a schema-7 snapshot listing a realtime
+    # table, or a schema-8 one listing it under links, is outside the layout.
+    seven = reader.read_index(_partitioned(tmp_path / "seven"))
+    assert seven.realtime is None and seven.realtime_unlinked() is None
+    snapshot_path = directory / "snapshot.json"
+    original = snapshot_path.read_text()
+    snapshot = json.loads(original)
+    snapshot["partitions"]["links"]["realtime"] = snapshot["partitions"]["FI"][
+        "realtime"
+    ]
+    snapshot_path.write_text(json.dumps(snapshot))
+    with pytest.raises(IncompatibleIndexError, match="tables outside the layout"):
+        reader.read_index(directory)
+    with pytest.raises(ValueError, match="outside the layout"):
+        contract.members(snapshot)
+    snapshot = json.loads(original)
+    snapshot["schema_version"] = 7
+    snapshot_path.write_text(json.dumps(snapshot))
+    with pytest.raises(IncompatibleIndexError, match="tables outside the layout"):
+        reader.read_index(directory)
+    snapshot_path.write_text(original)
+    # The release members list the realtime tables in table order.
+    members = contract.members(json.loads(original))
+    assert members[1:5] == [
+        "EE/feeds.parquet",
+        "EE/places.parquet",
+        "EE/edges.parquet",
+        "FI/feeds.parquet",
+    ]
+    assert (
+        "FI/realtime.parquet" in members and "international/realtime.parquet" in members
+    )
+    assets = pack(directory)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    _refresh._unpack(assets[contract.archive_name(SNAPSHOT_ID)], staging)
+    assert len(reader.read_index(staging).realtime) == 4

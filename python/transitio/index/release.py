@@ -59,11 +59,12 @@ MEMBERS = (
 # lists (``<partition>/<table>.parquet``) and the NOTICE.
 PARTITION_NAME = re.compile(r"[A-Z]{2}|international|links")
 PARTITION_MEMBER = re.compile(
-    r"(?:[A-Z]{2}|international|links)/(?:feeds|places|edges)\.parquet"
+    r"(?:[A-Z]{2}|international|links)/(?:feeds|realtime|places|edges)\.parquet"
 )
-TABLES = ("feeds", "places", "edges")
-# ``international`` holds feeds only and ``links`` edges only.
-PARTITION_TABLES = {"international": {"feeds"}, "links": {"edges"}}
+TABLES = ("feeds", "realtime", "places", "edges")
+# ``international`` holds feeds and their companions only, ``links`` edges
+# only; the realtime table exists from schema 8.
+PARTITION_TABLES = {"international": {"feeds", "realtime"}, "links": {"edges"}}
 
 
 def members(snapshot):
@@ -79,10 +80,11 @@ def members(snapshot):
     listing = snapshot.get("partitions")
     if not isinstance(listing, dict) or not listing:
         raise ValueError("lists no partitions")
+    known = set(TABLES) if version >= 8 else set(TABLES) - {"realtime"}
     for partition, tables in listing.items():
         if not isinstance(partition, str) or not PARTITION_NAME.fullmatch(partition):
             raise ValueError(f"names a partition outside the layout: {partition!r}")
-        allowed = PARTITION_TABLES.get(partition, set(TABLES))
+        allowed = PARTITION_TABLES.get(partition, known) & known
         if not isinstance(tables, dict) or not tables or set(tables) - allowed:
             raise ValueError(f"lists tables outside the layout for {partition!r}")
     found = [
