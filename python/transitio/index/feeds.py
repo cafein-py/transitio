@@ -13,7 +13,9 @@ every tier edge of the pair carries identically.
 Membership is a fact, not a score: a feed is in the index for a place because
 a scheduled stop lies there. An edge is *unknown* only when its tier is
 ``"unknown"``; ``on_unknown`` governs those (``"include"``, the default, keeps
-them flagged), and ``needs_review`` marks the tiers a person should check.
+them flagged in a tier query; a schema-7 place's default view lists its own
+categories and shows unknown edges only when every category is asked for),
+and ``needs_review`` marks the tiers a person should check.
 """
 
 import json
@@ -114,6 +116,26 @@ class PlaceService(ServiceLevel):
         )
 
 
+# The relevance categories in the order a place's view lists them, and the
+# categories each place kind shows by default: a city its primary and
+# secondary feeds, a region its secondary and tertiary, a country its tertiary.
+CATEGORY_ORDER = ("primary", "secondary", "tertiary", "international", "unknown")
+DEFAULT_CATEGORIES = {
+    "city": ("primary", "secondary"),
+    "metro": ("primary", "secondary"),
+    "region": ("secondary", "tertiary"),
+    "country": ("tertiary",),
+}
+
+
+def _relevance(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if number != number else number
+
+
 class TierEdge:
     """One membership edge, as the query matched it."""
 
@@ -128,6 +150,11 @@ class TierEdge:
         self.selector = _parse(record.get("selector"))
         self.evidence = _parse(record.get("evidence"))
         self.service = ServiceLevel(_parse(record.get("service")))
+        # Schema 7: the rank stage's relevance; None on an older index.
+        self.relevance_category = _scalar(record.get("relevance_category"))
+        self.relevance = _relevance(record.get("relevance"))
+        cross = record.get("cross_border")
+        self.cross_border = None if cross is None or cross != cross else bool(cross)
 
     def __repr__(self):
         return (
@@ -241,6 +268,25 @@ class IndexedFeed:
         return frozenset(self.edges)
 
     @property
+    def relevance_category(self):
+        """The strongest relevance category among the matched edges, or None
+        on an index without relevance."""
+        found = [e.relevance_category for e in self.edges.values()]
+        found = [c for c in found if c in CATEGORY_ORDER]
+        return min(found, key=CATEGORY_ORDER.index) if found else None
+
+    @property
+    def relevance(self):
+        """The pair's relevance score (identical on every edge of the pair),
+        or None on an index without relevance."""
+        scores = [e.relevance for e in self.edges.values() if e.relevance is not None]
+        return max(scores) if scores else None
+
+    @property
+    def cross_border(self):
+        return any(e.cross_border for e in self.edges.values())
+
+    @property
     def service(self):
         """The feed's service level in the place — identical on every tier
         edge of the pair, so any matched edge's copy is the answer."""
@@ -334,7 +380,7 @@ class FeedList(list):
         return geopandas.GeoDataFrame(data, geometry=hulls, crs="EPSG:4326")
 
 
-def _matched(edges, tiers, exclude, on_unknown):
+def _matched(edges, tiers, exclude, on_unknown, categories=None):
     """The edges of one feed the query matches, keyed by tier."""
     matched = {}
     for edge in edges:
@@ -345,8 +391,47 @@ def _matched(edges, tiers, exclude, on_unknown):
             continue
         if exclude and edge["tier"] in exclude:
             continue
+        if categories is not None and edge.get("relevance_category") not in categories:
+            continue
         matched.setdefault(edge["tier"], TierEdge(edge))
     return matched
+
+
+def _default_categories(place, tiers, categories, international):
+    """The relevance categories a query keeps: the ones asked for, else the
+    place kind's default view — with ``international`` added when the
+    cross-border feeds were asked for — unless tiers were named (a tier
+    query is answered in tiers)."""
+    if categories != "default":
+        return None if categories is None else frozenset(categories)
+    if tiers is not None:
+        return None
+    default = DEFAULT_CATEGORIES.get(place.kind)
+    if default is None:
+        return None
+    return frozenset(default) | ({"international"} if international else set())
+
+
+def _link_edges(index, place):
+    """The cross-border edges to ``place`` a country load does not carry in
+    its edges, with the rows of the feeds they name."""
+    if index.links is None or index.country is None:
+        return [], {}
+    links = index.links[index.links["place_id"] == place.id]
+    records = links.to_dict("records")
+    rows = {}
+    for partition in sorted({r["feed_partition"] for r in records}):
+        for row in index.feeds_in(partition).to_dict("records"):
+            rows[row["feed_id"]] = row
+    return records, rows
+
+
+def _view_key(feed):
+    """Sort key of a place's view: category order, then relevance high to
+    low, then the feed id."""
+    category = feed.relevance_category
+    rank = CATEGORY_ORDER.index(category) if category in CATEGORY_ORDER else 99
+    return (rank, -(feed.relevance or 0.0), feed.feed_id)
 
 
 def feeds_for_place(
@@ -358,6 +443,8 @@ def feeds_for_place(
     spec="gtfs",
     on_unknown="include",
     requires=None,
+    categories="default",
+    international=False,
 ):
     """The :class:`IndexedFeed` list for ``place``, filtered by the query.
 
@@ -368,8 +455,17 @@ def feeds_for_place(
     GTFS files the feed's manifest must carry (``"shapes.txt"``, or several);
     a feed whose recorded manifest lacks one — including a feed from a snapshot
     that predates the manifest, whose manifest is empty — is dropped, the
-    fail-closed reading of "must have this capability". Feeds come back sorted
-    by id.
+    fail-closed reading of "must have this capability".
+
+    On a schema-7 index the place's default view applies: a city keeps its
+    ``primary`` and ``secondary`` feeds, a region ``secondary`` and
+    ``tertiary``, a country ``tertiary`` (``categories`` names other
+    categories, ``None`` keeps every category; a ``tiers`` query is answered
+    in tiers instead), cross-border edges are left out unless
+    ``international=True`` adds them — for a country load, from the links
+    table and the partitions holding their feeds — and the feeds come back
+    by category, then relevance high to low, then id. An older index has no
+    relevance: every feed is listed, sorted by id.
     """
     if on_unknown not in ("include", "exclude"):
         raise ValueError("on_unknown must be 'include' or 'exclude'")
@@ -380,13 +476,29 @@ def feeds_for_place(
         if not all(isinstance(name, str) for name in needed):
             raise ValueError("requires must name GTFS files as strings")
     allowed = None if spec is None else {spec} if isinstance(spec, str) else set(spec)
-    if index.edges is None:
+    ranked = index.links is not None or (
+        index.edges is not None and "relevance_category" in index.edges.columns
+    )
+    if index.edges is None and not (ranked and international):
         return FeedList()
-    place_edges = index.edges[index.edges["place_id"] == place.id]
+    records = []
+    if index.edges is not None:
+        records = index.edges[index.edges["place_id"] == place.id].to_dict("records")
+    if ranked and not international:
+        records = [e for e in records if not e.get("cross_border")]
+    rows = {}
+    if index.feeds is not None:
+        rows = {row["feed_id"]: row for row in index.feeds.to_dict("records")}
+    if ranked and international:
+        linked, link_rows = _link_edges(index, place)
+        records += linked
+        rows = {**link_rows, **rows}
+    wanted = (
+        _default_categories(place, tiers, categories, international) if ranked else None
+    )
     by_feed = {}
-    for edge in place_edges.to_dict("records"):
+    for edge in records:
         by_feed.setdefault(edge["feed_id"], []).append(edge)
-    rows = {row["feed_id"]: row for row in index.feeds.to_dict("records")}
     found = FeedList()
     for feed_id in sorted(by_feed):
         row = rows.get(feed_id)
@@ -394,10 +506,12 @@ def feeds_for_place(
             continue
         if allowed is not None and row.get("spec") not in allowed:
             continue
-        matched = _matched(by_feed[feed_id], tiers, exclude, on_unknown)
+        matched = _matched(by_feed[feed_id], tiers, exclude, on_unknown, wanted)
         if not matched:
             continue
         feed = IndexedFeed(row, matched)
         if needed <= feed.files:
             found.append(feed)
+    if ranked:
+        found.sort(key=_view_key)
     return found

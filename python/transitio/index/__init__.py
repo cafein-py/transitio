@@ -665,7 +665,12 @@ def _read_partitioned(path, snapshot, version, country):
             links = links[links["place_id"].isin(here)].reset_index(drop=True)
     feeds = _concat(tables["feeds"])
     if feeds is None:
-        raise IncompatibleIndexError(f"{path}: the index carries no feeds table")
+        if country is None:
+            raise IncompatibleIndexError(f"{path}: the index carries no feeds table")
+        # A country served only through links has places but no home feeds.
+        import pandas
+
+        feeds = pandas.DataFrame(columns=sorted(_FEEDS_COLUMNS[version]))
     edges = _concat(tables["edges"])
     if country is None and links is not None and len(links):
         # The flat view: the domestic edges and the cross-border ones together.
@@ -781,10 +786,18 @@ def _coerce_index(index):
 
 
 def _feed_count_for(index):
-    """A place_id -> distinct-feed-count callable over the index's edges."""
-    if index.edges is None:
+    """A place_id -> distinct-feed-count callable over the index's edges —
+    the links into a country load included, so a name resolves as it does
+    on the whole index."""
+    tables = [t for t in (index.edges, index.links) if t is not None]
+    if not tables:
         return None
-    counts = index.edges.groupby("place_id")["feed_id"].nunique().to_dict()
+    import pandas
+
+    pairs = pandas.concat(
+        [t[["place_id", "feed_id"]] for t in tables], ignore_index=True
+    ).drop_duplicates()
+    counts = pairs.groupby("place_id")["feed_id"].nunique().to_dict()
     return lambda place_id: counts.get(place_id, 0)
 
 

@@ -73,7 +73,11 @@ def edge(place_id, feed_id, **kw):
         "fingerprint_kind": "none",
         "selector_state": "unavailable",
         "selector": None,
-        "needs_review": True,
+        "needs_review": kw.get("needs_review", True),
+        # Schema 7's relevance, when a partitioned fixture sets it.
+        "relevance_category": kw.get("relevance_category"),
+        "relevance": kw.get("relevance"),
+        "cross_border": kw.get("cross_border"),
     }
 
 

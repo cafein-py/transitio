@@ -135,13 +135,10 @@ def test_a_partitioned_index_reads_whole_and_per_country(tmp_path):
     # A place resolves and its feeds come through the joined edges as before;
     # loaded for one country, the links' feeds are not among them.
     helsinki = reader.place("hel", index=index)
-    assert {f.feed_id for f in helsinki.feeds(spec=None)} == {
-        "f-hsl",
-        "f-tlt",
-        "f-ferry",
-    }
+    everything = helsinki.feeds(spec=None, categories=None, international=True)
+    assert {f.feed_id for f in everything} == {"f-hsl", "f-tlt", "f-ferry"}
     finnish = reader.place("hel", index=finland)
-    assert [f.feed_id for f in finnish.feeds(spec=None)] == ["f-hsl"]
+    assert [f.feed_id for f in finnish.feeds(spec=None, categories=None)] == ["f-hsl"]
     assert reader.load(directory, country="EE").country == "EE"
 
 

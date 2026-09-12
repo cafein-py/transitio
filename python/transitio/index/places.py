@@ -213,6 +213,8 @@ class Place:
         spec="gtfs",
         on_unknown="include",
         requires=None,
+        categories="default",
+        international=False,
     ):
         """The feeds serving this place, as :class:`IndexedFeed` objects.
 
@@ -221,8 +223,10 @@ class Place:
         the feed kind (static GTFS by default; ``None`` for everything, a list
         to narrow), ``on_unknown`` governs unknown-tier edges and ``requires``
         keeps only feeds whose manifest carries the named GTFS files (for
-        example ``"shapes.txt"``). See
-        :func:`transitio.index.feeds.feeds_for_place`.
+        example ``"shapes.txt"``). On a schema-7 index ``categories`` picks
+        the relevance categories (the place kind's default view unless named;
+        ``None`` for all) and ``international=True`` adds the cross-border
+        feeds. See :func:`transitio.index.feeds.feeds_for_place`.
         """
         return self._lookup.feeds(
             self,
@@ -231,6 +235,8 @@ class Place:
             spec=spec,
             on_unknown=on_unknown,
             requires=requires,
+            categories=categories,
+            international=international,
         )
 
     def __eq__(self, other):
