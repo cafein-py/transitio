@@ -45,9 +45,21 @@ _MEMBER_LIMITS = {
     "snapshot.json": 8 * 1024 * 1024,
     "NOTICE": 8 * 1024 * 1024,
     "feeds.parquet": 512 * 1024 * 1024,
+    "realtime.parquet": 512 * 1024 * 1024,
     "places.parquet": 512 * 1024 * 1024,
     "edges.parquet": 512 * 1024 * 1024,
 }
+
+
+def _member_limit(name):
+    """The byte ceiling of a member, a partition table counting as its
+    table."""
+    return _MEMBER_LIMITS[name.rpartition("/")[2]]
+
+
+def _is_member_name(name):
+    return name in contract.MEMBERS or bool(contract.PARTITION_MEMBER.fullmatch(name))
+
 
 # The most a decompressed archive may stream, extension headers included:
 # every member at its ceiling plus header slack. tarfile materialises PAX
@@ -157,15 +169,23 @@ def _verified(root, snapshot_id):
 def _whole_members(path):
     """Every release member present at ``path`` as a bounded regular file
     (never a symlink or an over-large one) -- the licence ``NOTICE`` among
-    them, since it is authoritative for the snapshot."""
-    for name in contract.MEMBERS:
+    them, since it is authoritative for the snapshot. The members are the
+    snapshot's own (a schema-7 snapshot lists its partitions), so the
+    snapshot is read first."""
+    snapshot = _read_snapshot(path)
+    if snapshot is None:
+        return False
+    try:
+        names = contract.members(snapshot)
+    except ValueError:
+        return False
+    for name in names:
         try:
             info = os.lstat(path / name)
         except OSError:
             return False
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or not 0 < info.st_size <= _MEMBER_LIMITS[name]
+        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= _member_limit(
+            name
         ):
             return False
     return True
@@ -387,7 +407,7 @@ def _unpack(data, staging):
         with tarfile.open(fileobj=stream, mode="r|") as tar:
             for member in tar:
                 name = member.name
-                if name not in contract.MEMBERS:
+                if not _is_member_name(name):
                     raise DownloadError(
                         f"the archive holds an unexpected member {name!r}"
                     )
@@ -397,20 +417,37 @@ def _unpack(data, staging):
                     raise DownloadError(
                         f"the archive member {name!r} is not a regular file"
                     )
-                if member.size > _MEMBER_LIMITS[name]:
+                if member.size > _member_limit(name):
                     raise DownloadError(f"the archive member {name!r} is too large")
                 seen.add(name)
                 handle = tar.extractfile(member)
                 content = handle.read(member.size + 1) if handle is not None else b""
                 if len(content) != member.size:
                     raise DownloadError(f"the archive member {name!r} is truncated")
+                partition = name.rpartition("/")[0]
+                if partition:
+                    (staging / partition).mkdir(exist_ok=True)
                 with open(staging / name, "xb") as out:
                     out.write(content)
     except (tarfile.TarError, EOFError, OSError) as error:
         raise DownloadError(f"the archive could not be read: {error}") from error
-    missing = [name for name in contract.MEMBERS if name not in seen]
+    # The members owed are the snapshot's own, read once the stream ends; an
+    # unreadable snapshot owes the flat five and is refused by the reader.
+    snapshot = _read_snapshot(staging) if "snapshot.json" in seen else None
+    try:
+        expected = (
+            list(contract.MEMBERS) if snapshot is None else contract.members(snapshot)
+        )
+    except ValueError as error:
+        raise DownloadError(f"the archive's snapshot {error}") from error
+    missing = [name for name in expected if name not in seen]
     if missing:
         raise DownloadError(f"the archive lacks {', '.join(missing)}")
+    extra = sorted(seen - set(expected))
+    if extra:
+        raise DownloadError(
+            f"the archive holds members the snapshot does not list: {', '.join(extra)}"
+        )
 
 
 @contextlib.contextmanager

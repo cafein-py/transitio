@@ -181,6 +181,17 @@ class Place:
         return PlaceService(_parse(self._record.get("service")))
 
     @property
+    def validity(self):
+        """The validity of the feeds serving this place (schema 9): a
+        :class:`transitio.index.feeds.Validity` with the dated feed count,
+        the span, the windows of constant feed count and the best window;
+        None when the index predates it or no feed serves the place."""
+        from transitio.index.feeds import Validity, _parse
+
+        record = _parse(self._record.get("validity"))
+        return None if record is None else Validity(record)
+
+    @property
     def geometry(self):
         return self._record.get("geometry")
 
@@ -213,6 +224,8 @@ class Place:
         spec="gtfs",
         on_unknown="include",
         requires=None,
+        categories="default",
+        international=False,
     ):
         """The feeds serving this place, as :class:`IndexedFeed` objects.
 
@@ -221,8 +234,10 @@ class Place:
         the feed kind (static GTFS by default; ``None`` for everything, a list
         to narrow), ``on_unknown`` governs unknown-tier edges and ``requires``
         keeps only feeds whose manifest carries the named GTFS files (for
-        example ``"shapes.txt"``). See
-        :func:`transitio.index.feeds.feeds_for_place`.
+        example ``"shapes.txt"``). On a schema-7 index ``categories`` picks
+        the relevance categories (the place kind's default view unless named;
+        ``None`` for all) and ``international=True`` adds the cross-border
+        feeds. See :func:`transitio.index.feeds.feeds_for_place`.
         """
         return self._lookup.feeds(
             self,
@@ -231,6 +246,8 @@ class Place:
             spec=spec,
             on_unknown=on_unknown,
             requires=requires,
+            categories=categories,
+            international=international,
         )
 
     def __eq__(self, other):

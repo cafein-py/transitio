@@ -73,7 +73,11 @@ def edge(place_id, feed_id, **kw):
         "fingerprint_kind": "none",
         "selector_state": "unavailable",
         "selector": None,
-        "needs_review": True,
+        "needs_review": kw.get("needs_review", True),
+        # Schema 7's relevance, when a partitioned fixture sets it.
+        "relevance_category": kw.get("relevance_category"),
+        "relevance": kw.get("relevance"),
+        "cross_border": kw.get("cross_border"),
     }
 
 
@@ -256,7 +260,7 @@ def _service_by_place(edges):
     return totals
 
 
-def _place_row(record, snapshot_id, service=None):
+def _place_row(record, snapshot_id, service=None, validity=None, dated=False):
     # A row keyed by its QID states its identity; any other key is a
     # fixture's and states none.
     qid = record["place_id"] if _QID.match(record["place_id"]) else None
@@ -287,6 +291,7 @@ def _place_row(record, snapshot_id, service=None):
         "wikidata_id": qid,
         "concordances": json.dumps({"wikidata": [qid]} if qid else {}, sort_keys=True),
         "former_ids": [],
+        **({"validity": _json_block(validity)} if dated else {}),
         "geometry": None if geometry is None else bytes.fromhex(geometry),
     }
 
@@ -398,6 +403,263 @@ def index(tmp_path):
     return write_index(tmp_path / "index")
 
 
+PARTITIONED_SCHEMA_VERSION = 7
+FEEDS_SCHEMA_7 = FEEDS_SCHEMA.remove(FEEDS_SCHEMA.get_field_index("snapshot")).append(
+    pa.field("home_country", pa.string())
+)
+for _name, _type in (
+    ("country_shares", pa.string()),
+    ("scope", pa.string()),
+    ("declared_countries", pa.list_(pa.string())),
+    ("snapshot", pa.string()),
+):
+    FEEDS_SCHEMA_7 = FEEDS_SCHEMA_7.append(pa.field(_name, _type))
+EDGES_SCHEMA_7 = EDGES_SCHEMA
+for _name, _type in (
+    ("relevance_category", pa.string()),
+    ("relevance", pa.float64()),
+    ("cross_border", pa.bool_()),
+):
+    EDGES_SCHEMA_7 = EDGES_SCHEMA_7.append(pa.field(_name, _type))
+LINKS_SCHEMA_7 = EDGES_SCHEMA_7.append(pa.field("feed_partition", pa.string()))
+# Schema 8: GTFS only (no GBFS block), each static feed naming its GTFS-RT
+# companions, which ride in a realtime table beside the feeds.
+FEEDS_SCHEMA_8 = FEEDS_SCHEMA_7.remove(FEEDS_SCHEMA_7.get_field_index("gbfs"))
+FEEDS_SCHEMA_8 = FEEDS_SCHEMA_8.insert(
+    FEEDS_SCHEMA_8.get_field_index("snapshot"),
+    pa.field("realtime_feed_ids", pa.list_(pa.string())),
+)
+# Schema 9: the feed service span, and the place's validity JSON.
+FEEDS_SCHEMA_9 = FEEDS_SCHEMA_8
+for _name in ("service_start", "service_end"):
+    FEEDS_SCHEMA_9 = FEEDS_SCHEMA_9.insert(
+        FEEDS_SCHEMA_9.get_field_index("snapshot"), pa.field(_name, pa.string())
+    )
+PLACES_SCHEMA_9 = PLACES_SCHEMA.insert(
+    PLACES_SCHEMA.get_field_index("geometry"), pa.field("validity", pa.string())
+)
+REALTIME_SCHEMA = pa.schema(
+    [
+        ("feed_id", pa.string()),
+        ("onestop_id", pa.string()),
+        ("mdb_id", pa.string()),
+        ("id_minted", pa.bool_()),
+        ("source", pa.string()),
+        ("name", pa.string()),
+        ("aliases", pa.list_(pa.string())),
+        ("crosswalk_method", pa.string()),
+        ("crosswalk_confidence", pa.float64()),
+        ("static_feed_id", pa.string()),
+        ("static_link_method", pa.string()),
+        ("urls", pa.string()),
+        ("entity_types", pa.list_(pa.string())),
+        ("atlas", pa.string()),
+        ("mdb", pa.string()),
+        ("redistribution_allowed", pa.bool_()),
+        ("snapshot", pa.string()),
+    ]
+)
+
+
+def realtime_feed(feed_id, static_feed_id, urls=None, **kw):
+    """A GTFS-RT companion record for :func:`write_partitioned_index`."""
+    urls = (
+        {"realtime_trip_updates": f"https://rt.example/{feed_id}"}
+        if urls is None
+        else urls
+    )
+    return {
+        "feed_id": feed_id,
+        "onestop_id": feed_id,
+        "id_minted": False,
+        "source": kw.get("source", "atlas"),
+        "name": kw.get("name"),
+        "crosswalk_method": "none",
+        "crosswalk_confidence": 0.0,
+        "static_feed_id": static_feed_id,
+        "static_link_method": kw.get(
+            "method", "declared" if static_feed_id else "none"
+        ),
+        "urls": urls,
+        "entity_types": sorted(k.removeprefix("realtime_") for k in urls),
+        "redistribution_allowed": kw.get("redistribution_allowed"),
+    }
+
+
+def _realtime_row(record, snapshot_id):
+    return {
+        "feed_id": record["feed_id"],
+        "onestop_id": record.get("onestop_id"),
+        "mdb_id": record.get("mdb_id"),
+        "id_minted": record.get("id_minted", False),
+        "source": record.get("source", "atlas"),
+        "name": record.get("name"),
+        "aliases": record.get("aliases") or [],
+        "crosswalk_method": record.get("crosswalk_method", "none"),
+        "crosswalk_confidence": record.get("crosswalk_confidence", 0.0),
+        "static_feed_id": record.get("static_feed_id"),
+        "static_link_method": record.get("static_link_method"),
+        "urls": _json_block(record.get("urls") or {}),
+        "entity_types": list(record.get("entity_types") or []),
+        "atlas": _json_block(record.get("atlas")),
+        "mdb": _json_block(record.get("mdb")),
+        "redistribution_allowed": record.get("redistribution_allowed"),
+        "snapshot": snapshot_id,
+    }
+
+
+def _feed_row_7(record, snapshot_id):
+    row = _feed_row(record, snapshot_id)
+    row.update(
+        home_country=record.get("home_country"),
+        country_shares=_json_block(record.get("country_shares") or {}),
+        scope=record.get("scope", "declared"),
+        declared_countries=list(record.get("declared_countries") or []),
+    )
+    return row
+
+
+def _edge_row_7(record, snapshot_id, partition=None):
+    row = _edge_row(record, snapshot_id)
+    row.update(
+        relevance_category=record.get("relevance_category"),
+        relevance=record.get("relevance"),
+        cross_border=record.get("cross_border"),
+    )
+    if partition is not None:
+        row["feed_partition"] = partition
+    return row
+
+
+def _counts(feeds, places, edges, realtime, home, version):
+    """The manifest counts: from schema 8 the companions too, linked when
+    their static feed is one of the index's."""
+    counts = {"feeds": len(feeds), "places": len(places), "edges": len(edges)}
+    if version >= 9:
+        counts["feeds_dated"] = sum(1 for f in feeds if f.get("service_start"))
+    if realtime is not None:
+        linked = sum(1 for r in realtime if r.get("static_feed_id") in home)
+        counts.update(
+            realtime=len(realtime),
+            realtime_linked=linked,
+            realtime_unlinked=len(realtime) - linked,
+        )
+    return counts
+
+
+def write_partitioned_index(
+    directory,
+    *,
+    feeds,
+    places,
+    edges,
+    snapshot_id=SNAPSHOT_ID,
+    notice=NOTICE,
+    realtime=None,
+    validity=None,
+):
+    """Write a schema-7 index under ``directory``: feeds by ``home_country``
+    (``international`` without one), places by ``country_code``, edges under
+    the feed's home country when the place lies there, else in ``links`` with
+    ``feed_partition``; the manifest lists every table's rows and digest.
+    With ``realtime`` (GTFS-RT companion records) a schema-8 index: each
+    companion under its static feed's partition (``international`` without
+    one in the index), each static feed naming its companions. With
+    ``validity`` (``{place_id: validity record}``) a schema-9 index: the
+    feeds' ``service_start`` / ``service_end`` published, each listed place
+    carrying its validity JSON."""
+    directory.mkdir(parents=True, exist_ok=True)
+    version = PARTITIONED_SCHEMA_VERSION if realtime is None else 8
+    if validity is not None:  # ``{place_id: validity record}``: schema 9
+        version = 9
+        realtime = realtime or []
+    home = {feed["feed_id"]: feed.get("home_country") for feed in feeds}
+    country = {place["place_id"]: place["country_code"] for place in places}
+    companions = {}
+    for record in realtime or ():
+        companions.setdefault(record.get("static_feed_id"), []).append(
+            record["feed_id"]
+        )
+    parts = {}
+    for feed in feeds:
+        row = _feed_row_7(feed, snapshot_id)
+        if version >= 8:
+            del row["gbfs"]
+            row["realtime_feed_ids"] = sorted(companions.get(feed["feed_id"], ()))
+        if version >= 9:
+            row["service_start"] = feed.get("service_start")
+            row["service_end"] = feed.get("service_end")
+        parts.setdefault(home[feed["feed_id"]] or "international", {}).setdefault(
+            "feeds", []
+        ).append(row)
+    for record in realtime or ():
+        static = record.get("static_feed_id")
+        partition = (home.get(static) if static in home else None) or "international"
+        parts.setdefault(partition, {}).setdefault("realtime", []).append(
+            _realtime_row(record, snapshot_id)
+        )
+    service = _service_by_place(edges)
+    for place in places:
+        parts.setdefault(country[place["place_id"]], {}).setdefault(
+            "places", []
+        ).append(
+            _place_row(
+                place,
+                snapshot_id,
+                service.get(place["place_id"]),
+                validity=(validity or {}).get(place["place_id"]),
+                dated=version >= 9,
+            )
+        )
+    for record in edges:
+        feed_home = home[record["feed_id"]]
+        if feed_home is None or feed_home != country[record["place_id"]]:
+            row = _edge_row_7(record, snapshot_id, feed_home or "international")
+            parts.setdefault("links", {}).setdefault("edges", []).append(row)
+        else:
+            parts.setdefault(feed_home, {}).setdefault("edges", []).append(
+                _edge_row_7(record, snapshot_id)
+            )
+    listing = {}
+    for partition, tables in sorted(parts.items()):
+        (directory / partition).mkdir(exist_ok=True)
+        listing[partition] = {}
+        for table, rows in tables.items():
+            if table == "feeds":
+                schema = {7: FEEDS_SCHEMA_7, 8: FEEDS_SCHEMA_8}.get(
+                    version, FEEDS_SCHEMA_9
+                )
+                data = _parquet(rows, schema)
+            elif table == "realtime":
+                data = _parquet(rows, REALTIME_SCHEMA)
+            elif table == "places":
+                schema = PLACES_SCHEMA_9 if version >= 9 else PLACES_SCHEMA
+                data = _parquet(rows, schema.with_metadata({b"geo": _geo_metadata()}))
+            else:
+                schema = LINKS_SCHEMA_7 if partition == "links" else EDGES_SCHEMA_7
+                data = _parquet(rows, schema)
+            (directory / partition / f"{table}.parquet").write_bytes(data)
+            listing[partition][table] = {"rows": len(rows), "sha256": _sha256(data)}
+    manifest = {
+        "schema_version": version,
+        "discovery_semantics_version": reader.DISCOVERY_SEMANTICS_VERSION,
+        "min_reader_version": reader.MIN_READER_VERSIONS[version],
+        "built_with": transitio.__version__,
+        "snapshot_id": snapshot_id,
+        "built_at": "2026-09-01T00:00:00+00:00",
+        "counts": _counts(feeds, places, edges, realtime, home, version),
+        "partitions": listing,
+        "licensed": notice is not None,
+        "notice_sha256": None if notice is None else _sha256(notice),
+    }
+    if notice is not None:
+        (directory / "NOTICE").write_bytes(notice)
+    (directory / reader.SNAPSHOT_FILE).write_text(
+        json.dumps(manifest, indent=2, sort_keys=True)
+    )
+    return directory
+
+
 def manifest_bytes(**fields):
     manifest = {
         "snapshot_id": SNAPSHOT_ID,
@@ -412,8 +674,10 @@ def pack(directory):
     """The release assets of the index at ``directory``, in the contract's
     shape: the archive of its members, the archive's checksum and the
     manifest a client reads before downloading anything."""
-    members = [(name, (directory / name).read_bytes()) for name in contract.MEMBERS]
-    snapshot = json.loads(dict(members)[reader.SNAPSHOT_FILE])
+    snapshot = json.loads((directory / reader.SNAPSHOT_FILE).read_bytes())
+    members = [
+        (name, (directory / name).read_bytes()) for name in contract.members(snapshot)
+    ]
     snapshot_id = snapshot["snapshot_id"]
     name = contract.archive_name(snapshot_id)
     archive = _archive(members)
