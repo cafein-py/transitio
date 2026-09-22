@@ -16,7 +16,12 @@ from transitio.exceptions import (  # noqa: E402
     AmbiguousPlaceError,
     PlaceNotFoundError,
 )
-from transitio.index.places import _as_dict, _as_list, _as_str  # noqa: E402
+from transitio.index.places import (  # noqa: E402
+    _PlaceLookup,
+    _as_dict,
+    _as_list,
+    _as_str,
+)
 
 
 def _p(
@@ -207,6 +212,88 @@ def test_place_exposes_identity_hierarchy_and_geometry(idx):
     assert city.geometry.area > 0
     assert city.parent.id == "Q1384"
     assert [c.id for c in transitio_index.place("Q1384", index=idx).children] == ["Q60"]
+
+
+@pytest.mark.parametrize(
+    ("prefix", "options", "expected"),
+    [
+        # Exact labels first (the city's alias, the region's name), then the
+        # metro's longer name; the metro's own kind precedence never outranks
+        # an exact match.
+        ("new york", {}, ["Q60", "Q1384", "Q1109190"]),
+        # Prefix matches rank by kind, then the label: the metro, the cities
+        # (New York City, Newcastle, Newcastle upon Tyne), then the region.
+        ("new", {}, ["Q1109190", "Q60", "Q-ncl-au", "Q-ncl-uk", "Q1384"]),
+        ("new", {"limit": 2}, ["Q1109190", "Q60"]),
+        ("new", {"kinds": ["city"], "country": "GB"}, ["Q-ncl-uk"]),
+        ("new", {"kinds": "region"}, ["Q1384"]),
+        ("new", {"kinds": []}, []),
+        ("new", {"country": []}, []),
+        (
+            "new",
+            {"kinds": ["region", "metro"], "country": ["US"]},
+            ["Q1109190", "Q1384"],
+        ),
+        ("zür", {}, ["Q-zur"]),
+        ("ZURI", {}, ["Q-zur"]),
+        ("frankfurt am", {}, ["Q-ffm"]),
+        ("york", {}, []),  # labels are matched from their start
+        ("", {}, []),
+        ("   ", {}, []),
+    ],
+)
+def test_suggestions_rank_exact_kind_source_then_label(idx, prefix, options, expected):
+    found = transitio_index.suggest(prefix, index=idx, **options)
+    assert [s.place.id for s in found] == expected
+
+
+def test_suggestions_prefer_the_place_with_more_feeds(idx):
+    # Two Springfields tie on the label, its source and their kind; the one
+    # more feeds serve ranks first.
+    counts = {"Q-sp-ma": 3, "Q-sp-il": 1}
+    lookup = _PlaceLookup(idx.places, feed_count=lambda pid: counts.get(pid, 0))
+    hits = lookup.suggest("springfield", limit=2)
+    assert [hit.place.id for hit in hits] == ["Q-sp-ma", "Q-sp-il"]
+
+
+def test_preparing_builds_the_labels_once_ahead_of_the_first_suggestion(idx):
+    # An empty prefix is answered without building anything.
+    assert transitio_index.suggest("  ", index=idx) == []
+    assert transitio_index._lookup_for(idx)._name_index is None
+    assert transitio_index.prepare_suggestions(index=idx) is idx
+    built = transitio_index._lookup_for(idx)._name_index
+    assert built is not None
+    assert transitio_index.suggest("hels", index=idx)[0].place.id == "Q1757"
+    assert transitio_index._lookup_for(idx)._name_index is built
+
+
+def test_a_suggestion_names_the_label_that_matched_and_the_one_to_show(idx):
+    (hit,) = transitio_index.suggest("new yorkin", index=idx)
+    assert (hit.place.id, hit.matched, hit.source) == (
+        "Q60",
+        "New Yorkin kaupunki",
+        "fi",
+    )
+    assert hit.label == "New York City"
+    (hit,) = transitio_index.suggest("nyc", lang="fi", index=idx)
+    assert (hit.matched, hit.source, hit.label) == (
+        "NYC",
+        "alias",
+        "New Yorkin kaupunki",
+    )
+    # A place without the language keeps its name; the sorted labels are
+    # built once per lookup.
+    assert transitio_index.suggest("hels", lang="fi", index=idx)[0].label == "Helsinki"
+    lookup = transitio_index._lookup_for(idx)
+    built = lookup._name_index
+    assert (
+        built is not None and transitio.suggest("zur", index=idx)[0].place.id == "Q-zur"
+    )
+    assert lookup._name_index is built
+    with pytest.raises(ValueError, match="limit"):
+        transitio_index.suggest("new", limit=0, index=idx)
+    with pytest.raises(TypeError):
+        transitio_index.suggest("new", limit=1.5, index=idx)
 
 
 def test_a_prefix_and_a_diacritic_insensitive_match_resolve(idx):
