@@ -15,7 +15,7 @@ import json
 import math
 import re
 import unicodedata
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 
 from transitio.exceptions import (
     AmbiguousPlaceError,
@@ -108,6 +108,11 @@ def _normalize(text):
     return " ".join("".join(kept).split())
 
 
+# One delineation of a place: the place itself, an administrative ancestor
+# it lies within, or a metro it is a member of, with the row's kind and subtype.
+Delineation = namedtuple("Delineation", ["relation", "kind", "subtype", "place"])
+
+
 class Place:
     """A resolved place: its identity, hierarchy, names and boundary."""
 
@@ -127,6 +132,13 @@ class Place:
     @property
     def name(self):
         return self._record.get("name")
+
+    @property
+    def subtype(self):
+        """The place's ``source_subtype``: ``locality``, ``county``, ``region``
+        or ``country``, or a metro's definition such as ``functional urban
+        area``; None for a row without one."""
+        return self._record.get("source_subtype")
 
     @property
     def names(self):
@@ -207,6 +219,19 @@ class Place:
         return self._lookup.children(self.id)
 
     @property
+    def ancestors(self):
+        """The administrative chain upwards, nearest first: the parent, its
+        parent, and so on until a place has none the index holds; a place
+        already in the chain ends it, so a malformed table cannot loop."""
+        chain, seen = [], {self.id}
+        place = self.parent
+        while place is not None and place.id not in seen:
+            chain.append(place)
+            seen.add(place.id)
+            place = place.parent
+        return chain
+
+    @property
     def metros(self):
         """The metros this place belongs to, resolved from ``metro_ids``."""
         return self._lookup.resolve_ids(self.metro_ids)
@@ -215,6 +240,19 @@ class Place:
     def members(self):
         """The places that make up this one, resolved from ``member_ids``."""
         return self._lookup.resolve_ids(self.member_ids)
+
+    def delineations(self):
+        """Every delineation of this place as a :class:`Delineation`: the
+        place itself, then its ancestors nearest first, then the metros it
+        is a member of by subtype, name and id — one row of the places
+        table each, told apart by ``kind`` and ``subtype``."""
+        rows = [Delineation("itself", self.kind, self.subtype, self)]
+        rows += [Delineation("within", p.kind, p.subtype, p) for p in self.ancestors]
+        metros = sorted(
+            self.metros, key=lambda m: (m.subtype or "", m.name or "", m.id)
+        )
+        rows += [Delineation("member of", m.kind, m.subtype, m) for m in metros]
+        return rows
 
     def feeds(
         self,
@@ -276,7 +314,13 @@ class _PlaceLookup:
             record["names"] = _as_dict(record.get("names"))
             for key in ("aliases", "metro_ids", "member_ids", "former_ids"):
                 record[key] = _as_list(record.get(key))
-            for key in ("name", "parent_id", "default_metro_id", "country_code"):
+            for key in (
+                "name",
+                "parent_id",
+                "default_metro_id",
+                "country_code",
+                "source_subtype",
+            ):
                 record[key] = _as_str(record.get(key))
             place_id = record["place_id"]
             record["concordances"] = _as_concordances(record.get("concordances"))

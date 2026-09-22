@@ -32,10 +32,12 @@ def _p(
     member_ids=None,
     country_code="US",
     geometry=None,
+    source_subtype=None,
 ):
     return {
         "place_id": place_id,
         "kind": kind,
+        "source_subtype": source_subtype,
         "name": name,
         "names": names if names is not None else {"en": name},
         "aliases": aliases or [],
@@ -60,6 +62,7 @@ RECORDS = [
         parent_id="Q1384",
         metro_ids=["Q1109190", "Q-msa"],
         geometry=BOX,
+        source_subtype="locality",
     ),
     _p(
         "Q1109190",
@@ -67,9 +70,10 @@ RECORDS = [
         "New York metropolitan area",
         member_ids=["Q60"],
         geometry=BOX,
+        source_subtype="metropolitan statistical area",
     ),
-    _p("Q-msa", "metro", "Tri-State Metro"),
-    _p("Q1384", "region", "New York"),
+    _p("Q-msa", "metro", "Tri-State Metro", source_subtype="city-region (FAO)"),
+    _p("Q1384", "region", "New York", source_subtype="region"),
     _p("Q-sp-il", "city", "Springfield", country_code="US"),
     _p("Q-sp-ma", "city", "Springfield", country_code="US"),
     _p("Q-cam-uk", "city", "Cambridge", country_code="GB"),
@@ -88,9 +92,16 @@ RECORDS = [
         "Q-twin",
         "city",
         "Twinsburg",
+        parent_id="Q-nowhere",
         metro_ids=["Q1109190", "Q-msa", "Q-ghost"],
         country_code="US",
     ),
+    # Malformed chains: two regions naming each other as parents, a city
+    # under them, and a place that is its own parent.
+    _p("Q-cyc-a", "region", "Cycle A", parent_id="Q-cyc-b"),
+    _p("Q-cyc-b", "region", "Cycle B", parent_id="Q-cyc-a"),
+    _p("Q-cyc-x", "city", "Cycleville", parent_id="Q-cyc-a"),
+    _p("Q-self", "city", "Selfton", parent_id="Q-self"),
     _p("Q-stj", "city", "St. John's", country_code="CA"),
     _p("Q-whb", "city", "Wilkes-Barre", country_code="US"),
     _p("Q1757", "city", "Helsinki", names={"en": "Helsinki"}, country_code="FI"),
@@ -207,6 +218,32 @@ def test_place_exposes_identity_hierarchy_and_geometry(idx):
     assert city.geometry.area > 0
     assert city.parent.id == "Q1384"
     assert [c.id for c in transitio_index.place("Q1384", index=idx).children] == ["Q60"]
+
+
+def test_delineations_list_the_place_its_chain_and_its_areas(idx):
+    city = transitio_index.place("New York City", kind="city", index=idx)
+    assert city.subtype == "locality"
+    assert [p.id for p in city.ancestors] == ["Q1384"]
+    rows = city.delineations()
+    assert isinstance(rows[0], transitio_index.Delineation)
+    assert [(d.relation, d.kind, d.subtype, d.place.id) for d in rows] == [
+        ("itself", "city", "locality", "Q60"),
+        ("within", "region", "region", "Q1384"),
+        ("member of", "metro", "city-region (FAO)", "Q-msa"),
+        ("member of", "metro", "metropolitan statistical area", "Q1109190"),
+    ]
+    # A parent the index does not hold ends the chain, a metro it does not
+    # hold is omitted, and a row without a subtype has none.
+    twin = transitio_index.place("Twinsburg", index=idx)
+    assert twin.subtype is None and twin.ancestors == []
+    assert [d.place.id for d in twin.delineations()] == ["Q-twin", "Q-msa", "Q1109190"]
+    # A chain that loops ends at the first repeated place, nearest first.
+    looped = transitio_index.place("Cycleville", index=idx)
+    assert [p.id for p in looped.ancestors] == ["Q-cyc-a", "Q-cyc-b"]
+    assert [p.id for p in transitio_index.place("Cycle A", index=idx).ancestors] == [
+        "Q-cyc-b"
+    ]
+    assert transitio_index.place("Selfton", index=idx).ancestors == []
 
 
 def test_a_prefix_and_a_diacritic_insensitive_match_resolve(idx):

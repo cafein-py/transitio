@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- `Place.subtype`, `Place.ancestors` and `Place.delineations()`: every
+  delineation of a place — the place itself, its administrative ancestors
+  and the metros it is a member of — as `Delineation` rows carrying the
+  row's kind and subtype, so a caller can list the areal definitions a
+  place has and pick one.
+
 ### Changed
 
 - The feed-index build moved to its own repository,
