@@ -5,10 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## 0.12.0 — 2026-09-23
 
 ### Added
 
+- The reader accepts index schema 7, a snapshot laid out as partitions:
+  one directory per country (its feeds by home country, places and
+  domestic edges) beside `international/feeds.parquet` and
+  `links/edges.parquet`. `read_index(path)` joins every partition into
+  the flat feeds, places and edges tables, cross-border edges included,
+  and keeps the links table beside them; `read_index(path, country=...)`
+  loads one country with the links into it, and `Index.feeds_in(partition)`
+  reads a link's feed partition once. Every partition table is checked
+  against the manifest's digest, row count, columns and snapshot id, and
+  the release members and the refresh unpacker follow the partitions.
+- Default views per place kind on a schema-7 index: a city or metro lists
+  its primary and secondary feeds, a region its secondary and tertiary, a
+  country its tertiary; `categories` names other relevance categories or
+  `None` for all, `international=True` adds the cross-border feeds from
+  the links, and results come back by category, then relevance, then id.
+  Tier edges and feeds expose `relevance_category`, `relevance` and
+  `cross_border`.
+- Index schema 8: the feeds table is GTFS only and names its GTFS-RT
+  companions in `realtime_feed_ids`. `Index.realtime`,
+  `Index.realtime_in(partition)` and `Index.realtime_unlinked()` read the
+  `realtime.parquet` companion table, and a feed returned for a place
+  carries its companions as `IndexedFeed.realtime`, `RealtimeFeed` records
+  with the static feed, link method, entity types and endpoints.
+- Index schema 9: `IndexedFeed.service_start` and `service_end` are the
+  feed's calendar span, and `Place.validity` is a `Validity` record with
+  the dated and undated feed counts, the span, the `Window` records of
+  constant valid-feed count, the best window and `on(date)`, the number of
+  valid feeds on a day.
 - `Place.subtype`, `Place.ancestors` and `Place.delineations()`: every
   delineation of a place — the place itself, its administrative ancestors
   and the metros it is a member of — as `Delineation` rows carrying the
