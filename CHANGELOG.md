@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the metros it is a member of — as `Delineation` rows carrying the
   row's kind and subtype, so a caller can list the areal definitions a
   place has and pick one.
+- `transitio.index.suggest()` (and `transitio.suggest`): type-ahead place
+  suggestions for a typed prefix, matched against every name, translated
+  name and alias a place carries, ranked by exact label, kind precedence,
+  the label's source and feed count, with `kinds` and `country` filters
+  and a `lang` for the label shown; an index's labels are sorted once, on
+  the first call over it or ahead of it through `prepare_suggestions()`,
+  so a query over the whole catalogue answers in milliseconds.
 
 ### Changed
 

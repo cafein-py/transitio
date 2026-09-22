@@ -29,6 +29,7 @@ __all__ = [
     "pipeline",
     "place",
     "places",
+    "suggest",
     "repair",
     "infer_shapes",
     "repair_feed",
@@ -80,7 +81,7 @@ def __getattr__(name):
         from transitio.validate import validate_feed
 
         return validate_feed
-    if name in ("IndexedFeed", "Place", "place", "places"):
+    if name in ("IndexedFeed", "Place", "place", "places", "suggest"):
         from transitio import index
 
         return getattr(index, name)

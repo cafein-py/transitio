@@ -18,14 +18,16 @@ selects among installed ones; a query given no index reads the active one.
 import hashlib
 import io
 import json
+import operator
 import os
+import threading
 import re
 import stat
 from pathlib import Path
 
 from transitio.exceptions import IncompatibleIndexError, PlaceNotFoundError
 from transitio.index.feeds import IndexedFeed, Selector
-from transitio.index.places import Delineation, Place, _PlaceLookup
+from transitio.index.places import Delineation, Place, Suggestion, _PlaceLookup
 
 __all__ = [
     "Delineation",
@@ -33,11 +35,14 @@ __all__ = [
     "IndexedFeed",
     "Place",
     "Selector",
+    "Suggestion",
     "read_index",
     "load",
     "links",
     "place",
     "places",
+    "prepare_suggestions",
+    "suggest",
     "refresh",
     "use",
     "installed",
@@ -910,15 +915,20 @@ def _feed_count_for(index):
     return lambda place_id: counts.get(place_id, 0)
 
 
+# One lookup per index, whichever thread asks first.
+_LOOKUP_LOCK = threading.Lock()
+
+
 def _lookup_for(index):
-    lookup = getattr(index, "_place_lookup", None)
-    if lookup is None:
-        if index.places is None:
-            raise PlaceNotFoundError("this index carries no places")
-        lookup = _PlaceLookup(
-            index.places, feed_count=_feed_count_for(index), index=index
-        )
-        index._place_lookup = lookup
+    with _LOOKUP_LOCK:
+        lookup = getattr(index, "_place_lookup", None)
+        if lookup is None:
+            if index.places is None:
+                raise PlaceNotFoundError("this index carries no places")
+            lookup = _PlaceLookup(
+                index.places, feed_count=_feed_count_for(index), index=index
+            )
+            index._place_lookup = lookup
     return lookup
 
 
@@ -938,6 +948,39 @@ def place(query, *, kind=None, index=None):
 def places(query, *, index=None):
     """The places matching ``query``, ranked best first (never promoted)."""
     return _lookup_for(_coerce_index(index)).search(query)
+
+
+def suggest(prefix, *, limit=10, kinds=None, country=None, lang=None, index=None):
+    """Type-ahead: the places whose labels start with ``prefix``, ranked.
+
+    Every label a place carries counts — its name, its names in other
+    languages and its aliases — normalised as :func:`place` normalises a
+    query, so ``hels`` and ``helsingf`` both reach Helsinki. Places rank by
+    an exact label first, then kind precedence as :func:`places` ranks it,
+    the label's source (the name, a translation, an alias), more feeds, the
+    label and the id; one :class:`Suggestion` per place, at most ``limit``.
+    ``kinds`` keeps only those kinds, ``country`` one ISO code or several,
+    and ``lang`` picks the label to show (the place's name in that language
+    when it has one, else its name). An empty prefix suggests nothing. The
+    index's labels are sorted once, on the first call over it.
+    """
+    limit = operator.index(limit)  # a float or NaN limit is a TypeError
+    if limit < 1:
+        raise ValueError("limit must be at least 1")
+    lookup = _lookup_for(_coerce_index(index))
+    return lookup.suggest(prefix, limit=limit, kinds=kinds, country=country, lang=lang)
+
+
+def prepare_suggestions(*, index=None):
+    """Build the sorted labels :func:`suggest` reads, ahead of the first call.
+
+    The build takes seconds over a whole catalogue, so a server pays it at
+    startup rather than on a user's first keystroke; a later call is free.
+    Returns the index prepared (the active one when none is given).
+    """
+    prepared = _coerce_index(index)
+    _lookup_for(prepared).prepare()
+    return prepared
 
 
 from transitio.index._refresh import installed, refresh, use  # noqa: E402

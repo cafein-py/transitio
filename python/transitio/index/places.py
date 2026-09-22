@@ -14,6 +14,7 @@ else raises :class:`AmbiguousPlaceError` with the candidates, or
 import json
 import math
 import re
+import threading
 import unicodedata
 from collections import defaultdict, namedtuple
 
@@ -80,6 +81,17 @@ _OWN_ID = re.compile(r"\Atp_[1-9][0-9]*\Z")
 
 # Slash and middot variants that, like every dash, join whole words.
 _SLASH_SEPARATORS = frozenset("/\\⁄∕·−")
+
+# Where a label comes from, ranked: the primary name, a translated name, an alias.
+_NAME, _TRANSLATION, _ALIAS = 0, 1, 2
+# Sorts after every character a normalised label can hold, so ``prefix + _AFTER``
+# bounds the labels that start with ``prefix``.
+_AFTER = "\U0010ffff"
+
+# A type-ahead suggestion: the place, the label to show, and the label that
+# matched as the place carries it with its source (``"name"``, a language
+# code, or ``"alias"``).
+Suggestion = namedtuple("Suggestion", ["place", "label", "matched", "source"])
 
 
 def _is_separator(char):
@@ -298,6 +310,128 @@ class Place:
         return f"Place({self.id}, {self.kind}, {self.name!r})"
 
 
+def _labels_of(record):
+    """Each label a place carries, with its source and the source's rank."""
+    yield record["name"], "name", _NAME
+    for language, text in record["names"].items():
+        yield text, language, _TRANSLATION
+    for text in record["aliases"]:
+        yield text, "alias", _ALIAS
+
+
+class _NameIndex:
+    """Every label of every place, normalised and sorted, for prefix queries.
+
+    One row per distinct normalised label per place (the first source in
+    name, translation, alias order winning), sorted by the label, with the
+    place's kind, country and feed count beside it so a query ranks a slice
+    without touching the records. The slice of labels starting with a prefix
+    is found by two binary searches; a table of a few million rows answers
+    in milliseconds.
+    """
+
+    def __init__(self, records, feed_count):
+        import pyarrow as pa
+
+        columns = {
+            key: []
+            for key in (
+                "norm",
+                "owner",
+                "text",
+                "source",
+                "source_rank",
+                "kind",
+                "kind_rank",
+                "country",
+                "feeds",
+            )
+        }
+        for place_id, record in records.items():
+            seen = {}
+            for text, source, rank in _labels_of(record):
+                norm = _normalize(text)
+                if norm and norm not in seen:
+                    seen[norm] = (text, source, rank)
+            count = feed_count(place_id)
+            for norm, (text, source, rank) in seen.items():
+                columns["norm"].append(norm)
+                columns["owner"].append(place_id)
+                columns["text"].append(text)
+                columns["source"].append(source)
+                columns["source_rank"].append(rank)
+                columns["kind"].append(record["kind"])
+                columns["kind_rank"].append(_KIND_ORDER.get(record["kind"], 9))
+                columns["country"].append(record["country_code"])
+                columns["feeds"].append(count)
+        types = {"source_rank": pa.int8(), "kind_rank": pa.int8(), "feeds": pa.int32()}
+        table = pa.table(
+            {
+                key: pa.array(values, types.get(key, pa.string()))
+                for key, values in columns.items()
+            }
+        )
+        self._table = table.sort_by("norm").combine_chunks()
+        self._norms = self._table["norm"].chunk(0) if table.num_rows else None
+
+    def _lower_bound(self, key):
+        """The first row whose label sorts at or after ``key``."""
+        low, high = 0, self._table.num_rows
+        while low < high:
+            middle = (low + high) // 2
+            if self._norms[middle].as_py() < key:
+                low = middle + 1
+            else:
+                high = middle
+        return low
+
+    def query(self, prefix, *, limit, kinds=None, country=None):
+        """The best ``(place_id, text, source)`` per place whose label starts
+        with ``prefix``, ranked: an exact label first, then kind precedence,
+        the label's source, more feeds, the label and the id."""
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        norm = _normalize(prefix)
+        if not norm or self._norms is None:
+            return []
+        low = self._lower_bound(norm)
+        part = self._table.slice(low, self._lower_bound(norm + _AFTER) - low)
+        # A value set is typed, so an empty filter keeps nothing rather than
+        # raising against the string column.
+        if kinds is not None:
+            wanted = [kinds] if isinstance(kinds, str) else list(kinds)
+            wanted = pa.array(wanted, pa.string())
+            part = part.filter(pc.is_in(part["kind"], value_set=wanted))
+        if country is not None:
+            codes = [country] if isinstance(country, str) else list(country)
+            codes = pa.array(codes, pa.string())
+            part = part.filter(pc.is_in(part["country"], value_set=codes))
+        if part.num_rows == 0:
+            return []
+        part = part.append_column("exact", pc.equal(part["norm"], norm))
+        part = part.sort_by(
+            [
+                ("exact", "descending"),
+                ("kind_rank", "ascending"),
+                ("source_rank", "ascending"),
+                ("feeds", "descending"),
+                ("norm", "ascending"),
+                ("owner", "ascending"),
+            ]
+        )
+        hits, seen = [], set()
+        rows = zip(*(part[name].to_pylist() for name in ("owner", "text", "source")))
+        for owner, text, source in rows:
+            if owner in seen:
+                continue
+            seen.add(owner)
+            hits.append((owner, text, source))
+            if len(hits) == limit:
+                break
+        return hits
+
+
 class _PlaceLookup:
     """Resolution over one index's places, with an optional feed-count ranker."""
 
@@ -307,6 +441,8 @@ class _PlaceLookup:
         self._records = {}
         self._labels = {}
         self._children = defaultdict(list)
+        self._name_index = None  # built on the first suggestion, under the lock
+        self._name_lock = threading.Lock()
         # A former id or a QID the place carries resolves to it; a real id
         # always wins over an alias of another place.
         self._aliases = {}
@@ -404,6 +540,26 @@ class _PlaceLookup:
 
     def search(self, query, kind=None):
         return [self.get(place_id) for _, place_id in self._candidates(query, kind)]
+
+    def prepare(self):
+        """Build the sorted labels once; concurrent cold calls wait for one build."""
+        with self._name_lock:
+            if self._name_index is None:
+                self._name_index = _NameIndex(self._records, self._feed_count)
+        return self._name_index
+
+    def suggest(self, prefix, *, limit, kinds=None, country=None, lang=None):
+        if not _normalize(prefix):
+            return []  # nothing to match, so nothing to build yet
+        table = self.prepare()
+        hits = table.query(prefix, limit=limit, kinds=kinds, country=country)
+        suggestions = []
+        for owner, text, source in hits:
+            record = self._records[owner]
+            label = (record["names"].get(lang) if lang else None) or record["name"]
+            label = label or owner  # a nameless row still shows something
+            suggestions.append(Suggestion(Place(record, self), label, text, source))
+        return suggestions
 
     def resolve(self, query, kind=None):
         if isinstance(query, Place):
