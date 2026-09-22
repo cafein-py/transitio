@@ -96,6 +96,12 @@ RECORDS = [
         metro_ids=["Q1109190", "Q-msa", "Q-ghost"],
         country_code="US",
     ),
+    # Malformed chains: two regions naming each other as parents, a city
+    # under them, and a place that is its own parent.
+    _p("Q-cyc-a", "region", "Cycle A", parent_id="Q-cyc-b"),
+    _p("Q-cyc-b", "region", "Cycle B", parent_id="Q-cyc-a"),
+    _p("Q-cyc-x", "city", "Cycleville", parent_id="Q-cyc-a"),
+    _p("Q-self", "city", "Selfton", parent_id="Q-self"),
     _p("Q-stj", "city", "St. John's", country_code="CA"),
     _p("Q-whb", "city", "Wilkes-Barre", country_code="US"),
     _p("Q1757", "city", "Helsinki", names={"en": "Helsinki"}, country_code="FI"),
@@ -227,10 +233,17 @@ def test_delineations_list_the_place_its_chain_and_its_areas(idx):
         ("member of", "metro", "metropolitan statistical area", "Q1109190"),
     ]
     # A parent the index does not hold ends the chain, a metro it does not
-    # hold is omitted, and a record without the column has no subtype.
+    # hold is omitted, and a row without a subtype has none.
     twin = transitio_index.place("Twinsburg", index=idx)
     assert twin.subtype is None and twin.ancestors == []
     assert [d.place.id for d in twin.delineations()] == ["Q-twin", "Q-msa", "Q1109190"]
+    # A chain that loops ends at the first repeated place, nearest first.
+    looped = transitio_index.place("Cycleville", index=idx)
+    assert [p.id for p in looped.ancestors] == ["Q-cyc-a", "Q-cyc-b"]
+    assert [p.id for p in transitio_index.place("Cycle A", index=idx).ancestors] == [
+        "Q-cyc-b"
+    ]
+    assert transitio_index.place("Selfton", index=idx).ancestors == []
 
 
 def test_a_prefix_and_a_diacritic_insensitive_match_resolve(idx):

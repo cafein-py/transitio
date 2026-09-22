@@ -137,7 +137,7 @@ class Place:
     def subtype(self):
         """The place's ``source_subtype``: ``locality``, ``county``, ``region``
         or ``country``, or a metro's definition such as ``functional urban
-        area``; None when the index predates the column."""
+        area``; None for a row without one."""
         return self._record.get("source_subtype")
 
     @property
