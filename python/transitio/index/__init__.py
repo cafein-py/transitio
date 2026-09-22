@@ -25,9 +25,10 @@ from pathlib import Path
 
 from transitio.exceptions import IncompatibleIndexError, PlaceNotFoundError
 from transitio.index.feeds import IndexedFeed, Selector
-from transitio.index.places import Place, _PlaceLookup
+from transitio.index.places import Delineation, Place, _PlaceLookup
 
 __all__ = [
+    "Delineation",
     "Index",
     "IndexedFeed",
     "Place",
