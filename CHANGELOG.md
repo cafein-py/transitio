@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- `fetch` takes an `osm` flag (default True); with `osm=False` the OSM
+  stage is skipped and the result's `osm_pbf` is None, for callers who want
+  only the GTFS feeds.
+
 ## 0.12.0 — 2026-09-23
 
 ### Added
