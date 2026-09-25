@@ -407,3 +407,39 @@ def test_route_crop_source_routes_distinguishes_absent_from_empty(tmp_path):
     source2 = write_zip(tmp_path / "in2.zip", no_routes)
     report2 = crop_feed(source2, tmp_path / "out2.zip", routes=["r-in"])
     assert report2["source_routes"] is None
+
+
+def test_streamed_tables_are_cropped_without_a_row_cap(tmp_path):
+    # stop_times, trips and shapes are streamed, so the row cap that bounds
+    # the parsed tables does not apply to them, and shapes follow their trips
+    feed = dict(FEED)
+    feed["trips.txt"] = (
+        "route_id,service_id,trip_id,shape_id\n"
+        "r-in,wk,t-in,s-in\nr-out,wk,t-out,s-out\nr-in,old,t-old,s-in\n"
+    )
+    feed["shapes.txt"] = (
+        "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence\n"
+        "s-in,60.169,24.931,1\ns-in,60.171,24.941,2\n"
+        "s-out,60.205,24.655,1\ns-out,60.206,24.656,2\ns-out,60.207,24.657,3\n"
+    )
+    source = write_zip(tmp_path / "feed.zip", feed)
+    output = tmp_path / "cropped.zip"
+    # five rows fit every parsed table and the cropped feed; the source
+    # stop_times has six
+    result = crop_feed(source, output, aoi=CITY_BBOX, max_rows=5)
+    assert result["row_counts"]["stop_times.txt"] == 4  # t-in and t-old
+    assert result["row_counts"]["trips.txt"] == 2
+    assert result["row_counts"]["shapes.txt"] == 2
+    with zipfile.ZipFile(output) as archive:
+        shapes = archive.read("shapes.txt").decode().splitlines()
+    assert shapes[1:] == ["s-in,60.169,24.931,1", "s-in,60.171,24.941,2"]
+    # a cropped feed the budgets cannot validate whole is not published
+    with pytest.raises(OSError, match="cropped feed exceeds"):
+        crop_feed(source, tmp_path / "over.zip", aoi=CITY_BBOX, max_rows=3)
+    assert not (tmp_path / "over.zip").exists()
+    # a trip_id repeated in trips.txt is ambiguous, and uncapped it could
+    # grow the kept trips without bound
+    feed["trips.txt"] += "r-in,wk,t-in,s-in\n" * 1000
+    source = write_zip(tmp_path / "repeated.zip", feed)
+    with pytest.raises(OSError, match="repeats trip_id"):
+        crop_feed(source, tmp_path / "repeated-out.zip", aoi=CITY_BBOX)

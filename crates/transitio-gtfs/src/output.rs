@@ -74,14 +74,14 @@ impl ZipOutput {
     /// transformation never touched. Hostile names are the exception —
     /// traversal components, aliases of the entries already written and
     /// symlink entries never reach the output.
-    pub(crate) fn passthrough(&mut self, source: &Path, names: &[String]) -> Result<(), String> {
+    pub(crate) fn passthrough(
+        &mut self,
+        archive: &mut zip::ZipArchive<std::fs::File>,
+        names: &[String],
+    ) -> Result<(), String> {
         if names.is_empty() {
             return Ok(());
         }
-        let file = std::fs::File::open(source)
-            .map_err(|e| format!("cannot reopen {}: {e}", source.display()))?;
-        let mut archive = zip::ZipArchive::new(file)
-            .map_err(|e| format!("cannot reread {}: {e}", source.display()))?;
         let mut copied: std::collections::HashSet<String> = std::collections::HashSet::new();
         for index in 0..archive.len() {
             let entry = archive
@@ -141,7 +141,11 @@ pub(crate) fn write_zip(
         zip.table(name, table)?;
     }
     if let Some((source, names)) = passthrough {
-        zip.passthrough(source, names)?;
+        let file = std::fs::File::open(source)
+            .map_err(|e| format!("cannot reopen {}: {e}", source.display()))?;
+        let mut archive = zip::ZipArchive::new(file)
+            .map_err(|e| format!("cannot reread {}: {e}", source.display()))?;
+        zip.passthrough(&mut archive, names)?;
     }
     zip.finish()
 }
@@ -217,7 +221,8 @@ mod tests {
             .iter()
             .map(|n| n.to_string())
             .collect();
-        zip.passthrough(&source, &names).unwrap();
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&source).unwrap()).unwrap();
+        zip.passthrough(&mut archive, &names).unwrap();
         zip.finish().unwrap();
 
         let result = scan_reader(std::fs::File::open(&output).unwrap()).unwrap();

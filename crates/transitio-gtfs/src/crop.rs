@@ -6,9 +6,14 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
-use crate::output::write_zip;
-use crate::scan::{ScanOptions, ScanResult, Table};
-use crate::{rules, scan, semantics};
+use crate::output::ZipOutput;
+use crate::scan::{DelimiterGuard, NoTable, Row, ScanOptions, ScanResult, Table, TableReader};
+use crate::{rules, scan, schema, semantics};
+
+/// Tables read from the archive row by row rather than parsed whole: the
+/// ones a national feed makes far larger than memory. Everything kept
+/// from them is bounded by the crop, not by the feed.
+const STREAMED: &[&str] = &["stop_times.txt", "trips.txt", "shapes.txt"];
 
 /// One polygon: its outer ring first, then any holes, as WGS84
 /// (longitude, latitude) pairs.
@@ -65,9 +70,13 @@ pub fn crop(
         }
         None => None,
     };
-    let mut result = scan::scan_with(path, options)?;
-    rules::run_rules(&mut result, &options);
-    semantics::run_semantics(&mut result, &options);
+    // One open file for the scan, every streaming pass and the copied
+    // entries, so a source replaced under the crop cannot mix versions.
+    let source =
+        std::fs::File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let mut result = scan::scan_reader_streaming(reopen(&source)?, options, STREAMED)?;
+    // The tables parsed whole must be whole: a truncated stops.txt would
+    // crop silently wrong. The cropped feed is validated below.
     if !result.incomplete.is_empty()
         || result
             .notices
@@ -102,12 +111,25 @@ pub fn crop(
                 .collect()
         })
     });
-    let kept_trips = select_trips(&result, options, crop_options, area.as_deref())?;
-    retain(
-        &mut result,
-        &kept_trips,
-        (&crop_options.start_date, &crop_options.end_date),
-    );
+    let inside = inside_stops(&result, crop_options, area.as_deref());
+    let active = active_services(&result, &options, crop_options)?;
+    let touched = match &inside {
+        Some(inside) => Some(trips_touching(
+            &source,
+            &options,
+            inside,
+            crop_options.full_trips_only,
+        )?),
+        None => None,
+    };
+    let (kept_trips, trips) = select_trips(
+        &source,
+        &options,
+        crop_options,
+        touched.as_ref(),
+        active.as_ref(),
+    )?;
+    result.tables.insert("trips.txt".to_string(), trips);
 
     let staging = output.with_extension("zip.part");
     if staging
@@ -123,11 +145,20 @@ pub fn crop(
         }
     }
     let _ = std::fs::remove_file(&staging);
-    write_zip(
-        &result.tables,
-        Some((path, &result.unparsed_entries)),
+    let streamed_counts = match write_cropped(
+        &source,
         &staging,
-    )?;
+        &options,
+        &mut result,
+        &kept_trips,
+        crop_options,
+    ) {
+        Ok(counts) => counts,
+        Err(error) => {
+            let _ = std::fs::remove_file(&staging);
+            return Err(error);
+        }
+    };
     let validation = match scan::scan_with(&staging, options) {
         Ok(mut validation) => {
             rules::run_rules(&mut validation, &options);
@@ -139,13 +170,28 @@ pub fn crop(
             return Err(error);
         }
     };
+    // A cropped feed the budgets cannot validate whole is not published:
+    // its report would describe only part of it.
+    if !validation.incomplete.is_empty()
+        || validation
+            .notices
+            .iter()
+            .any(|n| matches!(n.code, "too_many_rows" | "notice_limit_reached"))
+    {
+        let _ = std::fs::remove_file(&staging);
+        return Err(
+            "cropped feed exceeds the scan or notice budgets; raise the limits to crop it"
+                .to_string(),
+        );
+    }
     std::fs::rename(&staging, output)
         .map_err(|e| format!("cannot move cropped feed into place: {e}"))?;
-    let row_counts = result
+    let mut row_counts: BTreeMap<String, usize> = result
         .tables
         .iter()
         .map(|(name, table)| (name.clone(), table.rows.len()))
         .collect();
+    row_counts.extend(streamed_counts);
     Ok(CropResult {
         row_counts,
         validation,
@@ -154,7 +200,11 @@ pub fn crop(
 }
 
 fn column(table: &Table, name: &str) -> Option<usize> {
-    table.headers.iter().position(|h| h == name)
+    position(&table.headers, name)
+}
+
+fn position(headers: &[String], name: &str) -> Option<usize> {
+    headers.iter().position(|h| h == name)
 }
 
 /// Whether a point lies on a ring's boundary (within a rounding
@@ -292,25 +342,67 @@ pub fn validate_polygon(parts: &[PolygonRings]) -> Result<(), String> {
     Ok(())
 }
 
-fn ids<'t>(table: &'t Table, field: &str) -> Option<(usize, &'t Table)> {
-    column(table, field).map(|i| (i, table))
+/// The named table streamed from the archive under the stream guard, or
+/// None when the archive has no such entry or it is empty.
+fn stream_table<'a>(
+    archive: &'a mut zip::ZipArchive<std::fs::File>,
+    name: &'static str,
+    options: &ScanOptions,
+) -> Result<Option<TableReader<DelimiterGuard<zip::read::ZipFile<'a, std::fs::File>>>>, String> {
+    let entry = match archive.by_name(name) {
+        Ok(entry) => entry,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(error) => return Err(format!("cannot read {name}: {error}")),
+    };
+    let spec = schema::spec_for(name).expect("a streamed table is a known GTFS file");
+    let mut notices = Vec::new();
+    let guarded = DelimiterGuard::new(entry, options);
+    match TableReader::open(spec, guarded, options, u64::MAX, &mut notices) {
+        Ok(reader) => Ok(Some(reader)),
+        Err(NoTable::Empty) => Ok(None),
+        Err(NoTable::Unreadable) => Err(unreadable(name, &notices)),
+    }
 }
 
-/// Decide which trips survive both crops.
-fn select_trips(
+/// Another handle on the one open source file, for the next pass over it.
+fn reopen(source: &std::fs::File) -> Result<std::fs::File, String> {
+    source
+        .try_clone()
+        .map_err(|e| format!("cannot reopen the source archive: {e}"))
+}
+
+fn open_archive(source: &std::fs::File) -> Result<zip::ZipArchive<std::fs::File>, String> {
+    zip::ZipArchive::new(reopen(source)?)
+        .map_err(|e| format!("cannot reread the source archive: {e}"))
+}
+
+/// A stream that stopped short of its table cannot be cropped from.
+fn whole<R: std::io::Read>(
+    reader: &TableReader<R>,
+    name: &str,
+    notices: &[crate::notice::Notice],
+) -> Result<(), String> {
+    if reader.truncated() {
+        return Err(unreadable(name, notices));
+    }
+    Ok(())
+}
+
+fn unreadable(name: &str, notices: &[crate::notice::Notice]) -> String {
+    let message = notices
+        .iter()
+        .rev()
+        .find_map(|n| n.context.get("message").and_then(|v| v.as_str()))
+        .unwrap_or("unreadable");
+    format!("{name} cannot be streamed: {message}")
+}
+
+/// The stops inside the crop area, or None without a spatial crop.
+fn inside_stops(
     result: &ScanResult,
-    scan_options_ref: ScanOptions,
     crop_options: &CropOptions,
     polygon: Option<&[PolygonRings]>,
-) -> Result<HashSet<String>, String> {
-    let trips_table = result
-        .tables
-        .get("trips.txt")
-        .ok_or("feed has no usable trips.txt")?;
-    let trip_index = column(trips_table, "trip_id").ok_or("trips.txt has no trip_id column")?;
-    let service_index = column(trips_table, "service_id");
-    let route_index = column(trips_table, "route_id");
-
+) -> Option<HashSet<String>> {
     // Spatial selection over stop coordinates: a box, or the polygon
     // parts (pre-filtered by their own bounds) when one was given.
     let area: Option<CropArea> = match (polygon, crop_options.bbox) {
@@ -318,7 +410,7 @@ fn select_trips(
         (None, Some(bbox)) => Some((bbox, None)),
         (None, None) => None,
     };
-    let inside_stops: Option<HashSet<String>> = area.map(|((minx, miny, maxx, maxy), parts)| {
+    area.map(|((minx, miny, maxx, maxy), parts)| {
         result
             .tables
             .get("stops.txt")
@@ -346,83 +438,206 @@ fn select_trips(
                 )
             })
             .unwrap_or_default()
-    });
+    })
+}
 
+/// The services active inside the date window, or None without one.
+fn active_services(
+    result: &ScanResult,
+    options: &ScanOptions,
+    crop_options: &CropOptions,
+) -> Result<Option<HashSet<String>>, String> {
     // Temporal selection over actual service activity: weekday flags and
     // calendar_dates exceptions included, via the semantic tier's
     // active-date computation.
-    let active_services: Option<HashSet<String>> =
-        match (&crop_options.start_date, &crop_options.end_date) {
-            (None, None) => None,
-            (start, end) => {
-                let parse = |value: &Option<String>, fallback: &str| {
-                    chrono::NaiveDate::parse_from_str(
-                        value.as_deref().unwrap_or(fallback),
-                        "%Y%m%d",
-                    )
+    match (&crop_options.start_date, &crop_options.end_date) {
+        (None, None) => Ok(None),
+        (start, end) => {
+            let parse = |value: &Option<String>, fallback: &str| {
+                chrono::NaiveDate::parse_from_str(value.as_deref().unwrap_or(fallback), "%Y%m%d")
                     .map_err(|_| "invalid crop date; expected YYYYMMDD".to_string())
-                };
-                let window_start = parse(start, "00010101")?;
-                let window_end = parse(end, "99991231")?;
-                let dates = semantics::active_service_dates(&result.tables, &scan_options_ref);
-                Some(
-                    dates
-                        .into_iter()
-                        .filter(|(_, days)| {
-                            days.iter().any(|d| *d >= window_start && *d <= window_end)
-                        })
-                        .map(|(id, _)| id)
-                        .collect(),
-                )
-            }
-        };
-
-    // Trip stop membership from stop_times.
-    let mut trip_stops: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    if let Some((trip_i, table)) = result
-        .tables
-        .get("stop_times.txt")
-        .and_then(|t| ids(t, "trip_id"))
-    {
-        if let Some(stop_i) = column(table, "stop_id") {
-            for row in &table.rows {
-                trip_stops
-                    .entry(row.fields[trip_i].clone())
-                    .or_default()
-                    .push(row.fields[stop_i].clone());
-            }
+            };
+            let window_start = parse(start, "00010101")?;
+            let window_end = parse(end, "99991231")?;
+            let dates = semantics::active_service_dates(&result.tables, options);
+            Ok(Some(
+                dates
+                    .into_iter()
+                    .filter(|(_, days)| days.iter().any(|d| *d >= window_start && *d <= window_end))
+                    .map(|(id, _)| id)
+                    .collect(),
+            ))
         }
     }
+}
 
+/// Pass 1 over stop_times.txt: the trips serving an inside stop, less,
+/// with full trips only, those also serving an outside one. Both sets
+/// are bounded by the area, not the feed.
+fn trips_touching(
+    source: &std::fs::File,
+    options: &ScanOptions,
+    inside: &HashSet<String>,
+    full_trips_only: bool,
+) -> Result<HashSet<String>, String> {
+    let mut archive = open_archive(source)?;
+    let mut touched = HashSet::new();
+    let Some(mut reader) = stream_table(&mut archive, "stop_times.txt", options)? else {
+        return Ok(touched);
+    };
+    let (Some(trip), Some(stop)) = (
+        position(reader.headers(), "trip_id"),
+        position(reader.headers(), "stop_id"),
+    ) else {
+        return Ok(touched);
+    };
+    let mut notices = Vec::new();
+    while let Some(row) = reader.next_row(&mut notices) {
+        if inside.contains(&row.fields[stop]) {
+            touched.insert(row.fields[trip].clone());
+        }
+    }
+    whole(&reader, "stop_times.txt", &notices)?;
+    if full_trips_only && !touched.is_empty() {
+        // A trip's outside stop may come before its inside one, so the
+        // touched set is complete first and pruned in a second pass.
+        drop(reader);
+        let mut archive = open_archive(source)?;
+        let Some(mut reader) = stream_table(&mut archive, "stop_times.txt", options)? else {
+            return Ok(touched);
+        };
+        let mut notices = Vec::new();
+        let mut partly_outside = HashSet::new();
+        while let Some(row) = reader.next_row(&mut notices) {
+            if !inside.contains(&row.fields[stop]) && touched.contains(&row.fields[trip]) {
+                partly_outside.insert(row.fields[trip].clone());
+            }
+        }
+        whole(&reader, "stop_times.txt", &notices)?;
+        touched.retain(|trip| !partly_outside.contains(trip));
+    }
+    Ok(touched)
+}
+
+/// Decide which trips survive every crop, streaming trips.txt and keeping
+/// only the survivors as the trips table.
+fn select_trips(
+    source: &std::fs::File,
+    options: &ScanOptions,
+    crop_options: &CropOptions,
+    touched: Option<&HashSet<String>>,
+    active: Option<&HashSet<String>>,
+) -> Result<(HashSet<String>, Table), String> {
+    let mut archive = open_archive(source)?;
+    let Some(mut reader) = stream_table(&mut archive, "trips.txt", options)? else {
+        return Err("feed has no usable trips.txt".to_string());
+    };
+    let headers = reader.headers().to_vec();
+    let trip_index = position(&headers, "trip_id").ok_or("trips.txt has no trip_id column")?;
+    let service_index = position(&headers, "service_id");
+    let route_index = position(&headers, "route_id");
     let mut kept = HashSet::new();
-    for row in &trips_table.rows {
-        let trip_id = &row.fields[trip_index];
+    let mut rows = Vec::new();
+    let mut notices = Vec::new();
+    while let Some(row) = reader.next_row(&mut notices) {
         if let Some(routes) = &crop_options.routes {
             let route = route_index.map(|i| row.fields[i].as_str()).unwrap_or("");
             if !routes.contains(route) {
                 continue;
             }
         }
-        if let Some(active) = &active_services {
+        if let Some(active) = active {
             let service = service_index.map(|i| row.fields[i].as_str()).unwrap_or("");
             if !active.contains(service) {
                 continue;
             }
         }
-        if let Some(inside) = &inside_stops {
-            let stops = trip_stops.get(trip_id).map(|v| v.as_slice()).unwrap_or(&[]);
-            let keep = if crop_options.full_trips_only {
-                !stops.is_empty() && stops.iter().all(|s| inside.contains(s))
-            } else {
-                stops.iter().any(|s| inside.contains(s))
-            };
-            if !keep {
+        if let Some(touched) = touched {
+            if !touched.contains(&row.fields[trip_index]) {
                 continue;
             }
         }
-        kept.insert(trip_id.clone());
+        if !kept.insert(row.fields[trip_index].clone()) {
+            // Ambiguous, and with no row cap on trips.txt a way to grow the
+            // kept table without bound.
+            return Err(format!(
+                "trips.txt repeats trip_id {:?}; an ambiguous feed cannot be cropped",
+                row.fields[trip_index]
+            ));
+        }
+        rows.push(Row {
+            csv_row: row.csv_row,
+            fields: row.fields,
+        });
     }
-    Ok(kept)
+    whole(&reader, "trips.txt", &notices)?;
+    Ok((kept, Table { headers, rows }))
+}
+
+/// Write the cropped feed: the kept trips' stop_times straight from the
+/// source (pass 2), the parsed tables after the cascade, the kept trips'
+/// shapes straight from the source, and the entries copied through.
+/// Returns the row counts of the streamed tables.
+fn write_cropped(
+    source: &std::fs::File,
+    staging: &Path,
+    options: &ScanOptions,
+    result: &mut ScanResult,
+    kept_trips: &HashSet<String>,
+    crop_options: &CropOptions,
+) -> Result<BTreeMap<String, usize>, String> {
+    let mut zip = ZipOutput::create(staging)?;
+    let mut counts = BTreeMap::new();
+    let mut kept_stops: HashSet<String> = HashSet::new();
+    {
+        let mut archive = open_archive(source)?;
+        let opened = stream_table(&mut archive, "stop_times.txt", options)?;
+        if let Some(mut reader) = opened {
+            let headers = reader.headers().to_vec();
+            let trip = position(&headers, "trip_id");
+            let stop = position(&headers, "stop_id");
+            let mut notices = Vec::new();
+            let rows = std::iter::from_fn(|| reader.next_row(&mut notices))
+                .filter(|row| trip.is_some_and(|i| kept_trips.contains(&row.fields[i])))
+                .inspect(|row| {
+                    if let Some(i) = stop {
+                        kept_stops.insert(row.fields[i].clone());
+                    }
+                })
+                .map(|row| row.fields);
+            let count = zip.rows("stop_times.txt", &headers, rows)?;
+            whole(&reader, "stop_times.txt", &notices)?;
+            counts.insert("stop_times.txt".to_string(), count);
+        }
+    }
+    retain(
+        result,
+        kept_trips,
+        (&crop_options.start_date, &crop_options.end_date),
+        kept_stops,
+    );
+    for (name, table) in &result.tables {
+        zip.table(name, table)?;
+    }
+    let kept_shapes = referenced(result, "trips.txt", "shape_id");
+    {
+        let mut archive = open_archive(source)?;
+        let opened = stream_table(&mut archive, "shapes.txt", options)?;
+        if let Some(mut reader) = opened {
+            let headers = reader.headers().to_vec();
+            let shape = position(&headers, "shape_id");
+            let mut notices = Vec::new();
+            let rows = std::iter::from_fn(|| reader.next_row(&mut notices))
+                .filter(|row| shape.is_some_and(|i| kept_shapes.contains(&row.fields[i])))
+                .map(|row| row.fields);
+            let count = zip.rows("shapes.txt", &headers, rows)?;
+            whole(&reader, "shapes.txt", &notices)?;
+            counts.insert("shapes.txt".to_string(), count);
+        }
+    }
+    zip.passthrough(&mut open_archive(source)?, &result.unparsed_entries)?;
+    zip.finish()?;
+    Ok(counts)
 }
 
 /// Retain only the kept trips and everything they reference, then the
@@ -431,13 +646,14 @@ fn retain(
     result: &mut ScanResult,
     kept_trips: &HashSet<String>,
     window: (&Option<String>, &Option<String>),
+    kept_stops: HashSet<String>,
 ) {
     keep_rows(result, "trips.txt", "trip_id", kept_trips);
     keep_rows(result, "stop_times.txt", "trip_id", kept_trips);
     keep_rows(result, "frequencies.txt", "trip_id", kept_trips);
 
     // Stops actually served (their full sequences), plus their parents.
-    let mut kept_stops = referenced(result, "stop_times.txt", "stop_id");
+    let mut kept_stops = kept_stops;
     if let Some(stops) = result.tables.get("stops.txt") {
         if let (Some(id), Some(parent)) =
             (column(stops, "stop_id"), column(stops, "parent_station"))
