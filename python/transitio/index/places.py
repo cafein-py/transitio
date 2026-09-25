@@ -6,7 +6,9 @@ defined ranking, never a guess: the query is normalised and matched
 against every place's labels and aliases in every language, candidates score on
 match strength then ``kind`` precedence then feed count, and a winner is taken
 only when it is the sole exact match or beats the runner-up by the ambiguity
-margin. A city's namesakes do not compete with it: a metro in its country
+margin, which never favours a place reached only through an alias or a
+translation over one carrying the name as its own. A city's namesakes do not
+compete with it: a metro in its country
 shares its name because it is the city's metro or named after it, and a
 same-named area containing it that runs much the same service (no more than
 the margin beyond the city's feeds) is the city itself. Anything else
@@ -76,6 +78,10 @@ _EXACT, _PREFIX, _SUBSET = 3, 2, 1
 # kind precedence for the metro-default world: a metro outranks the city it
 # contains, which outranks the region, which outranks the country.
 _KIND_ORDER = {"metro": 0, "city": 1, "region": 2, "country": 3}
+
+# ``_decide``'s answer when the margin would favour an alias over a name: no
+# decision, and no other contest may overturn it.
+_VETOED = object()
 
 _QID = re.compile(r"\AQ[1-9][0-9]*\Z")
 # The index's own place id (schema 6); a query in this form is an id lookup.
@@ -544,21 +550,22 @@ class _PlaceLookup:
         return scored
 
     def search(self, query, kind=None):
-        return [self.get(place_id) for _, place_id in self._qualified(query, kind)]
+        return [self.get(place_id) for _, place_id in self._qualified(query, kind)[1]]
 
     def _qualified(self, query, kind):
-        """The candidates for ``query``: as written when a label matches it
-        exactly, else, for "Name, Qualifier, ...", the candidates for the name
-        that lie within a place each qualifier names — a region, a country or
-        a country's code ("London, Ontario", "City of London, UK")."""
+        """The name the query asks for and its candidates: as written when a
+        label matches it exactly, else, for "Name, Qualifier, ...", the
+        candidates for the name that lie within a place each qualifier names —
+        a region, a country or a country's code ("London, Ontario", "City of
+        London, UK")."""
         scored = self._candidates(query, kind)
         if "," not in query or any(tier == _EXACT for tier, _ in scored):
-            return scored
+            return query, scored
         name, *rest = query.split(",")
         qualifiers = [_normalize(part) for part in rest if _normalize(part)]
         if not _normalize(name) or not qualifiers:
-            return scored
-        return [
+            return query, scored
+        return name, [
             (tier, place_id)
             for tier, place_id in self._candidates(name, kind)
             if all(self._within(place_id, qualifier) for qualifier in qualifiers)
@@ -605,21 +612,26 @@ class _PlaceLookup:
             if place is None:
                 raise PlaceNotFoundError(f"no place with id {query!r} in the index")
             return place
-        scored = self._qualified(query, kind)
+        name, scored = self._qualified(query, kind)
         if not scored:
             raise PlaceNotFoundError(f"no place matches {query!r}")
-        return self.get(self._winner(query, scored))
+        return self.get(self._winner(query, scored, name))
 
-    def _winner(self, query, scored):
+    def _winner(self, query, scored, name):
         namesakes = self._namesakes(scored)
+        winner = None
         if namesakes:
-            winner = self._decide([item for item in scored if item[1] not in namesakes])
+            narrowed = [item for item in scored if item[1] not in namesakes]
+            winner = self._decide(narrowed, name)
             # Setting namesakes aside only lets a city win; any other winner
             # there would be one the full contest never chose.
-            if winner is not None and self._records[winner]["kind"] == "city":
-                return winner
-        winner = self._decide(scored)
-        if winner is not None:
+            if winner is not None and winner is not _VETOED:
+                if self._records[winner]["kind"] == "city":
+                    return winner
+                winner = None
+        if winner is not _VETOED:  # a veto stands; the full contest may not overturn it
+            winner = self._decide(scored, name)
+        if winner is not None and winner is not _VETOED:
             return winner
         candidates = [self.get(pid) for _, pid in scored]
         error = AmbiguousPlaceError(
@@ -629,9 +641,14 @@ class _PlaceLookup:
         error.candidates = tuple(candidates)
         raise error
 
-    def _decide(self, scored):
+    def _decide(self, scored, name):
         """The sole candidate, the sole exact match, or a top candidate that
-        beats the runner-up by the margin; None when none of these holds."""
+        beats the runner-up by the margin; None when none of these holds, and
+        ``_VETOED`` when the margin alone would decide against the name. The
+        margin never favours a place reached only through an alias or a
+        translation over one carrying ``name`` as its own: Saint Paul,
+        Minnesota, whose aliases include São Paulo, has more feeds than São
+        Paulo itself in a thinly covered index."""
         if len(scored) == 1:
             return scored[0][1]
         exact = [pid for tier, pid in scored if tier == _EXACT]
@@ -644,6 +661,12 @@ class _PlaceLookup:
         # feed counts yet (declared edges arrive later) this never fires, so
         # genuinely tied names stay ambiguous rather than guessed.
         if top_feeds and top_feeds > 2 * self._feed_count(runner_id):
+            norm = _normalize(name)
+            own = {
+                pid for pid in exact if _normalize(self._records[pid]["name"]) == norm
+            }
+            if own and top_id not in own:
+                return _VETOED
             return top_id
         return None
 

@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The feed-count margin that breaks a name tie never favours a place reached
+  only through an alias or a translation over one carrying the name as its
+  own: "Sao Paulo" raises `AmbiguousPlaceError` instead of naming Saint Paul,
+  Minnesota, whose aliases include São Paulo, and "Sao Paulo, Brazil"
+  resolves.
 - A bare place name resolves to the city rather than raising
   `AmbiguousPlaceError` when the other places sharing the name are named
   after it: the metros in its country (with several metro definitions a

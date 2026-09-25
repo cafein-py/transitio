@@ -277,3 +277,53 @@ def test_a_city_is_not_outranked_by_the_places_named_after_it():
     for name in ("London", "New York", "Hamilton"):
         with pytest.raises(AmbiguousPlaceError):
             lookup.resolve(name)
+
+
+def test_the_feed_margin_does_not_favour_an_alias_over_a_name():
+    # Saint Paul, Minnesota carries "São Paulo" as an alias and more feeds than
+    # São Paulo itself: the name stays ambiguous rather than naming Saint Paul,
+    # and a qualifier picks São Paulo; a translation still reaches Vienna.
+    pandas = pytest.importorskip("pandas")
+    from transitio.exceptions import AmbiguousPlaceError
+    from transitio.index.places import _PlaceLookup
+
+    def place(place_id, kind, name, country, aliases=(), names=None):
+        return {
+            "place_id": place_id,
+            "kind": kind,
+            "name": name,
+            "names": names or {"en": name},
+            "aliases": list(aliases),
+            "parent_id": None,
+            "default_metro_id": None,
+            "metro_ids": [],
+            "member_ids": [],
+            "country_code": country,
+            "source_subtype": None,
+        }
+
+    # Kingston: an aliased city abroad would win the narrowed contest on feeds;
+    # the veto must not hand the name to the busy metro set aside as a namesake.
+    feeds = {"c-stp": 7, "c-sp": 2, "c-vie": 27, "m-wien": 30}
+    feeds.update({"c-kin": 5, "c-kin-us": 30, "m-kin": 100})
+    lookup = _PlaceLookup(
+        pandas.DataFrame(
+            [
+                place("br", "country", "Brazil", "BR"),
+                place("c-sp", "city", "São Paulo", "BR"),
+                place("c-stp", "city", "Saint Paul", "US", aliases=["São Paulo"]),
+                place("c-vie", "city", "Vienna", "AT", names={"de": "Wien"}),
+                place("m-wien", "metro", "Wien", "AT"),
+                place("c-kin", "city", "Kingston", "JM"),
+                place("m-kin", "metro", "Kingston", "JM"),
+                place("c-kin-us", "city", "Port Kingston", "US", aliases=["Kingston"]),
+            ]
+        ),
+        feed_count=lambda place_id: feeds.get(place_id, 0),
+    )
+    with pytest.raises(AmbiguousPlaceError):
+        lookup.resolve("Sao Paulo")
+    assert lookup.resolve("Sao Paulo, Brazil").id == "c-sp"
+    assert lookup.resolve("Wien").id == "c-vie"
+    with pytest.raises(AmbiguousPlaceError):
+        lookup.resolve("Kingston")
