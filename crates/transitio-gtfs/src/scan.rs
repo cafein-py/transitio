@@ -111,8 +111,20 @@ pub fn scan(path: &Path) -> Result<ScanResult, String> {
 }
 
 pub fn scan_with(path: &Path, options: ScanOptions) -> Result<ScanResult, String> {
+    scan_streaming(path, options, &[])
+}
+
+/// `scan_with`, leaving the named GTFS files for the caller to stream: they
+/// are read for nothing here, so they appear in neither `tables` nor
+/// `unparsed_entries` and are not charged against the byte budgets, while
+/// still counting as present for the feed-level checks.
+pub fn scan_streaming(
+    path: &Path,
+    options: ScanOptions,
+    streamed: &[&str],
+) -> Result<ScanResult, String> {
     let file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    scan_reader_with(file, options)
+    scan_reader_streaming(file, options, streamed)
 }
 
 pub fn scan_reader<R: Read + Seek>(reader: R) -> Result<ScanResult, String> {
@@ -120,8 +132,16 @@ pub fn scan_reader<R: Read + Seek>(reader: R) -> Result<ScanResult, String> {
 }
 
 pub fn scan_reader_with<R: Read + Seek>(
+    reader: R,
+    options: ScanOptions,
+) -> Result<ScanResult, String> {
+    scan_reader_streaming(reader, options, &[])
+}
+
+pub fn scan_reader_streaming<R: Read + Seek>(
     mut reader: R,
     options: ScanOptions,
+    streamed: &[&str],
 ) -> Result<ScanResult, String> {
     // The zip crate's read index is keyed by name and silently keeps only
     // the last occurrence of a duplicated entry, so shadowed duplicates are
@@ -192,6 +212,10 @@ pub fn scan_reader_with<R: Read + Seek>(
         };
         if duplicated.contains(spec.name) {
             continue; // noticed above; never parse an ambiguous table
+        }
+        if streamed.contains(&spec.name) {
+            present.insert(spec.name);
+            continue; // the caller streams it
         }
         // Per-entry failures (corrupt member, budget violation) are noticed
         // and skipped so every other readable table still gets validated;
@@ -1369,5 +1393,43 @@ mod tests {
             assert!(truncated);
             assert_eq!(notice_codes(&notices), ["unreadable_file"]);
         }
+    }
+
+    #[test]
+    fn a_streamed_file_is_left_to_the_caller() {
+        // a byte budget below stop_times.txt's size: parsed, it would be
+        // refused as unreadable; streamed, it is not read at all
+        let files = minimal();
+        let stop_times = files
+            .iter()
+            .find(|(name, _)| *name == "stop_times.txt")
+            .map(|(_, content)| content.len())
+            .unwrap();
+        let options = ScanOptions {
+            max_entry_bytes: stop_times as u64 - 1,
+            ..ScanOptions::default()
+        };
+        let parsed = scan_reader_with(build_zip(&files), options).unwrap();
+        assert!(parsed.incomplete.contains("stop_times.txt"));
+
+        let result =
+            scan_reader_streaming(build_zip(&files), options, &["stop_times.txt"]).unwrap();
+        assert!(!result.tables.contains_key("stop_times.txt"));
+        assert!(!result
+            .unparsed_entries
+            .contains(&"stop_times.txt".to_string()));
+        assert!(!result.incomplete.contains("stop_times.txt"));
+        let about_stop_times: Vec<_> = result
+            .notices
+            .iter()
+            .filter(|n| {
+                n.context.get("filename").and_then(|v| v.as_str()) == Some("stop_times.txt")
+                    || n.code == "missing_required_file"
+            })
+            .map(|n| n.code)
+            .collect();
+        assert!(about_stop_times.is_empty(), "{about_stop_times:?}");
+        // the other tables are parsed as usual
+        assert!(result.tables.contains_key("trips.txt"));
     }
 }

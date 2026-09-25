@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
-use crate::repair::write_zip;
+use crate::output::write_zip;
 use crate::scan::{ScanOptions, ScanResult, Table};
 use crate::{rules, scan, semantics};
 

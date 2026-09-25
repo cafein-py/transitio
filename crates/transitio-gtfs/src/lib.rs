@@ -5,6 +5,7 @@
 pub mod crop;
 pub mod fields;
 pub mod notice;
+pub mod output;
 pub mod readiness;
 pub mod repair;
 pub mod rules;
