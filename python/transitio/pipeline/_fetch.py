@@ -170,11 +170,11 @@ class _SkipFeed(Exception):
 def _process_feed(
     path, *, geometry, tag, repair, crop, modes, when_ymd, hosted, budgets, routes=None
 ):
-    """Repair, crop, mode-filter, validate and report one downloaded feed.
+    """Crop, repair, mode-filter, validate and report one downloaded feed.
 
     Returns ``(path, report, fixes, present_routes)``; ``present_routes`` is the
-    set of ``route_id`` values in the feed as it enters the route crop (after
-    any repair), or ``None`` when a ``routes`` filter is not applied or that
+    set of ``route_id`` values in the downloaded feed as it enters the route
+    crop, or ``None`` when a ``routes`` filter is not applied or that
     feed's routes.txt cannot be read — so a caller records an *undetermined*
     drop rather than a false empty one. Raises :class:`_SkipFeed` when the feed
     drops out. Shared by the AOI and the place paths.
@@ -188,11 +188,6 @@ def _process_feed(
     sidecar = path.with_suffix(".provenance.json")
     if sidecar.exists():
         provenance = json.loads(sidecar.read_text())
-    fixes = []
-    if repair:
-        repaired = path.with_name(f"{path.stem}-repaired-{tag}.zip")
-        fixes = repair_feed(path, repaired, **budgets)["fixes"]
-        path = repaired
     present_routes = None
     if crop or routes is not None:
         cropped = path.with_name(f"{path.stem}-cropped-{tag}.zip")
@@ -206,6 +201,13 @@ def _process_feed(
             source = report.get("source_routes")
             present_routes = None if source is None else set(source)
         path = cropped
+    # The crop comes first, so the repair works on the area's feed rather
+    # than on the whole source.
+    fixes = []
+    if repair:
+        repaired = path.with_name(f"{path.stem}-repaired-{tag}.zip")
+        fixes = repair_feed(path, repaired, **budgets)["fixes"]
+        path = repaired
     if modes is not None:
         served = _feed_modes(path)
         if served is None:
@@ -297,9 +299,9 @@ def fetch(
     ``"error"`` raises :class:`~transitio.exceptions.StaleSelectorError`.
 
     Resolves and crops the OSM extract, discovers the GTFS feeds (overlapping
-    the AOI, or the place's indexed feeds), downloads each feed, validates it,
-    optionally repairs and spatially crops it, and builds a merged report per
-    feed.
+    the AOI, or the place's indexed feeds), downloads each feed, spatially
+    crops it, optionally repairs it, validates it, and builds a merged report
+    per feed.
     With an API token, downloads come from catalogued dataset versions
     (checksum-verified, with the hosted canonical-validator report);
     without one, the unversioned latest hosted zip is fetched — a moving
@@ -325,8 +327,8 @@ def fetch(
         (post-crop) feed's routes.txt, since the catalog carries no mode
         metadata. Unknown mode names raise ``ValueError``.
     repair : bool, default False
-        Repair each feed (gtfstidy contract) before use; conservative
-        default leaves feeds untouched.
+        Repair each feed (gtfstidy contract) after the crop, before use;
+        conservative default leaves feeds untouched.
     crop : bool, default True
         Spatially crop each feed to the AOI's bounding box.
     osm : bool, default True
@@ -824,14 +826,15 @@ def _fetch_place(
                 if selection is not None:
                     selections.append(selection)
                 continue
-            # ``present`` is the routes.txt the crop scanned (post-repair): the
-            # audit is the selector's own action over the feed's routes -- the
-            # selected routes it carried (``kept``) and the rest it held that
-            # the selector removed (``dropped``). A selected route repair had
-            # already removed is in neither, and any later spatial crop is a
-            # separate transform reported in ``reports``, not here. Both are
-            # None (undetermined) when routes.txt could not be read. Only a
-            # trusted complete selector was cropped (``routes`` is set).
+            # ``present`` is the routes.txt the crop scanned, the download
+            # before any repair: the audit is the selector's own action over
+            # the feed's routes -- the selected routes it carried (``kept``)
+            # and the rest it held that the selector removed (``dropped``).
+            # A later repair may still change the delivered feed, and any
+            # spatial crop is a separate transform reported in ``reports``,
+            # not here. Both are None (undetermined) when routes.txt could
+            # not be read. Only a trusted complete selector was cropped
+            # (``routes`` is set).
             if selection is not None and routes is not None:
                 selection["kept"] = (
                     None if present is None else sorted(present & routes)

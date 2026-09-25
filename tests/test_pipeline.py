@@ -748,6 +748,24 @@ def _multi_route_gtfs(routes=_ROUTE_SPECS):
     return buf.getvalue()
 
 
+def _with_invalid_wheelchair(payload):
+    # An invalid wheelchair_accessible on t1: a repairable error inside the
+    # retained area, so a repair after the crop is observable.
+    import io as _io
+
+    with zipfile.ZipFile(_io.BytesIO(payload)) as z:
+        members = {n: z.read(n).decode() for n in z.namelist()}
+    lines = members["trips.txt"].splitlines()
+    lines[0] += ",wheelchair_accessible"
+    lines[1:] = [f"{line},{'9' if ',t1,' in line else '0'}" for line in lines[1:]]
+    members["trips.txt"] = "\n".join(lines) + "\n"
+    buf = _io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for n, c in members.items():
+            z.writestr(n, c)
+    return buf.getvalue()
+
+
 def _stamp_fingerprint(edges, payload, kind="route_stops"):
     # Stamp the real fingerprint of the stubbed download onto complete-selector
     # edges so fetch-time validation trusts them (build and download agree).
@@ -803,7 +821,7 @@ def test_fetch_place_crops_bundles_to_the_selected_routes(
             "needs_review": False,
         }
 
-    payload = _multi_route_gtfs()
+    payload = _with_invalid_wheelchair(_multi_route_gtfs())
     edges = _stamp_fingerprint(
         [
             sel_edge("local", "r-local"),
@@ -815,8 +833,19 @@ def test_fetch_place_crops_bundles_to_the_selected_routes(
     index = _selector_index(tmp_path, edges)
     _stub_pbf_and_atlas(monkeypatch, tmp_path, payload)
 
-    # repair=True rewrites the feed before the crop; the selector is validated
-    # against the download and still cropped correctly on the repaired bytes.
+    # repair=True rewrites the cropped feed; the selector is validated against
+    # the download, which is what the crop runs on.
+    repaired_inputs = []
+    if repair:
+        import transitio.repair as repair_module
+
+        real_repair = repair_module.repair_feed
+
+        def recording_repair(path, output, **options):
+            repaired_inputs.append(str(path))
+            return real_repair(path, output, **options)
+
+        monkeypatch.setattr(repair_module, "repair_feed", recording_repair)
     result = fetch(
         place="Q1757",
         index=index,
@@ -826,6 +855,9 @@ def test_fetch_place_crops_bundles_to_the_selected_routes(
         tiers=["local", "regional"],
         exclude=["national"],
     )
+    # the repair, when asked for, receives the cropped feed
+    assert bool(repaired_inputs) == repair
+    assert all("-cropped-" in path for path in repaired_inputs)
     # The delivered feed keeps only the selected tiers' routes, and the crop
     # cascade drops the entities only the removed routes referenced.
     tables = _feed_tables(result.feeds[0])
@@ -844,8 +876,11 @@ def test_fetch_place_crops_bundles_to_the_selected_routes(
         "wk-r-local",
         "wk-r-reg",
     }
-    # The delivered feed is referentially consistent (no validation errors).
+    # The delivered feed is referentially consistent (no validation errors);
+    # the planted enum value is a warning, reported only when left unrepaired.
     assert result.reports[0]["summary"]["counts"]["errors"] == 0
+    codes = {group["code"] for group in result.reports[0]["notices"]}
+    assert ("unexpected_enum_value" in codes) == (not repair)
     (selection,) = result.selections
     assert selection["feed_id"] == "f-a"
     assert selection["selector_state"] == "complete"
@@ -855,6 +890,17 @@ def test_fetch_place_crops_bundles_to_the_selected_routes(
     # The audit names the contributing per-tier edges.
     by_tier = {e["tier"]: e["route_ids"] for e in selection["selected_by"]}
     assert by_tier == {"local": ["r-local"], "regional": ["r-reg"]}
+    # the repair fixes the retained trip's invalid value after the crop; a
+    # crop alone leaves attributes untouched
+    wheelchair = {
+        t_["trip_id"]: t_["wheelchair_accessible"] for t_ in tables["trips.txt"]
+    }
+    if repair:
+        assert wheelchair["t1"] == "0"
+        assert any(f["field"] == "wheelchair_accessible" for f in result.repairs[0])
+    else:
+        assert wheelchair["t1"] == "9"
+        assert result.repairs == [[]]
 
 
 def test_fetch_place_output_names_differ_by_selected_routes(tmp_path, monkeypatch):
