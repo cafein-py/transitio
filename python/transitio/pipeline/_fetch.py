@@ -34,7 +34,7 @@ _MODES_BYTE_CAP = 64 * 1024 * 1024
 class FetchResult:
     """What the pipeline produced for one AOI."""
 
-    osm_pbf: pathlib.Path
+    osm_pbf: pathlib.Path | None
     feeds: list
     reports: list
     repairs: list
