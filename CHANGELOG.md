@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stage is skipped and the result's `osm_pbf` is None, for callers who want
   only the GTFS feeds.
 
+### Changed
+
+- `fetch` crops each feed before repairing it, so with the default crop
+  `repair=True` works on the area's feed rather than on the whole source.
+
 ## 0.12.0 — 2026-09-23
 
 ### Added
