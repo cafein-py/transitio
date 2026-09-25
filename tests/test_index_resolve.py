@@ -124,21 +124,20 @@ def idx():
     return _index(RECORDS)
 
 
-def test_a_bare_city_name_promotes_to_its_default_metro(idx):
-    place = transitio_index.place("New York City", index=idx)
+@pytest.mark.parametrize("name", ["New York City", "Twinsburg"])
+def test_a_bare_city_name_returns_the_city(idx, name):
+    # with a default metro (New York City) or several metros (Twinsburg)
+    assert transitio_index.place(name, index=idx).kind == "city"
+
+
+def test_kind_pins_the_scope(idx):
+    place = transitio_index.place("New York metropolitan area", kind="metro", index=idx)
     assert place.id == "Q1109190"
-    assert place.kind == "metro"
-    assert place.promoted_from == "Q60"
+    with pytest.raises(PlaceNotFoundError):
+        transitio_index.place("New York metropolitan area", kind="city", index=idx)
 
 
-def test_kind_pins_the_scope_and_suppresses_promotion(idx):
-    place = transitio_index.place("New York City", kind="city", index=idx)
-    assert place.id == "Q60"
-    assert place.kind == "city"
-    assert place.promoted_from is None
-
-
-def test_a_qid_resolves_directly_without_promotion(idx):
+def test_a_qid_resolves_directly(idx):
     assert transitio_index.place("Q60", index=idx).id == "Q60"
     assert transitio_index.place("Q1109190", index=idx).id == "Q1109190"
 
@@ -166,13 +165,6 @@ def test_frankfurt_and_newcastle_short_names_are_ambiguous(idx):
     with pytest.raises(AmbiguousPlaceError) as newcastle:
         transitio_index.place("Newcastle", index=idx)
     assert {c.id for c in newcastle.value.candidates} == {"Q-ncl-uk", "Q-ncl-au"}
-
-
-def test_a_multi_metro_city_without_a_default_is_not_promoted(idx):
-    place = transitio_index.place("Twinsburg", index=idx)
-    assert place.id == "Q-twin"
-    assert place.kind == "city"
-    assert place.promoted_from is None
 
 
 def test_metro_and_member_traversals_resolve_to_places(idx):
@@ -351,7 +343,7 @@ def test_a_feeds_only_index_has_no_places_to_resolve():
 
 
 def test_the_top_level_alias_is_wired(idx):
-    assert transitio.place("New York City", index=idx).id == "Q1109190"
+    assert transitio.place("New York City", index=idx).id == "Q60"
     assert transitio.Place is transitio_index.Place
 
 

@@ -216,3 +216,64 @@ def test_area_search_ranks_local_feed_over_continental_aggregate(tmp_path):
     assert [feed.id for feed in ranked] == ["mdb-2", "mdb-1"]
     # the limit applies after ranking, not in catalogue file order
     assert [feed.id for feed in search_csv(path, bounds=helsinki, limit=1)] == ["mdb-2"]
+
+
+def test_a_city_is_not_outranked_by_the_places_named_after_it():
+    # Augsburg's name is shared by three metros in its country, one per metro
+    # definition, and by a containing region with about the same service;
+    # London's only exact-match city is in Canada, the metros sharing its name
+    # in the UK; New York State carries far more service than the city; and
+    # Hamilton's busier British metro must not win once the Canadian one, the
+    # city's namesake, is set aside.
+    pandas = pytest.importorskip("pandas")
+    from transitio.exceptions import AmbiguousPlaceError
+    from transitio.index.places import _PlaceLookup
+
+    def place(place_id, kind, name, country, parent=None):
+        return {
+            "place_id": place_id,
+            "kind": kind,
+            "name": name,
+            "names": {"en": name},
+            "aliases": [],
+            "parent_id": parent,
+            "default_metro_id": None,
+            "metro_ids": [],
+            "member_ids": [],
+            "country_code": country,
+            "source_subtype": None,
+        }
+
+    feeds = {
+        "c-aug": 30,
+        "r-aug": 31,
+        "c-ny": 68,
+        "r-ny": 165,
+        "c-ham": 5,
+        "m-ham-ca": 40,
+        "m-ham-gb": 60,
+    }
+    lookup = _PlaceLookup(
+        pandas.DataFrame(
+            [
+                place("r-aug", "region", "Augsburg", "DE"),
+                place("c-aug", "city", "Augsburg", "DE", parent="r-aug"),
+                place("m-aug-1", "metro", "Augsburg", "DE"),
+                place("m-aug-2", "metro", "Augsburg", "DE"),
+                place("m-aug-3", "metro", "Augsburg", "DE"),
+                place("c-lon", "city", "London", "CA"),
+                place("m-lon-1", "metro", "London", "GB"),
+                place("m-lon-2", "metro", "London", "GB"),
+                place("r-ny", "region", "New York", "US"),
+                place("c-ny", "city", "New York", "US", parent="r-ny"),
+                place("c-ham", "city", "Hamilton", "CA"),
+                place("m-ham-ca", "metro", "Hamilton", "CA"),
+                place("m-ham-gb", "metro", "Hamilton", "GB"),
+            ]
+        ),
+        feed_count=lambda place_id: feeds.get(place_id, 0),
+    )
+    assert lookup.resolve("Augsburg").id == "c-aug"
+    for name in ("London", "New York", "Hamilton"):
+        with pytest.raises(AmbiguousPlaceError):
+            lookup.resolve(name)

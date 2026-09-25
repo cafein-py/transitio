@@ -51,7 +51,7 @@ import transitio
 
 transitio.index.refresh()            # once: install the newest feed index
 
-augsburg = transitio.place("Augsburg", kind="city")
+augsburg = transitio.place("Augsburg")
 result = transitio.fetch(
     place=augsburg,
     tiers=["local", "regional"],     # leave out long-distance services
@@ -64,9 +64,11 @@ Each feed is cropped to the place's boundary; a national feed such as
 Germany's is streamed through the crop, so it fits in memory bounded by the
 area. `merge_feeds` writes one feed from the cropped ones; with
 `check=False` it keeps the file when the validator reports errors, which
-the returned report lists. A name shared by a city and its metros raises
-`AmbiguousPlaceError`; `kind="city"` (or `"metro"`, `"region"`,
-`"country"`) or a Wikidata id picks one.
+the returned report lists. A bare name resolves to the city before the
+metros named after it. Where different places share a name and none clearly
+leads, as for London in the UK and in Canada, `place` raises
+`AmbiguousPlaceError`; `kind="city"` (or `"metro"`, `"region"`, `"country"`)
+restricts the scope and a Wikidata id picks one place.
 
 ### Inferring missing route shapes
 

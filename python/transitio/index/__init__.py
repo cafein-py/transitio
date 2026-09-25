@@ -70,10 +70,10 @@ MIN_READER_VERSIONS = {
     9: "0.12.0",
 }
 
-# Bumped whenever name resolution, ranking, promotion or filtering changes:
-# the snapshot pins the data, this pins how the reader interprets it, and a
-# result that records both (with the transitio version) is reproducible.
-DISCOVERY_SEMANTICS_VERSION = 1
+# Bumped whenever name resolution, ranking or filtering changes: the snapshot
+# pins the data, this pins how the reader interprets it, and a result that
+# records both (with the transitio version) is reproducible.
+DISCOVERY_SEMANTICS_VERSION = 2
 
 FEEDS_FILE = "feeds.parquet"
 REALTIME_FILE = "realtime.parquet"
@@ -936,9 +936,10 @@ def place(query, *, kind=None, index=None):
     """Resolve ``query`` to a single :class:`Place`, or raise.
 
     ``query`` is a name, a QID, an own ``tp_`` id, or a :class:`Place`; an id
-    resolves through the place's former ids and the QIDs it carries. A bare
-    city name promotes to its default metro; ``kind`` pins the scope and
-    suppresses promotion. Raises
+    resolves through the place's former ids and the QIDs it carries. A name
+    shared by a city and the metros named after it in its country, or an
+    area containing it with much the same service, resolves to the city;
+    ``kind`` pins the scope. Raises
     :class:`~transitio.exceptions.PlaceNotFoundError` or
     :class:`~transitio.exceptions.AmbiguousPlaceError`.
     """
@@ -946,7 +947,7 @@ def place(query, *, kind=None, index=None):
 
 
 def places(query, *, index=None):
-    """The places matching ``query``, ranked best first (never promoted)."""
+    """The places matching ``query``, ranked best first."""
     return _lookup_for(_coerce_index(index)).search(query)
 
 

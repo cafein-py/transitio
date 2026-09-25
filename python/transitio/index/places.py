@@ -6,8 +6,11 @@ defined ranking, never a guess: the query is normalised and matched
 against every place's labels and aliases in every language, candidates score on
 match strength then ``kind`` precedence then feed count, and a winner is taken
 only when it is the sole exact match or beats the runner-up by the ambiguity
-margin. A bare city name promotes to its default metro (decision M). Anything
-else raises :class:`AmbiguousPlaceError` with the candidates, or
+margin. A city's namesakes do not compete with it: a metro in its country
+shares its name because it is the city's metro or named after it, and a
+same-named area containing it that runs much the same service (no more than
+the margin beyond the city's feeds) is the city itself. Anything else
+raises :class:`AmbiguousPlaceError` with the candidates, or
 :class:`PlaceNotFoundError`.
 """
 
@@ -128,10 +131,9 @@ Delineation = namedtuple("Delineation", ["relation", "kind", "subtype", "place"]
 class Place:
     """A resolved place: its identity, hierarchy, names and boundary."""
 
-    def __init__(self, record, lookup, *, promoted_from=None):
+    def __init__(self, record, lookup):
         self._record = record
         self._lookup = lookup
-        self.promoted_from = promoted_from
 
     @property
     def id(self):
@@ -572,11 +574,30 @@ class _PlaceLookup:
         scored = self._candidates(query, kind)
         if not scored:
             raise PlaceNotFoundError(f"no place matches {query!r}")
-        winner_id = self._winner(query, scored)
-        winner = self.get(winner_id)
-        return self._promote(winner) if kind is None else winner
+        return self.get(self._winner(query, scored))
 
     def _winner(self, query, scored):
+        namesakes = self._namesakes(scored)
+        if namesakes:
+            winner = self._decide([item for item in scored if item[1] not in namesakes])
+            # Setting namesakes aside only lets a city win; any other winner
+            # there would be one the full contest never chose.
+            if winner is not None and self._records[winner]["kind"] == "city":
+                return winner
+        winner = self._decide(scored)
+        if winner is not None:
+            return winner
+        candidates = [self.get(pid) for _, pid in scored]
+        error = AmbiguousPlaceError(
+            f"{query!r} matches several places: "
+            + ", ".join(repr(c) for c in candidates)
+        )
+        error.candidates = tuple(candidates)
+        raise error
+
+    def _decide(self, scored):
+        """The sole candidate, the sole exact match, or a top candidate that
+        beats the runner-up by the margin; None when none of these holds."""
         if len(scored) == 1:
             return scored[0][1]
         exact = [pid for tier, pid in scored if tier == _EXACT]
@@ -590,19 +611,35 @@ class _PlaceLookup:
         # genuinely tied names stay ambiguous rather than guessed.
         if top_feeds and top_feeds > 2 * self._feed_count(runner_id):
             return top_id
-        candidates = [self.get(pid) for _, pid in scored]
-        error = AmbiguousPlaceError(
-            f"{query!r} matches several places: "
-            + ", ".join(repr(c) for c in candidates)
-        )
-        error.candidates = tuple(candidates)
-        raise error
+        return None
 
-    def _promote(self, place):
-        """A bare city name resolves to its default metro (decision M)."""
-        if place.kind != "city" or not place.default_metro_id:
-            return place
-        metro = self.get(place.default_metro_id)
-        if metro is None:
-            return place
-        return Place(metro._record, self, promoted_from=place.id)
+    def _namesakes(self, scored):
+        """The exact matches that share an exact-match city's name because of
+        that city: the metros in its country, and the areas containing it
+        whose feeds stay within the margin of the city's. A metro elsewhere
+        shares the name by coincidence (London, UK against London, Ontario),
+        and a containing area with far more service is a place of its own
+        (New York State against New York City); both stay."""
+        exact = [pid for tier, pid in scored if tier == _EXACT]
+        cities = [pid for pid in exact if self._records[pid]["kind"] == "city"]
+        if not cities:
+            return set()
+        countries = {self._records[pid].get("country_code") for pid in cities}
+        countries.discard(None)
+        namesakes = {
+            pid
+            for pid in exact
+            if self._records[pid]["kind"] == "metro"
+            and self._records[pid].get("country_code") in countries
+        }
+        for city in cities:
+            feeds = self._feed_count(city)
+            if not feeds:
+                continue  # without feed counts the service cannot be compared
+            containing = {place.id for place in self.get(city).ancestors}
+            namesakes.update(
+                pid
+                for pid in exact
+                if pid in containing and self._feed_count(pid) <= 2 * feeds
+            )
+        return namesakes

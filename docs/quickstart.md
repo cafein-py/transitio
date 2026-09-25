@@ -63,7 +63,7 @@ transitio.index.refresh()
 the place's boundary:
 
 ```python
-augsburg = transitio.place("Augsburg", kind="city")
+augsburg = transitio.place("Augsburg")
 result = transitio.fetch(
     place=augsburg,
     tiers=["local", "regional"],   # or exclude=["national", "international"]
@@ -174,14 +174,20 @@ snapshot, else the newest installed one.
 ```python
 import transitio
 
-augsburg = transitio.place("Augsburg", kind="city")
+augsburg = transitio.place("Augsburg")
 transitio.places("Augsburg")      # every match, ranked best first
 transitio.suggest("augs")         # type-ahead over names, translations, aliases
 ```
 
-A name can match several places — a city and each metro it belongs to share
-it — and `place` then raises `AmbiguousPlaceError`; `kind` (`"city"`,
-`"metro"`, `"region"`, `"country"`) picks the scope.
+A name can match several places. A city wins over the metros in its country
+that carry its name, and over a same-named area containing it that runs much
+the same service: "Augsburg" is the city, not its three metros, and
+"Helsinki" the city, not the Helsinki sub-region. Other places sharing a name
+are decided as before, by the sole exact match or a clear lead in feeds; where
+neither holds, as for London in the UK and in Canada, or New York City and
+New York State, `place` raises `AmbiguousPlaceError`. `kind` (`"city"`,
+`"metro"`, `"region"`, `"country"`) restricts the scope, and a Wikidata id or
+the index's own id picks one place.
 
 The index keys every place by its own id, a `tp_<n>` that never changes or
 gets reused, and keeps the external ids the place carries beside it:

@@ -335,11 +335,9 @@ def test_requires_refuses_non_string_names(idx):
         metro.feeds(requires=["shapes.txt", 3])
 
 
-def test_a_bare_city_name_promotes_and_finds_the_declared_feed(idx):
-    # The plan's offline guarantee: a city-only declared feed is reachable
-    # through the city's default-metro query.
+def test_a_bare_city_name_finds_the_city_and_its_feed(idx):
     place = transitio.place("Gotham", index=idx)
-    assert place.id == "Q102"
+    assert place.id == "Q101"
     assert "f-city" in [f.feed_id for f in place.feeds()]
 
 

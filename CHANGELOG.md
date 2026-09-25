@@ -9,10 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A bare place name resolves to the city rather than raising
+  `AmbiguousPlaceError` when the other places sharing the name are named
+  after it: the metros in its country (with several metro definitions a
+  city and each of its metros share a name) and a containing area that runs
+  much the same service. "Helsinki", "Berlin" and "Augsburg" now resolve to
+  the city. Other places sharing a name are decided as before, by the sole
+  exact match or a lead of more than twice the runner-up's feeds, so London
+  in the UK and in Canada stays ambiguous in the published index.
+  `DISCOVERY_SEMANTICS_VERSION` is 2.
+- A bare city name is no longer promoted to the city's default metro. The
+  city's metros are listed by `Place.metros` and `Place.delineations()`;
+  `kind="metro"` restricts a name to metros.
+
 - `crop_feed` leaves out an optional table the crop empties (for example
   frequencies.txt or shapes.txt when no retained trip uses them) instead
   of writing it as a header alone, which validators report as an empty
   file. Required files are still written.
+
+### Removed
+
+- `Place.promoted_from`, which only a promoted city carried.
 
 ## 0.13.0 — 2026-09-25
 
