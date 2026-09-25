@@ -3,8 +3,9 @@ Copyright (c) 2026 Henrikki Tenkanen
 
 This software is licensed under the MIT License; see LICENSE for the terms.
 
-The feed index that transitio bundles and downloads is derived data compiled
-from several open sources. Every built index also carries its own NOTICE file,
+The feed index that transitio installs with transitio.index.refresh() is
+derived data compiled from several open sources; release wheels ship without
+an index. Every built index also carries its own NOTICE file,
 generated when it is built, recording the exact versions and licences of the
 sources that index was built from; that per-snapshot NOTICE travels with the
 index and is authoritative for a given snapshot. The upstream sources are:
@@ -14,15 +15,35 @@ index and is authoritative for a given snapshot. The upstream sources are:
     https://github.com/transitland/transitland-atlas
   - Mobility Database catalog (MobilityData) -- feed identities and metadata.
     https://mobilitydatabase.org/
-  - GBFS systems.csv (MobilityData) -- shared-mobility system identities.
-    https://github.com/MobilityData/gbfs
-  - Overture Maps divisions -- administrative boundary geometry. The divisions
-    theme includes content derived from OpenStreetMap (c) OpenStreetMap
-    contributors, available under the Open Database License (ODbL 1.0), whose
-    share-alike and attribution terms apply to the boundary geometry.
+  - GBFS systems.csv (MobilityData) -- shared-mobility system identities,
+    read by the build to keep them apart from the transit feeds; the index
+    does not list them. https://github.com/MobilityData/gbfs
+  - Overture Maps divisions -- administrative boundary geometry, provided
+    under CDLA-Permissive-2.0 (https://cdla.dev/permissive-2-0/), derived
+    from OpenStreetMap (c) OpenStreetMap contributors under the Open Database
+    License (ODbL 1.0), whose share-alike and attribution terms apply to the
+    geometry derived from it; geoBoundaries (CC BY 4.0); and Esri Community
+    Maps and Maps Entity Variant Names (CC0 1.0).
     https://overturemaps.org/  https://www.openstreetmap.org/copyright
   - Wikidata -- place identifiers and names, dedicated to the public domain
     under CC0. https://www.wikidata.org/
+
+Metro memberships were derived at build time from these sources; the index
+ships no boundary data of theirs:
+
+  - GHS Urban Centre Database 2025 (GHS-UCDB R2024A), European Commission,
+    Joint Research Centre, doi:10.2905/1a338be6-7eaf-480c-9664-3a8ade88cbcd
+    -- CC BY 4.0 (Commission Decision 2011/833/EU).
+  - Girgin, Cattaneo, de By, McMenomy, Nelson and Vaz (2024), Worldwide
+    Delineation of Multi-Tier City-Regions (Zenodo) -- the FAO city-regions,
+    CC BY 4.0. https://doi.org/10.5281/zenodo.11187634
+  - Eurostat, Urban Audit functional urban areas (2024) and Eurostat,
+    metropolitan regions (NUTS 2021) -- Eurostat copyright notice
+    (https://ec.europa.eu/eurostat/help/copyright-notice). The administrative
+    boundaries are (c) EuroGeographics, under the Eurostat/GISCO conditions of
+    use, which restrict them to non-commercial use.
+    https://ec.europa.eu/eurostat/web/gisco/geodata/statistical-units
+  - Overture Maps divisions, as above.
 
 A feed's coverage geometry is withheld only where the feed's licence explicitly
 disallows redistribution. A feed whose licence is unknown keeps its coverage
