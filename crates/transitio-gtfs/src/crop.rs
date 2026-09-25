@@ -616,11 +616,16 @@ fn write_cropped(
         (&crop_options.start_date, &crop_options.end_date),
         kept_stops,
     );
+    // An optional table the crop emptied is left out rather than written as
+    // a header alone, which validators report as an empty file.
+    result.tables.retain(|name, table| {
+        !table.rows.is_empty() || schema::spec_for(name).is_none_or(|spec| spec.required)
+    });
     for (name, table) in &result.tables {
         zip.table(name, table)?;
     }
     let kept_shapes = referenced(result, "trips.txt", "shape_id");
-    {
+    if !kept_shapes.is_empty() {
         let mut archive = open_archive(source)?;
         let opened = stream_table(&mut archive, "shapes.txt", options)?;
         if let Some(mut reader) = opened {

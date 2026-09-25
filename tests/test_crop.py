@@ -443,3 +443,38 @@ def test_streamed_tables_are_cropped_without_a_row_cap(tmp_path):
     source = write_zip(tmp_path / "repeated.zip", feed)
     with pytest.raises(OSError, match="repeats trip_id"):
         crop_feed(source, tmp_path / "repeated-out.zip", aoi=CITY_BBOX)
+
+
+def test_optional_tables_the_crop_empties_are_left_out(tmp_path):
+    # frequencies and shapes serve only the outside trip
+    feed = dict(FEED)
+    feed["trips.txt"] = (
+        "route_id,service_id,trip_id,shape_id\n"
+        "r-in,wk,t-in,\nr-out,wk,t-out,s-out\nr-in,old,t-old,\n"
+    )
+    feed["shapes.txt"] = (
+        "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence\n"
+        "s-out,60.205,24.655,1\ns-out,60.206,24.656,2\n"
+    )
+    feed["frequencies.txt"] = (
+        "trip_id,start_time,end_time,headway_secs\nt-out,09:00:00,10:00:00,600\n"
+    )
+    source = write_zip(tmp_path / "feed.zip", feed)
+    output = tmp_path / "cropped.zip"
+    result = crop_feed(source, output, aoi=CITY_BBOX)
+    with zipfile.ZipFile(output) as archive:
+        names = set(archive.namelist())
+    assert "frequencies.txt" not in names and "shapes.txt" not in names
+    assert "frequencies.txt" not in result["row_counts"]
+    assert "shapes.txt" not in result["row_counts"]
+    codes = {n["code"] for n in result["remaining_notices"]}
+    assert "empty_file" not in codes
+    # an area with no stops empties the required files too; they stay, so
+    # the report names them rather than a missing file
+    empty = tmp_path / "nothing.zip"
+    result = crop_feed(source, empty, aoi=(0.0, 0.0, 0.1, 0.1))
+    with zipfile.ZipFile(empty) as archive:
+        names = set(archive.namelist())
+    assert {"stops.txt", "routes.txt", "trips.txt", "stop_times.txt"} <= names
+    assert "frequencies.txt" not in names
+    assert "empty_file" in {n["code"] for n in result["remaining_notices"]}
