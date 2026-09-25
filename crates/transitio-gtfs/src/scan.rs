@@ -390,7 +390,6 @@ fn read_table(
     options: &ScanOptions,
     notices: &mut Vec<Notice>,
 ) -> (Option<Table>, bool) {
-    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
     if bytes.is_empty() {
         notices.push(empty_file(spec.name));
         return (None, false);
@@ -417,158 +416,16 @@ fn read_table(
             return (None, true);
         }
     }
-    let mut reader = csv::ReaderBuilder::new()
-        .has_headers(false)
-        .flexible(true)
-        .from_reader(bytes);
-    let mut records = reader.byte_records();
-
-    // Headers are kept verbatim: normalising them here would be silent
-    // repair, and a feed other readers reject must not validate clean.
-    let headers: Vec<String> = match records.next() {
-        None => {
-            notices.push(empty_file(spec.name));
-            return (None, false);
-        }
-        Some(Err(error)) => {
-            notices.push(csv_parsing_failed(spec.name, 1, &error));
-            return (None, true);
-        }
-        Some(Ok(record)) => record
-            .iter()
-            .map(|field| String::from_utf8_lossy(field).into_owned())
-            .collect(),
+    let mut reader = match TableReader::open(spec, bytes, options, options.max_rows, notices) {
+        Ok(reader) => reader,
+        Err(NoTable::Empty) => return (None, false),
+        Err(NoTable::Unreadable) => return (None, true),
     };
-    if headers.len() > options.max_columns {
-        notices.push(unreadable_file(
-            spec.name,
-            &format!(
-                "{} columns exceed the {}-column limit",
-                headers.len(),
-                options.max_columns
-            ),
-        ));
-        return (None, true);
-    }
-    if headers.iter().any(|h| h.contains('\u{FFFD}')) {
-        notices.push(invalid_character(spec.name, 1));
-    }
-
-    let mut seen_headers = HashSet::new();
-    for header in &headers {
-        if header.is_empty() {
-            notices.push(
-                Notice::new("empty_column_name", Severity::Warning).with("filename", spec.name),
-            );
-            continue;
-        }
-        if header.trim() != header {
-            notices.push(
-                Notice::new("leading_or_trailing_whitespaces", Severity::Warning)
-                    .with("filename", spec.name)
-                    .with("csvRowNumber", 1)
-                    .with("fieldValue", header.as_str()),
-            );
-        }
-        if !seen_headers.insert(header.clone()) {
-            notices.push(
-                Notice::new("duplicated_column", Severity::Error)
-                    .with("filename", spec.name)
-                    .with("fieldName", header.as_str()),
-            );
-        }
-    }
-    for column in spec.required_columns {
-        if !headers.iter().any(|h| h == column) {
-            notices.push(
-                Notice::new("missing_required_column", Severity::Error)
-                    .with("filename", spec.name)
-                    .with("fieldName", *column),
-            );
-        }
-    }
-
     let mut rows = Vec::new();
-    let mut csv_row = 1u64;
-    let mut truncated = false;
-    // Row-level notices are sampled: past the per-file cap they are counted
-    // but not retained, so millions of malformed rows cannot balloon the
-    // notice list. Errors and warnings have separate quotas so a flood of
-    // warnings can never crowd out error notices.
-    let mut error_notices = 0u64;
-    let mut warning_notices = 0u64;
-    let push_sampled = |notices: &mut Vec<Notice>, counter: &mut u64, notice: Notice| {
-        if *counter < options.max_notices_per_file {
-            notices.push(notice);
-        }
-        *counter += 1;
-    };
-    for result in records {
-        csv_row += 1;
-        // The row cap bounds the retained representation and the notice
-        // count, which byte budgets alone cannot (per-field overhead
-        // amplifies delimiter-heavy input).
-        if csv_row - 1 > options.max_rows {
-            notices.push(
-                Notice::new("too_many_rows", Severity::Error)
-                    .with("filename", spec.name)
-                    .with("rowNumber", csv_row),
-            );
-            truncated = true;
-            break;
-        }
-        let record = match result {
-            Err(error) => {
-                // Collector model: notice the malformed record and keep
-                // reading; already-parsed rows stay usable.
-                let notice = csv_parsing_failed(spec.name, csv_row, &error);
-                push_sampled(notices, &mut error_notices, notice);
-                continue;
-            }
-            Ok(record) => record,
-        };
-        if record.len() != headers.len() {
-            let notice = Notice::new("invalid_row_length", Severity::Error)
-                .with("filename", spec.name)
-                .with("csvRowNumber", csv_row)
-                .with("rowLength", record.len())
-                .with("headerCount", headers.len());
-            push_sampled(notices, &mut error_notices, notice);
-            continue;
-        }
-        let fields: Vec<String> = record
-            .iter()
-            .map(|field| String::from_utf8_lossy(field).into_owned())
-            .collect();
-        if fields.iter().all(|field| field.trim().is_empty()) {
-            let notice = Notice::new("empty_row", Severity::Warning)
-                .with("filename", spec.name)
-                .with("csvRowNumber", csv_row);
-            push_sampled(notices, &mut warning_notices, notice);
-            continue;
-        }
-        if fields.iter().any(|field| field.contains('\u{FFFD}')) {
-            let notice = invalid_character(spec.name, csv_row);
-            push_sampled(notices, &mut error_notices, notice);
-            continue;
-        }
-        rows.push(Row { csv_row, fields });
+    while let Some(row) = reader.next_row(notices) {
+        rows.push(row);
     }
-    let suppressed_errors = error_notices.saturating_sub(options.max_notices_per_file);
-    let suppressed_warnings = warning_notices.saturating_sub(options.max_notices_per_file);
-    if suppressed_errors + suppressed_warnings > 0 {
-        // The summary escalates to ERROR when error notices were dropped.
-        let severity = if suppressed_errors > 0 {
-            Severity::Error
-        } else {
-            Severity::Warning
-        };
-        notices.push(
-            Notice::new("notice_limit_reached", severity)
-                .with("filename", spec.name)
-                .with("suppressedCount", suppressed_errors + suppressed_warnings),
-        );
-    }
+    let truncated = reader.truncated();
     if rows.is_empty() {
         // Header-only files (or files whose every row was dropped) carry no
         // entities; a required file passing clean in that state would be a
@@ -576,7 +433,280 @@ fn read_table(
         notices.push(empty_file(spec.name));
         return (None, truncated);
     }
-    (Some(Table { headers, rows }), truncated)
+    (
+        Some(Table {
+            headers: reader.into_headers(),
+            rows,
+        }),
+        truncated,
+    )
+}
+
+/// Why a stream yields no table: nothing to read, or input the caller
+/// marks incomplete. The notices are already recorded either way.
+pub enum NoTable {
+    Empty,
+    Unreadable,
+}
+
+/// One GTFS file's rows streamed from any reader under the structural
+/// checks of the scan, so a pass over a file far larger than memory keeps
+/// only what it takes from each row. `read_table` collects it into a
+/// `Table`; header checks, row checks and the sampled row-level notices
+/// are the same either way.
+pub struct TableReader<R: Read> {
+    spec: &'static schema::FileSpec,
+    records: csv::ByteRecordsIntoIter<std::io::Chain<std::io::Cursor<Vec<u8>>, R>>,
+    headers: Vec<String>,
+    csv_row: u64,
+    max_rows: u64,
+    max_notices: u64,
+    error_notices: u64,
+    warning_notices: u64,
+    truncated: bool,
+    finished: bool,
+}
+
+impl<R: Read> TableReader<R> {
+    /// Read and check the header row. `max_rows` caps the data rows
+    /// (`u64::MAX` for none); a leading UTF-8 byte-order mark is skipped.
+    pub fn open(
+        spec: &'static schema::FileSpec,
+        mut reader: R,
+        options: &ScanOptions,
+        max_rows: u64,
+        notices: &mut Vec<Notice>,
+    ) -> Result<Self, NoTable> {
+        let mut prefix = vec![0u8; 3];
+        let mut filled = 0;
+        while filled < prefix.len() {
+            match reader.read(&mut prefix[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(error) => {
+                    notices.push(unreadable_file(spec.name, &error.to_string()));
+                    return Err(NoTable::Unreadable);
+                }
+            }
+        }
+        prefix.truncate(filled);
+        if prefix.is_empty() {
+            notices.push(empty_file(spec.name));
+            return Err(NoTable::Empty);
+        }
+        if prefix == b"\xef\xbb\xbf" {
+            prefix.clear();
+        }
+        let mut records = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true)
+            .from_reader(std::io::Cursor::new(prefix).chain(reader))
+            .into_byte_records();
+
+        // Headers are kept verbatim: normalising them here would be silent
+        // repair, and a feed other readers reject must not validate clean.
+        let headers: Vec<String> = match records.next() {
+            None => {
+                notices.push(empty_file(spec.name));
+                return Err(NoTable::Empty);
+            }
+            Some(Err(error)) if error.is_io_error() => {
+                notices.push(unreadable_file(spec.name, &error.to_string()));
+                return Err(NoTable::Unreadable);
+            }
+            Some(Err(error)) => {
+                notices.push(csv_parsing_failed(spec.name, 1, &error));
+                return Err(NoTable::Unreadable);
+            }
+            Some(Ok(record)) => record
+                .iter()
+                .map(|field| String::from_utf8_lossy(field).into_owned())
+                .collect(),
+        };
+        if headers.len() > options.max_columns {
+            notices.push(unreadable_file(
+                spec.name,
+                &format!(
+                    "{} columns exceed the {}-column limit",
+                    headers.len(),
+                    options.max_columns
+                ),
+            ));
+            return Err(NoTable::Unreadable);
+        }
+        if headers.iter().any(|h| h.contains('\u{FFFD}')) {
+            notices.push(invalid_character(spec.name, 1));
+        }
+
+        let mut seen_headers = HashSet::new();
+        for header in &headers {
+            if header.is_empty() {
+                notices.push(
+                    Notice::new("empty_column_name", Severity::Warning).with("filename", spec.name),
+                );
+                continue;
+            }
+            if header.trim() != header {
+                notices.push(
+                    Notice::new("leading_or_trailing_whitespaces", Severity::Warning)
+                        .with("filename", spec.name)
+                        .with("csvRowNumber", 1)
+                        .with("fieldValue", header.as_str()),
+                );
+            }
+            if !seen_headers.insert(header.clone()) {
+                notices.push(
+                    Notice::new("duplicated_column", Severity::Error)
+                        .with("filename", spec.name)
+                        .with("fieldName", header.as_str()),
+                );
+            }
+        }
+        for column in spec.required_columns {
+            if !headers.iter().any(|h| h == column) {
+                notices.push(
+                    Notice::new("missing_required_column", Severity::Error)
+                        .with("filename", spec.name)
+                        .with("fieldName", *column),
+                );
+            }
+        }
+        Ok(TableReader {
+            spec,
+            records,
+            headers,
+            csv_row: 1,
+            max_rows,
+            max_notices: options.max_notices_per_file,
+            error_notices: 0,
+            warning_notices: 0,
+            truncated: false,
+            finished: false,
+        })
+    }
+
+    pub fn headers(&self) -> &[String] {
+        &self.headers
+    }
+
+    pub fn into_headers(self) -> Vec<String> {
+        self.headers
+    }
+
+    /// Whether the rows stopped short of the file: the row cap, or a read
+    /// failure part-way through.
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// The next row that passes the structural checks; malformed rows are
+    /// noticed and skipped. Ends at the row cap with `too_many_rows`, and
+    /// at a read failure with `unreadable_file`; the suppressed-notice
+    /// summary is recorded once when the rows end.
+    pub fn next_row(&mut self, notices: &mut Vec<Notice>) -> Option<Row> {
+        if self.finished {
+            return None;
+        }
+        // Row-level notices are sampled: past the per-file cap they are
+        // counted but not retained, so millions of malformed rows cannot
+        // balloon the notice list. Errors and warnings have separate quotas
+        // so a flood of warnings can never crowd out error notices.
+        let max_notices = self.max_notices;
+        let push_sampled = |notices: &mut Vec<Notice>, counter: &mut u64, notice: Notice| {
+            if *counter < max_notices {
+                notices.push(notice);
+            }
+            *counter += 1;
+        };
+        loop {
+            let Some(result) = self.records.next() else {
+                self.finish(notices);
+                return None;
+            };
+            if let Err(error) = &result {
+                if error.is_io_error() {
+                    // The source itself failed; retrying would fail again,
+                    // and the failure is not a row.
+                    notices.push(unreadable_file(self.spec.name, &error.to_string()));
+                    self.truncated = true;
+                    self.finish(notices);
+                    return None;
+                }
+            }
+            self.csv_row += 1;
+            // The row cap bounds the retained representation and the notice
+            // count, which byte budgets alone cannot (per-field overhead
+            // amplifies delimiter-heavy input).
+            if self.csv_row - 1 > self.max_rows {
+                notices.push(
+                    Notice::new("too_many_rows", Severity::Error)
+                        .with("filename", self.spec.name)
+                        .with("rowNumber", self.csv_row),
+                );
+                self.truncated = true;
+                self.finish(notices);
+                return None;
+            }
+            let record = match result {
+                Err(error) => {
+                    // Collector model: notice the malformed record and keep
+                    // reading; already-parsed rows stay usable.
+                    let notice = csv_parsing_failed(self.spec.name, self.csv_row, &error);
+                    push_sampled(notices, &mut self.error_notices, notice);
+                    continue;
+                }
+                Ok(record) => record,
+            };
+            if record.len() != self.headers.len() {
+                let notice = Notice::new("invalid_row_length", Severity::Error)
+                    .with("filename", self.spec.name)
+                    .with("csvRowNumber", self.csv_row)
+                    .with("rowLength", record.len())
+                    .with("headerCount", self.headers.len());
+                push_sampled(notices, &mut self.error_notices, notice);
+                continue;
+            }
+            let fields: Vec<String> = record
+                .iter()
+                .map(|field| String::from_utf8_lossy(field).into_owned())
+                .collect();
+            if fields.iter().all(|field| field.trim().is_empty()) {
+                let notice = Notice::new("empty_row", Severity::Warning)
+                    .with("filename", self.spec.name)
+                    .with("csvRowNumber", self.csv_row);
+                push_sampled(notices, &mut self.warning_notices, notice);
+                continue;
+            }
+            if fields.iter().any(|field| field.contains('\u{FFFD}')) {
+                let notice = invalid_character(self.spec.name, self.csv_row);
+                push_sampled(notices, &mut self.error_notices, notice);
+                continue;
+            }
+            return Some(Row {
+                csv_row: self.csv_row,
+                fields,
+            });
+        }
+    }
+
+    fn finish(&mut self, notices: &mut Vec<Notice>) {
+        self.finished = true;
+        let suppressed_errors = self.error_notices.saturating_sub(self.max_notices);
+        let suppressed_warnings = self.warning_notices.saturating_sub(self.max_notices);
+        if suppressed_errors + suppressed_warnings > 0 {
+            // The summary escalates to ERROR when error notices were dropped.
+            let severity = if suppressed_errors > 0 {
+                Severity::Error
+            } else {
+                Severity::Warning
+            };
+            notices.push(
+                Notice::new("notice_limit_reached", severity)
+                    .with("filename", self.spec.name)
+                    .with("suppressedCount", suppressed_errors + suppressed_warnings),
+            );
+        }
+    }
 }
 
 fn empty_file(filename: &'static str) -> Notice {
@@ -1082,5 +1212,162 @@ mod tests {
     #[test]
     fn not_a_zip_is_an_error() {
         assert!(scan_reader(Cursor::new(b"plain text".to_vec())).is_err());
+    }
+
+    struct Streamed {
+        headers: Vec<String>,
+        rows: Vec<Row>,
+        notices: Vec<Notice>,
+        truncated: bool,
+    }
+
+    fn stream(bytes: &[u8], options: &ScanOptions, max_rows: u64) -> Streamed {
+        let spec = schema::spec_for("stops.txt").unwrap();
+        let mut notices = Vec::new();
+        let mut reader = match TableReader::open(spec, bytes, options, max_rows, &mut notices) {
+            Ok(reader) => reader,
+            Err(outcome) => {
+                return Streamed {
+                    headers: Vec::new(),
+                    rows: Vec::new(),
+                    notices,
+                    truncated: matches!(outcome, NoTable::Unreadable),
+                }
+            }
+        };
+        let mut rows = Vec::new();
+        while let Some(row) = reader.next_row(&mut notices) {
+            rows.push(row);
+        }
+        Streamed {
+            truncated: reader.truncated(),
+            headers: reader.into_headers(),
+            rows,
+            notices,
+        }
+    }
+
+    fn notice_codes(notices: &[Notice]) -> Vec<&'static str> {
+        notices.iter().map(|n| n.code).collect()
+    }
+
+    #[test]
+    fn streamed_rows_and_notices_match_the_collected_parse() {
+        // a byte-order mark, a short row, an empty row and an undecodable
+        // byte between two good rows; a doubled byte-order mark, which the
+        // csv reader removes after the first one is skipped, as before
+        for (bytes, expected_codes) in [
+            (
+                &b"\xef\xbb\xbfstop_id,stop_name,stop_lat,stop_lon\n\
+                a,Alpha,60.1,24.9\n\
+                short,row\n\
+                ,,,\n\
+                b,Br\xffavo,60.2,24.8\n\
+                c,Charlie,60.3,24.7\n"[..],
+                vec!["invalid_row_length", "empty_row", "invalid_character"],
+            ),
+            (
+                &b"\xef\xbb\xbf\xef\xbb\xbfstop_id,stop_name,stop_lat,stop_lon\na,Alpha,60.1,24.9\n"[..],
+                vec![],
+            ),
+        ] {
+            let options = ScanOptions::default();
+            let spec = schema::spec_for("stops.txt").unwrap();
+            let mut collected_notices = Vec::new();
+            let (table, truncated) = read_table(spec, bytes, &options, &mut collected_notices);
+            let table = table.unwrap();
+            assert!(!truncated);
+
+            let streamed = stream(bytes, &options, options.max_rows);
+            assert!(!streamed.truncated);
+            assert_eq!(streamed.headers, table.headers);
+            assert_eq!(streamed.rows.len(), table.rows.len());
+            for (streamed, collected) in streamed.rows.iter().zip(&table.rows) {
+                assert_eq!(streamed.csv_row, collected.csv_row);
+                assert_eq!(streamed.fields, collected.fields);
+            }
+            // code, severity and context alike
+            assert_eq!(
+                format!("{:?}", streamed.notices),
+                format!("{collected_notices:?}")
+            );
+            assert_eq!(notice_codes(&streamed.notices), expected_codes);
+        }
+    }
+
+    #[test]
+    fn streamed_rows_stop_at_the_cap_with_the_notice_summary() {
+        // the cap counts every data row, malformed ones included
+        let bytes = b"stop_id,stop_name,stop_lat,stop_lon\n\
+            a,Alpha,60.1,24.9\n\
+            short\n\
+            shorter\n\
+            b,Bravo,60.2,24.8\n";
+        let options = ScanOptions {
+            max_notices_per_file: 1,
+            ..ScanOptions::default()
+        };
+        let streamed = stream(bytes, &options, 3);
+        assert_eq!(streamed.rows.len(), 1);
+        assert!(streamed.truncated);
+        assert_eq!(
+            notice_codes(&streamed.notices),
+            [
+                "invalid_row_length",
+                "too_many_rows",
+                "notice_limit_reached"
+            ]
+        );
+    }
+
+    /// A source that fails after delivering its first `good` bytes.
+    struct FailAfter {
+        bytes: Vec<u8>,
+        good: usize,
+        delivered: usize,
+    }
+
+    impl std::io::Read for FailAfter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.delivered >= self.good {
+                return Err(std::io::Error::other("source failed"));
+            }
+            let end = self.good.min(self.delivered + buf.len());
+            let read = end - self.delivered;
+            buf[..read].copy_from_slice(&self.bytes[self.delivered..end]);
+            self.delivered = end;
+            Ok(read)
+        }
+    }
+
+    #[test]
+    fn a_read_failure_ends_a_stream_as_unreadable() {
+        let bytes = b"stop_id,stop_name,stop_lat,stop_lon\na,Alpha,60.1,24.9\nb,Bravo,60.2,24.8\n";
+        let spec = schema::spec_for("stops.txt").unwrap();
+        // failing inside the header, and right after the one allowed row,
+        // which must not read as the row cap
+        for (good, max_rows, rows_before) in [(10, u64::MAX, 0), (54, 1, 1)] {
+            let mut notices = Vec::new();
+            let source = FailAfter {
+                bytes: bytes.to_vec(),
+                good,
+                delivered: 0,
+            };
+            let options = ScanOptions::default();
+            let mut rows = 0;
+            let truncated = match TableReader::open(spec, source, &options, max_rows, &mut notices)
+            {
+                Ok(mut reader) => {
+                    while reader.next_row(&mut notices).is_some() {
+                        rows += 1;
+                    }
+                    reader.truncated()
+                }
+                Err(outcome) => matches!(outcome, NoTable::Unreadable),
+            };
+            assert_eq!(rows, rows_before);
+            assert!(truncated);
+            assert_eq!(notice_codes(&notices), ["unreadable_file"]);
+        }
     }
 }
