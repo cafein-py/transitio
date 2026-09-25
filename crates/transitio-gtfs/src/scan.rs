@@ -709,6 +709,126 @@ impl<R: Read> TableReader<R> {
     }
 }
 
+/// The longest logical CSV record a stream may carry; anything beyond it
+/// is a flood, not a GTFS row.
+pub const MAX_RECORD_BYTES: u64 = 16 * 1024 * 1024;
+
+/// A reader that fails once a logical CSV record carries more delimiters
+/// than the guard allows, or more bytes than `MAX_RECORD_BYTES`: the
+/// defence `read_table` applies before parsing, for input that is streamed
+/// rather than held in memory and so has no entry budget bounding it.
+/// Quoting is tracked the way the csv reader reads it, so a record that
+/// spans quoted newlines counts as one record. The bytes before the flood
+/// are still delivered, so the rows read so far stay usable.
+pub struct DelimiterGuard<R: Read> {
+    inner: R,
+    guard: usize,
+    delimiters: usize,
+    record_bytes: u64,
+    field: FieldState,
+    /// Leading bytes matched against the byte-order marks the parser
+    /// removes (`TableReader::open` skips one, the csv reader a second);
+    /// `LEADING_MARK_BYTES` once they are complete or ruled out.
+    leading: usize,
+    tripped: Option<String>,
+}
+
+const BYTE_ORDER_MARK: [u8; 3] = [0xef, 0xbb, 0xbf];
+const LEADING_MARK_BYTES: usize = 2 * BYTE_ORDER_MARK.len();
+
+/// Where the guard is inside the CSV grammar: at the start of a field, in
+/// an unquoted field, inside quotes, or just after a quote inside quotes
+/// (the next byte tells an escaped quote from the closing one).
+#[derive(Clone, Copy)]
+enum FieldState {
+    Start,
+    Unquoted,
+    Quoted,
+    QuoteInQuoted,
+}
+
+impl<R: Read> DelimiterGuard<R> {
+    pub fn new(inner: R, options: &ScanOptions) -> Self {
+        DelimiterGuard {
+            inner,
+            guard: options.max_columns.saturating_mul(4).max(4096),
+            delimiters: 0,
+            record_bytes: 0,
+            field: FieldState::Start,
+            leading: 0,
+            tripped: None,
+        }
+    }
+}
+
+impl<R: Read> Read for DelimiterGuard<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(reason) = &self.tripped {
+            return Err(std::io::Error::other(reason.clone()));
+        }
+        let read = self.inner.read(buf)?;
+        for (offset, &byte) in buf[..read].iter().enumerate() {
+            if self.leading < LEADING_MARK_BYTES {
+                if byte == BYTE_ORDER_MARK[self.leading % BYTE_ORDER_MARK.len()] {
+                    self.leading += 1;
+                    continue; // a byte-order mark is not record content
+                }
+                // Not a mark after all: the bytes taken for a partial one
+                // were ordinary field bytes.
+                let partial = self.leading % BYTE_ORDER_MARK.len();
+                if partial > 0 {
+                    self.record_bytes += partial as u64;
+                    self.field = FieldState::Unquoted;
+                }
+                self.leading = LEADING_MARK_BYTES;
+            }
+            self.record_bytes += 1;
+            let mut delimiter = false;
+            let mut record_end = false;
+            self.field = match (self.field, byte) {
+                (FieldState::Start, b'"') => FieldState::Quoted,
+                (FieldState::Quoted, b'"') => FieldState::QuoteInQuoted,
+                (FieldState::Quoted, _) => FieldState::Quoted,
+                (FieldState::QuoteInQuoted, b'"') => FieldState::Quoted,
+                (_, b',') => {
+                    delimiter = true;
+                    FieldState::Start
+                }
+                // the csv reader ends a record at \n, \r or \r\n alike
+                (_, b'\n' | b'\r') => {
+                    record_end = true;
+                    FieldState::Start
+                }
+                _ => FieldState::Unquoted,
+            };
+            if record_end {
+                self.delimiters = 0;
+                self.record_bytes = 0;
+                continue;
+            }
+            if delimiter {
+                self.delimiters += 1;
+            }
+            let reason = if self.delimiters > self.guard {
+                format!("a record has more than {} delimiters", self.guard)
+            } else if self.record_bytes > MAX_RECORD_BYTES {
+                format!("a record is longer than {MAX_RECORD_BYTES} bytes")
+            } else {
+                continue;
+            };
+            self.tripped = Some(reason.clone());
+            // Hand back what precedes the flood; the next read fails. An
+            // empty read would pass for a clean end.
+            return if offset == 0 {
+                Err(std::io::Error::other(reason))
+            } else {
+                Ok(offset)
+            };
+        }
+        Ok(read)
+    }
+}
+
 fn empty_file(filename: &'static str) -> Notice {
     Notice::new("empty_file", Severity::Error).with("filename", filename)
 }
@@ -1224,7 +1344,8 @@ mod tests {
     fn stream(bytes: &[u8], options: &ScanOptions, max_rows: u64) -> Streamed {
         let spec = schema::spec_for("stops.txt").unwrap();
         let mut notices = Vec::new();
-        let mut reader = match TableReader::open(spec, bytes, options, max_rows, &mut notices) {
+        let reader = DelimiterGuard::new(bytes, options);
+        let mut reader = match TableReader::open(spec, reader, options, max_rows, &mut notices) {
             Ok(reader) => reader,
             Err(outcome) => {
                 return Streamed {
@@ -1369,5 +1490,74 @@ mod tests {
             assert!(truncated);
             assert_eq!(notice_codes(&notices), ["unreadable_file"]);
         }
+    }
+
+    #[test]
+    fn a_flooded_record_ends_a_stream_as_unreadable() {
+        let header = b"stop_id,stop_name,stop_lat,stop_lon\n";
+        let row = b"a,Alpha,60.1,24.9\n";
+        let commas: Vec<u8> = std::iter::repeat_n(b',', 5000).collect();
+        // 5000 delimiters in a data row and in the header; one record over
+        // the byte limit through quoted newlines, and one through a field
+        let flooded_row: Vec<u8> = [&header[..], &row[..], &commas[..], &b"\n"[..]].concat();
+        let flooded_header: Vec<u8> = [&commas[..], &b"\n"[..], &row[..]].concat();
+        let mut quoted = [&header[..], &row[..], &b"q,\""[..]].concat();
+        quoted.extend(std::iter::repeat_n(b'\n', MAX_RECORD_BYTES as usize + 1));
+        quoted.extend(b"\",1,2\n");
+        let mut oversized = [&header[..], &row[..], &b"o,"[..]].concat();
+        oversized.extend(std::iter::repeat_n(b'x', MAX_RECORD_BYTES as usize + 1));
+        oversized.extend(b",1,2\n");
+        // a quoted first header field right after one byte-order mark, and
+        // after the two the parser removes
+        let mut marked_header = b"\xef\xbb\xbf\"stop".to_vec();
+        marked_header.extend(std::iter::repeat_n(b'\n', MAX_RECORD_BYTES as usize + 1));
+        marked_header.extend(b"_id\",stop_name,stop_lat,stop_lon\n");
+        marked_header.extend(row);
+        let twice_marked_header: Vec<u8> = [&BYTE_ORDER_MARK[..], &marked_header[..]].concat();
+        // the flooded row arriving right after the last allowed row is a
+        // read failure, not the row cap
+        for (bytes, max_rows, rows_before) in [
+            (flooded_row, 1, 1),
+            (flooded_header, u64::MAX, 0),
+            (quoted, u64::MAX, 1),
+            (oversized, u64::MAX, 1),
+            (marked_header, u64::MAX, 0),
+            (twice_marked_header, u64::MAX, 0),
+        ] {
+            let streamed = stream(&bytes, &ScanOptions::default(), max_rows);
+            // the rows before the flood are usable; nothing after it is read
+            assert_eq!(streamed.rows.len(), rows_before);
+            assert!(streamed.truncated);
+            assert_eq!(notice_codes(&streamed.notices), ["unreadable_file"]);
+        }
+    }
+
+    #[test]
+    fn quoted_delimiters_and_newlines_do_not_trip_the_guard() {
+        // quoting starts right after the byte-order mark, in the header
+        // as in the rows
+        let bytes = b"\xef\xbb\xbf\"x,\ny\",stop_id,stop_name,stop_lat,stop_lon\n\
+            1,a,\"Alpha, the \"\"first\"\"\nstop\",60.1,24.9\n\
+            2,b,Bravo,60.2,24.8\n";
+        let streamed = stream(bytes, &ScanOptions::default(), u64::MAX);
+        assert!(!streamed.truncated);
+        assert_eq!(streamed.headers[0], "x,\ny");
+        assert_eq!(streamed.rows.len(), 2);
+        assert_eq!(streamed.rows[0].fields[2], "Alpha, the \"first\"\nstop");
+        assert!(streamed.notices.is_empty());
+    }
+
+    #[test]
+    fn carriage_returns_end_records_for_the_guard() {
+        // 2000 rows of three delimiters each, separated by lone carriage
+        // returns: far over the guard unless every row resets it
+        let mut bytes = b"stop_id,stop_name,stop_lat,stop_lon\r".to_vec();
+        for i in 0..2000 {
+            bytes.extend(format!("s{i},Stop {i},60.1,24.9\r").as_bytes());
+        }
+        let streamed = stream(&bytes, &ScanOptions::default(), u64::MAX);
+        assert!(!streamed.truncated);
+        assert_eq!(streamed.rows.len(), 2000);
+        assert!(streamed.notices.is_empty());
     }
 }
