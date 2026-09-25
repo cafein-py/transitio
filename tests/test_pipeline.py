@@ -560,7 +560,10 @@ def test_fetch_place_records_index_provenance(tmp_path, monkeypatch):
     _stub_pbf_and_atlas(monkeypatch, tmp_path, _gtfs_payload())
     result = fetch(place="Q1757", index=index, directory=tmp_path / "out", crop=False)
     assert result.provenance["snapshot"] == index.snapshot_id
-    assert result.provenance["discovery_semantics_version"] == 1
+    assert (
+        result.provenance["discovery_semantics_version"]
+        == transitio.index.DISCOVERY_SEMANTICS_VERSION
+    )
     assert result.provenance["transitio_version"]
 
 
