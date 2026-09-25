@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `fetch` crops each feed before repairing it, so with the default crop
   `repair=True` works on the area's feed rather than on the whole source.
+- `crop_feed` streams stop_times.txt, trips.txt and shapes.txt from the
+  archive instead of parsing them whole, so a national feed crops to a
+  city within the default budgets and in memory bounded by the area. The
+  row and byte budgets keep applying to the other tables and to the
+  cropped feed, whose validation the report describes; the source feed is
+  no longer validated before the crop. A cropped feed the budgets cannot
+  validate whole, and a feed repeating a `trip_id` in trips.txt, are
+  refused.
 
 ## 0.12.0 — 2026-09-23
 

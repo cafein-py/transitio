@@ -100,7 +100,10 @@ def crop_feed(
         Keep only trips whose every stop lies inside the AOI.
     **options
         The ``validate_feed`` keyword arguments (budgets,
-        ``reference_date``, ``reference_time``).
+        ``reference_date``, ``reference_time``). The budgets bound the
+        tables parsed whole and the cropped feed; stop_times.txt, trips.txt
+        and shapes.txt are streamed from the archive, so a national feed
+        crops to a city within the defaults.
 
     Returns
     -------
