@@ -6,9 +6,9 @@ raw ingredients of routing — OSM extracts and GTFS timetables — from the ope
 data ecosystem to your area of interest, validated and repaired, ready for
 cafein to brew into routing results.
 
-**Status: early development.** Acquisition (Mobility Database catalog + OSM
-extracts), GTFS validation, repair and cropping are in place, tied together by
-the one-call `transitio.fetch` pipeline.
+**Status: early development.** Acquisition (Mobility Database catalog, the
+feed index + OSM extracts), GTFS validation, repair and cropping are in place,
+tied together by the one-call `transitio.fetch` pipeline.
 
 The feed index that `transitio.index` reads is built in a separate repository,
 [transitio-dev/transitio-index](https://github.com/transitio-dev/transitio-index).
@@ -34,9 +34,39 @@ osm = result.to_pyrosm()   # pyrosm.OSM reader over the extract
 service day (needs a free Mobility Database API token, passed as
 `refresh_token=` or via the `MOBILITY_API_REFRESH_TOKEN` environment
 variable), `modes=["rail", "tram"]` to keep only feeds serving given modes,
-and `repair=True` to repair feeds before use. With a token, GTFS downloads
-are catalogued dataset versions verified against catalog checksums; without
-one, the latest hosted zips are fetched as-is — unverified moving targets.
+`repair=True` to repair feeds after the crop, `osm=False` to skip the OSM
+extract when only the timetables are needed, and `crop=False` to keep feeds
+whole. With a token, GTFS downloads are catalogued dataset versions verified
+against catalog checksums; without one, the latest hosted zips are fetched
+as-is — unverified moving targets.
+
+### Feeds for a place
+
+The feed index lists the feeds serving each place, by the tier of service
+they run there: `local`, `regional`, `national` or `international`. Install
+it once, then fetch a place's feeds by tier:
+
+```python
+import transitio
+
+transitio.index.refresh()            # once: install the newest feed index
+
+augsburg = transitio.place("Augsburg", kind="city")
+result = transitio.fetch(
+    place=augsburg,
+    tiers=["local", "regional"],     # leave out long-distance services
+    osm=False,                       # timetables only
+)
+transitio.merge_feeds(result.feeds, "augsburg.gtfs.zip", check=False)
+```
+
+Each feed is cropped to the place's boundary; a national feed such as
+Germany's is streamed through the crop, so it fits in memory bounded by the
+area. `merge_feeds` writes one feed from the cropped ones; with
+`check=False` it keeps the file when the validator reports errors, which
+the returned report lists. A name shared by a city and its metros raises
+`AmbiguousPlaceError`; `kind="city"` (or `"metro"`, `"region"`,
+`"country"`) or a Wikidata id picks one.
 
 ### Inferring missing route shapes
 

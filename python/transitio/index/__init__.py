@@ -802,7 +802,7 @@ def _read_partitioned(path, snapshot, version, country):
 
 
 def load(path, *, country=None):
-    """:func:`read_index` under the plan's name: the whole index, or one
+    """:func:`read_index` under a shorter name: the whole index, or one
     country partition of a schema-7 index."""
     return read_index(path, country=country)
 
