@@ -34,7 +34,7 @@ _MODES_BYTE_CAP = 64 * 1024 * 1024
 class FetchResult:
     """What the pipeline produced for one AOI."""
 
-    osm_pbf: pathlib.Path
+    osm_pbf: pathlib.Path | None
     feeds: list
     reports: list
     repairs: list
@@ -66,7 +66,8 @@ class FetchResult:
             raise ImportError(
                 "the cafein package is required for to_cafein()"
             ) from error
-        options.setdefault("osm_pbf", os.fspath(self.osm_pbf))
+        if self.osm_pbf is not None:
+            options.setdefault("osm_pbf", os.fspath(self.osm_pbf))
         paths = [os.fspath(path) for path in self.feeds]
         return cafein.TransportNetwork.from_gtfs(paths, **options)
 
@@ -76,6 +77,10 @@ class FetchResult:
         Keyword arguments pass through to ``pyrosm.OSM`` (for example
         ``bounding_box`` to read a sub-area of the cropped extract).
         """
+        if self.osm_pbf is None:
+            raise ValueError(
+                "this result has no OSM extract; it was fetched with osm=False"
+            )
         from pyrosm import OSM
 
         return OSM(os.fspath(self.osm_pbf), **options)
@@ -268,6 +273,7 @@ def fetch(
     modes=None,
     repair=False,
     crop=True,
+    osm=True,
     refresh_token=None,
     cache_dir=None,
     directory=None,
@@ -323,6 +329,11 @@ def fetch(
         default leaves feeds untouched.
     crop : bool, default True
         Spatially crop each feed to the AOI's bounding box.
+    osm : bool, default True
+        Fetch the OSM extract for the AOI. With ``osm=False`` the OSM stage
+        is skipped and the result's ``osm_pbf`` is None, for callers who
+        want only the GTFS feeds; ``to_pyrosm`` then raises and
+        ``to_cafein`` builds without a walking network.
     refresh_token, cache_dir, directory, country_code
         Passed to the catalog and OSM layers.
     **budgets
@@ -385,6 +396,7 @@ def fetch(
             modes=modes,
             repair=repair,
             crop=crop,
+            osm=osm,
             refresh_token=refresh_token,
             cache_dir=cache_dir,
             directory=directory,
@@ -413,7 +425,9 @@ def fetch(
         ).encode()
     ).hexdigest()[:16]
 
-    osm_pbf = fetch_pbf(geometry, cache_dir=cache_dir, directory=directory)
+    osm_pbf = (
+        fetch_pbf(geometry, cache_dir=cache_dir, directory=directory) if osm else None
+    )
 
     feeds, reports, repairs, skipped = [], [], [], []
     with MobilityDatabase(refresh_token, cache_dir=cache_dir) as db:
@@ -559,6 +573,7 @@ def _fetch_place(
     modes,
     repair,
     crop,
+    osm,
     refresh_token,
     cache_dir,
     directory,
@@ -620,7 +635,9 @@ def _fetch_place(
         ).encode()
     ).hexdigest()[:16]
 
-    osm_pbf = fetch_pbf(geometry, cache_dir=cache_dir, directory=directory)
+    osm_pbf = (
+        fetch_pbf(geometry, cache_dir=cache_dir, directory=directory) if osm else None
+    )
 
     kept = place_obj.feeds(tiers=tiers, exclude=exclude, on_unknown=on_unknown)
     feeds, reports, repairs, skipped, selections = [], [], [], [], []

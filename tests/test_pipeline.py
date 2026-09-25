@@ -1059,3 +1059,104 @@ def test_fetch_place_excludes_an_unknown_only_feed(tmp_path, monkeypatch):
     )
     assert result.feeds == []
     assert result.skipped == [("f-a", "only unknown-tier edges")]
+
+
+def test_fetch_aoi_without_osm_skips_the_extract(pipeline_env, monkeypatch):
+    tmp_path, _ = pipeline_env
+
+    def forbidden(*a, **k):  # osm=False must not reach the OSM stage
+        raise AssertionError("fetch_pbf called despite osm=False")
+
+    monkeypatch.setattr("transitio.osm._fetch.fetch_pbf", forbidden)
+    monkeypatch.setattr("transitio.osm.fetch_pbf", forbidden)
+    with pytest.warns(UserWarning):
+        result = fetch(
+            (24.6, 60.1, 25.2, 60.4),
+            directory=tmp_path,
+            osm=False,
+            reference_date="20260601",
+        )
+    assert result.osm_pbf is None
+    assert len(result.feeds) == 1  # the GTFS side is unaffected
+
+
+def test_fetch_place_without_osm_skips_the_extract(tmp_path, monkeypatch):
+    import io as _io
+
+    import transitio.index as transitio_index
+    from index_fixture import HULL, covered_feed, edge, write_index
+
+    feeds = [
+        {
+            **covered_feed("f-a", coverage_source="crawl"),
+            "coverage": HULL,
+            "atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}},
+        }
+    ]
+    edges = [edge("Q1757", "f-a", tier="local")]
+    index = transitio_index.read_index(
+        write_index(tmp_path / "index", feeds=feeds, edges=edges)
+    )
+    buffer = _io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, content in GTFS.items():
+            archive.writestr(name, content)
+    payload = buffer.getvalue()
+
+    def fake_download(self, feed, directory=None):
+        base = __import__("pathlib").Path(directory) if directory else tmp_path
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / "latest.zip"
+        path.write_bytes(payload)
+        return path
+
+    def forbidden(*a, **k):
+        raise AssertionError("fetch_pbf called despite osm=False")
+
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas.download", fake_download)
+    monkeypatch.setattr("transitio.osm.fetch_pbf", forbidden)
+    monkeypatch.setattr("transitio.osm._fetch.fetch_pbf", forbidden)
+
+    result = fetch(
+        place="Q1757",
+        index=index,
+        directory=tmp_path / "out",
+        crop=False,
+        osm=False,
+        reference_date="20260601",
+    )
+    assert result.osm_pbf is None
+    assert [p.name for p in result.feeds] == ["latest.zip"]
+
+
+def test_to_pyrosm_without_an_extract_is_refused(tmp_path):
+    from transitio.pipeline import FetchResult
+
+    result = FetchResult(osm_pbf=None, feeds=[], reports=[], repairs=[], skipped=[])
+    with pytest.raises(ValueError, match="no OSM extract"):
+        result.to_pyrosm()
+
+
+def test_to_cafein_without_an_extract_builds_without_a_network(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    from transitio.pipeline import FetchResult
+
+    calls = {}
+
+    class FakeNetwork:
+        @staticmethod
+        def from_gtfs(paths, **options):
+            calls["options"] = options
+            return "network"
+
+    fake = types.SimpleNamespace(TransportNetwork=FakeNetwork)
+    monkeypatch.setitem(sys.modules, "cafein", fake)
+    feed = tmp_path / "feed.zip"
+    feed.write_bytes(b"PK")
+    result = FetchResult(
+        osm_pbf=None, feeds=[feed], reports=[{}], repairs=[[]], skipped=[]
+    )
+    assert result.to_cafein() == "network"
+    assert "osm_pbf" not in calls["options"]  # no extract, no walking network
