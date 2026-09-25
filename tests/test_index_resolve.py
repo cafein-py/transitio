@@ -393,3 +393,68 @@ def test_schema_6_places_resolve_by_own_id_and_every_alias():
     old = transitio.place("Q1757", index=_index(RECORDS))
     assert old.wikidata_id == "Q1757" and old.former_ids == []
     assert old.concordances == {"wikidata": ["Q1757"]}
+
+
+QUALIFIED = [
+    _p("c-gb", "country", "United Kingdom", aliases=["UK", "GB"], country_code="GB"),
+    _p("c-ca", "country", "Canada", aliases=["CA"], country_code="CA"),
+    _p("r-eng", "region", "England", parent_id="c-gb", country_code="GB"),
+    _p("r-ont", "region", "Ontario", parent_id="c-ca", country_code="CA"),
+    _p(
+        "p-lon",
+        "city",
+        "London",
+        aliases=["Greater London"],
+        parent_id="r-eng",
+        country_code="GB",
+    ),
+    _p("p-col", "region", "City of London", parent_id="r-eng", country_code="GB"),
+    _p(
+        "p-lon-on",
+        "city",
+        "London",
+        aliases=["City of London"],
+        parent_id="r-ont",
+        country_code="CA",
+    ),
+    _p("m-lon-gb", "metro", "London", country_code="GB"),
+    _p("m-lon-ca", "metro", "London", country_code="CA"),
+    _p(
+        "p-qp",
+        "city",
+        "Queen's Park",
+        aliases=["Queen's Park, Greater London"],
+        parent_id="r-eng",
+        country_code="GB",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "query, expected",
+    [
+        ("London, UK", "p-lon"),
+        ("London, United Kingdom", "p-lon"),
+        ("London, England", "p-lon"),
+        ("City of London, UK", "p-col"),
+        ("London, Ontario", "p-lon-on"),
+        ("London, Canada", "p-lon-on"),
+        ("London, Ontario, Canada", "p-lon-on"),
+        # a label that itself holds a comma matches as written
+        ("Queen's Park, Greater London", "p-qp"),
+        ("London, Mars", None),
+        ("Atlantis, UK", None),
+    ],
+)
+def test_a_qualifier_names_the_region_or_country_holding_the_place(query, expected):
+    idx = _index(QUALIFIED)
+    if expected is None:
+        with pytest.raises(PlaceNotFoundError):
+            transitio_index.place(query, index=idx)
+    else:
+        place = transitio_index.place(query, index=idx)
+        assert place.id == expected
+        # places() lists only matches inside the qualifier, the answer among them
+        found = transitio_index.places(query, index=idx)
+        assert expected in [p.id for p in found]
+        assert {p.country_code for p in found} == {place.country_code}

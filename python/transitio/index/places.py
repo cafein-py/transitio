@@ -443,6 +443,7 @@ class _PlaceLookup:
         self._records = {}
         self._labels = {}
         self._children = defaultdict(list)
+        self._countries = defaultdict(list)
         self._name_index = None  # built on the first suggestion, under the lock
         self._name_lock = threading.Lock()
         # A former id or a QID the place carries resolves to it; a real id
@@ -473,6 +474,8 @@ class _PlaceLookup:
             self._labels[place_id] = self._normalized_labels(record)
             if record["parent_id"]:
                 self._children[record["parent_id"]].append(place_id)
+            if record["kind"] == "country" and record["country_code"]:
+                self._countries[record["country_code"]].append(place_id)
             qids = record["concordances"].get("wikidata", [])
             for alias in [*record["former_ids"], *qids]:
                 self._aliases.setdefault(alias, place_id)
@@ -541,7 +544,38 @@ class _PlaceLookup:
         return scored
 
     def search(self, query, kind=None):
-        return [self.get(place_id) for _, place_id in self._candidates(query, kind)]
+        return [self.get(place_id) for _, place_id in self._qualified(query, kind)]
+
+    def _qualified(self, query, kind):
+        """The candidates for ``query``: as written when a label matches it
+        exactly, else, for "Name, Qualifier, ...", the candidates for the name
+        that lie within a place each qualifier names — a region, a country or
+        a country's code ("London, Ontario", "City of London, UK")."""
+        scored = self._candidates(query, kind)
+        if "," not in query or any(tier == _EXACT for tier, _ in scored):
+            return scored
+        name, *rest = query.split(",")
+        qualifiers = [_normalize(part) for part in rest if _normalize(part)]
+        if not _normalize(name) or not qualifiers:
+            return scored
+        return [
+            (tier, place_id)
+            for tier, place_id in self._candidates(name, kind)
+            if all(self._within(place_id, qualifier) for qualifier in qualifiers)
+        ]
+
+    def _within(self, place_id, qualifier):
+        """Whether a place containing ``place_id`` — an ancestor, or the
+        country its country code names — carries ``qualifier`` as a label."""
+        containing = [place.id for place in self.get(place_id).ancestors]
+        containing += self._countries.get(
+            self._records[place_id].get("country_code"), []
+        )
+        return any(
+            label == qualifier
+            for other in containing
+            for label, _ in self._labels[other]
+        )
 
     def prepare(self):
         """Build the sorted labels once; concurrent cold calls wait for one build."""
@@ -571,7 +605,7 @@ class _PlaceLookup:
             if place is None:
                 raise PlaceNotFoundError(f"no place with id {query!r} in the index")
             return place
-        scored = self._candidates(query, kind)
+        scored = self._qualified(query, kind)
         if not scored:
             raise PlaceNotFoundError(f"no place matches {query!r}")
         return self.get(self._winner(query, scored))

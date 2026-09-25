@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- `place()` and `places()` read a qualified name, "Name, Qualifier" with one
+  or more qualifiers, as the places lying within a region or country each
+  qualifier names: `"London, Ontario"`, `"London, Canada"`,
+  `"City of London, UK"`. Qualifiers match the names, translations and
+  aliases of a place's region and country, codes such as `UK` included; a
+  label that itself holds a comma still matches as written.
+
 ### Changed
 
 - A bare place name resolves to the city rather than raising
