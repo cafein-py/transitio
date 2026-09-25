@@ -330,7 +330,8 @@ def fetch(
         Repair each feed (gtfstidy contract) after the crop, before use;
         conservative default leaves feeds untouched.
     crop : bool, default True
-        Spatially crop each feed to the AOI's bounding box.
+        Spatially crop each feed to the area: to its polygon when it has
+        one (a place's boundary included), otherwise to its bounding box.
     osm : bool, default True
         Fetch the OSM extract for the AOI. With ``osm=False`` the OSM stage
         is skipped and the result's ``osm_pbf`` is None, for callers who

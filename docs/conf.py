@@ -32,6 +32,9 @@ extensions = [
 
 # Generate the per-object stub pages referenced by the autosummary tables.
 autosummary_generate = True
+# The place() function and the Place class would share a stub file on a
+# case-insensitive filesystem.
+autosummary_filename_map = {"transitio.index.place": "transitio.index.place-function"}
 
 # Enable MyST's colon-fence syntax (:::{admonition} ... :::) in the
 # Markdown pages.
