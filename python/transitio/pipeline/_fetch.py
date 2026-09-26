@@ -44,6 +44,9 @@ class FetchResult:
     # The index snapshot the feeds were discovered from; None for the AOI path,
     # which discovers by bounding box and has no snapshot.
     snapshot: str = None
+    # {feed id: [ids of delivered feeds containing it]} over the delivered
+    # feeds, from the index's contained_in (schema 10); empty otherwise.
+    contained: dict = dataclasses.field(default_factory=dict)
 
     def __iter__(self):  # convenient (pbf, feeds) unpacking
         return iter((self.osm_pbf, self.feeds))
@@ -225,6 +228,124 @@ def _process_feed(
     return path, report, fixes, present_routes
 
 
+def _hash_stream(handle):
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: handle.read(1 << 20), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _snapshot(path):
+    """``(archive SHA-256, entries)`` of the zip at ``path``, read through one
+    open: the entries as sorted ``(name, CRC-32, size)`` from the central
+    directory, nothing decompressed. None when it cannot be read."""
+    try:
+        with open(path, "rb") as handle:
+            digest = _hash_stream(handle)
+            handle.seek(0)
+            with zipfile.ZipFile(handle) as archive:
+                listing = sorted(
+                    (info.filename, info.CRC, info.file_size)
+                    for info in archive.infolist()
+                    if not info.is_dir()
+                )
+        return digest, tuple(listing)
+    except Exception:  # noqa: B902 — an unreadable archive matches nothing
+        return None
+
+
+def _entry_digests(path, digest):
+    """Every entry of the zip at ``path`` as sorted ``(name, CRC-32, size,
+    SHA-256)``, one row per entry, read through one open that must still hold
+    the archive ``digest`` recorded earlier; None when it does not or the
+    archive cannot be read."""
+    try:
+        with open(path, "rb") as handle:
+            if _hash_stream(handle) != digest:
+                return None
+            handle.seek(0)
+            rows = []
+            with zipfile.ZipFile(handle) as archive:
+                for info in archive.infolist():
+                    if info.is_dir():
+                        continue
+                    with archive.open(info) as member:
+                        entry = _hash_stream(member)
+                    rows.append((info.filename, info.CRC, info.file_size, entry))
+        return tuple(sorted(rows))
+    except Exception:  # noqa: B902 — an unreadable archive matches nothing
+        return None
+
+
+class _Delivered:
+    """The downloads a call has delivered, with the route filter each was
+    cropped to: a later download with the same content under the same filter
+    would deliver the same file again. Each download is described as it was
+    when checked, before it was processed."""
+
+    def __init__(self):
+        self._feeds = []
+        self._facts = {}
+        self._entries = {}
+
+    def _about(self, path):
+        if path not in self._facts:
+            self._facts[path] = _snapshot(path)
+        return self._facts[path]
+
+    def _digests(self, path):
+        if path not in self._entries:
+            self._entries[path] = _entry_digests(path, self._facts[path][0])
+        return self._entries[path]
+
+    def same_as(self, path, routes=None):
+        """The id of a delivered feed whose download holds the same content
+        as ``path`` and was cropped to the same ``routes``, else None. Same
+        content: equal archive digests, or equal entry listings (name, CRC-32,
+        size) confirmed by equal SHA-256 digests of every entry. An archive
+        that cannot be read, or that changed since it was checked, matches
+        nothing."""
+        facts = self._about(path)
+        if facts is None:
+            return None
+        for feed_id, other, cropped_to in self._feeds:
+            recorded = self._facts[other]
+            if cropped_to != routes or recorded is None:
+                continue
+            if facts[0] == recorded[0]:
+                return feed_id
+            if facts[1] and facts[1] == recorded[1]:
+                mine = self._digests(path)
+                if mine is not None and mine == self._digests(other):
+                    return feed_id
+        return None
+
+    def add(self, feed_id, path, routes=None):
+        self._about(path)
+        self._feeds.append((feed_id, path, routes))
+
+
+def _containers_first(feeds):
+    """``feeds`` with each one after the feeds among them that contain it
+    (``contained_in``), in their given order otherwise."""
+    by_id = {feed.feed_id: feed for feed in feeds}
+    depth = {}
+
+    def level(feed, seen=()):
+        if feed.feed_id not in depth:
+            above = [
+                by_id[c]
+                for c in feed.contained_in
+                if c in by_id and c not in seen and c != feed.feed_id
+            ]
+            depth[feed.feed_id] = 1 + max(
+                (level(c, (*seen, feed.feed_id)) for c in above), default=-1
+            )
+        return depth[feed.feed_id]
+
+    return sorted(feeds, key=level)
+
+
 def _download_indexed(feed, db, atlas, base_dir):
     """Download an indexed feed, preferring its Mobility Database URL over its
     Transitland Atlas URL (decision I: MDB wins where a feed has both), and
@@ -271,6 +392,7 @@ def fetch(
     exclude=None,
     on_unknown="include",
     on_untrusted_selector="auto",
+    contained="keep",
     index=None,
     modes=None,
     repair=False,
@@ -289,14 +411,21 @@ def fetch(
     ``place``, feeds are selected from the built index by tier -- ``tiers``,
     ``exclude`` and ``on_unknown`` filter the edges -- and the place geometry
     supplies the AOI; ``tiers``, ``exclude``, ``on_unknown``,
-    ``on_untrusted_selector`` and ``index`` apply only with ``place``, and
-    ``country_code`` only with ``aoi``. When a selector cannot be trusted --
+    ``on_untrusted_selector``, ``contained`` and ``index`` apply only with
+    ``place``, and ``country_code`` only with ``aoi``. When a selector cannot be trusted --
     its evidence was missing at build time, or its fingerprint no longer
     matches the download -- ``on_untrusted_selector`` decides the outcome:
     ``"auto"`` (default) skips the feed when an ``exclude`` was asked for and
     otherwise delivers it whole with its tier treated as ``unknown``;
     ``"whole"`` always delivers it whole; ``"drop"`` always skips it;
     ``"error"`` raises :class:`~transitio.exceptions.StaleSelectorError`.
+    A schema-10 index records the larger feeds whose stops and routes contain
+    a feed's; ``contained="keep"`` (default) delivers every feed and reports
+    the delivered pairs in ``FetchResult.contained``, ``contained="drop"``
+    leaves a feed out when a feed containing it is delivered in the call,
+    before downloading it (containers are fetched first). Containment is a
+    heuristic, not proof that every trip is carried, so nothing is left out
+    by default.
 
     Resolves and crops the OSM extract, discovers the GTFS feeds (overlapping
     the AOI, or the place's indexed feeds), downloads each feed, spatially
@@ -308,7 +437,10 @@ def fetch(
     target with no upstream checksum, documented in its provenance
     sidecar as such. Every overlapping feed is processed, in a
     deterministic order with official feeds first; one broken feed never
-    aborts the others — it lands in ``skipped`` with its reason.
+    aborts the others — it lands in ``skipped`` with its reason. A download
+    whose content equals a feed already delivered in the call (cropped to the
+    same routes) is not delivered twice: it is skipped as ``"same content as
+    <feed id>"``.
 
     Parameters
     ----------
@@ -347,7 +479,8 @@ def fetch(
     FetchResult
         ``osm_pbf``, validated ``feeds`` (paths), merged ``reports`` and
         repair ``repairs`` (fix logs, empty without ``repair=True``) per
-        kept feed, and ``skipped`` (feed id, reason) pairs. Reports merge
+        kept feed, ``skipped`` (feed id, reason) pairs and, on the place
+        path, the ``contained`` pairs among the delivered feeds. Reports merge
         the local validation of the delivered feed with the hosted report
         of the published dataset, so after cropping or repair the hosted
         side describes the pre-transform original.
@@ -364,11 +497,14 @@ def fetch(
         or index is not None
         or on_unknown != "include"
         or on_untrusted_selector != "auto"
+        or contained != "keep"
     ):
         raise ValueError(
-            "tiers=, exclude=, on_unknown=, on_untrusted_selector= and index= "
-            "apply only with place="
+            "tiers=, exclude=, on_unknown=, on_untrusted_selector=, contained= "
+            "and index= apply only with place="
         )
+    if contained not in ("keep", "drop"):
+        raise ValueError("contained= must be 'keep' or 'drop'")
     if place is not None and country_code is not None:
         raise ValueError("country_code= applies only with aoi=")
     if on_untrusted_selector not in ("auto", "whole", "drop", "error"):
@@ -394,6 +530,7 @@ def fetch(
             exclude=exclude,
             on_unknown=on_unknown,
             on_untrusted_selector=on_untrusted_selector,
+            contained=contained,
             index=index,
             when=when,
             modes=modes,
@@ -432,7 +569,10 @@ def fetch(
         fetch_pbf(geometry, cache_dir=cache_dir, directory=directory) if osm else None
     )
 
+    from transitio.catalog._atlas import _feed_dir
+
     feeds, reports, repairs, skipped = [], [], [], []
+    delivered = _Delivered()
     with MobilityDatabase(refresh_token, cache_dir=cache_dir) as db:
         if when is not None and not db._refresh_token:
             warnings.warn(
@@ -463,14 +603,22 @@ def fetch(
                 except Exception as error:  # noqa: B902
                     skipped.append((feed.id, f"dataset selection failed: {error}"))
                     continue
+            # Each feed downloads into its own digest-named folder, so two
+            # hosted latest.zip files never overwrite each other.
+            target = pathlib.Path(directory) / _feed_dir(feed.id) if directory else None
             try:
                 if dataset is not None:
-                    path = db.download(dataset, directory=directory)
+                    path = db.download(dataset, directory=target)
                 else:
-                    path = db.download_latest(feed, directory=directory)
+                    path = db.download_latest(feed, directory=target)
             except Exception as error:  # noqa: B902
                 skipped.append((feed.id, f"download failed: {error}"))
                 continue
+            twin = delivered.same_as(path)
+            if twin is not None:
+                skipped.append((feed.id, f"same content as {twin}"))
+                continue
+            download = path
             hosted = None
             if dataset is not None:
                 try:
@@ -502,6 +650,7 @@ def fetch(
             reports.append(report)
             repairs.append(fixes)
             feeds.append(path)
+            delivered.add(feed.id, download)
 
     return FetchResult(
         osm_pbf=osm_pbf,
@@ -571,6 +720,7 @@ def _fetch_place(
     exclude,
     on_unknown,
     on_untrusted_selector,
+    contained,
     index,
     when,
     modes,
@@ -643,7 +793,11 @@ def _fetch_place(
     )
 
     kept = place_obj.feeds(tiers=tiers, exclude=exclude, on_unknown=on_unknown)
+    if contained == "drop":
+        kept = _containers_first(kept)
     feeds, reports, repairs, skipped, selections = [], [], [], [], []
+    delivered = _Delivered()
+    delivered_ids = []
     if on_unknown == "exclude":
         included = place_obj.feeds(tiers=tiers, exclude=exclude, on_unknown="include")
         for dropped in {f.feed_id for f in included} - {f.feed_id for f in kept}:
@@ -669,6 +823,13 @@ def _fetch_place(
                 stacklevel=2,
             )
         for feed in kept:
+            if contained == "drop":
+                container = next(
+                    (c for c in feed.contained_in if c in delivered_ids), None
+                )
+                if container is not None:
+                    skipped.append((feed.feed_id, f"contained in {container}"))
+                    continue
             dataset = None
             errors = []
             if db._refresh_token:
@@ -795,6 +956,13 @@ def _fetch_place(
                         "declared_as": None,
                         "selected_by": selected_by,
                     }
+            twin = delivered.same_as(path, routes)
+            if twin is not None:
+                skipped.append((feed.feed_id, f"same content as {twin}"))
+                if selection is not None:
+                    selections.append(selection)
+                continue
+            download = path
             # A per-feed tag folds in the selected routes so the same feed
             # fetched under different tiers never overwrites an earlier output.
             feed_tag = tag
@@ -846,8 +1014,16 @@ def _fetch_place(
             reports.append(report)
             repairs.append(fixes)
             feeds.append(path)
+            delivered.add(feed.feed_id, download, routes)
+            delivered_ids.append(feed.feed_id)
             if selection is not None:
                 selections.append(selection)
+
+    pairs = {
+        feed.feed_id: sorted(set(feed.contained_in) & set(delivered_ids))
+        for feed in kept
+        if feed.feed_id in delivered_ids
+    }
 
     return FetchResult(
         osm_pbf=osm_pbf,
@@ -858,4 +1034,5 @@ def _fetch_place(
         selections=selections,
         provenance=provenance,
         snapshot=provenance["snapshot"],
+        contained={feed_id: ids for feed_id, ids in pairs.items() if ids},
     )

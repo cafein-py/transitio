@@ -291,6 +291,14 @@ class IndexedFeed:
         return _day(self._row.get("service_end"))
 
     @property
+    def contained_in(self):
+        """The ids of the larger feeds whose stops and routes contain this
+        feed's (schema 10): a stop-and-route heuristic, not proof that every
+        trip is carried. Empty before schema 10."""
+        ids = self._row.get("contained_in")
+        return [] if ids is None else [str(feed_id) for feed_id in ids]
+
+    @property
     def coverage_source(self):
         return _scalar(self._row.get("coverage_source"))
 

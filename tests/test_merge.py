@@ -184,6 +184,55 @@ def test_feed_wide_attribution_passes_through():
     assert row["agency_id"] == "" and row["route_id"] == "" and row["trip_id"] == ""
 
 
+def _city_in(zone, agency_id="hsl"):
+    builder = build_city(agency_id)
+    builder.tables["agency.txt"]["agency_timezone"] = zone
+    return builder
+
+
+HEL, UTC, OSLO = "Europe/Helsinki", "UTC", "Europe/Oslo"
+
+
+@pytest.mark.parametrize(
+    "zones, timezones, error, skipped",
+    [
+        ([HEL, UTC, HEL], "refuse", "differ", None),
+        ([HEL, UTC, HEL], "skip", None, [{"feed": 1, "timezones": [UTC]}]),
+        (
+            [UTC, UTC, HEL, HEL],
+            "skip",
+            None,
+            [{"feed": 2, "timezones": [HEL]}, {"feed": 3, "timezones": [HEL]}],
+        ),
+        ([HEL, UTC, OSLO], "skip", "fewer than two", None),
+        ([HEL, HEL], "maybe", "must be", None),
+    ],
+    ids=["refused", "outlier-left-out", "tie-earliest", "too-few-left", "bad-option"],
+)
+def test_feeds_of_another_time_zone(tmp_path, zones, timezones, error, skipped):
+    feeds = [_city_in(zone, f"a{i}") for i, zone in enumerate(zones)]
+    output = tmp_path / "merged.zip"
+    if error:
+        with pytest.raises(ValueError, match=error):
+            merge_feeds(feeds, output, timezones=timezones, reference_date="20260601")
+        return
+    report = merge_feeds(feeds, output, timezones=timezones, reference_date="20260601")
+    assert report["skipped_feeds"] == skipped
+    # The feeds kept keep the prefixes they had among all the inputs.
+    left = {entry["feed"] for entry in skipped}
+    agencies = set(FeedEditor(output).tables["agency.txt"]["agency_id"])
+    assert agencies == {f"f{i + 1}:a{i}" for i in range(len(zones)) if i not in left}
+
+
+def test_zones_tied_in_one_feed_resolve_by_name():
+    from transitio.gtfs._merge import _timezone_outliers
+
+    both = {"agency.txt": frame(agency_id=["a", "b"], agency_timezone=[UTC, HEL])}
+    tables = [both, {"agency.txt": frame(agency_timezone=[UTC])}]
+    tables.append({"agency.txt": frame(agency_timezone=[HEL])})
+    assert _timezone_outliers(tables) == {0: [HEL, UTC], 1: [UTC]}
+
+
 def test_conflicting_agency_timezones():
     first = {"agency.txt": frame(agency_id=["a"], agency_timezone=["Europe/Helsinki"])}
     second = {

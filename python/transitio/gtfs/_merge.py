@@ -256,7 +256,36 @@ def merge_tables(table_sets, *, prefixes=None, extra_entries=None):
     return merged, sorted(dropped)
 
 
-def merge_feeds(feeds, output, *, prefixes=None, check=True, **budgets):
+def _timezones(tables):
+    agency = tables.get("agency.txt")
+    if agency is None or "agency_timezone" not in agency.columns:
+        return set()
+    return {value.strip() for value in agency["agency_timezone"] if value.strip()}
+
+
+def _timezone_outliers(table_sets):
+    """``{position: [time zones]}`` for the feeds declaring a time zone other
+    than the one most feeds declare (ties: the earliest feed's, then the
+    first by name); a feed that declares none differs from nothing."""
+    declared = [_timezones(tables) for tables in table_sets]
+    counts, first = {}, {}
+    for position, zones in enumerate(declared):
+        for zone in zones:
+            counts[zone] = counts.get(zone, 0) + 1
+            first.setdefault(zone, position)
+    if len(counts) < 2:
+        return {}
+    common = min(counts, key=lambda zone: (-counts[zone], first[zone], zone))
+    return {
+        position: sorted(zones)
+        for position, zones in enumerate(declared)
+        if zones - {common}
+    }
+
+
+def merge_feeds(
+    feeds, output, *, prefixes=None, check=True, timezones="refuse", **budgets
+):
     """Merge GTFS feeds into one zip, written atomically and validated.
 
     See :func:`merge_tables` for the merge semantics (id namespacing,
@@ -276,6 +305,14 @@ def merge_feeds(feeds, output, *, prefixes=None, check=True, **budgets):
         Raise :class:`~transitio.exceptions.InvalidFeedError` when the
         validator reports ERROR-severity notices (the report is on the
         exception and the file is still written).
+    timezones : {"refuse", "skip"}, default "refuse"
+        Feeds declaring different ``agency_timezone`` values cannot share
+        one dataset. ``"refuse"`` raises ``ValueError``; ``"skip"`` leaves
+        out the feeds whose time zone differs from the one most feeds
+        declare (ties: the earliest feed's, then the first by name) and
+        merges the rest, each
+        keeping the prefix it had among all the inputs. Fewer than two
+        feeds left still raises.
     **budgets
         ``validate_feed`` keyword arguments.
 
@@ -283,10 +320,14 @@ def merge_feeds(feeds, output, *, prefixes=None, check=True, **budgets):
     -------
     dict
         The ``validate_feed`` report of the written feed, with a
-        ``"dropped_files"`` key listing what the merge discarded.
+        ``"dropped_files"`` key listing what the merge discarded and a
+        ``"skipped_feeds"`` key listing the feeds left out, one
+        ``{"feed": <input position>, "timezones": [...]}`` each.
     """
     from transitio.edit import FeedBuilder, FeedEditor
 
+    if timezones not in ("refuse", "skip"):
+        raise ValueError(f"timezones must be 'refuse' or 'skip', not {timezones!r}")
     feeds = list(feeds)
     if len(feeds) < 2:
         raise ValueError("need at least two feeds to merge")
@@ -302,6 +343,22 @@ def merge_feeds(feeds, output, *, prefixes=None, check=True, **budgets):
             extras = getattr(feed, "_extra_entries", {})
         table_sets.append(tables)
         extra_entries.append(list(extras))
+    skipped = []
+    outliers = _timezone_outliers(table_sets) if timezones == "skip" else {}
+    if outliers:
+        kept = [i for i in range(len(table_sets)) if i not in outliers]
+        if len(kept) < 2:
+            raise ValueError(
+                f"fewer than two feeds share a time zone: {sorted(outliers.values())}"
+            )
+        names = _clean_prefixes(prefixes, len(table_sets))
+        skipped = [
+            {"feed": position, "timezones": zones}
+            for position, zones in sorted(outliers.items())
+        ]
+        table_sets = [table_sets[i] for i in kept]
+        extra_entries = [extra_entries[i] for i in kept]
+        prefixes = [names[i] for i in kept]
     tables, dropped = merge_tables(
         table_sets, prefixes=prefixes, extra_entries=extra_entries
     )
@@ -311,6 +368,8 @@ def merge_feeds(feeds, output, *, prefixes=None, check=True, **budgets):
         report = builder.save(output, check=check, **budgets)
     except InvalidFeedError as error:
         error.report["dropped_files"] = dropped
+        error.report["skipped_feeds"] = skipped
         raise
     report["dropped_files"] = dropped
+    report["skipped_feeds"] = skipped
     return report

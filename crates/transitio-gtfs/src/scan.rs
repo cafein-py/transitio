@@ -15,8 +15,9 @@ use crate::schema;
 /// raise them for oversized trusted feeds. `u64::MAX` disables a byte or
 /// row limit. A violated limit is reported per file (`unreadable_file` /
 /// `too_many_rows`) and the scan continues; only an untraversable archive
-/// aborts with an error.
-pub const DEFAULT_MAX_ENTRY_BYTES: u64 = 1024 * 1024 * 1024;
+/// aborts with an error. One entry may use the whole total budget: a large
+/// city cropped from a national feed keeps a `stop_times.txt` over 1 GiB.
+pub const DEFAULT_MAX_ENTRY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_ROWS: u64 = 20_000_000;
 pub const DEFAULT_MAX_COLUMNS: usize = 1000;

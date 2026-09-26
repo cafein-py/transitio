@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- The reader reads schema-10 indexes, whose feeds table records for each
+  feed the larger feeds whose stops and routes contain its own
+  (`contained_in`, exposed as `IndexedFeed.contained_in`; empty before
+  schema 10). Schema 10 needs transitio 0.15.0.
+- `fetch(place=..., contained="drop")` leaves a feed out when a feed
+  containing it is delivered in the same call, before downloading it, and
+  fetches containers first; the default, `contained="keep"`, delivers every
+  feed and reports the delivered pairs in `FetchResult.contained`.
+  Containment is a heuristic, not proof that every trip is carried.
+
+- `merge_feeds(..., timezones="skip")` leaves out the feeds whose
+  `agency_timezone` differs from the one most feeds declare (ties: the
+  earliest feed's, then the first by name) and merges the rest, each keeping the prefix it had among
+  all the inputs; the report lists them under `"skipped_feeds"`. The default,
+  `timezones="refuse"`, raises as before. New York City's 41 feeds could not
+  be merged because one intercity coach feed declares UTC.
+
+### Changed
+
+- `fetch` delivers a feed's data once when two catalogue entries serve the
+  same files: a download whose content equals a feed already delivered in
+  the call, cropped to the same routes, is recorded in `skipped` as
+  `"same content as <feed id>"` instead of being cropped, validated and
+  delivered again. Content is the same when the archives' SHA-256 digests
+  match, or when every entry's name, CRC-32 and size match and the SHA-256
+  digests of the decompressed entries confirm it.
+
+### Fixed
+
+- The default per-file budget of validation and cropping (`max_entry_bytes`)
+  is 2 GiB, the whole total budget, instead of 1 GiB. Greater London cropped
+  from Great Britain's national bus feed keeps a 1.4 GiB `stop_times.txt`
+  (18.2 million rows, within the row budget), which the crop refused with
+  "cropped feed exceeds the scan or notice budgets".
+- `fetch` over an area with a `directory` writes each feed into its own
+  folder. Without an API token every feed's download was named `latest.zip`
+  in the one directory, so each feed overwrote the one before and the result
+  listed the last feed several times.
+
 ## 0.14.0 — 2026-09-26
 
 ### Added
