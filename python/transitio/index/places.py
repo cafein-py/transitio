@@ -486,6 +486,14 @@ class _PlaceLookup:
             for alias in [*record["former_ids"], *qids]:
                 self._aliases.setdefault(alias, place_id)
 
+    def _own_names(self, place_id):
+        """The normalized name and language labels of a place, its aliases
+        left out."""
+        record = self._records[place_id]
+        return {
+            _normalize(text) for text in [record["name"], *record["names"].values()]
+        }
+
     @staticmethod
     def _normalized_labels(record):
         raw = [record["name"], *record["names"].values(), *record["aliases"]]
@@ -618,7 +626,7 @@ class _PlaceLookup:
         return self.get(self._winner(query, scored, name))
 
     def _winner(self, query, scored, name):
-        namesakes = self._namesakes(scored)
+        namesakes = self._namesakes(scored, name)
         winner = None
         if namesakes:
             narrowed = [item for item in scored if item[1] not in namesakes]
@@ -670,20 +678,38 @@ class _PlaceLookup:
             return top_id
         return None
 
-    def _namesakes(self, scored):
+    def _namesakes(self, scored, name):
         """The exact matches that share an exact-match city's name because of
-        that city: the metros in its country, and the areas containing it
-        whose feeds stay within the margin of the city's. A metro elsewhere
-        shares the name by coincidence (London, UK against London, Ontario),
-        and a containing area with far more service is a place of its own
-        (New York State against New York City); both stay."""
+        that city: the metros in its country, the areas containing it whose
+        feeds stay within the margin of the city's, and the places inside a
+        city carrying ``name`` as a name of its own that reach it only through
+        an alias (Puente Aranda, a district of Bogotá, lists Bogotá). A metro
+        elsewhere shares the name by coincidence (London, UK against London,
+        Ontario), and a containing area with far more service is a place of
+        its own (New York State against New York City); both stay."""
         exact = [pid for tier, pid in scored if tier == _EXACT]
-        cities = [pid for pid in exact if self._records[pid]["kind"] == "city"]
+        norm = _normalize(name)
+        named = {
+            pid
+            for pid in exact
+            if self._records[pid]["kind"] == "city" and norm in self._own_names(pid)
+        }
+        inside = {
+            pid
+            for pid in exact
+            if norm not in self._own_names(pid)
+            and named & {place.id for place in self.get(pid).ancestors}
+        }
+        cities = [
+            pid
+            for pid in exact
+            if self._records[pid]["kind"] == "city" and pid not in inside
+        ]
         if not cities:
             return set()
         countries = {self._records[pid].get("country_code") for pid in cities}
         countries.discard(None)
-        namesakes = {
+        namesakes = inside | {
             pid
             for pid in exact
             if self._records[pid]["kind"] == "metro"
