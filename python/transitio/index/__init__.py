@@ -939,7 +939,10 @@ def place(query, *, kind=None, index=None):
     resolves through the place's former ids and the QIDs it carries. A name
     shared by a city and the metros named after it in its country, or an
     area containing it with much the same service, resolves to the city;
-    ``kind`` pins the scope. Raises
+    ``kind`` pins the scope. A qualified name, "Name, Qualifier" with one or
+    more qualifiers, keeps the places lying within a region or country each
+    qualifier names ("London, Ontario", "City of London, UK"); a label that
+    itself holds a comma still matches as written. Raises
     :class:`~transitio.exceptions.PlaceNotFoundError` or
     :class:`~transitio.exceptions.AmbiguousPlaceError`.
     """
@@ -947,7 +950,8 @@ def place(query, *, kind=None, index=None):
 
 
 def places(query, *, index=None):
-    """The places matching ``query``, ranked best first."""
+    """The places matching ``query``, ranked best first; a qualified name
+    lists only the places within its qualifiers, as :func:`place` reads it."""
     return _lookup_for(_coerce_index(index)).search(query)
 
 

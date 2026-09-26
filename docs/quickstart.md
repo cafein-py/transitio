@@ -175,6 +175,7 @@ snapshot, else the newest installed one.
 import transitio
 
 augsburg = transitio.place("Augsburg")
+transitio.place("London, Ontario")   # a qualifier names the region or country
 transitio.places("Augsburg")      # every match, ranked best first
 transitio.suggest("augs")         # type-ahead over names, translations, aliases
 ```
@@ -185,7 +186,12 @@ the same service: "Augsburg" is the city, not its three metros, and
 "Helsinki" the city, not the Helsinki sub-region. Other places sharing a name
 are decided as before, by the sole exact match or a clear lead in feeds; where
 neither holds, as for London in the UK and in Canada, or New York City and
-New York State, `place` raises `AmbiguousPlaceError`. `kind` (`"city"`,
+New York State, `place` raises `AmbiguousPlaceError`. A qualifier after a
+comma names the region or country that holds the place — `"London, Ontario"`,
+`"London, Canada"`, `"City of London, UK"` — and is matched against the names,
+translations and aliases of the place's region and country, so codes such as
+`UK` or `USA` work; a name that itself contains a comma, such as an alias
+`"Queen's Park, Greater London"`, still matches as written. `kind` (`"city"`,
 `"metro"`, `"region"`, `"country"`) restricts the scope, and a Wikidata id or
 the index's own id picks one place.
 

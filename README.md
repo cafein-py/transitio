@@ -67,8 +67,10 @@ area. `merge_feeds` writes one feed from the cropped ones; with
 the returned report lists. A bare name resolves to the city before the
 metros named after it. Where different places share a name and none clearly
 leads, as for London in the UK and in Canada, `place` raises
-`AmbiguousPlaceError`; `kind="city"` (or `"metro"`, `"region"`, `"country"`)
-restricts the scope and a Wikidata id picks one place.
+`AmbiguousPlaceError`; a qualifier names the region or country that holds
+the place, as in `"London, Ontario"` or `"City of London, UK"`, `kind="city"`
+(or `"metro"`, `"region"`, `"country"`) restricts the scope, and a Wikidata
+id picks one place.
 
 ### Inferring missing route shapes
 

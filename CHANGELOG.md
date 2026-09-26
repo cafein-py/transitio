@@ -7,14 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- `place()` and `places()` read a qualified name, "Name, Qualifier" with one
+  or more qualifiers, as the places lying within a region or country each
+  qualifier names: `"London, Ontario"`, `"London, Canada"`,
+  `"City of London, UK"`. Qualifiers match the names, translations and
+  aliases of a place's region and country, codes such as `UK` included; a
+  label that itself holds a comma still matches as written.
+
 ### Changed
 
+- The feed-count margin that breaks a name tie never favours a place reached
+  only through an alias or a translation over one carrying the name as its
+  own: "Sao Paulo" raises `AmbiguousPlaceError` instead of naming Saint Paul,
+  Minnesota, whose aliases include São Paulo, and "Sao Paulo, Brazil"
+  resolves.
 - A bare place name resolves to the city rather than raising
   `AmbiguousPlaceError` when the other places sharing the name are named
   after it: the metros in its country (with several metro definitions a
-  city and each of its metros share a name) and a containing area that runs
-  much the same service. "Helsinki", "Berlin" and "Augsburg" now resolve to
-  the city. Other places sharing a name are decided as before, by the sole
+  city and each of its metros share a name), a containing area that runs
+  much the same service, and a place inside the city that lists its name
+  only as an alias, such as a district of Bogotá. "Helsinki", "Berlin",
+  "Augsburg" and "Bogotá" now resolve to the city. Other places sharing a name are decided as before, by the sole
   exact match or a lead of more than twice the runner-up's feeds, so London
   in the UK and in Canada stays ambiguous in the published index.
   `DISCOVERY_SEMANTICS_VERSION` is 2.
