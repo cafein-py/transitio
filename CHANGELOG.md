@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The default per-file budget of validation and cropping (`max_entry_bytes`)
+  is 2 GiB, the whole total budget, instead of 1 GiB. Greater London cropped
+  from Great Britain's national bus feed keeps a 1.4 GiB `stop_times.txt`
+  (18.2 million rows, within the row budget), which the crop refused with
+  "cropped feed exceeds the scan or notice budgets".
 - `fetch` over an area with a `directory` writes each feed into its own
   folder. Without an API token every feed's download was named `latest.zip`
   in the one directory, so each feed overwrote the one before and the result

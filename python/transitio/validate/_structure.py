@@ -37,7 +37,7 @@ def validate_feed(
     path : str or pathlib.Path
         Path of the GTFS ``.zip`` file.
     max_entry_bytes : int, optional
-        Uncompressed-size budget per archive entry (default 1 GiB). A file
+        Uncompressed-size budget per archive entry (default 2 GiB). A file
         over budget is reported as ``unreadable_file`` and skipped.
     max_total_bytes : int, optional
         Cumulative uncompressed-size budget (default 2 GiB), enforced while
