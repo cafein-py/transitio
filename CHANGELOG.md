@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## 0.14.0 — 2026-09-26
 
 ### Added
 
@@ -29,14 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   city and each of its metros share a name), a containing area that runs
   much the same service, and a place inside the city that lists its name
   only as an alias, such as a district of Bogotá. "Helsinki", "Berlin",
-  "Augsburg" and "Bogotá" now resolve to the city. Other places sharing a name are decided as before, by the sole
-  exact match or a lead of more than twice the runner-up's feeds, so London
-  in the UK and in Canada stays ambiguous in the published index.
-  `DISCOVERY_SEMANTICS_VERSION` is 2.
+  "Augsburg" and "Bogotá" now resolve to the city. Other places sharing a
+  name are decided as before, by the sole exact match or a lead of more
+  than twice the runner-up's feeds. `DISCOVERY_SEMANTICS_VERSION` is 2.
 - A bare city name is no longer promoted to the city's default metro. The
   city's metros are listed by `Place.metros` and `Place.delineations()`;
   `kind="metro"` restricts a name to metros.
-
 - `crop_feed` leaves out an optional table the crop empties (for example
   frequencies.txt or shapes.txt when no retained trip uses them) instead
   of writing it as a header alone, which validators report as an empty
