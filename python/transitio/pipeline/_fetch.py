@@ -432,6 +432,8 @@ def fetch(
         fetch_pbf(geometry, cache_dir=cache_dir, directory=directory) if osm else None
     )
 
+    from transitio.catalog._atlas import _feed_dir
+
     feeds, reports, repairs, skipped = [], [], [], []
     with MobilityDatabase(refresh_token, cache_dir=cache_dir) as db:
         if when is not None and not db._refresh_token:
@@ -463,11 +465,14 @@ def fetch(
                 except Exception as error:  # noqa: B902
                     skipped.append((feed.id, f"dataset selection failed: {error}"))
                     continue
+            # Each feed downloads into its own digest-named folder, so two
+            # hosted latest.zip files never overwrite each other.
+            target = pathlib.Path(directory) / _feed_dir(feed.id) if directory else None
             try:
                 if dataset is not None:
-                    path = db.download(dataset, directory=directory)
+                    path = db.download(dataset, directory=target)
                 else:
-                    path = db.download_latest(feed, directory=directory)
+                    path = db.download_latest(feed, directory=target)
             except Exception as error:  # noqa: B902
                 skipped.append((feed.id, f"download failed: {error}"))
                 continue

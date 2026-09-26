@@ -98,6 +98,47 @@ def test_fetch_end_to_end(pipeline_env):
     assert pbf == fake_pbf and feeds == result.feeds
 
 
+def test_an_area_fetch_keeps_each_feeds_download_apart(pipeline_env, monkeypatch):
+    import io as _io
+
+    from transitio.catalog._client import MobilityDatabase
+
+    tmp_path, _ = pipeline_env
+    other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "HKL")}
+    payloads = {}
+    for key, tables in (("mdb-10", GTFS), ("mdb-11", other)):
+        buffer = _io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            for name, content in tables.items():
+                archive.writestr(name, content)
+        payloads[f"/{key}/latest.zip"] = buffer.getvalue()
+    row = CSV_BODY.splitlines()[1]
+    csv = CSV_BODY + row.replace("mdb-10", "mdb-11").replace(",HSL,", ",HKL,") + "\n"
+
+    def handler(request):
+        if request.url.path == "/feeds_v2.csv":
+            return httpx.Response(200, text=csv)
+        if request.url.path in payloads:
+            return httpx.Response(200, content=payloads[request.url.path])
+        return httpx.Response(404)
+
+    def patched(refresh_token=None, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        kwargs["cache_dir"] = tmp_path / "cache"
+        return MobilityDatabase(refresh_token, **kwargs)
+
+    monkeypatch.setattr("transitio.catalog.MobilityDatabase", patched)
+    with pytest.warns(UserWarning):
+        result = fetch(
+            (24.6, 60.1, 25.2, 60.4),
+            directory=tmp_path / "out",
+            reference_date="20260601",
+        )
+    assert len(set(result.feeds)) == 2
+    agencies = {zipfile.ZipFile(p).read("agency.txt") for p in result.feeds}
+    assert len(agencies) == 2
+
+
 def test_fetch_when_without_token_warns(pipeline_env):
     tmp_path, _ = pipeline_env
     with pytest.warns(UserWarning) as caught:
