@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- `merge_feeds(..., timezones="skip")` leaves out the feeds whose
+  `agency_timezone` differs from the one most feeds declare (ties: the
+  earliest feed's, then the first by name) and merges the rest, each keeping the prefix it had among
+  all the inputs; the report lists them under `"skipped_feeds"`. The default,
+  `timezones="refuse"`, raises as before. New York City's 41 feeds could not
+  be merged because one intercity coach feed declares UTC.
+
 ### Changed
 
 - `fetch` delivers a feed's data once when two catalogue entries serve the
