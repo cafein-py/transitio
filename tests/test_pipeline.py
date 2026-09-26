@@ -98,20 +98,22 @@ def test_fetch_end_to_end(pipeline_env):
     assert pbf == fake_pbf and feeds == result.feeds
 
 
-def test_an_area_fetch_keeps_each_feeds_download_apart(pipeline_env, monkeypatch):
+def _zip(tables, compression=zipfile.ZIP_DEFLATED):
     import io as _io
 
+    buffer = _io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=compression) as archive:
+        for name, content in tables.items():
+            archive.writestr(name, content)
+    return buffer.getvalue()
+
+
+def _area_fetch(monkeypatch, tmp_path, second):
+    """An area fetch over two hosted feeds, mdb-10 serving ``GTFS`` and mdb-11
+    the zip bytes ``second``."""
     from transitio.catalog._client import MobilityDatabase
 
-    tmp_path, _ = pipeline_env
-    other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "HKL")}
-    payloads = {}
-    for key, tables in (("mdb-10", GTFS), ("mdb-11", other)):
-        buffer = _io.BytesIO()
-        with zipfile.ZipFile(buffer, "w") as archive:
-            for name, content in tables.items():
-                archive.writestr(name, content)
-        payloads[f"/{key}/latest.zip"] = buffer.getvalue()
+    payloads = {"/mdb-10/latest.zip": _zip(GTFS), "/mdb-11/latest.zip": second}
     row = CSV_BODY.splitlines()[1]
     csv = CSV_BODY + row.replace("mdb-10", "mdb-11").replace(",HSL,", ",HKL,") + "\n"
 
@@ -129,14 +131,68 @@ def test_an_area_fetch_keeps_each_feeds_download_apart(pipeline_env, monkeypatch
 
     monkeypatch.setattr("transitio.catalog.MobilityDatabase", patched)
     with pytest.warns(UserWarning):
-        result = fetch(
+        return fetch(
             (24.6, 60.1, 25.2, 60.4),
             directory=tmp_path / "out",
             reference_date="20260601",
         )
+
+
+def test_an_area_fetch_keeps_each_feeds_download_apart(pipeline_env, monkeypatch):
+    tmp_path, _ = pipeline_env
+    other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "HKL")}
+    result = _area_fetch(monkeypatch, tmp_path, _zip(other))
     assert len(set(result.feeds)) == 2
     agencies = {zipfile.ZipFile(p).read("agency.txt") for p in result.feeds}
     assert len(agencies) == 2
+
+
+def test_an_area_fetch_delivers_the_same_content_once(pipeline_env, monkeypatch):
+    tmp_path, _ = pipeline_env
+    # Other archive bytes, the same files: stored rather than deflated.
+    result = _area_fetch(monkeypatch, tmp_path, _zip(GTFS, zipfile.ZIP_STORED))
+    assert len(result.feeds) == 1
+    ((feed_id, reason),) = result.skipped
+    other = ({"mdb-10", "mdb-11"} - {feed_id}).pop()
+    assert reason == f"same content as {other}"
+
+
+OTHER_TRIPS = {**GTFS, "trips.txt": "route_id,service_id,trip_id\nr1,wk,t2\n"}
+
+
+@pytest.mark.parametrize(
+    "second, routes, replaced, same",
+    [
+        (_zip(GTFS), None, False, True),
+        (_zip(GTFS, zipfile.ZIP_STORED), None, False, True),
+        (_zip(OTHER_TRIPS), None, False, False),
+        (_zip(GTFS), frozenset({"r1"}), False, False),
+        (b"not a zip", None, False, False),
+        # The delivered download changed after its check: nothing to match.
+        (_zip(GTFS, zipfile.ZIP_STORED), None, True, False),
+    ],
+    ids=[
+        "same-archive",
+        "same-entries",
+        "other-content",
+        "other-routes",
+        "unreadable",
+        "changed-since",
+    ],
+)
+def test_a_delivered_feed_is_recognised_by_its_content(
+    tmp_path, second, routes, replaced, same
+):
+    from transitio.pipeline._fetch import _Delivered
+
+    first, again = tmp_path / "a.zip", tmp_path / "b.zip"
+    first.write_bytes(_zip(GTFS))
+    again.write_bytes(second)
+    delivered = _Delivered()
+    delivered.add("feed-a", first)
+    if replaced:
+        first.write_bytes(_zip(OTHER_TRIPS))
+    assert delivered.same_as(again, routes) == ("feed-a" if same else None)
 
 
 def test_fetch_when_without_token_warns(pipeline_env):
@@ -440,14 +496,16 @@ def test_fetch_place_selects_downloads_and_processes(tmp_path, monkeypatch):
     import transitio.index as transitio_index
     from index_fixture import HULL, covered_feed, edge, write_index
 
+    # Two catalogue entries serving the same archive: one is delivered.
     feeds = [
         {
-            **covered_feed("f-a", coverage_source="crawl"),
+            **covered_feed(feed_id, coverage_source="crawl"),
             "coverage": HULL,
-            "atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}},
+            "atlas": {"urls": {"static_current": f"https://feeds.example/{feed_id}"}},
         }
+        for feed_id in ("f-a", "f-b")
     ]
-    edges = [edge("Q1757", "f-a", tier="local")]
+    edges = [edge("Q1757", feed_id, tier="local") for feed_id in ("f-a", "f-b")]
     index = transitio_index.read_index(
         write_index(tmp_path / "index", feeds=feeds, edges=edges)
     )
@@ -460,6 +518,7 @@ def test_fetch_place_selects_downloads_and_processes(tmp_path, monkeypatch):
 
     def fake_download(self, feed, directory=None):
         base = __import__("pathlib").Path(directory) if directory else tmp_path
+        base = base / feed.feed_id
         base.mkdir(parents=True, exist_ok=True)
         path = base / "latest.zip"
         path.write_bytes(payload)
@@ -480,7 +539,8 @@ def test_fetch_place_selects_downloads_and_processes(tmp_path, monkeypatch):
     )
     assert result.osm_pbf == fake_pbf
     assert [p.name for p in result.feeds] == ["latest.zip"]
-    assert result.skipped == []
+    ((feed_id, reason),) = result.skipped
+    assert reason == f"same content as {({'f-a', 'f-b'} - {feed_id}).pop()}"
     assert result.selections == []
 
 

@@ -225,6 +225,103 @@ def _process_feed(
     return path, report, fixes, present_routes
 
 
+def _hash_stream(handle):
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: handle.read(1 << 20), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _snapshot(path):
+    """``(archive SHA-256, entries)`` of the zip at ``path``, read through one
+    open: the entries as sorted ``(name, CRC-32, size)`` from the central
+    directory, nothing decompressed. None when it cannot be read."""
+    try:
+        with open(path, "rb") as handle:
+            digest = _hash_stream(handle)
+            handle.seek(0)
+            with zipfile.ZipFile(handle) as archive:
+                listing = sorted(
+                    (info.filename, info.CRC, info.file_size)
+                    for info in archive.infolist()
+                    if not info.is_dir()
+                )
+        return digest, tuple(listing)
+    except Exception:  # noqa: B902 — an unreadable archive matches nothing
+        return None
+
+
+def _entry_digests(path, digest):
+    """Every entry of the zip at ``path`` as sorted ``(name, CRC-32, size,
+    SHA-256)``, one row per entry, read through one open that must still hold
+    the archive ``digest`` recorded earlier; None when it does not or the
+    archive cannot be read."""
+    try:
+        with open(path, "rb") as handle:
+            if _hash_stream(handle) != digest:
+                return None
+            handle.seek(0)
+            rows = []
+            with zipfile.ZipFile(handle) as archive:
+                for info in archive.infolist():
+                    if info.is_dir():
+                        continue
+                    with archive.open(info) as member:
+                        entry = _hash_stream(member)
+                    rows.append((info.filename, info.CRC, info.file_size, entry))
+        return tuple(sorted(rows))
+    except Exception:  # noqa: B902 — an unreadable archive matches nothing
+        return None
+
+
+class _Delivered:
+    """The downloads a call has delivered, with the route filter each was
+    cropped to: a later download with the same content under the same filter
+    would deliver the same file again. Each download is described as it was
+    when checked, before it was processed."""
+
+    def __init__(self):
+        self._feeds = []
+        self._facts = {}
+        self._entries = {}
+
+    def _about(self, path):
+        if path not in self._facts:
+            self._facts[path] = _snapshot(path)
+        return self._facts[path]
+
+    def _digests(self, path):
+        if path not in self._entries:
+            self._entries[path] = _entry_digests(path, self._facts[path][0])
+        return self._entries[path]
+
+    def same_as(self, path, routes=None):
+        """The id of a delivered feed whose download holds the same content
+        as ``path`` and was cropped to the same ``routes``, else None. Same
+        content: equal archive digests, or equal entry listings (name, CRC-32,
+        size) confirmed by equal SHA-256 digests of every entry. An archive
+        that cannot be read, or that changed since it was checked, matches
+        nothing."""
+        facts = self._about(path)
+        if facts is None:
+            return None
+        for feed_id, other, cropped_to in self._feeds:
+            recorded = self._facts[other]
+            if cropped_to != routes or recorded is None:
+                continue
+            if facts[0] == recorded[0]:
+                return feed_id
+            if facts[1] and facts[1] == recorded[1]:
+                mine = self._digests(path)
+                if mine is not None and mine == self._digests(other):
+                    return feed_id
+        return None
+
+    def add(self, feed_id, path, routes=None):
+        self._about(path)
+        self._feeds.append((feed_id, path, routes))
+
+
 def _download_indexed(feed, db, atlas, base_dir):
     """Download an indexed feed, preferring its Mobility Database URL over its
     Transitland Atlas URL (decision I: MDB wins where a feed has both), and
@@ -308,7 +405,10 @@ def fetch(
     target with no upstream checksum, documented in its provenance
     sidecar as such. Every overlapping feed is processed, in a
     deterministic order with official feeds first; one broken feed never
-    aborts the others — it lands in ``skipped`` with its reason.
+    aborts the others — it lands in ``skipped`` with its reason. A download
+    whose content equals a feed already delivered in the call (cropped to the
+    same routes) is not delivered twice: it is skipped as ``"same content as
+    <feed id>"``.
 
     Parameters
     ----------
@@ -435,6 +535,7 @@ def fetch(
     from transitio.catalog._atlas import _feed_dir
 
     feeds, reports, repairs, skipped = [], [], [], []
+    delivered = _Delivered()
     with MobilityDatabase(refresh_token, cache_dir=cache_dir) as db:
         if when is not None and not db._refresh_token:
             warnings.warn(
@@ -476,6 +577,11 @@ def fetch(
             except Exception as error:  # noqa: B902
                 skipped.append((feed.id, f"download failed: {error}"))
                 continue
+            twin = delivered.same_as(path)
+            if twin is not None:
+                skipped.append((feed.id, f"same content as {twin}"))
+                continue
+            download = path
             hosted = None
             if dataset is not None:
                 try:
@@ -507,6 +613,7 @@ def fetch(
             reports.append(report)
             repairs.append(fixes)
             feeds.append(path)
+            delivered.add(feed.id, download)
 
     return FetchResult(
         osm_pbf=osm_pbf,
@@ -649,6 +756,7 @@ def _fetch_place(
 
     kept = place_obj.feeds(tiers=tiers, exclude=exclude, on_unknown=on_unknown)
     feeds, reports, repairs, skipped, selections = [], [], [], [], []
+    delivered = _Delivered()
     if on_unknown == "exclude":
         included = place_obj.feeds(tiers=tiers, exclude=exclude, on_unknown="include")
         for dropped in {f.feed_id for f in included} - {f.feed_id for f in kept}:
@@ -800,6 +908,13 @@ def _fetch_place(
                         "declared_as": None,
                         "selected_by": selected_by,
                     }
+            twin = delivered.same_as(path, routes)
+            if twin is not None:
+                skipped.append((feed.feed_id, f"same content as {twin}"))
+                if selection is not None:
+                    selections.append(selection)
+                continue
+            download = path
             # A per-feed tag folds in the selected routes so the same feed
             # fetched under different tiers never overwrites an earlier output.
             feed_tag = tag
@@ -851,6 +966,7 @@ def _fetch_place(
             reports.append(report)
             repairs.append(fixes)
             feeds.append(path)
+            delivered.add(feed.feed_id, download, routes)
             if selection is not None:
                 selections.append(selection)
 

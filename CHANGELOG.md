@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+
+- `fetch` delivers a feed's data once when two catalogue entries serve the
+  same files: a download whose content equals a feed already delivered in
+  the call, cropped to the same routes, is recorded in `skipped` as
+  `"same content as <feed id>"` instead of being cropped, validated and
+  delivered again. Content is the same when the archives' SHA-256 digests
+  match, or when every entry's name, CRC-32 and size match and the SHA-256
+  digests of the decompressed entries confirm it.
+
 ### Fixed
 
 - `fetch` over an area with a `directory` writes each feed into its own
