@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## 0.15.0 — 2026-09-26
 
 ### Added
 
@@ -18,13 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fetches containers first; the default, `contained="keep"`, delivers every
   feed and reports the delivered pairs in `FetchResult.contained`.
   Containment is a heuristic, not proof that every trip is carried.
-
 - `merge_feeds(..., timezones="skip")` leaves out the feeds whose
   `agency_timezone` differs from the one most feeds declare (ties: the
-  earliest feed's, then the first by name) and merges the rest, each keeping the prefix it had among
-  all the inputs; the report lists them under `"skipped_feeds"`. The default,
-  `timezones="refuse"`, raises as before. New York City's 41 feeds could not
-  be merged because one intercity coach feed declares UTC.
+  earliest feed's, then the first by name) and merges the rest, each keeping
+  the prefix it had among all the inputs; the report lists them under
+  `"skipped_feeds"`. The default, `timezones="refuse"`, raises as before.
+  New York City's 41 feeds could not be merged because one intercity coach
+  feed declares UTC.
 
 ### Changed
 
