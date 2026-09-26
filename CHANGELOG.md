@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The reader reads schema-10 indexes, whose feeds table records for each
+  feed the larger feeds whose stops and routes contain its own
+  (`contained_in`, exposed as `IndexedFeed.contained_in`; empty before
+  schema 10). Schema 10 needs transitio 0.15.0.
+- `fetch(place=..., contained="drop")` leaves a feed out when a feed
+  containing it is delivered in the same call, before downloading it, and
+  fetches containers first; the default, `contained="keep"`, delivers every
+  feed and reports the delivered pairs in `FetchResult.contained`.
+  Containment is a heuristic, not proof that every trip is carried.
+
 - `merge_feeds(..., timezones="skip")` leaves out the feeds whose
   `agency_timezone` differs from the one most feeds declare (ties: the
   earliest feed's, then the first by name) and merges the rest, each keeping the prefix it had among

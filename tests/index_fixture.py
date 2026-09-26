@@ -435,6 +435,11 @@ for _name in ("service_start", "service_end"):
     FEEDS_SCHEMA_9 = FEEDS_SCHEMA_9.insert(
         FEEDS_SCHEMA_9.get_field_index("snapshot"), pa.field(_name, pa.string())
     )
+# Schema 10: the larger feeds containing each feed.
+FEEDS_SCHEMA_10 = FEEDS_SCHEMA_9.insert(
+    FEEDS_SCHEMA_9.get_field_index("snapshot"),
+    pa.field("contained_in", pa.list_(pa.string())),
+)
 PLACES_SCHEMA_9 = PLACES_SCHEMA.insert(
     PLACES_SCHEMA.get_field_index("geometry"), pa.field("validity", pa.string())
 )
@@ -557,6 +562,7 @@ def write_partitioned_index(
     notice=NOTICE,
     realtime=None,
     validity=None,
+    contained=None,
 ):
     """Write a schema-7 index under ``directory``: feeds by ``home_country``
     (``international`` without one), places by ``country_code``, edges under
@@ -567,12 +573,17 @@ def write_partitioned_index(
     one in the index), each static feed naming its companions. With
     ``validity`` (``{place_id: validity record}``) a schema-9 index: the
     feeds' ``service_start`` / ``service_end`` published, each listed place
-    carrying its validity JSON."""
+    carrying its validity JSON. With ``contained`` (``{feed_id: [container
+    ids]}``) a schema-10 index: every feed lists the feeds containing it."""
     directory.mkdir(parents=True, exist_ok=True)
     version = PARTITIONED_SCHEMA_VERSION if realtime is None else 8
+    if contained is not None:
+        validity = validity or {}
     if validity is not None:  # ``{place_id: validity record}``: schema 9
         version = 9
         realtime = realtime or []
+    if contained is not None:
+        version = 10
     home = {feed["feed_id"]: feed.get("home_country") for feed in feeds}
     country = {place["place_id"]: place["country_code"] for place in places}
     companions = {}
@@ -589,6 +600,8 @@ def write_partitioned_index(
         if version >= 9:
             row["service_start"] = feed.get("service_start")
             row["service_end"] = feed.get("service_end")
+        if version >= 10:
+            row["contained_in"] = sorted(contained.get(feed["feed_id"], ()))
         parts.setdefault(home[feed["feed_id"]] or "international", {}).setdefault(
             "feeds", []
         ).append(row)
@@ -626,9 +639,11 @@ def write_partitioned_index(
         listing[partition] = {}
         for table, rows in tables.items():
             if table == "feeds":
-                schema = {7: FEEDS_SCHEMA_7, 8: FEEDS_SCHEMA_8}.get(
-                    version, FEEDS_SCHEMA_9
-                )
+                schema = {
+                    7: FEEDS_SCHEMA_7,
+                    8: FEEDS_SCHEMA_8,
+                    9: FEEDS_SCHEMA_9,
+                }.get(version, FEEDS_SCHEMA_10)
                 data = _parquet(rows, schema)
             elif table == "realtime":
                 data = _parquet(rows, REALTIME_SCHEMA)

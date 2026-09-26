@@ -44,6 +44,9 @@ class FetchResult:
     # The index snapshot the feeds were discovered from; None for the AOI path,
     # which discovers by bounding box and has no snapshot.
     snapshot: str = None
+    # {feed id: [ids of delivered feeds containing it]} over the delivered
+    # feeds, from the index's contained_in (schema 10); empty otherwise.
+    contained: dict = dataclasses.field(default_factory=dict)
 
     def __iter__(self):  # convenient (pbf, feeds) unpacking
         return iter((self.osm_pbf, self.feeds))
@@ -322,6 +325,27 @@ class _Delivered:
         self._feeds.append((feed_id, path, routes))
 
 
+def _containers_first(feeds):
+    """``feeds`` with each one after the feeds among them that contain it
+    (``contained_in``), in their given order otherwise."""
+    by_id = {feed.feed_id: feed for feed in feeds}
+    depth = {}
+
+    def level(feed, seen=()):
+        if feed.feed_id not in depth:
+            above = [
+                by_id[c]
+                for c in feed.contained_in
+                if c in by_id and c not in seen and c != feed.feed_id
+            ]
+            depth[feed.feed_id] = 1 + max(
+                (level(c, (*seen, feed.feed_id)) for c in above), default=-1
+            )
+        return depth[feed.feed_id]
+
+    return sorted(feeds, key=level)
+
+
 def _download_indexed(feed, db, atlas, base_dir):
     """Download an indexed feed, preferring its Mobility Database URL over its
     Transitland Atlas URL (decision I: MDB wins where a feed has both), and
@@ -368,6 +392,7 @@ def fetch(
     exclude=None,
     on_unknown="include",
     on_untrusted_selector="auto",
+    contained="keep",
     index=None,
     modes=None,
     repair=False,
@@ -386,14 +411,21 @@ def fetch(
     ``place``, feeds are selected from the built index by tier -- ``tiers``,
     ``exclude`` and ``on_unknown`` filter the edges -- and the place geometry
     supplies the AOI; ``tiers``, ``exclude``, ``on_unknown``,
-    ``on_untrusted_selector`` and ``index`` apply only with ``place``, and
-    ``country_code`` only with ``aoi``. When a selector cannot be trusted --
+    ``on_untrusted_selector``, ``contained`` and ``index`` apply only with
+    ``place``, and ``country_code`` only with ``aoi``. When a selector cannot be trusted --
     its evidence was missing at build time, or its fingerprint no longer
     matches the download -- ``on_untrusted_selector`` decides the outcome:
     ``"auto"`` (default) skips the feed when an ``exclude`` was asked for and
     otherwise delivers it whole with its tier treated as ``unknown``;
     ``"whole"`` always delivers it whole; ``"drop"`` always skips it;
     ``"error"`` raises :class:`~transitio.exceptions.StaleSelectorError`.
+    A schema-10 index records the larger feeds whose stops and routes contain
+    a feed's; ``contained="keep"`` (default) delivers every feed and reports
+    the delivered pairs in ``FetchResult.contained``, ``contained="drop"``
+    leaves a feed out when a feed containing it is delivered in the call,
+    before downloading it (containers are fetched first). Containment is a
+    heuristic, not proof that every trip is carried, so nothing is left out
+    by default.
 
     Resolves and crops the OSM extract, discovers the GTFS feeds (overlapping
     the AOI, or the place's indexed feeds), downloads each feed, spatially
@@ -447,7 +479,8 @@ def fetch(
     FetchResult
         ``osm_pbf``, validated ``feeds`` (paths), merged ``reports`` and
         repair ``repairs`` (fix logs, empty without ``repair=True``) per
-        kept feed, and ``skipped`` (feed id, reason) pairs. Reports merge
+        kept feed, ``skipped`` (feed id, reason) pairs and, on the place
+        path, the ``contained`` pairs among the delivered feeds. Reports merge
         the local validation of the delivered feed with the hosted report
         of the published dataset, so after cropping or repair the hosted
         side describes the pre-transform original.
@@ -464,11 +497,14 @@ def fetch(
         or index is not None
         or on_unknown != "include"
         or on_untrusted_selector != "auto"
+        or contained != "keep"
     ):
         raise ValueError(
-            "tiers=, exclude=, on_unknown=, on_untrusted_selector= and index= "
-            "apply only with place="
+            "tiers=, exclude=, on_unknown=, on_untrusted_selector=, contained= "
+            "and index= apply only with place="
         )
+    if contained not in ("keep", "drop"):
+        raise ValueError("contained= must be 'keep' or 'drop'")
     if place is not None and country_code is not None:
         raise ValueError("country_code= applies only with aoi=")
     if on_untrusted_selector not in ("auto", "whole", "drop", "error"):
@@ -494,6 +530,7 @@ def fetch(
             exclude=exclude,
             on_unknown=on_unknown,
             on_untrusted_selector=on_untrusted_selector,
+            contained=contained,
             index=index,
             when=when,
             modes=modes,
@@ -683,6 +720,7 @@ def _fetch_place(
     exclude,
     on_unknown,
     on_untrusted_selector,
+    contained,
     index,
     when,
     modes,
@@ -755,8 +793,11 @@ def _fetch_place(
     )
 
     kept = place_obj.feeds(tiers=tiers, exclude=exclude, on_unknown=on_unknown)
+    if contained == "drop":
+        kept = _containers_first(kept)
     feeds, reports, repairs, skipped, selections = [], [], [], [], []
     delivered = _Delivered()
+    delivered_ids = []
     if on_unknown == "exclude":
         included = place_obj.feeds(tiers=tiers, exclude=exclude, on_unknown="include")
         for dropped in {f.feed_id for f in included} - {f.feed_id for f in kept}:
@@ -782,6 +823,13 @@ def _fetch_place(
                 stacklevel=2,
             )
         for feed in kept:
+            if contained == "drop":
+                container = next(
+                    (c for c in feed.contained_in if c in delivered_ids), None
+                )
+                if container is not None:
+                    skipped.append((feed.feed_id, f"contained in {container}"))
+                    continue
             dataset = None
             errors = []
             if db._refresh_token:
@@ -967,8 +1015,15 @@ def _fetch_place(
             repairs.append(fixes)
             feeds.append(path)
             delivered.add(feed.feed_id, download, routes)
+            delivered_ids.append(feed.feed_id)
             if selection is not None:
                 selections.append(selection)
+
+    pairs = {
+        feed.feed_id: sorted(set(feed.contained_in) & set(delivered_ids))
+        for feed in kept
+        if feed.feed_id in delivered_ids
+    }
 
     return FetchResult(
         osm_pbf=osm_pbf,
@@ -979,4 +1034,5 @@ def _fetch_place(
         selections=selections,
         provenance=provenance,
         snapshot=provenance["snapshot"],
+        contained={feed_id: ids for feed_id, ids in pairs.items() if ids},
     )

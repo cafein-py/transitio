@@ -549,9 +549,85 @@ def test_fetch_aoi_rejects_place_only_arguments():
         {"exclude": ["national"]},
         {"tiers": ["local"]},
         {"on_unknown": "exclude"},
+        {"contained": "drop"},
     ):
         with pytest.raises(ValueError, match="apply only with place="):
             fetch((0, 0, 1, 1), **kwargs)
+    with pytest.raises(ValueError, match="'keep' or 'drop'"):
+        fetch(place="X", contained="maybe")
+
+
+@pytest.mark.parametrize("contained", ["keep", "drop"])
+def test_a_contained_feed_is_reported_or_left_out(tmp_path, monkeypatch, contained):
+    import pathlib
+
+    import transitio.index as transitio_index
+    from index_fixture import HULL, PLACES, covered_feed, edge, write_partitioned_index
+
+    monkeypatch.setattr(
+        "transitio.__version__", transitio_index.MIN_READER_VERSIONS[10]
+    )
+    ids = ("f-a", "f-b")
+    feeds = [
+        {
+            **covered_feed(feed_id, coverage_source="crawl"),
+            "coverage": HULL,
+            "home_country": "FI",
+            "scope": "domestic",
+            "atlas": {"urls": {"static_current": f"https://feeds.example/{feed_id}"}},
+        }
+        for feed_id in ids
+    ]
+    edges = [
+        edge(
+            "Q1757",
+            feed_id,
+            tier="local",
+            relevance_category="primary",
+            relevance=0.5,
+            cross_border=False,
+        )
+        for feed_id in ids
+    ]
+    directory = write_partitioned_index(
+        tmp_path / "index",
+        feeds=feeds,
+        places=[PLACES[0]],
+        edges=edges,
+        contained={"f-a": ["f-b"]},
+    )
+    other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "HKL")}
+    payloads = {"f-a": _zip(GTFS), "f-b": _zip(other)}
+    fetched = []
+
+    def fake_download(self, feed, directory=None):
+        fetched.append(feed.feed_id)
+        base = pathlib.Path(directory) / feed.feed_id
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / "latest.zip"
+        path.write_bytes(payloads[feed.feed_id])
+        return path
+
+    fake_pbf = tmp_path / "aoi.osm.pbf"
+    fake_pbf.write_bytes(b"\x00fake")
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas.download", fake_download)
+    monkeypatch.setattr("transitio.osm.fetch_pbf", lambda *a, **k: fake_pbf)
+    monkeypatch.setattr("transitio.osm._fetch.fetch_pbf", lambda *a, **k: fake_pbf)
+    result = fetch(
+        place="Q1757",
+        index=transitio_index.read_index(directory),
+        directory=tmp_path / "out",
+        crop=False,
+        contained=contained,
+        reference_date="20260601",
+    )
+    if contained == "keep":
+        assert sorted(fetched) == list(ids) and len(result.feeds) == 2
+        assert result.contained == {"f-a": ["f-b"]}
+    else:
+        # The container comes first; the contained feed is never downloaded.
+        assert fetched == ["f-b"] and result.skipped == [("f-a", "contained in f-b")]
+        assert result.contained == {}
 
 
 def test_fetch_place_rejects_country_code():

@@ -364,6 +364,23 @@ def test_a_schema_8_index_carries_the_realtime_companions(tmp_path):
     assert len(reader.read_index(staging).realtime) == 4
 
 
+def test_a_schema_10_index_lists_the_feeds_containing_a_feed(tmp_path, monkeypatch):
+    monkeypatch.setattr(transitio, "__version__", reader.MIN_READER_VERSIONS[10])
+    directory = write_partitioned_index(
+        tmp_path / "index",
+        feeds=FEEDS,
+        places=PLACES,
+        edges=EDGES,
+        contained={"f-hsl": ["f-ferry"]},
+    )
+    index = reader.read_index(directory)
+    assert index.schema_version == 10
+    assert index.snapshot["min_reader_version"] == "0.15.0"
+    served = reader.place("hel", index=index).feeds(categories=None)
+    assert {f.feed_id: f.contained_in for f in served}["f-hsl"] == ["f-ferry"]
+    assert reader.place("tll", index=index).feeds(categories=None)[0].contained_in == []
+
+
 def test_a_schema_9_index_carries_the_feed_spans_and_place_validity(tmp_path):
     import datetime
 
@@ -421,6 +438,7 @@ def test_a_schema_9_index_carries_the_feed_spans_and_place_validity(tmp_path):
     (hsl,) = [f for f in helsinki.feeds(categories=None) if f.feed_id == "f-hsl"]
     assert hsl.service_start == datetime.date(2026, 9, 1)
     assert hsl.service_end == datetime.date(2026, 9, 14)
+    assert hsl.contained_in == []  # schema 10 lists containers
     checked = helsinki.validity
     assert checked.feeds_dated == 1 and checked.feeds_undated == 2
     assert checked.start == datetime.date(2026, 9, 1)
