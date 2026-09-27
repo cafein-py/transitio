@@ -10,6 +10,10 @@ hashes ``(route_id, agency_id, route_type)`` plus the same coordinate set:
 route ids alone would let a feed keep its ids while moving its stops across a
 border or into a second city. Both are derivable from the downloaded feed
 alone; neither includes anything computed against the boundary cache.
+
+The content identity (:func:`identity`) is a separate, per-table digest of a
+feed's schedule tables, normalized so that two copies of one feed match
+however they were packaged.
 """
 
 import collections
@@ -19,12 +23,24 @@ import hashlib
 import heapq
 import io
 import json
+import lzma
+import math
 import os
+import re
 import struct
 import tempfile
 import zipfile
+import zlib
 
-__all__ = ["COORDINATE_DECIMALS", "KINDS", "compute", "from_feed"]
+__all__ = [
+    "COORDINATE_DECIMALS",
+    "IDENTITY_TABLES",
+    "IDENTITY_VERSION",
+    "KINDS",
+    "compute",
+    "from_feed",
+    "identity",
+]
 
 KINDS = ("route_stops", "feed_stops")
 # ~1 m: absorbs float formatting churn, never a moved stop.
@@ -221,6 +237,17 @@ def _member_served(archive, routes):
         return served
 
 
+IDENTITY_TABLES = (
+    "stops.txt",
+    "routes.txt",
+    "trips.txt",
+    "calendar.txt",
+    "calendar_dates.txt",
+    "stop_times.txt",
+)
+# Part of every table digest: a normalization change never matches old ones.
+IDENTITY_VERSION = 1
+
 # Row digests are sorted in memory up to _SPILL_ROWS, then written as sorted
 # runs and merged at most _MERGE_FAN_IN at a time, so memory stays bounded
 # whatever the table holds.
@@ -231,6 +258,128 @@ _MERGE_FAN_IN = 32
 _ROW_DIGEST_BYTES = 16
 # One distinct row digest and how many rows share it.
 _RECORD = struct.Struct(f">{_ROW_DIGEST_BYTES}sQ")
+
+# What makes a source unreadable rather than a defect: zipfile raises most of
+# these for a malformed or encrypted archive, csv and the decoder the rest.
+_UNREADABLE = (
+    OSError,
+    EOFError,
+    ValueError,
+    RuntimeError,
+    csv.Error,
+    zipfile.BadZipFile,
+    zlib.error,
+    lzma.LZMAError,
+    _MemberTooLarge,
+)
+_SINGLE_DIGIT_HOUR = re.compile(r"[0-9]:[0-9]{2}:[0-9]{2}")
+
+
+def identity(source, *, max_member_bytes=_MAX_MEMBER_BYTES):
+    """``{table: hex digest}`` over the feed's identity tables, or None.
+
+    ``source`` is a GTFS zip (a path or a binary file object); members are
+    read at the root. Each carried table in :data:`IDENTITY_TABLES` gets a
+    digest of its rows, independent of column order, row order, whitespace
+    around values, empty or absent optional columns, byte-order mark and line
+    endings; stop coordinates are rounded to :data:`COORDINATE_DECIMALS` and
+    single-digit stop-time hours zero-padded, and everything else, ids
+    included, is kept verbatim. None when the source is unreadable: not a
+    zip, an identity table named twice or over ``max_member_bytes``, invalid
+    UTF-8 or CSV (a field longer than the ``csv`` field size limit
+    included), a header naming a column twice.
+    """
+    try:
+        with _Source(source, max_member_bytes) as members:
+            digests = {}
+            for table in IDENTITY_TABLES:
+                raw = members.open(table)
+                if raw is not None:
+                    digests[table] = _table_digest(table, raw)
+            return digests
+    except _UNREADABLE:
+        return None
+
+
+class _Source:
+    """The root members of a GTFS zip, opened by name."""
+
+    def __init__(self, source, max_member_bytes):
+        self._max = max_member_bytes
+        self._archive = zipfile.ZipFile(source)
+        names = collections.Counter(i.filename for i in self._archive.infolist())
+        if any(names[table] > 1 for table in IDENTITY_TABLES):
+            self._archive.close()
+            raise ValueError("an identity table is named twice")
+
+    def open(self, name):
+        """A binary stream over member ``name``, or None when it is absent."""
+        try:
+            info = self._archive.getinfo(name)
+        except KeyError:
+            return None
+        if info.file_size > self._max:
+            raise _MemberTooLarge(name)
+        return self._archive.open(info)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self._archive.close()
+
+
+def _table_digest(table, raw):
+    """The digest of one table's normalized rows, in sorted row order."""
+    with (
+        io.TextIOWrapper(
+            raw, encoding="utf-8-sig", errors="strict", newline=""
+        ) as text,
+        _SortedDigests() as rows,
+    ):
+        reader = csv.reader(text, strict=True)
+        header = [name.strip() for name in next(reader, [])]
+        if len(set(header)) != len(header):
+            raise ValueError(f"{table}: a column is named twice")
+        fix = _fixes(table)
+        order = sorted(range(len(header)), key=header.__getitem__)
+        prefixes = [f"{len(name)}:{name}" for name in header]
+        fixes = [fix.get(name) for name in header]
+        for fields in reader:
+            parts = []
+            for index in order:
+                if index >= len(fields):
+                    continue
+                value = fields[index].strip()
+                if not value:
+                    continue
+                if fixes[index] is not None:
+                    value = fixes[index](value)
+                parts.append(f"{prefixes[index]}{len(value)}:{value}")
+            if parts:
+                encoded = "".join(parts).encode("utf-8")
+                rows.add(hashlib.sha256(encoded).digest()[:_ROW_DIGEST_BYTES])
+        return rows.hexdigest(f"{IDENTITY_VERSION}\n{table}\n")
+
+
+def _fixes(table):
+    if table == "stops.txt":
+        return {"stop_lat": _coordinate, "stop_lon": _coordinate}
+    if table == "stop_times.txt":
+        return {"arrival_time": _clock, "departure_time": _clock}
+    return {}
+
+
+def _coordinate(value):
+    try:
+        number = float(value)
+    except ValueError:
+        return value
+    return repr(_round(number)) if math.isfinite(number) else value
+
+
+def _clock(value):
+    return "0" + value if _SINGLE_DIGIT_HOUR.fullmatch(value) else value
 
 
 class _SortedDigests:
