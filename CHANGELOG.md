@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.16.0 — 2026-09-27
+
+### Added
+
+- `transitio.index.fingerprint.identity(source)` computes a per-table content
+  identity of a GTFS feed, from a zip or from a directory holding the member
+  files: one digest each for stops, routes, trips, calendar, calendar_dates
+  and stop_times. A digest does not change with column order, row order,
+  whitespace around values, empty or absent optional columns, byte-order
+  mark, line endings or zip packaging; stop coordinates are rounded to about
+  1 m and single-digit stop-time hours zero-padded, and ids and all other
+  values are kept verbatim. An unreadable source has no identity (`None`).
+  Large tables are hashed with bounded memory.
+- `fingerprint.identical_groups(identities)` groups the feeds whose
+  identities match: equal stops, routes and trips, the same calendar
+  tables, and equal stop_times where both feeds carry it.
+
 ## 0.15.0 — 2026-09-26
 
 ### Added
