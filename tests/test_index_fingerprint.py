@@ -1,5 +1,6 @@
 """The classification fingerprint's canonicalisation."""
 
+import hashlib
 import io
 import warnings
 import zipfile
@@ -119,3 +120,22 @@ def test_coordinates_are_rounded_and_order_is_canonical():
 def test_bad_inputs_are_refused(kind, served, message):
     with pytest.raises(ValueError, match=message):
         fingerprint.compute(kind, ROUTES, COORDS, served)
+
+
+def test_sorted_digests_ignore_order_count_repeats_and_spill_alike(monkeypatch):
+    rows = [hashlib.sha256(bytes([i % 7])).digest()[:16] for i in range(40)]
+
+    def digest(batch):
+        with fingerprint._SortedDigests() as sorted_rows:
+            for row in batch:
+                sorted_rows.add(row)
+            return sorted_rows.hexdigest("table\n")
+
+    held = digest(rows)
+    assert digest(rows[::-1]) == held
+    assert digest(rows + rows[:1]) != held
+    # One row per run and pairwise merges: records collapse across runs, and
+    # runs merge in stages, to the same digest.
+    monkeypatch.setattr(fingerprint, "_SPILL_ROWS", 1)
+    monkeypatch.setattr(fingerprint, "_MERGE_FAN_IN", 2)
+    assert digest(rows[::-1]) == held

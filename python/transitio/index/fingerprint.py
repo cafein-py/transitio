@@ -16,8 +16,12 @@ import collections
 import contextlib
 import csv
 import hashlib
+import heapq
 import io
 import json
+import os
+import struct
+import tempfile
 import zipfile
 
 __all__ = ["COORDINATE_DECIMALS", "KINDS", "compute", "from_feed"]
@@ -215,3 +219,103 @@ def _member_served(archive, routes):
                 continue
             served.setdefault(route_id, set()).add(stop_id)
         return served
+
+
+# Row digests are sorted in memory up to _SPILL_ROWS, then written as sorted
+# runs and merged at most _MERGE_FAN_IN at a time, so memory stays bounded
+# whatever the table holds.
+_SPILL_ROWS = 1 << 20
+_MERGE_FAN_IN = 32
+# 128 bits per row: a crafted row matching a given one still needs a second
+# preimage, and a spilled national stop_times.txt takes half the disk.
+_ROW_DIGEST_BYTES = 16
+# One distinct row digest and how many rows share it.
+_RECORD = struct.Struct(f">{_ROW_DIGEST_BYTES}sQ")
+
+
+class _SortedDigests:
+    """Row digests hashed in sorted order as ``(digest, count)`` records.
+
+    Up to ``_SPILL_ROWS`` digests are held and sorted in memory; beyond that
+    each batch becomes a sorted run file, and every ``_MERGE_FAN_IN`` runs
+    are merged into one, so neither memory nor open files grow with the
+    table. Identical rows collapse into one record, and the in-memory and
+    spilled paths hash the same records.
+    """
+
+    def __init__(self):
+        self._rows = []
+        self._count = 0
+        self._directory = None
+        self._runs = []
+
+    def add(self, digest):
+        self._count += 1
+        self._rows.append(digest)
+        if len(self._rows) >= _SPILL_ROWS:
+            self._spill()
+
+    def _spill(self):
+        if self._directory is None:
+            self._directory = tempfile.TemporaryDirectory(
+                prefix="transitio-identity-", ignore_cleanup_errors=True
+            )
+        self._rows.sort()
+        self._runs.append(self._write(_collapse((d, 1) for d in self._rows)))
+        self._rows = []
+        if len(self._runs) >= _MERGE_FAN_IN:
+            runs, self._runs = self._runs, []
+            self._runs.append(self._write(_merged(runs)))
+            for run in runs:
+                os.unlink(run)
+
+    def _write(self, records):
+        handle, path = tempfile.mkstemp(dir=self._directory.name)
+        with os.fdopen(handle, "wb") as out:
+            for digest, count in records:
+                out.write(_RECORD.pack(digest, count))
+        return path
+
+    def hexdigest(self, header):
+        final = hashlib.sha256(f"{header}{self._count}\n".encode("utf-8"))
+        if self._directory is None:
+            self._rows.sort()
+            records = _collapse((d, 1) for d in self._rows)
+        else:
+            if self._rows:
+                self._spill()
+            records = _merged(self._runs)
+        for digest, count in records:
+            final.update(_RECORD.pack(digest, count))
+        return final.hexdigest()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        if self._directory is not None:
+            self._directory.cleanup()
+
+
+def _collapse(records):
+    """Sorted ``(digest, count)`` records with equal digests summed."""
+    current, total = None, 0
+    for digest, count in records:
+        if digest == current:
+            total += count
+            continue
+        if current is not None:
+            yield current, total
+        current, total = digest, count
+    if current is not None:
+        yield current, total
+
+
+def _merged(runs):
+    return _collapse(heapq.merge(*(_run_records(run) for run in runs)))
+
+
+def _run_records(path):
+    with open(path, "rb") as handle:
+        while chunk := handle.read(_RECORD.size * 4096):
+            yield from _RECORD.iter_unpack(chunk)
