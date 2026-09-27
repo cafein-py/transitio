@@ -191,6 +191,44 @@ def test_identity_ignores_packaging_and_sees_each_table_change(tmp_path):
         assert {t for t in base if found[t] != base[t]} == {table}
 
 
+_T = {"stops.txt": "s", "routes.txt": "r", "trips.txt": "t", "calendar.txt": "c"}
+
+
+@pytest.mark.parametrize(
+    ("identities", "groups"),
+    [
+        (
+            {"a": {**_T, "stop_times.txt": "x"}, "b": {**_T, "stop_times.txt": "x"}},
+            [["a", "b"]],
+        ),
+        ({"a": {**_T, "stop_times.txt": "x"}, "b": {**_T, "stop_times.txt": "y"}}, []),
+        ({"b": _T, "a": {**_T, "stop_times.txt": "x"}, "c": _T}, [["a", "b", "c"]]),
+        (
+            {
+                "a": {**_T, "stop_times.txt": "x"},
+                "b": _T,
+                "c": {**_T, "stop_times.txt": "y"},
+            },
+            [],
+        ),
+        ({"a": _T, "b": {**_T, "calendar_dates.txt": "d"}}, []),
+        ({"a": None, "b": _T, "c": {**_T, "trips.txt": ""}}, []),
+        ({"a": {**_T, "calendar.txt": ""}, "b": {**_T, "calendar.txt": ""}}, []),
+    ],
+    ids=[
+        "equal",
+        "times-differ",
+        "untimed-joins",
+        "untimed-ambiguous",
+        "calendars-differ",
+        "unusable",
+        "no-calendar",
+    ],
+)
+def test_identical_groups(identities, groups):
+    assert fingerprint.identical_groups(identities) == groups
+
+
 def test_an_unreadable_source_has_no_identity():
     dup = io.BytesIO()
     with warnings.catch_warnings():

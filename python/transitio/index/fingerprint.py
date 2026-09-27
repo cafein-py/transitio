@@ -13,7 +13,8 @@ alone; neither includes anything computed against the boundary cache.
 
 The content identity (:func:`identity`) is a separate, per-table digest of a
 feed's schedule tables, normalized so that two copies of one feed match
-however they were packaged.
+however they were packaged; :func:`identical_groups` groups the feeds whose
+identities match.
 """
 
 import collections
@@ -41,6 +42,7 @@ __all__ = [
     "KINDS",
     "compute",
     "from_feed",
+    "identical_groups",
     "identity",
 ]
 
@@ -261,6 +263,9 @@ _ROW_DIGEST_BYTES = 16
 # One distinct row digest and how many rows share it.
 _RECORD = struct.Struct(f">{_ROW_DIGEST_BYTES}sQ")
 
+_KEY_TABLES = IDENTITY_TABLES[:5]
+_REQUIRED_TABLES = ("stops.txt", "routes.txt", "trips.txt")
+
 # What makes a source unreadable rather than a defect: zipfile raises most of
 # these for a malformed or encrypted archive, csv and the decoder the rest.
 _UNREADABLE = (
@@ -303,6 +308,41 @@ def identity(source, *, max_member_bytes=_MAX_MEMBER_BYTES):
             return digests
     except _UNREADABLE:
         return None
+
+
+def identical_groups(identities):
+    """The groups of feeds with identical content, from ``{id: identity}``.
+
+    Identical means equal stops, routes and trips, the same calendar and
+    calendar_dates tables (at least one of them), and equal stop_times when
+    both feeds carry it. A feed without stop_times joins the one group of its
+    other tables when there is exactly one, and stays out when several
+    stop_times versions exist. Returns the groups of two or more ids, each
+    sorted, in sorted order.
+    """
+    keyed = collections.defaultdict(list)
+    for feed_id, found in identities.items():
+        if not found or not all(found.get(t) for t in _REQUIRED_TABLES):
+            continue
+        if not (found.get("calendar.txt") or found.get("calendar_dates.txt")):
+            continue
+        key = tuple(found.get(t) for t in _KEY_TABLES)
+        keyed[key].append((feed_id, found.get("stop_times.txt")))
+    groups = []
+    for members in keyed.values():
+        timed = collections.defaultdict(list)
+        untimed = []
+        for feed_id, times in members:
+            if times:
+                timed[times].append(feed_id)
+            else:
+                untimed.append(feed_id)
+        if len(timed) == 1:
+            next(iter(timed.values())).extend(untimed)
+        elif not timed:
+            timed[None] = untimed
+        groups.extend(sorted(ids) for ids in timed.values() if len(ids) > 1)
+    return sorted(groups)
 
 
 class _Source:
