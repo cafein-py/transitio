@@ -2,6 +2,7 @@
 
 import hashlib
 import io
+import os
 import warnings
 import zipfile
 
@@ -169,12 +170,15 @@ def _repackaged(members):
     return out
 
 
-def test_identity_ignores_packaging_and_sees_each_table_change():
+def test_identity_ignores_packaging_and_sees_each_table_change(tmp_path):
     base = fingerprint.identity(io.BytesIO(_feed_zip(_FEED)))
     assert set(base) == set(fingerprint.IDENTITY_TABLES) - {"calendar_dates.txt"}
     agency = _FEED["agency.txt"].replace("https://a.example", "https://b.example")
     repackaged = _repackaged({**_FEED, "agency.txt": agency})
     assert fingerprint.identity(io.BytesIO(_feed_zip(repackaged))) == base
+    for name, text in repackaged.items():
+        (tmp_path / name).write_bytes(text.encode("utf-8"))
+    assert fingerprint.identity(tmp_path) == base
     changes = {
         "stops.txt": ("60.3,25.0", "60.31,25.0"),
         "stop_times.txt": ("06:00:00,06:00:00", "06:01:00,06:01:00"),
@@ -225,6 +229,26 @@ def test_an_unreadable_source_has_no_identity():
         assert fingerprint.identity(source) is None
     oversize = io.BytesIO(_feed_zip(_FEED))
     assert fingerprint.identity(oversize, max_member_bytes=10) is None
+
+
+def test_a_directory_member_must_be_a_regular_file_under_the_ceiling(tmp_path):
+    folder = tmp_path / "feed"
+    folder.mkdir()
+    for name, text in _FEED.items():
+        (folder / name).write_text(text)
+    assert fingerprint.identity(folder) is not None
+    assert fingerprint.identity(folder, max_member_bytes=10) is None
+    (folder / "stops.txt").unlink()
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(folder / "stops.txt")  # never opened, so nothing blocks
+        assert fingerprint.identity(folder) is None
+        (folder / "stops.txt").unlink()
+    (tmp_path / "elsewhere.txt").write_text(_FEED["stops.txt"])
+    try:
+        (folder / "stops.txt").symlink_to(tmp_path / "elsewhere.txt")
+    except OSError:
+        pytest.skip("symlinks are not available here")
+    assert fingerprint.identity(folder) is None
 
 
 def test_only_a_clock_time_gets_its_hour_padded():

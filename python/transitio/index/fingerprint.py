@@ -26,7 +26,9 @@ import json
 import lzma
 import math
 import os
+import pathlib
 import re
+import stat
 import struct
 import tempfile
 import zipfile
@@ -139,7 +141,7 @@ def from_feed(path, kind):
 
 
 class _MemberTooLarge(Exception):
-    """A member's declared size is over the build's per-member ceiling."""
+    """A member is over the build's per-member ceiling."""
 
 
 # Ceiling on one member's uncompressed size, mirroring the crawl's member
@@ -278,15 +280,17 @@ _SINGLE_DIGIT_HOUR = re.compile(r"[0-9]:[0-9]{2}:[0-9]{2}")
 def identity(source, *, max_member_bytes=_MAX_MEMBER_BYTES):
     """``{table: hex digest}`` over the feed's identity tables, or None.
 
-    ``source`` is a GTFS zip (a path or a binary file object); members are
-    read at the root. Each carried table in :data:`IDENTITY_TABLES` gets a
+    ``source`` is a GTFS zip (a path or a binary file object) or a directory
+    holding the member files, which must not change while they are read;
+    members are read at the root. Each carried table in :data:`IDENTITY_TABLES` gets a
     digest of its rows, independent of column order, row order, whitespace
     around values, empty or absent optional columns, byte-order mark and line
     endings; stop coordinates are rounded to :data:`COORDINATE_DECIMALS` and
     single-digit stop-time hours zero-padded, and everything else, ids
     included, is kept verbatim. None when the source is unreadable: not a
-    zip, an identity table named twice or over ``max_member_bytes``, invalid
-    UTF-8 or CSV (a field longer than the ``csv`` field size limit
+    zip, an identity table named twice or over ``max_member_bytes``, a
+    directory member that is not a regular file (a symlink included),
+    invalid UTF-8 or CSV (a field longer than the ``csv`` field size limit
     included), a header naming a column twice.
     """
     try:
@@ -302,10 +306,15 @@ def identity(source, *, max_member_bytes=_MAX_MEMBER_BYTES):
 
 
 class _Source:
-    """The root members of a GTFS zip, opened by name."""
+    """The root members of a GTFS zip or directory, opened by name."""
 
     def __init__(self, source, max_member_bytes):
         self._max = max_member_bytes
+        self._archive = None
+        self._root = None
+        if isinstance(source, (str, os.PathLike)) and os.path.isdir(source):
+            self._root = pathlib.Path(source)
+            return
         self._archive = zipfile.ZipFile(source)
         names = collections.Counter(i.filename for i in self._archive.infolist())
         if any(names[table] > 1 for table in IDENTITY_TABLES):
@@ -314,6 +323,26 @@ class _Source:
 
     def open(self, name):
         """A binary stream over member ``name``, or None when it is absent."""
+        if self._root is not None:
+            path = self._root / name
+            try:
+                seen = os.lstat(path)
+            except FileNotFoundError:
+                return None
+            # A symlink, FIFO or device is refused before it is opened; the
+            # opened file must then be the one inspected, so a swap in between
+            # is refused too (Windows has no O_NOFOLLOW to do it atomically).
+            if not stat.S_ISREG(seen.st_mode):
+                raise ValueError(f"{name} is not a regular file")
+            flags = os.O_RDONLY
+            for flag in ("O_BINARY", "O_NOFOLLOW", "O_NONBLOCK"):
+                flags |= getattr(os, flag, 0)
+            raw = io.FileIO(os.open(path, flags), "rb")
+            opened = os.fstat(raw.fileno())
+            if (opened.st_dev, opened.st_ino) != (seen.st_dev, seen.st_ino):
+                raw.close()
+                raise ValueError(f"{name} changed while it was opened")
+            return io.BufferedReader(_Bounded(raw, self._max, name))
         try:
             info = self._archive.getinfo(name)
         except KeyError:
@@ -326,7 +355,8 @@ class _Source:
         return self
 
     def __exit__(self, *exc_info):
-        self._archive.close()
+        if self._archive is not None:
+            self._archive.close()
 
 
 def _table_digest(table, raw):
@@ -380,6 +410,31 @@ def _coordinate(value):
 
 def _clock(value):
     return "0" + value if _SINGLE_DIGIT_HOUR.fullmatch(value) else value
+
+
+class _Bounded(io.RawIOBase):
+    """A file read to at most ``limit`` bytes; one byte more is an error, so
+    a member grown after it was opened cannot pass the ceiling."""
+
+    def __init__(self, raw, limit, name):
+        self._raw = raw
+        self._left = limit
+        self._name = name
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        got = self._raw.readinto(buffer)
+        if got:
+            self._left -= got
+            if self._left < 0:
+                raise _MemberTooLarge(self._name)
+        return got
+
+    def close(self):
+        self._raw.close()
+        super().close()
 
 
 class _SortedDigests:
