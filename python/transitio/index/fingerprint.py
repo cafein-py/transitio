@@ -10,17 +10,41 @@ hashes ``(route_id, agency_id, route_type)`` plus the same coordinate set:
 route ids alone would let a feed keep its ids while moving its stops across a
 border or into a second city. Both are derivable from the downloaded feed
 alone; neither includes anything computed against the boundary cache.
+
+The content identity (:func:`identity`) is a separate, per-table digest of a
+feed's schedule tables, normalized so that two copies of one feed match
+however they were packaged; :func:`identical_groups` groups the feeds whose
+identities match.
 """
 
 import collections
 import contextlib
 import csv
 import hashlib
+import heapq
 import io
 import json
+import lzma
+import math
+import os
+import pathlib
+import re
+import stat
+import struct
+import tempfile
 import zipfile
+import zlib
 
-__all__ = ["COORDINATE_DECIMALS", "KINDS", "compute", "from_feed"]
+__all__ = [
+    "COORDINATE_DECIMALS",
+    "IDENTITY_TABLES",
+    "IDENTITY_VERSION",
+    "KINDS",
+    "compute",
+    "from_feed",
+    "identical_groups",
+    "identity",
+]
 
 KINDS = ("route_stops", "feed_stops")
 # ~1 m: absorbs float formatting churn, never a moved stop.
@@ -119,7 +143,7 @@ def from_feed(path, kind):
 
 
 class _MemberTooLarge(Exception):
-    """A member's declared size is over the build's per-member ceiling."""
+    """A member is over the build's per-member ceiling."""
 
 
 # Ceiling on one member's uncompressed size, mirroring the crawl's member
@@ -215,3 +239,327 @@ def _member_served(archive, routes):
                 continue
             served.setdefault(route_id, set()).add(stop_id)
         return served
+
+
+IDENTITY_TABLES = (
+    "stops.txt",
+    "routes.txt",
+    "trips.txt",
+    "calendar.txt",
+    "calendar_dates.txt",
+    "stop_times.txt",
+)
+# Part of every table digest: a normalization change never matches old ones.
+IDENTITY_VERSION = 1
+
+# Row digests are sorted in memory up to _SPILL_ROWS, then written as sorted
+# runs and merged at most _MERGE_FAN_IN at a time, so memory stays bounded
+# whatever the table holds.
+_SPILL_ROWS = 1 << 20
+_MERGE_FAN_IN = 32
+# 128 bits per row: a crafted row matching a given one still needs a second
+# preimage, and a spilled national stop_times.txt takes half the disk.
+_ROW_DIGEST_BYTES = 16
+# One distinct row digest and how many rows share it.
+_RECORD = struct.Struct(f">{_ROW_DIGEST_BYTES}sQ")
+
+_KEY_TABLES = IDENTITY_TABLES[:5]
+_REQUIRED_TABLES = ("stops.txt", "routes.txt", "trips.txt")
+
+# What makes a source unreadable rather than a defect: zipfile raises most of
+# these for a malformed or encrypted archive, csv and the decoder the rest.
+_UNREADABLE = (
+    OSError,
+    EOFError,
+    ValueError,
+    RuntimeError,
+    csv.Error,
+    zipfile.BadZipFile,
+    zlib.error,
+    lzma.LZMAError,
+    _MemberTooLarge,
+)
+_SINGLE_DIGIT_HOUR = re.compile(r"[0-9]:[0-9]{2}:[0-9]{2}")
+
+
+def identity(source, *, max_member_bytes=_MAX_MEMBER_BYTES):
+    """``{table: hex digest}`` over the feed's identity tables, or None.
+
+    ``source`` is a GTFS zip (a path or a binary file object) or a directory
+    holding the member files, which must not change while they are read;
+    members are read at the root. Each carried table in :data:`IDENTITY_TABLES` gets a
+    digest of its rows, independent of column order, row order, whitespace
+    around values, empty or absent optional columns, byte-order mark and line
+    endings; stop coordinates are rounded to :data:`COORDINATE_DECIMALS` and
+    single-digit stop-time hours zero-padded, and everything else, ids
+    included, is kept verbatim. None when the source is unreadable: not a
+    zip, an identity table named twice or over ``max_member_bytes``, a
+    directory member that is not a regular file (a symlink included),
+    invalid UTF-8 or CSV (a field longer than the ``csv`` field size limit
+    included), a header naming a column twice.
+    """
+    try:
+        with _Source(source, max_member_bytes) as members:
+            digests = {}
+            for table in IDENTITY_TABLES:
+                raw = members.open(table)
+                if raw is not None:
+                    digests[table] = _table_digest(table, raw)
+            return digests
+    except _UNREADABLE:
+        return None
+
+
+def identical_groups(identities):
+    """The groups of feeds with identical content, from ``{id: identity}``.
+
+    Identical means equal stops, routes and trips, the same calendar and
+    calendar_dates tables (at least one of them), and equal stop_times when
+    both feeds carry it. A feed without stop_times joins the one group of its
+    other tables when there is exactly one, and stays out when several
+    stop_times versions exist. Returns the groups of two or more ids, each
+    sorted, in sorted order.
+    """
+    keyed = collections.defaultdict(list)
+    for feed_id, found in identities.items():
+        if not found or not all(found.get(t) for t in _REQUIRED_TABLES):
+            continue
+        if not (found.get("calendar.txt") or found.get("calendar_dates.txt")):
+            continue
+        key = tuple(found.get(t) for t in _KEY_TABLES)
+        keyed[key].append((feed_id, found.get("stop_times.txt")))
+    groups = []
+    for members in keyed.values():
+        timed = collections.defaultdict(list)
+        untimed = []
+        for feed_id, times in members:
+            if times:
+                timed[times].append(feed_id)
+            else:
+                untimed.append(feed_id)
+        if len(timed) == 1:
+            next(iter(timed.values())).extend(untimed)
+        elif not timed:
+            timed[None] = untimed
+        groups.extend(sorted(ids) for ids in timed.values() if len(ids) > 1)
+    return sorted(groups)
+
+
+class _Source:
+    """The root members of a GTFS zip or directory, opened by name."""
+
+    def __init__(self, source, max_member_bytes):
+        self._max = max_member_bytes
+        self._archive = None
+        self._root = None
+        if isinstance(source, (str, os.PathLike)) and os.path.isdir(source):
+            self._root = pathlib.Path(source)
+            return
+        self._archive = zipfile.ZipFile(source)
+        names = collections.Counter(i.filename for i in self._archive.infolist())
+        if any(names[table] > 1 for table in IDENTITY_TABLES):
+            self._archive.close()
+            raise ValueError("an identity table is named twice")
+
+    def open(self, name):
+        """A binary stream over member ``name``, or None when it is absent."""
+        if self._root is not None:
+            path = self._root / name
+            try:
+                seen = os.lstat(path)
+            except FileNotFoundError:
+                return None
+            # A symlink, FIFO or device is refused before it is opened; the
+            # opened file must then be the one inspected, so a swap in between
+            # is refused too (Windows has no O_NOFOLLOW to do it atomically).
+            if not stat.S_ISREG(seen.st_mode):
+                raise ValueError(f"{name} is not a regular file")
+            flags = os.O_RDONLY
+            for flag in ("O_BINARY", "O_NOFOLLOW", "O_NONBLOCK"):
+                flags |= getattr(os, flag, 0)
+            raw = io.FileIO(os.open(path, flags), "rb")
+            opened = os.fstat(raw.fileno())
+            if (opened.st_dev, opened.st_ino) != (seen.st_dev, seen.st_ino):
+                raw.close()
+                raise ValueError(f"{name} changed while it was opened")
+            return io.BufferedReader(_Bounded(raw, self._max, name))
+        try:
+            info = self._archive.getinfo(name)
+        except KeyError:
+            return None
+        if info.file_size > self._max:
+            raise _MemberTooLarge(name)
+        return self._archive.open(info)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        if self._archive is not None:
+            self._archive.close()
+
+
+def _table_digest(table, raw):
+    """The digest of one table's normalized rows, in sorted row order."""
+    with (
+        io.TextIOWrapper(
+            raw, encoding="utf-8-sig", errors="strict", newline=""
+        ) as text,
+        _SortedDigests() as rows,
+    ):
+        reader = csv.reader(text, strict=True)
+        header = [name.strip() for name in next(reader, [])]
+        if len(set(header)) != len(header):
+            raise ValueError(f"{table}: a column is named twice")
+        fix = _fixes(table)
+        order = sorted(range(len(header)), key=header.__getitem__)
+        prefixes = [f"{len(name)}:{name}" for name in header]
+        fixes = [fix.get(name) for name in header]
+        for fields in reader:
+            parts = []
+            for index in order:
+                if index >= len(fields):
+                    continue
+                value = fields[index].strip()
+                if not value:
+                    continue
+                if fixes[index] is not None:
+                    value = fixes[index](value)
+                parts.append(f"{prefixes[index]}{len(value)}:{value}")
+            if parts:
+                encoded = "".join(parts).encode("utf-8")
+                rows.add(hashlib.sha256(encoded).digest()[:_ROW_DIGEST_BYTES])
+        return rows.hexdigest(f"{IDENTITY_VERSION}\n{table}\n")
+
+
+def _fixes(table):
+    if table == "stops.txt":
+        return {"stop_lat": _coordinate, "stop_lon": _coordinate}
+    if table == "stop_times.txt":
+        return {"arrival_time": _clock, "departure_time": _clock}
+    return {}
+
+
+def _coordinate(value):
+    try:
+        number = float(value)
+    except ValueError:
+        return value
+    return repr(_round(number)) if math.isfinite(number) else value
+
+
+def _clock(value):
+    return "0" + value if _SINGLE_DIGIT_HOUR.fullmatch(value) else value
+
+
+class _Bounded(io.RawIOBase):
+    """A file read to at most ``limit`` bytes; one byte more is an error, so
+    a member grown after it was opened cannot pass the ceiling."""
+
+    def __init__(self, raw, limit, name):
+        self._raw = raw
+        self._left = limit
+        self._name = name
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        got = self._raw.readinto(buffer)
+        if got:
+            self._left -= got
+            if self._left < 0:
+                raise _MemberTooLarge(self._name)
+        return got
+
+    def close(self):
+        self._raw.close()
+        super().close()
+
+
+class _SortedDigests:
+    """Row digests hashed in sorted order as ``(digest, count)`` records.
+
+    Up to ``_SPILL_ROWS`` digests are held and sorted in memory; beyond that
+    each batch becomes a sorted run file, and every ``_MERGE_FAN_IN`` runs
+    are merged into one, so neither memory nor open files grow with the
+    table. Identical rows collapse into one record, and the in-memory and
+    spilled paths hash the same records.
+    """
+
+    def __init__(self):
+        self._rows = []
+        self._count = 0
+        self._directory = None
+        self._runs = []
+
+    def add(self, digest):
+        self._count += 1
+        self._rows.append(digest)
+        if len(self._rows) >= _SPILL_ROWS:
+            self._spill()
+
+    def _spill(self):
+        if self._directory is None:
+            self._directory = tempfile.TemporaryDirectory(
+                prefix="transitio-identity-", ignore_cleanup_errors=True
+            )
+        self._rows.sort()
+        self._runs.append(self._write(_collapse((d, 1) for d in self._rows)))
+        self._rows = []
+        if len(self._runs) >= _MERGE_FAN_IN:
+            runs, self._runs = self._runs, []
+            self._runs.append(self._write(_merged(runs)))
+            for run in runs:
+                os.unlink(run)
+
+    def _write(self, records):
+        handle, path = tempfile.mkstemp(dir=self._directory.name)
+        with os.fdopen(handle, "wb") as out:
+            for digest, count in records:
+                out.write(_RECORD.pack(digest, count))
+        return path
+
+    def hexdigest(self, header):
+        final = hashlib.sha256(f"{header}{self._count}\n".encode("utf-8"))
+        if self._directory is None:
+            self._rows.sort()
+            records = _collapse((d, 1) for d in self._rows)
+        else:
+            if self._rows:
+                self._spill()
+            records = _merged(self._runs)
+        for digest, count in records:
+            final.update(_RECORD.pack(digest, count))
+        return final.hexdigest()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        if self._directory is not None:
+            self._directory.cleanup()
+
+
+def _collapse(records):
+    """Sorted ``(digest, count)`` records with equal digests summed."""
+    current, total = None, 0
+    for digest, count in records:
+        if digest == current:
+            total += count
+            continue
+        if current is not None:
+            yield current, total
+        current, total = digest, count
+    if current is not None:
+        yield current, total
+
+
+def _merged(runs):
+    return _collapse(heapq.merge(*(_run_records(run) for run in runs)))
+
+
+def _run_records(path):
+    with open(path, "rb") as handle:
+        while chunk := handle.read(_RECORD.size * 4096):
+            yield from _RECORD.iter_unpack(chunk)
