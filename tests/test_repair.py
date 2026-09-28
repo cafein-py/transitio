@@ -103,9 +103,9 @@ def test_repair_helsinki_roundtrip(tmp_path, helsinki_gtfs):
 
 def test_repair_refuses_truncated_snapshots(tmp_path):
     source = write_zip(tmp_path / "broken.zip", BROKEN)
-    with pytest.raises(OSError, match="budget"):
+    with pytest.raises(OSError, match="max_rows"):
         repair_feed(source, tmp_path / "out.zip", max_rows=1)
-    with pytest.raises(OSError, match="budget"):
+    with pytest.raises(OSError, match="max_notices_per_file"):
         repair_feed(source, tmp_path / "out.zip", max_notices_per_file=1)
 
 

@@ -19,6 +19,7 @@ The pipeline
 
    fetch
    FetchResult
+   FetchResult.selection_table
    FetchResult.to_cafein
    FetchResult.to_pyrosm
 
