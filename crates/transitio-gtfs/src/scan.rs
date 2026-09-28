@@ -31,6 +31,11 @@ const MAX_CENTRAL_DIRECTORY_BYTES: u64 = 256 * 1024 * 1024;
 /// indexing allocation; a GTFS feed holds a few dozen files.
 const MAX_ARCHIVE_ENTRIES: u64 = 4096;
 
+/// Bytes after the end-of-central-directory record that the archive-tail
+/// read has room for even behind the longest comment; some published feeds
+/// carry a few.
+const TRAILING_BYTES_ROOM: u64 = 64 * 1024;
+
 /// Recognized non-CSV GTFS files: not unknown, content out of the
 /// structural tier's scope.
 const NON_CSV_FILES: &[&str] = &["locations.geojson"];
@@ -149,14 +154,21 @@ pub fn scan_reader_streaming<R: Read + Seek>(
     // invisible through its API. GTFS files duplicated in the archive are
     // ambiguous (other readers may take the first occurrence); walk the
     // central directory directly to detect and refuse them.
-    let duplicated =
+    let (duplicated, archive_end) =
         duplicated_gtfs_entries(&mut reader).map_err(|e| format!("not a readable zip: {e}"))?;
     reader
         .seek(SeekFrom::Start(0))
         .map_err(|e| format!("cannot rewind archive: {e}"))?;
 
+    // Bytes after the end-of-central-directory record are hidden, so the
+    // zip crate reads the archive the walker checked.
+    let bounded = Bounded {
+        inner: reader,
+        len: archive_end,
+        pos: 0,
+    };
     let mut archive =
-        zip::ZipArchive::new(reader).map_err(|e| format!("not a readable zip: {e}"))?;
+        zip::ZipArchive::new(bounded).map_err(|e| format!("not a readable zip: {e}"))?;
     let mut notices = Vec::new();
     let mut tables = BTreeMap::new();
     let mut incomplete = std::collections::BTreeSet::new();
@@ -232,17 +244,30 @@ pub fn scan_reader_streaming<R: Read + Seek>(
         };
         // An entry may never read past the remaining cumulative budget, so
         // the total limit holds while reading, not after the fact.
-        let budget = options
-            .max_entry_bytes
-            .min(options.max_total_bytes.saturating_sub(total_bytes));
+        let remaining = options.max_total_bytes.saturating_sub(total_bytes);
+        let budget = options.max_entry_bytes.min(remaining);
+        // Every budget a size is over, since raising one alone may not do.
+        let over = |size: u64| {
+            let mut budgets = Vec::new();
+            if size > options.max_entry_bytes {
+                budgets.push("max_entry_bytes");
+            }
+            if size > remaining {
+                budgets.push("max_total_bytes");
+            }
+            budgets
+        };
         if entry.size() > budget {
-            notices.push(unreadable_file(
-                spec.name,
-                &format!(
-                    "declares {} uncompressed bytes, over the {budget}-byte budget",
-                    entry.size()
-                ),
-            ));
+            notices.push(
+                unreadable_file(
+                    spec.name,
+                    &format!(
+                        "declares {} uncompressed bytes, over the {budget}-byte budget",
+                        entry.size()
+                    ),
+                )
+                .with("budgets", over(entry.size())),
+            );
             present.insert(spec.name);
             incomplete.insert(spec.name.to_string());
             continue;
@@ -263,10 +288,10 @@ pub fn scan_reader_streaming<R: Read + Seek>(
             continue;
         }
         if bytes.len() as u64 > budget {
-            notices.push(unreadable_file(
-                spec.name,
-                &format!("exceeds the {budget}-byte budget"),
-            ));
+            notices.push(
+                unreadable_file(spec.name, &format!("exceeds the {budget}-byte budget"))
+                    .with("budgets", over(bytes.len() as u64)),
+            );
             present.insert(spec.name);
             incomplete.insert(spec.name.to_string());
             continue;
@@ -295,57 +320,123 @@ pub fn scan_reader_streaming<R: Read + Seek>(
     })
 }
 
+/// Why a feed cannot be taken whole to `verb` it, or None when it can,
+/// from the notices of its scan and the files it left incomplete: each
+/// file cut short, with every budget it exceeded and that budget's value
+/// ("stops.txt exceeds max_rows (5)"), and with `notice_caps` each file
+/// whose notices were sampled.
+pub fn refusal<'a>(
+    notices: &[Notice],
+    incomplete: impl IntoIterator<Item = &'a str>,
+    options: &ScanOptions,
+    notice_caps: bool,
+    verb: &str,
+) -> Option<String> {
+    let mut reasons = BTreeSet::new();
+    let mut budgets = BTreeSet::new();
+    let mut explained = HashSet::new();
+    let mut raisable = true;
+    for notice in notices {
+        let Some(file) = notice.context.get("filename").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let exceeded: Vec<&str> = match notice.code {
+            "too_many_rows" => vec!["max_rows"],
+            "unreadable_file" => notice
+                .context
+                .get("budgets")
+                .and_then(|v| v.as_array())
+                .map(|names| names.iter().filter_map(|n| n.as_str()).collect())
+                .unwrap_or_default(),
+            "notice_limit_reached" if notice_caps => {
+                if notice.context.contains_key("blockId") {
+                    reasons.insert(format!(
+                        "{file} reaches the block overlap check cap that no budget raises"
+                    ));
+                    raisable = false;
+                    continue;
+                }
+                vec!["max_notices_per_file"]
+            }
+            _ => continue,
+        };
+        for budget in exceeded {
+            let value = match budget {
+                "max_entry_bytes" => options.max_entry_bytes,
+                "max_total_bytes" => options.max_total_bytes,
+                "max_rows" => options.max_rows,
+                "max_columns" => options.max_columns as u64,
+                "max_notices_per_file" => options.max_notices_per_file,
+                _ => continue,
+            };
+            reasons.insert(format!("{file} exceeds {budget} ({value})"));
+            budgets.insert(budget);
+            if notice.code != "notice_limit_reached" {
+                explained.insert(file);
+            }
+        }
+    }
+    for file in incomplete {
+        if explained.contains(file) {
+            continue;
+        }
+        // A duplicated, corrupt or header-unparseable entry, or a guard no
+        // budget raises: nothing reads it whole.
+        let cause = notices.iter().rev().find(|n| {
+            matches!(
+                n.code,
+                "unreadable_file" | "csv_parsing_failed" | "duplicate_zip_entry"
+            ) && n.context.get("filename").and_then(|v| v.as_str()) == Some(file)
+        });
+        let detail = cause.map_or("unreadable", |n| {
+            n.context
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or(n.code)
+        });
+        reasons.insert(format!("{file} cannot be read whole: {detail}"));
+        raisable = false;
+    }
+    if reasons.is_empty() {
+        return None;
+    }
+    let list = reasons.into_iter().collect::<Vec<_>>().join(", ");
+    Some(if !raisable {
+        format!("{list}; cannot {verb} this feed")
+    } else if budgets.len() > 1 {
+        format!("{list}; raise them to {verb} this feed")
+    } else {
+        format!("{list}; raise it to {verb} this feed")
+    })
+}
+
 /// Walk the central directory and return the root-level GTFS filenames that
-/// occur more than once. The end-of-central-directory record is located by
-/// its signature in the archive tail; ZIP64 archives are followed through
-/// the ZIP64 locator.
+/// occur more than once, with the offset where the archive ends. The
+/// end-of-central-directory record is located by its signature in the
+/// archive tail, where trailing bytes may follow it; ZIP64 archives are
+/// followed through the ZIP64 locator.
 fn duplicated_gtfs_entries<R: Read + Seek>(
     reader: &mut R,
-) -> Result<BTreeSet<&'static str>, String> {
+) -> Result<(BTreeSet<&'static str>, u64), String> {
     let file_len = reader
         .seek(SeekFrom::End(0))
         .map_err(|e| format!("cannot read archive length: {e}"))?;
     // EOCD is 22 bytes plus a comment of at most 65535 bytes; the ZIP64
-    // locator (20 bytes) sits directly before the EOCD when present.
-    let tail_len = file_len.min(22 + 65_535 + 20);
+    // locator (20 bytes) sits directly before the EOCD when present, and
+    // trailing bytes may follow it.
+    let tail_len = file_len.min(20 + 22 + 65_535 + TRAILING_BYTES_ROOM);
+    let tail_start = file_len - tail_len;
     reader
-        .seek(SeekFrom::Start(file_len - tail_len))
+        .seek(SeekFrom::Start(tail_start))
         .map_err(|e| format!("cannot seek archive tail: {e}"))?;
     let mut tail = vec![0u8; tail_len as usize];
     reader
         .read_exact(&mut tail)
         .map_err(|e| format!("cannot read archive tail: {e}"))?;
 
-    let eocd_pos = find_eocd(&tail).ok_or("no end-of-central-directory record found")?;
-    let eocd = &tail[eocd_pos..];
-    let mut total_entries = u16::from_le_bytes([eocd[10], eocd[11]]) as u64;
-    let mut cd_size = u32::from_le_bytes([eocd[12], eocd[13], eocd[14], eocd[15]]) as u64;
-    let mut cd_offset = u32::from_le_bytes([eocd[16], eocd[17], eocd[18], eocd[19]]) as u64;
-
-    if total_entries == 0xFFFF || cd_size == 0xFFFF_FFFF || cd_offset == 0xFFFF_FFFF {
-        // ZIP64: the locator directly precedes the EOCD.
-        let locator_pos = eocd_pos
-            .checked_sub(20)
-            .ok_or("truncated ZIP64 end-of-central-directory locator")?;
-        let locator = &tail[locator_pos..eocd_pos];
-        if locator[0..4] != [0x50, 0x4b, 0x06, 0x07] {
-            return Err("missing ZIP64 end-of-central-directory locator".to_string());
-        }
-        let zip64_eocd_offset = u64::from_le_bytes(locator[8..16].try_into().unwrap());
-        reader
-            .seek(SeekFrom::Start(zip64_eocd_offset))
-            .map_err(|e| format!("cannot seek ZIP64 record: {e}"))?;
-        let mut zip64 = [0u8; 56];
-        reader
-            .read_exact(&mut zip64)
-            .map_err(|e| format!("cannot read ZIP64 record: {e}"))?;
-        if zip64[0..4] != [0x50, 0x4b, 0x06, 0x06] {
-            return Err("invalid ZIP64 end-of-central-directory record".to_string());
-        }
-        total_entries = u64::from_le_bytes(zip64[32..40].try_into().unwrap());
-        cd_size = u64::from_le_bytes(zip64[40..48].try_into().unwrap());
-        cd_offset = u64::from_le_bytes(zip64[48..56].try_into().unwrap());
-    }
+    let (record, (total_entries, cd_size, cd_offset)) =
+        find_eocd(reader, &tail, tail_start)?.ok_or("no end-of-central-directory record found")?;
+    let archive_end = tail_start + record.end as u64;
     if cd_size > MAX_CENTRAL_DIRECTORY_BYTES {
         return Err(format!(
             "central directory of {cd_size} bytes exceeds the {MAX_CENTRAL_DIRECTORY_BYTES}-byte limit"
@@ -390,23 +481,125 @@ fn duplicated_gtfs_entries<R: Read + Seek>(
         cursor += 46 + name_len + extra_len + comment_len;
     }
 
-    Ok(counts
+    let duplicated = counts
         .into_iter()
         .filter(|(_, count)| *count > 1)
         .map(|(name, _)| name)
-        .collect())
+        .collect();
+    Ok((duplicated, archive_end))
 }
 
-fn find_eocd(tail: &[u8]) -> Option<usize> {
-    // Scan backwards for the EOCD signature at a position whose comment
-    // length is consistent with the record ending at the archive tail.
+/// A central directory's entry count, size and offset.
+type Directory = (u64, u64, u64);
+
+/// The span within `tail` of the last EOCD record that fits in it and whose
+/// central directory checks out, with that directory. `tail_start` is the
+/// tail's offset in the archive. A stray signature inside entry data or
+/// trailing bytes fails the check.
+fn find_eocd<R: Read + Seek>(
+    reader: &mut R,
+    tail: &[u8],
+    tail_start: u64,
+) -> Result<Option<(std::ops::Range<usize>, Directory)>, String> {
     let sig = [0x50, 0x4b, 0x05, 0x06];
-    (0..tail.len().saturating_sub(21)).rev().find(|&pos| {
-        tail[pos..pos + 4] == sig && {
-            let comment_len = u16::from_le_bytes([tail[pos + 20], tail[pos + 21]]) as usize;
-            pos + 22 + comment_len == tail.len()
+    for pos in (0..tail.len().saturating_sub(21)).rev() {
+        if tail[pos..pos + 4] != sig {
+            continue;
         }
-    })
+        let comment_len = u16::from_le_bytes([tail[pos + 20], tail[pos + 21]]) as usize;
+        let record = pos..pos + 22 + comment_len;
+        if record.end > tail.len() {
+            continue;
+        }
+        if let Some(directory) = central_directory(reader, tail, tail_start, pos)? {
+            return Ok(Some((record, directory)));
+        }
+    }
+    Ok(None)
+}
+
+/// The central directory described by the EOCD record at `pos` in `tail`,
+/// or None unless the directory ends where the record starts. A ZIP64
+/// record is followed through the locator directly before the EOCD, and
+/// the directory must end where the ZIP64 record starts.
+fn central_directory<R: Read + Seek>(
+    reader: &mut R,
+    tail: &[u8],
+    tail_start: u64,
+    pos: usize,
+) -> Result<Option<Directory>, String> {
+    let eocd = &tail[pos..pos + 22];
+    let entries = u16::from_le_bytes([eocd[10], eocd[11]]) as u64;
+    let cd_size = u32::from_le_bytes([eocd[12], eocd[13], eocd[14], eocd[15]]) as u64;
+    let cd_offset = u32::from_le_bytes([eocd[16], eocd[17], eocd[18], eocd[19]]) as u64;
+    if entries != 0xFFFF && cd_size != 0xFFFF_FFFF && cd_offset != 0xFFFF_FFFF {
+        let consistent = cd_offset + cd_size == tail_start + pos as u64;
+        return Ok(consistent.then_some((entries, cd_size, cd_offset)));
+    }
+
+    let Some(locator_pos) = pos.checked_sub(20) else {
+        return Ok(None);
+    };
+    let locator = &tail[locator_pos..pos];
+    if locator[0..4] != [0x50, 0x4b, 0x06, 0x07] {
+        return Ok(None);
+    }
+    // The 56-byte ZIP64 record must lie before its locator.
+    let zip64_offset = u64::from_le_bytes(locator[8..16].try_into().unwrap());
+    let locator_offset = tail_start + locator_pos as u64;
+    if locator_offset < 56 || zip64_offset > locator_offset - 56 {
+        return Ok(None);
+    }
+    reader
+        .seek(SeekFrom::Start(zip64_offset))
+        .map_err(|e| format!("cannot seek ZIP64 record: {e}"))?;
+    let mut zip64 = [0u8; 56];
+    reader
+        .read_exact(&mut zip64)
+        .map_err(|e| format!("cannot read ZIP64 record: {e}"))?;
+    if zip64[0..4] != [0x50, 0x4b, 0x06, 0x06] {
+        return Ok(None);
+    }
+    let entries = u64::from_le_bytes(zip64[32..40].try_into().unwrap());
+    let cd_size = u64::from_le_bytes(zip64[40..48].try_into().unwrap());
+    let cd_offset = u64::from_le_bytes(zip64[48..56].try_into().unwrap());
+    let consistent = cd_offset.checked_add(cd_size) == Some(zip64_offset);
+    Ok(consistent.then_some((entries, cd_size, cd_offset)))
+}
+
+/// A reader over the first `len` bytes of `inner`, whose position it
+/// tracks as `pos`.
+struct Bounded<R> {
+    inner: R,
+    len: u64,
+    pos: u64,
+}
+
+impl<R: Read> Read for Bounded<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let limit = self.len.saturating_sub(self.pos).min(buf.len() as u64) as usize;
+        let read = self.inner.read(&mut buf[..limit])?;
+        self.pos += read as u64;
+        Ok(read)
+    }
+}
+
+impl<R: Seek> Seek for Bounded<R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let target = match pos {
+            SeekFrom::Start(offset) => Some(offset),
+            SeekFrom::End(delta) => self.len.checked_add_signed(delta),
+            SeekFrom::Current(delta) => self.pos.checked_add_signed(delta),
+        }
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid seek to a negative or overflowing position",
+            )
+        })?;
+        self.pos = self.inner.seek(SeekFrom::Start(target))?;
+        Ok(self.pos)
+    }
 }
 
 fn read_table(
@@ -431,13 +624,16 @@ fn read_table(
     for (line_index, line) in bytes.split(|b| *b == b'\n').enumerate() {
         let delimiters = line.iter().filter(|b| **b == b',').count();
         if delimiters > delimiter_guard {
-            notices.push(unreadable_file(
-                spec.name,
-                &format!(
-                    "line {} has {delimiters} delimiters, over the {delimiter_guard} guard",
-                    line_index + 1
-                ),
-            ));
+            notices.push(
+                unreadable_file(
+                    spec.name,
+                    &format!(
+                        "line {} has {delimiters} delimiters, over the {delimiter_guard} guard",
+                        line_index + 1
+                    ),
+                )
+                .with("budgets", vec!["max_columns"]),
+            );
             return (None, true);
         }
     }
@@ -536,7 +732,7 @@ impl<R: Read> TableReader<R> {
                 return Err(NoTable::Empty);
             }
             Some(Err(error)) if error.is_io_error() => {
-                notices.push(unreadable_file(spec.name, &error.to_string()));
+                notices.push(read_failure(spec.name, &error));
                 return Err(NoTable::Unreadable);
             }
             Some(Err(error)) => {
@@ -549,14 +745,17 @@ impl<R: Read> TableReader<R> {
                 .collect(),
         };
         if headers.len() > options.max_columns {
-            notices.push(unreadable_file(
-                spec.name,
-                &format!(
-                    "{} columns exceed the {}-column limit",
-                    headers.len(),
-                    options.max_columns
-                ),
-            ));
+            notices.push(
+                unreadable_file(
+                    spec.name,
+                    &format!(
+                        "{} columns exceed the {}-column limit",
+                        headers.len(),
+                        options.max_columns
+                    ),
+                )
+                .with("budgets", vec!["max_columns"]),
+            );
             return Err(NoTable::Unreadable);
         }
         if headers.iter().any(|h| h.contains('\u{FFFD}')) {
@@ -652,7 +851,7 @@ impl<R: Read> TableReader<R> {
                 if error.is_io_error() {
                     // The source itself failed; retrying would fail again,
                     // and the failure is not a row.
-                    notices.push(unreadable_file(self.spec.name, &error.to_string()));
+                    notices.push(read_failure(self.spec.name, error));
                     self.truncated = true;
                     self.finish(notices);
                     return None;
@@ -755,8 +954,24 @@ pub struct DelimiterGuard<R: Read> {
     /// removes (`TableReader::open` skips one, the csv reader a second);
     /// `LEADING_MARK_BYTES` once they are complete or ruled out.
     leading: usize,
-    tripped: Option<String>,
+    tripped: Option<Tripped>,
 }
+
+/// Why a `DelimiterGuard` stopped, and the `ScanOptions` field that
+/// raises its limit, if any.
+#[derive(Clone, Debug)]
+struct Tripped {
+    reason: String,
+    budget: Option<&'static str>,
+}
+
+impl std::fmt::Display for Tripped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for Tripped {}
 
 const BYTE_ORDER_MARK: [u8; 3] = [0xef, 0xbb, 0xbf];
 const LEADING_MARK_BYTES: usize = 2 * BYTE_ORDER_MARK.len();
@@ -788,8 +1003,8 @@ impl<R: Read> DelimiterGuard<R> {
 
 impl<R: Read> Read for DelimiterGuard<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if let Some(reason) = &self.tripped {
-            return Err(std::io::Error::other(reason.clone()));
+        if let Some(tripped) = &self.tripped {
+            return Err(std::io::Error::other(tripped.clone()));
         }
         let read = self.inner.read(buf)?;
         for (offset, &byte) in buf[..read].iter().enumerate() {
@@ -834,18 +1049,24 @@ impl<R: Read> Read for DelimiterGuard<R> {
             if delimiter {
                 self.delimiters += 1;
             }
-            let reason = if self.delimiters > self.guard {
-                format!("a record has more than {} delimiters", self.guard)
+            let tripped = if self.delimiters > self.guard {
+                Tripped {
+                    reason: format!("a record has more than {} delimiters", self.guard),
+                    budget: Some("max_columns"),
+                }
             } else if self.record_bytes > MAX_RECORD_BYTES {
-                format!("a record is longer than {MAX_RECORD_BYTES} bytes")
+                Tripped {
+                    reason: format!("a record is longer than {MAX_RECORD_BYTES} bytes"),
+                    budget: None,
+                }
             } else {
                 continue;
             };
-            self.tripped = Some(reason.clone());
+            self.tripped = Some(tripped.clone());
             // Hand back what precedes the flood; the next read fails. An
             // empty read would pass for a clean end.
             return if offset == 0 {
-                Err(std::io::Error::other(reason))
+                Err(std::io::Error::other(tripped))
             } else {
                 Ok(offset)
             };
@@ -859,11 +1080,29 @@ fn empty_file(filename: &'static str) -> Notice {
 }
 
 /// transitio-specific (no canonical equivalent): the entry exists but
-/// cannot be safely read — corrupt member, or a violated size/column guard.
+/// cannot be safely read — corrupt member, or a violated size/column guard,
+/// whose `ScanOptions` fields the caller adds as `budgets`.
 fn unreadable_file(filename: &'static str, message: &str) -> Notice {
     Notice::new("unreadable_file", Severity::Error)
         .with("filename", filename)
         .with("message", message)
+}
+
+/// `unreadable_file` for a read that failed, naming the budget when a
+/// `DelimiterGuard` stopped it.
+fn read_failure(filename: &'static str, error: &csv::Error) -> Notice {
+    let notice = unreadable_file(filename, &error.to_string());
+    let budget = match error.kind() {
+        csv::ErrorKind::Io(io) => io
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<Tripped>())
+            .and_then(|tripped| tripped.budget),
+        _ => None,
+    };
+    match budget {
+        Some(budget) => notice.with("budgets", vec![budget]),
+        None => notice,
+    }
 }
 
 fn invalid_character(filename: &'static str, csv_row: u64) -> Notice {
@@ -985,19 +1224,33 @@ fn duplicate_key_checks(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::Cursor;
 
     use super::*;
 
     fn zip_with(files: &[(&str, &[u8])]) -> Cursor<Vec<u8>> {
+        zip_written(files, zip::write::SimpleFileOptions::default(), false)
+    }
+
+    /// `zip_with` under the given entry options, with a ZIP64 footer when
+    /// `zip64` is set.
+    fn zip_written(
+        files: &[(&str, &[u8])],
+        options: zip::write::SimpleFileOptions,
+        zip64: bool,
+    ) -> Cursor<Vec<u8>> {
         let mut cursor = Cursor::new(Vec::new());
         {
             let mut writer = zip::ZipWriter::new(&mut cursor);
-            let options = zip::write::SimpleFileOptions::default();
             for (name, content) in files {
                 writer.start_file(*name, options).unwrap();
                 std::io::Write::write_all(&mut writer, content).unwrap();
+            }
+            if zip64 {
+                // Any extensible data sector, even an empty one, makes the
+                // writer emit the ZIP64 footer.
+                writer.set_raw_zip64_extensible_data_sector(Box::new([]));
             }
             writer.finish().unwrap();
         }
@@ -1005,7 +1258,7 @@ mod tests {
         cursor
     }
 
-    fn build_zip(files: &[(&str, &str)]) -> Cursor<Vec<u8>> {
+    pub(crate) fn build_zip(files: &[(&str, &str)]) -> Cursor<Vec<u8>> {
         let bytes: Vec<(&str, &[u8])> = files
             .iter()
             .map(|(name, content)| (*name, content.as_bytes()))
@@ -1013,7 +1266,7 @@ mod tests {
         zip_with(&bytes)
     }
 
-    fn minimal() -> Vec<(&'static str, &'static str)> {
+    pub(crate) fn minimal() -> Vec<(&'static str, &'static str)> {
         vec![
             (
                 "agency.txt",
@@ -1359,6 +1612,63 @@ mod tests {
         assert!(scan_reader(Cursor::new(b"plain text".to_vec())).is_err());
     }
 
+    #[test]
+    fn bytes_after_the_end_record_are_tolerated() {
+        let feed: Vec<(&str, &[u8])> = minimal()
+            .into_iter()
+            .map(|(name, content)| (name, content.as_bytes()))
+            .collect();
+        let deflated = zip::write::SimpleFileOptions::default();
+        let archive = zip_written(&feed, deflated, false).into_inner();
+        let zip64 = zip_written(&feed, deflated, true).into_inner();
+        let appended = |extra: &[u8]| [archive.as_slice(), extra].concat();
+        let mut truncated = archive.clone();
+        truncated.pop();
+        // An end record whose entry count defers to a missing ZIP64 record.
+        let mut zip64_like = [0u8; 22];
+        zip64_like[..4].copy_from_slice(&[0x50, 0x4b, 0x05, 0x06]);
+        zip64_like[10..12].copy_from_slice(&[0xff, 0xff]);
+        // A stored entry holding an empty end record, cut before the real
+        // central directory: the stray record claims a directory that does
+        // not end where it starts.
+        let mut record = [0u8; 22];
+        record[..4].copy_from_slice(&[0x50, 0x4b, 0x05, 0x06]);
+        let stored = deflated.compression_method(zip::CompressionMethod::Stored);
+        let mut stray = zip_written(&[("notes.bin", &record)], stored, false).into_inner();
+        let end = stray.len();
+        let cd_offset = u32::from_le_bytes(stray[end - 6..end - 2].try_into().unwrap());
+        stray.truncate(cd_offset as usize);
+
+        let mut names: Vec<&str> = minimal().iter().map(|(name, _)| *name).collect();
+        names.sort_unstable();
+        let cases = [
+            ("none", archive.clone(), true),
+            ("one byte", appended(&[0]), true),
+            ("two bytes", appended(&[0, 0]), true),
+            ("64 KiB", appended(&[0; 64 * 1024]), true),
+            ("zip64", [zip64.as_slice(), &[0, 0]].concat(), true),
+            ("zip64-like trailer", appended(&zip64_like), true),
+            ("stray record", stray, false),
+            ("truncated", truncated, false),
+        ];
+        for (case, bytes, accepted) in cases {
+            match scan_reader(Cursor::new(bytes)) {
+                Ok(result) => {
+                    assert!(accepted, "{case}: expected a refusal");
+                    let listed: Vec<&str> = result.tables.keys().map(String::as_str).collect();
+                    assert_eq!(listed, names, "{case}");
+                }
+                Err(error) => {
+                    assert!(!accepted, "{case}: {error}");
+                    assert_eq!(
+                        error, "not a readable zip: no end-of-central-directory record found",
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+
     struct Streamed {
         headers: Vec<String>,
         rows: Vec<Row>,
@@ -1578,20 +1888,23 @@ mod tests {
         marked_header.extend(row);
         let twice_marked_header: Vec<u8> = [&BYTE_ORDER_MARK[..], &marked_header[..]].concat();
         // the flooded row arriving right after the last allowed row is a
-        // read failure, not the row cap
-        for (bytes, max_rows, rows_before) in [
-            (flooded_row, 1, 1),
-            (flooded_header, u64::MAX, 0),
-            (quoted, u64::MAX, 1),
-            (oversized, u64::MAX, 1),
-            (marked_header, u64::MAX, 0),
-            (twice_marked_header, u64::MAX, 0),
+        // read failure, not the row cap; only the delimiter guard follows a
+        // budget
+        let columns = Some(serde_json::json!(["max_columns"]));
+        for (bytes, max_rows, rows_before, budgets) in [
+            (flooded_row, 1, 1, columns.clone()),
+            (flooded_header, u64::MAX, 0, columns),
+            (quoted, u64::MAX, 1, None),
+            (oversized, u64::MAX, 1, None),
+            (marked_header, u64::MAX, 0, None),
+            (twice_marked_header, u64::MAX, 0, None),
         ] {
             let streamed = stream(&bytes, &ScanOptions::default(), max_rows);
             // the rows before the flood are usable; nothing after it is read
             assert_eq!(streamed.rows.len(), rows_before);
             assert!(streamed.truncated);
             assert_eq!(notice_codes(&streamed.notices), ["unreadable_file"]);
+            assert_eq!(streamed.notices[0].context.get("budgets"), budgets.as_ref());
         }
     }
 

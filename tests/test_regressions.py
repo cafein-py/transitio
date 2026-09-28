@@ -8,6 +8,7 @@ pytest.importorskip("transitio._core")
 
 from transitio.gtfs import crop_feed  # noqa: E402
 from transitio.repair import repair_feed  # noqa: E402
+from transitio.validate import validate_feed  # noqa: E402
 
 FEED = {
     "agency.txt": (
@@ -164,6 +165,16 @@ def test_unparsed_entries_survive_rewrites(tmp_path):
     crop_feed(source, cropped, aoi=WIDE_BBOX, reference_date="20260601")
     assert read_entry(cropped, "locations.geojson") == geojson
     assert read_entry(cropped, "notes.md") == notes
+
+
+def test_bytes_after_the_end_record_do_not_refuse_the_archive(tmp_path):
+    # A zip with bytes after its end-of-central-directory record was "not a
+    # readable zip", though Python's zipfile reads it.
+    source = write_zip(tmp_path / "feed.zip", FEED)
+    with open(source, "ab") as handle:
+        handle.write(b"\0\0")
+    report = validate_feed(source, reference_date="20260601")
+    assert report["row_counts"]["stops.txt"] == 3
 
 
 def test_hostile_passthrough_names_are_not_copied(tmp_path):
