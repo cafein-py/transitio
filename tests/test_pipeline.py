@@ -180,7 +180,7 @@ OTHER_TRIPS = {**GTFS, "trips.txt": "route_id,service_id,trip_id\nr1,wk,t2\n"}
         (_zip(GTFS), None, False, True),
         (_zip(GTFS, zipfile.ZIP_STORED), None, False, True),
         (_zip(OTHER_TRIPS), None, False, False),
-        (_zip(GTFS), frozenset({"r1"}), False, False),
+        (_zip(GTFS), frozenset({"r1"}), False, True),
         (b"not a zip", None, False, False),
         # The delivered download changed after its check: nothing to match.
         (_zip(GTFS, zipfile.ZIP_STORED), None, True, False),
@@ -203,10 +203,10 @@ def test_a_delivered_feed_is_recognised_by_its_content(
     first.write_bytes(_zip(GTFS))
     again.write_bytes(second)
     delivered = _Delivered()
-    delivered.add("feed-a", first)
+    delivered.add("feed-a", first, routes)
     if replaced:
         first.write_bytes(_zip(OTHER_TRIPS))
-    assert delivered.same_as(again, routes) == ("feed-a" if same else None)
+    assert delivered.same_as(again) == [("feed-a", routes)] * same
 
 
 def test_fetch_when_without_token_warns(pipeline_env):
@@ -563,7 +563,7 @@ def test_fetch_aoi_rejects_place_only_arguments():
         {"exclude": ["national"]},
         {"tiers": ["local"]},
         {"on_unknown": "exclude"},
-        {"contained": "drop"},
+        {"contained": "keep"},
     ):
         with pytest.raises(ValueError, match="apply only with place="):
             fetch((0, 0, 1, 1), **kwargs)
@@ -575,9 +575,10 @@ def test_fetch_aoi_rejects_place_only_arguments():
         fetch(place="X", when="2026-06-01", reference_date="20260602")
 
 
-def _partitioned_index(tmp_path, monkeypatch, feeds, contained=None):
+def _partitioned_index(tmp_path, monkeypatch, feeds, contained=None, edges=None):
     """A schema-10 index serving Q1757 with ``feeds`` (``{feed id: extra
-    columns}``), each a local feed at ``https://feeds.example/<feed id>``."""
+    columns}``) in that order, each a local feed at
+    ``https://feeds.example/<feed id>``; ``edges`` adds edge fields by feed id."""
     import transitio.index as transitio_index
     from index_fixture import HULL, PLACES, covered_feed, edge, write_partitioned_index
 
@@ -595,29 +596,30 @@ def _partitioned_index(tmp_path, monkeypatch, feeds, contained=None):
         }
         for feed_id, extra in feeds.items()
     ]
-    edges = [
+    records = [
         edge(
             "Q1757",
             feed_id,
             tier="local",
             relevance_category="primary",
-            relevance=0.5,
+            relevance=1 - position / 100,
             cross_border=False,
         )
-        for feed_id in feeds
+        for position, feed_id in enumerate(feeds)
     ]
+    for record in records:
+        record.update((edges or {}).get(record["feed_id"], {}))
     directory = write_partitioned_index(
         tmp_path / "index",
         feeds=rows,
         places=[PLACES[0]],
-        edges=edges,
+        edges=records,
         contained=contained or {},
     )
     return transitio_index.read_index(directory)
 
 
-@pytest.mark.parametrize("contained", ["keep", "drop"])
-def test_a_contained_feed_is_reported_or_left_out(tmp_path, monkeypatch, contained):
+def test_a_kept_contained_feed_is_reported(tmp_path, monkeypatch):
     import pathlib
 
     ids = ("f-a", "f-b")
@@ -646,22 +648,15 @@ def test_a_contained_feed_is_reported_or_left_out(tmp_path, monkeypatch, contain
         index=index,
         directory=tmp_path / "out",
         crop=False,
-        contained=contained,
+        contained="keep",
         reference_date="20260601",
     )
     decisions = [
         (e["feed_id"], e["decision"], e["contained_in"]) for e in result.selection
     ]
-    if contained == "keep":
-        assert sorted(fetched) == list(ids) and len(result.feeds) == 2
-        assert result.contained == {"f-a": ["f-b"]}
-        assert decisions == [(i, "delivered", []) for i in ids]
-    else:
-        # The container comes first; the contained feed is never downloaded.
-        assert fetched == ["f-b"] and result.skipped == [("f-a", "contained in f-b")]
-        assert result.contained == {}
-        # The record keeps candidate order.
-        assert decisions == [("f-a", "skipped", ["f-b"]), ("f-b", "delivered", [])]
+    assert sorted(fetched) == list(ids) and len(result.feeds) == 2
+    assert result.contained == {"f-a": ["f-b"]}
+    assert decisions == [(i, "delivered", []) for i in ids]
 
 
 def _calendar(start, end, days="1111111"):
@@ -778,6 +773,202 @@ def test_date_rules_decide_before_and_after_download(
     assert (entry["path"] is not None) == (entry["decision"] == "delivered")
     assert result.skipped == [("f-a", reason)] * bool(reason)
     assert result.selection_table().to_dict("records") == result.selection
+
+
+def _network(agency="HSL", start="20260101", stops=None, hours=(8,), **options):
+    """GTFS of ``agency`` whose ``routes`` each run a trip from s2 to s3 at
+    each of ``hours``, daily from ``start`` through 2026, among stops s<i>
+    (s0 to s9 unless ``stops`` names them)."""
+    stops = range(10) if stops is None else stops
+    trips = [(r, h) for r in options.get("routes", ("r1",)) for h in hours]
+    times = (
+        "{0}{1},{1:02}:00:00,{1:02}:00:00,s2,1\n{0}{1},{1:02}:10:00,{1:02}:10:00,s3,2"
+    )
+    tables = {
+        **_calendar(start, "20261231"),
+        "agency.txt": GTFS["agency.txt"].replace("HSL", agency),
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\n"
+        + "".join(f"s{i},S{i},{60 + i / 100:.2f},24.9\n" for i in stops),
+        "routes.txt": "route_id,agency_id,route_short_name,route_type\n"
+        + "".join(f"{r},hsl,{r},3\n" for r in options.get("routes", ("r1",))),
+        "trips.txt": "route_id,service_id,trip_id\n"
+        + "".join(f"{r},wk,{r}{h}\n" for r, h in trips),
+        "stop_times.txt": GTFS["stop_times.txt"].split("\n")[0]
+        + "".join("\n" + times.format(r, h) for r, h in trips),
+    }
+    if options.get("transfers"):
+        tables["transfers.txt"] = "from_stop_id,to_stop_id,transfer_type\ns2,s3,0\n"
+    return _zip(tables)
+
+
+# Specs for _network, plus "cut" (the routes a selector keeps), "in" (the
+# containers the index names), "ended" (an index window that ended) and
+# "renewed" (a probe answering 200).
+NEW, OLD, OLDER = ({"start": f"2026{month}01"} for month in ("06", "05", "04"))
+C, F = {"agency": "C"}, {"agency": "F"}
+AB, ABC = {**C, "routes": ("a", "b")}, {**C, "routes": ("a", "b", "c")}
+IN_C, ADDS = {**F, "in": "C"}, f"+ similar to A but adds service on {DAY}"
+KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
+
+
+@pytest.mark.filterwarnings("ignore:no Mobility Database API token")
+@pytest.mark.parametrize(
+    "feeds, when, expected",
+    [
+        ({"X": F, "Y": F}, None, {"X": "+", "Y": "- same content as X [X]"}),
+        (
+            {"X": {**ABC, "cut": "a b"}, "Y": {**ABC, "cut": "b c"}},
+            None,
+            {"X": "+ cut to routes a, b", "Y": "+ cut to routes b, c [X]"},
+        ),
+        ({"F": IN_C, "C": {**C, "renewed": True}}, None, {"C": "+", "F": KEPT}),
+        ({"F": {**IN_C, "renewed": True}, "C": C}, None, {"C": "+", "F": KEPT}),
+        (
+            {"F": IN_C, "C": {**AB, "cut": "a"}},
+            None,
+            {
+                "C": "+ cut to routes a",
+                "F": "+ kept: container C cropped to selected routes",
+            },
+        ),
+        (
+            {"F": IN_C, "C": {**C, "ended": True}},
+            None,
+            {"C": f"- {R_ENDED}{SAME}", "F": "+ kept: container C skipped"},
+        ),
+        (
+            {"P": {**AB, "cut": "a"}, "C": AB, "F": IN_C},
+            None,
+            {"P": "+ cut to routes a", "C": "+ [P]", "F": SKIP_C},
+        ),
+        (
+            {"C": AB, "P": {**AB, "cut": "a"}, "F": IN_C},
+            None,
+            {"C": "+", "P": "- same content as C [C]", "F": SKIP_C},
+        ),
+        (
+            {"A": NEW, "B": OLD},
+            DAY,
+            {"A": "+", "B": "- another version of A [A 1.0 1.0]"},
+        ),
+        ({"A": NEW, "B": {**OLD, "hours": (8, 9)}}, DAY, {"A": "+", "B": ADDS}),
+        ({"A": NEW, "B": {**OLD, "hours": (9,)}}, DAY, {"A": "+", "B": ADDS}),
+        (
+            {"A": {**NEW, "hours": (8, 9)}, "B": OLD, "C": {**OLDER, "hours": (8, 10)}},
+            DAY,
+            {"A": "+", "B": "- another version of A [A 1.0 1.0]", "C": ADDS},
+        ),
+        (
+            {"C": {**OLDER, "hours": (8, 10)}, "B": OLD, "A": {**NEW, "hours": (8, 9)}},
+            DAY,
+            {"A": "+", "B": "- another version of A [A 1.0 1.0]", "C": ADDS},
+        ),
+        (
+            {
+                "A": NEW,
+                "B": {**OLD, "stops": range(1, 11)},
+                "C": {**OLDER, "stops": range(2, 12)},
+            },
+            DAY,
+            {"A": "+", "B": "- another version of A [A 1.0 0.818]", "C": "+"},
+        ),
+        ({"V": NEW, "C": OLD, "F": IN_C}, DAY, {"V": "+", "C": "+", "F": SKIP_C}),
+        (
+            {"V": NEW, "E": OLD, "C": OLD, "F": IN_C},
+            DAY,
+            {"V": "+", "E": "+", "C": "- same content as E [E]", "F": SKIP_C},
+        ),
+        (
+            {"A": {**NEW, "stops": range(8)}, "B": {**OLD, "stops": range(1, 9)}},
+            DAY,
+            {"A": "+", "B": "+"},
+        ),
+        (
+            {"A": NEW, "B": {**OLD, "transfers": True}},
+            DAY,
+            {"A": "+", "B": "+ similar to A; kept, has transfers or pathways"},
+        ),
+        (
+            {"A": {"start": "20260701"}, "B": OLD},
+            None,
+            {
+                "A": "+ similar to B; kept, no study day",
+                "B": "+ similar to A; kept, no study day",
+            },
+        ),
+    ],
+    ids=(
+        "identical identical-overlapping-routes container-renewed "
+        "contained-renewed container-cropped container-expired "
+        "partial-copy-first partial-copy-after version-covered "
+        "version-extra-trip version-other-times versions-three "
+        "versions-three-reversed version-chain version-protected-container "
+        "version-same-content-container version-under-stop-threshold "
+        "version-transfers versions-no-study-day"
+    ).split(),
+)
+def test_fetch_delivers_one_copy_per_service(
+    tmp_path, monkeypatch, feeds, when, expected
+):
+    from transitio.catalog import TransitlandAtlas
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    payloads, columns, edges, contained, renewed = {}, {}, {}, {}, set()
+    for feed_id, spec in feeds.items():
+        spec = dict(spec)
+        cut, containers, ended = (spec.pop(key, None) for key in ("cut", "in", "ended"))
+        renewed.update([feed_id] if spec.pop("renewed", False) else [])
+        payloads[feed_id] = _network(**spec)
+        columns[feed_id] = {"etag": '"v1"'}
+        if ended:
+            columns[feed_id].update(service_start=ENDED[0], service_end=ENDED[1])
+        if cut:
+            selector = {"route_id": cut.split()}
+            fields = {"selector_state": "complete", "selector": selector}
+            edges[feed_id] = _stamp_fingerprint([fields], payloads[feed_id])[0]
+        if containers:
+            contained[feed_id] = containers.split()
+    index = _partitioned_index(tmp_path, monkeypatch, columns, contained, edges)
+    downloads = []
+
+    def handler(request):
+        feed_id = request.url.path.strip("/")
+        if request.method == "GET":
+            downloads.append(feed_id)
+            return httpx.Response(200, content=payloads[feed_id])
+        return httpx.Response(200 if feed_id in renewed else 304)
+
+    class Served(TransitlandAtlas):
+        def __init__(self, **kwargs):
+            super().__init__(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas", Served)
+    result = fetch(
+        place="Q1757",
+        index=index,
+        directory=tmp_path / "out",
+        crop=False,
+        osm=False,
+        when=when,
+        tiers=["local"] if edges else None,
+    )
+
+    def seen(e):
+        links = e["same_as"] + e["contained_in"] + [*(e["version_of"] or {}).values()]
+        links = links and f"[{' '.join(map(str, links))}]"
+        head = f"- {e['reason']}" if e["reason"] else "+"
+        return " ".join(filter(None, (head, e["note"], links)))
+
+    assert {e["feed_id"]: seen(e) for e in result.selection} == expected
+    # A feed left out before download is never downloaded; every other is.
+    early = ("contained in", "unchanged since indexed")
+    assert sorted(downloads) == sorted(
+        e["feed_id"]
+        for e in result.selection
+        if not any(w in (e["reason"] or "") for w in early)
+    )
+    paths = [e["path"] for e in result.selection if e["decision"] == "delivered"]
+    assert sorted(result.feeds) == sorted(paths) and len(result.reports) == len(paths)
 
 
 def test_fetch_place_rejects_country_code():

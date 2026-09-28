@@ -218,6 +218,34 @@ def _digest(frame, key):
     return pd.util.hash_pandas_object(frame, index=False, hash_key=key).to_numpy()
 
 
+def route_keys(tables):
+    """Each route's key, indexed by ``route_id`` (the first row of each id
+    kept): ``agency``, its agency name, and ``name``, its short name, else
+    long name, both casefolded; ``type``, its route type; and its
+    ``continuous_pickup`` and ``continuous_drop_off``, blank when unset."""
+    agency, routes = (
+        tables.get(name, pd.DataFrame()) for name in ("agency.txt", "routes.txt")
+    )
+    names = _stripped(agency, "agency_name").str.casefold()
+    route_agency = _column(routes, "agency_id")
+    agency_names = route_agency.map(_keyed(names, _column(agency, "agency_id")))
+    if len(agency) == 1:
+        # A single-agency feed may leave a route's agency_id blank.
+        agency_names = agency_names.mask(route_agency.str.strip() == "", names.iloc[0])
+    short = _stripped(routes, "route_short_name")
+    keys = pd.DataFrame(
+        {
+            "agency": agency_names.fillna(""),
+            "name": short.mask(short == "", _stripped(routes, "route_long_name")),
+            "type": _stripped(routes, "route_type"),
+            "continuous_pickup": _stripped(routes, "continuous_pickup"),
+            "continuous_drop_off": _stripped(routes, "continuous_drop_off"),
+        }
+    )
+    keys["name"] = keys["name"].str.casefold()
+    return _keyed(keys, _column(routes, "route_id"))
+
+
 def trip_signatures(tables):
     """The signature of each trip in a feed's tables.
 
@@ -248,30 +276,9 @@ def trip_signatures(tables):
     if "trip_id" not in trips.columns:
         trips = none
     trips = trips.drop_duplicates("trip_id", keep=False).set_index("trip_id")
-    agency, routes, stops = (
-        tables.get(name, pd.DataFrame())
-        for name in ("agency.txt", "routes.txt", "stops.txt")
-    )
-
-    names = _stripped(agency, "agency_name").str.casefold()
-    route_agency = _column(routes, "agency_id")
-    agency_names = route_agency.map(_keyed(names, _column(agency, "agency_id")))
-    if len(agency) == 1:
-        # A single-agency feed may leave a route's agency_id blank.
-        agency_names = agency_names.mask(route_agency.str.strip() == "", names.iloc[0])
-    short = _stripped(routes, "route_short_name")
-    route_keys = pd.DataFrame(
-        {
-            "agency": agency_names.fillna(""),
-            "name": short.mask(short == "", _stripped(routes, "route_long_name")),
-            "type": _stripped(routes, "route_type"),
-            "continuous_pickup": _stripped(routes, "continuous_pickup"),
-            "continuous_drop_off": _stripped(routes, "continuous_drop_off"),
-        }
-    )
-    route_keys["name"] = route_keys["name"].str.casefold()
-    route_keys = _keyed(route_keys, _column(routes, "route_id"))
-    trips = trips[_column(trips, "route_id").isin(route_keys.index)]
+    stops = tables.get("stops.txt", pd.DataFrame())
+    keys = route_keys(tables)
+    trips = trips[_column(trips, "route_id").isin(keys.index)]
     coordinates = pd.DataFrame(
         {
             axis: pd.to_numeric(_stripped(stops, f"stop_{axis}"), errors="coerce")
@@ -295,7 +302,7 @@ def trip_signatures(tables):
     ordered, ranked = codes[order], sequence[order]
     repeated = (ordered[1:] == ordered[:-1]) & (ranked[1:] == ranked[:-1])
     unsigned = np.r_[codes[~orderable | (stop_rows < 0)], ordered[1:][repeated]]
-    row_keys = route_keys.reindex(
+    row_keys = keys.reindex(
         stop_times["trip_id"].map(_column(trips, "route_id")).to_numpy()
     )
 
@@ -329,7 +336,7 @@ def trip_signatures(tables):
     def per_trip(values):
         return pd.Series(values, index=signed_ids).reindex(trips.index).to_numpy()
 
-    route = route_keys.reindex(_column(trips, "route_id").to_numpy())
+    route = keys.reindex(_column(trips, "route_id").to_numpy())
     whole = route[["agency", "name", "type"]].set_axis(trips.index)
     whole = whole.assign(
         wheelchair=_stripped(trips, "wheelchair_accessible", "0"),
