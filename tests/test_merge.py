@@ -1,3 +1,4 @@
+import collections
 import datetime
 import re
 import struct
@@ -35,7 +36,10 @@ def frame(**columns):
 def test_merge_colliding_ids(tmp_path):
     output = tmp_path / "merged.zip"
     report = merge_feeds(
-        [build_city(), build_city()], output, reference_date="20260601"
+        [build_city(), build_city()],
+        output,
+        duplicate_trips="keep",
+        reference_date="20260601",
     )
     assert not any(n["severity"] == "ERROR" for n in report["notices"])
     assert report["dropped_files"] == []
@@ -504,6 +508,8 @@ def test_argument_errors():
         merge_tables([feed, feed], prefixes=["x", "y:z"])
     with pytest.raises(ValueError, match="prefixes"):
         merge_tables([feed, feed], prefixes=["x"])
+    with pytest.raises(ValueError, match="duplicate_trips"):
+        merge_tables([feed, feed], duplicate_trips="maybe")
 
 
 SERVICES = {
@@ -674,3 +680,163 @@ def test_service_dates(monkeypatch, calendar, exceptions, budget, expected, unex
     days = dates["date"].dt.strftime("%Y%m%d").groupby(dates["service_id"])
     assert {service: sorted(found) for service, found in days} == expected
     assert left_out == unexpanded
+
+
+def _links(*pairs):
+    return {(*ends, "", "") for pair in pairs for ends in (pair, pair[::-1])}
+
+
+ONE = _trips({})
+PAIR = _trips({"block_id": "b"}, {"times": LATER, "block_id": "b"})
+LINKED = _trips({}, {"stops": ("s1", "s3"), "times": LATER})
+FREQUENCY = (
+    "frequencies.txt",
+    dict(trip_id="t1", start_time="08:00:00", end_time="10:00:00", headway_secs="600"),
+)
+TRANSFER = (
+    "transfers.txt",
+    dict(from_stop_id="s2", to_stop_id="s2", from_trip_id="t1", to_trip_id="t2"),
+)
+EXTRA_DAY = (
+    "calendar_dates.txt",
+    dict(service_id="long", date="20370105", exception_type="1"),
+)
+SPLIT = _trips(
+    {"block_id": "x", "service": "jan1"},
+    {"times": LATER, "block_id": "x", "service": "jan1"},
+    {"service": "jan2"},
+    {"times": LATER, "service": "jan2"},
+)
+
+# Block b's trips come first by trip id, block a's first by block_id.
+BLOCKS = _trips(
+    {"block_id": "b", "stops": ("s5", "s2")},
+    {"block_id": "b", "stops": ("s5", "s2"), "times": LATER},
+    {"block_id": "a"},
+    {"block_id": "a", "times": LATER},
+)
+
+
+@pytest.mark.parametrize(
+    "inputs, dropped, expected",
+    [
+        ([ONE, ONE], {"f2:t1"}, {}),
+        (
+            [ONE, _trips({}, {})],
+            {"f2:t1"},
+            {"transfers": _links(("f2:s1", "f1:s1"), ("f2:s2", "f1:s2"))},
+        ),
+        (
+            [ONE, _trips({"service": "jan1"}, {"service": "jan2"})],
+            {"f2:t1", "f2:t2"},
+            {},
+        ),
+        ([_trips({}, {"times": LATER}), PAIR], set(), {}),
+        ([ONE, _trips({"service": "mid"})], {"f2:t1"}, {}),
+        ([ONE, _trips({"service": "late"})], set(), {}),
+        ([ONE, _trips({"times": LATER})], set(), {}),
+        ([ONE, _trips({"route": "r2"})], set(), {}),
+        ([ONE, {"trips": ONE, "rows": [FREQUENCY]}], set(), {}),
+        ([{"trips": ONE, "rows": [FREQUENCY]}, ONE], set(), {}),
+        (
+            [ONE, {"trips": _trips({}, {"times": LATER}), "rows": [TRANSFER]}],
+            set(),
+            {"transfers": {("f2:s2", "f2:s2", "f2:t1", "f2:t2")}},
+        ),
+        ([ONE, PAIR], set(), {}),
+        ([[{**trip, "block_id": "x"} for trip in PAIR], PAIR], {"f2:t1", "f2:t2"}, {}),
+        ([SPLIT, PAIR], set(), {}),
+        (
+            [BLOCKS, [*PAIR, {"trip_id": "t3", "stops": ("s1", "s3")}]],
+            {"f2:t1", "f2:t2"},
+            {"transfers": _links(("f2:s1", "f1:s5"))},
+        ),
+        (
+            [ONE, ONE, LINKED],
+            {"f2:t1", "f3:t1"},
+            {"transfers": _links(("f3:s1", "f1:s1"))},
+        ),
+        (
+            [{"trips": ONE, "continuous": "0"}, {"trips": ONE, "continuous": "2"}],
+            set(),
+            {},
+        ),
+        ([ONE, LINKED], {"f2:t1"}, {"transfers": _links(("f2:s1", "f1:s1"))}),
+        ([ONE, _trips({"stop_fields": {"pickup_type": ("1", "")}})], set(), {}),
+        ([_trips({"shape_id": "sa"}), _trips({"shape_id": "sb"})], {"f2:t1"}, {}),
+        (
+            [
+                _trips({"service": "long"}),
+                {"trips": _trips({"service": "long"}), "rows": [EXTRA_DAY]},
+            ],
+            set(),
+            {},
+        ),
+        ([_trips({"service": "huge"})] * 2, set(), {"unexpanded": 2}),
+        ([ONE, ONE], set(), {"mode": "keep"}),
+    ],
+    ids=(
+        "identical one-for-one disjoint-days block-vs-unblocked subset-days "
+        "partial-overlap other-times other-route later-frequency "
+        "earlier-frequency trip-transfer half-a-block block-for-block "
+        "block-completed-elsewhere candidate-block-order three-inputs "
+        "route-continuous-pickup "
+        "stop-link other-pickup other-shape extra-day-past-4000 unexpanded keep"
+    ).split(),
+)
+def test_duplicate_trips(tmp_path, inputs, dropped, expected):
+    feeds = [
+        _repeats(**spec if isinstance(spec, dict) else {"trips": spec})
+        for spec in inputs
+    ]
+    output = tmp_path / "merged.zip"
+    mode = expected.get("mode", "drop")
+    report = merge_feeds(feeds, output, check=False, duplicate_trips=mode)
+    merged = FeedEditor(output).tables
+    every = {
+        f"f{position + 1}:{trip_id}"
+        for position, feed in enumerate(feeds)
+        for trip_id in feed.tables["trips.txt"]["trip_id"]
+    }
+    assert set(merged["trips.txt"]["trip_id"]) == every - dropped
+    assert set(merged["stop_times.txt"]["trip_id"]) == every - dropped
+    # Kept trips keep their shapes, and unused shapes stay.
+    shapes = set(merged.get("shapes.txt", frame(shape_id=[]))["shape_id"])
+    assert set(merged["trips.txt"].get("shape_id", [""])) - {""} <= shapes
+    columns = ["from_stop_id", "to_stop_id", "from_trip_id", "to_trip_id"]
+    transfers = merged.get("transfers.txt", pd.DataFrame(columns=columns))
+    rows = transfers.reindex(columns=columns).fillna("").itertuples(index=False)
+    assert set(rows) == expected.get("transfers", set())
+    by_feed = collections.Counter(int(trip[1]) - 1 for trip in dropped)
+    assert report["duplicate_trips"] == {
+        "dropped": len(dropped),
+        "by_feed": dict(by_feed),
+        "unexpanded_services": expected.get("unexpanded", 0),
+        "stop_links": sum(not row[2] for row in expected.get("transfers", ())) // 2,
+    }
+
+
+def test_rows_of_dropped_trips_go():
+    from transitio.gtfs._patch import _drop_trip_rows
+
+    tables = {
+        "trips.txt": frame(trip_id=["t1", "t2"]),
+        "stop_times.txt": frame(trip_id=["t1", "t2"]),
+        "transfers.txt": frame(from_trip_id=["t1", "t2"], to_trip_id=["t2", ""]),
+        "attributions.txt": frame(trip_id=["t1", "t2"]),
+    }
+    _drop_trip_rows(tables, {"t1"}, [])
+    for name in ("trips.txt", "stop_times.txt", "attributions.txt"):
+        assert list(tables[name]["trip_id"]) == ["t2"]
+    assert list(tables["transfers.txt"]["from_trip_id"]) == ["t2"]
+
+
+def test_block_matching_takes_long_augmenting_paths():
+    from transitio.gtfs._duplicates import _one_to_one
+
+    # The last entry's only option is the first's, which moves every other
+    # entry along, deeper than Python's recursion limit.
+    count = 3000
+    options = [[i, i + 1] for i in range(count - 1)] + [[0]]
+    assert _one_to_one(options) == [*range(1, count), 0]
+    assert _one_to_one([[0], [0]]) is None

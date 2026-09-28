@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `merge_feeds` and `merge_tables` leave out an input's trips that repeat
+  trips kept from the inputs before it (`duplicate_trips="drop"`, the
+  default; `"keep"` keeps them). Trips repeat when their route key, stops,
+  times and pickup and drop-off behaviour match, on dates the earlier trips
+  run, one earlier trip per later trip and date; trips sharing a `block_id`
+  go together. A dropped trip's stops still served by a kept trip are linked
+  to the earlier trip's stops by transfers, and the report counts drops
+  under `"duplicate_trips"`. A regional aggregate merged with an operator's
+  own feed, as in London and Augsburg, carried the operator's trips twice.
 - `merge_feeds` and `merge_tables` merge inputs whose `agency_timezone` names
   differ but denote the same clock, such as `CET` and `Europe/Paris` (Paris),
   or `America/Montreal` and `America/Toronto` (Montréal). Two names are

@@ -8,6 +8,7 @@ import math
 import pandas as pd
 
 from transitio.exceptions import InvalidFeedError
+from transitio.gtfs._duplicates import drop_duplicate_trips
 
 # Every standard column holding a feed-scoped identifier or a reference
 # to one; all get the feed prefix so same-valued ids from different
@@ -188,7 +189,9 @@ def _normalise_networks(tables):
         ).fillna("")
 
 
-def merge_tables(table_sets, *, prefixes=None, extra_entries=None):
+def merge_tables(
+    table_sets, *, prefixes=None, extra_entries=None, duplicate_trips="drop"
+):
     """Merge several feeds' tables into one referentially consistent set.
 
     Every id (and every standard reference to one) gets the feed's
@@ -231,6 +234,22 @@ def merge_tables(table_sets, *, prefixes=None, extra_entries=None):
     extra_entries : sequence of sequence of str, optional
         Per feed, the archive entries that are not GTFS tables; they
         are reported as dropped (``locations.geojson`` is refused).
+    duplicate_trips : {"drop", "keep"}, default "drop"
+        ``"drop"`` leaves out each input's trips that repeat trips kept
+        from the inputs before it: same route key, stops, times and pickup
+        and drop-off behaviour (see
+        :func:`~transitio.gtfs._schedule.trip_signatures`). Headsigns,
+        short names, ``shape_id`` and shape geometry, ``timepoint`` and
+        ``shape_dist_traveled`` may differ; the earlier trip's are kept.
+        On each date, one earlier trip covers one later trip, and a later
+        trip goes only when covered on every date it runs; a block
+        (``block_id``) of several trips goes only when one earlier block
+        covers it trip for trip. Frequency-based trips, trips in a
+        trip-specific transfer and trips of a calendar spanning over
+        40,000 days are never compared. A dropped trip's rows go with it,
+        and each of its stops a kept trip still serves is linked both ways
+        to the earlier trip's stop (``transfer_type`` 2). ``"keep"`` keeps
+        every trip.
 
     Returns
     -------
@@ -239,18 +258,33 @@ def merge_tables(table_sets, *, prefixes=None, extra_entries=None):
         list of file names discarded by the merge.
     """
     tables, dropped, _ = _merge_tables(
-        table_sets, prefixes=prefixes, extra_entries=extra_entries
+        table_sets,
+        prefixes=prefixes,
+        extra_entries=extra_entries,
+        duplicate_trips=duplicate_trips,
     )
     return tables, dropped
 
 
 def _merge_tables(
-    table_sets, *, prefixes, extra_entries, interval=None, classes=None, labels=None
+    table_sets,
+    *,
+    prefixes,
+    extra_entries,
+    duplicate_trips="drop",
+    interval=None,
+    classes=None,
+    labels=None,
+    positions=None,
 ):
-    """:func:`merge_tables`, plus the time zone details the merge report
-    carries; ``interval`` and ``classes`` may come from a caller that
-    compared the zones already, and ``labels`` name the inputs in a
-    refusal."""
+    """:func:`merge_tables`, plus the details the merge report carries;
+    ``interval`` and ``classes`` may come from a caller that compared the
+    zones already, ``labels`` name the inputs in a refusal, and
+    ``positions`` are their positions in the report."""
+    if duplicate_trips not in ("drop", "keep"):
+        raise ValueError(
+            f"duplicate_trips must be 'drop' or 'keep', not {duplicate_trips!r}"
+        )
     table_sets = list(table_sets)
     if len(table_sets) < 2:
         raise ValueError("need at least two feeds to merge")
@@ -298,9 +332,11 @@ def _merge_tables(
 
     dropped = set()
     parts = {}
+    prefixed = []
     for tables, extras, prefix in zip(table_sets, extra_entries, prefixes):
         dropped.update(extras)
-        for filename, table in _prefix_feed(tables, prefix, dropped).items():
+        prefixed.append(_prefix_feed(tables, prefix, dropped))
+        for filename, table in prefixed[-1].items():
             parts.setdefault(filename, []).append(table)
     merged = {
         filename: pd.concat(tables, ignore_index=True).fillna("")
@@ -311,11 +347,17 @@ def _merge_tables(
         agency = merged["agency.txt"]
         filled = agency["agency_timezone"].str.strip() != ""
         agency.loc[filled, "agency_timezone"] = used
+    duplicates = {"dropped": 0, "by_feed": {}, "unexpanded_services": 0}
+    duplicates["stop_links"] = 0
+    if duplicate_trips == "drop":
+        at = range(len(prefixed)) if positions is None else positions
+        duplicates = drop_duplicate_trips(merged, prefixed, at)
     details = {
         "timezone_interval": (
             None if interval is None else [instant.isoformat() for instant in interval]
         ),
         "timezone_aliases": aliases,
+        "duplicate_trips": duplicates,
     }
     return merged, sorted(dropped), details
 
@@ -456,7 +498,14 @@ def _zone_classes(names, interval):
 
 
 def merge_feeds(
-    feeds, output, *, prefixes=None, check=True, timezones="refuse", **budgets
+    feeds,
+    output,
+    *,
+    prefixes=None,
+    check=True,
+    timezones="refuse",
+    duplicate_trips="drop",
+    **budgets,
 ):
     """Merge GTFS feeds into one zip, written atomically and validated.
 
@@ -487,6 +536,9 @@ def merge_feeds(
         feed's, then the first by name) and merges the rest, each keeping
         the prefix it had among all the inputs. Fewer than two feeds left
         still raises.
+    duplicate_trips : {"drop", "keep"}, default "drop"
+        Whether to leave out the trips an input repeats from the inputs
+        before it (see :func:`merge_tables`).
     **budgets
         ``validate_feed`` keyword arguments.
 
@@ -504,7 +556,11 @@ def merge_feeds(
         ``"timezone_interval"`` gives the UTC instants ``[start, end]``
         (ISO 8601) over which time zone names are compared, and
         ``"timezone_aliases"`` maps each ``agency_timezone`` name replaced
-        to the name used.
+        to the name used. ``"duplicate_trips"`` counts the trips dropped
+        as repeats, ``{"dropped": <n>, "by_feed": {<input position>: <n>},
+        "unexpanded_services": <n>, "stop_links": <n>}``: the services not
+        expanded, whose trips were never compared, and the stop pairs
+        linked.
     """
     from transitio.edit import FeedBuilder, FeedEditor
 
@@ -542,6 +598,7 @@ def merge_feeds(
     if len(zones) > 1:
         classes = _zone_classes(zones, interval)
     skipped = []
+    positions = list(range(len(table_sets)))
     outliers = _timezone_outliers(table_sets, classes) if timezones == "skip" else {}
     if outliers:
         kept = [i for i in range(len(table_sets)) if i not in outliers]
@@ -557,13 +614,16 @@ def merge_feeds(
         extra_entries = [extra_entries[i] for i in kept]
         names = [names[i] for i in kept]
         labels = [labels[i] for i in kept]
+        positions = kept
     tables, dropped, details = _merge_tables(
         table_sets,
         prefixes=names,
         extra_entries=extra_entries,
+        duplicate_trips=duplicate_trips,
         interval=interval,
         classes=classes,
         labels=labels,
+        positions=positions,
     )
     extra = {
         "dropped_files": dropped,
