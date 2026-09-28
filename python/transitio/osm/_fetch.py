@@ -6,10 +6,13 @@ import datetime
 import hashlib
 import json
 import re
+import warnings
 from pathlib import Path
 
 import httpx
+import numpy as np
 import platformdirs
+import shapely
 from shapely.geometry import box
 from shapely.geometry.base import BaseGeometry
 
@@ -46,6 +49,52 @@ def _as_geometry(aoi):
     if not (minx <= maxx and miny <= maxy):
         raise ValueError("invalid bounding box: expected minx <= maxx and miny <= maxy")
     return box(minx, miny, maxx, maxy)
+
+
+def _utm_groups(geoms):
+    """Yield ``(central meridian, projected)`` per UTM zone: the geometries
+    whose centroid falls in the zone, as a GeoSeries in that zone's CRS."""
+    import geopandas as gpd
+
+    centroids = shapely.centroid(geoms)
+    lon, lat = shapely.get_x(centroids), shapely.get_y(centroids)
+    zones = np.floor((lon + 180.0) / 6.0).astype(int) % 60 + 1
+    codes = np.where(lat < 0, 32700, 32600) + zones
+    for code in np.unique(codes):
+        chosen = gpd.GeoSeries(geoms[codes == code], crs="EPSG:4326")
+        yield 6 * (int(code) % 100) - 183, chosen.to_crs(int(code))
+
+
+def _buffered(geometry, buffer_m):
+    """``geometry`` grown by ``buffer_m`` metres; unchanged at 0.
+
+    Each part is buffered in the UTM zone of its centroid and the results are
+    unioned in WGS84, so far-apart parts each grow by the full distance.
+    """
+    if not buffer_m:
+        return geometry
+    world = box(-180.0, -90.0, 180.0, 90.0)
+    grown, crossed = [], False
+    for meridian, projected in _utm_groups(shapely.get_parts(geometry)):
+        # Longitudes wrap around the zone's meridian, so a part grown across
+        # the antimeridian is clipped there instead of spanning the globe:
+        # one extract envelope cannot span it.
+        wgs84 = f"+proj=longlat +datum=WGS84 +lon_wrap={meridian}"
+        back = projected.buffer(buffer_m).to_crs(wgs84).to_numpy()
+        crossed = crossed or not shapely.covered_by(back, world).all()
+        grown.extend(shapely.intersection(back, world))
+    if crossed:
+        warnings.warn(
+            "the AOI is not grown across the antimeridian", UserWarning, stacklevel=3
+        )
+    return shapely.union_all(grown)
+
+
+def _area_km2(geometry):
+    """The area of ``geometry`` in km², each part measured in the UTM zone of
+    its centroid."""
+    parts = shapely.get_parts(geometry)
+    return sum(projected.area.sum() for _, projected in _utm_groups(parts)) / 1e6
 
 
 def _resolve_url(geometry, update):
@@ -114,16 +163,24 @@ def _write_provenance(path, *, geometry, url, extract_sha256, cropped):
 
 
 def fetch_pbf(
-    aoi, *, crop=True, directory=None, cache_dir=None, update=False, transport=None
+    aoi,
+    *,
+    crop=True,
+    buffer_m=0,
+    directory=None,
+    cache_dir=None,
+    update=False,
+    transport=None,
 ):
     """Download (and by default crop) the OSM extract covering an AOI.
 
-    Resolution and cropping build on pyrosm: the smallest Geofabrik extract
-    whose extent covers the AOI is picked from pyrosm's bundled extract
-    index, its ``.osm.pbf`` is downloaded into the transitio cache, and by
-    default the result is cropped to the AOI geometry (the true polygon, not
-    just its envelope). A ``.provenance.json`` sidecar records the source
-    extract URL, checksums and retrieval timestamp.
+    Resolution and cropping build on pyrosm: the AOI is grown by ``buffer_m``,
+    the smallest Geofabrik extract whose extent covers the grown AOI is picked
+    from pyrosm's bundled extract index, its ``.osm.pbf`` is downloaded into
+    the transitio cache, and by default the result is cropped to the envelope
+    of the grown AOI (pyrosm crops a polygon by its bounding box). A
+    ``.provenance.json`` sidecar records the source extract URL, checksums,
+    the grown AOI's bounds and the retrieval timestamp.
 
     Parameters
     ----------
@@ -132,8 +189,15 @@ def fetch_pbf(
         ``(minx, miny, maxx, maxy)`` tuple in WGS84, or a place name to
         geocode via Nominatim.
     crop : bool, default True
-        Crop the downloaded extract to the AOI geometry; ``False`` returns
-        the full covering extract.
+        Crop the downloaded extract to the envelope of the grown AOI;
+        ``False`` returns the full covering extract.
+    buffer_m : float, default 0
+        Metres to grow the AOI by before the extract is picked and cropped.
+        Each part of the geometry is buffered in the UTM zone of its centroid
+        and the results are unioned, so far-apart parts each grow by the full
+        distance; 0 leaves the AOI unchanged. A part does not grow across
+        the antimeridian, which one extract envelope cannot span; a
+        ``UserWarning`` says when a part is clipped there.
     directory : str or pathlib.Path, optional
         Directory for the returned file; defaults to the transitio cache.
         Full extracts backing a crop always stay in the cache.
@@ -151,7 +215,7 @@ def fetch_pbf(
     pathlib.Path
         Path of the ``.osm.pbf`` file.
     """
-    geometry = _as_geometry(aoi)
+    geometry = _buffered(_as_geometry(aoi), buffer_m)
     cache = (
         Path(cache_dir) if cache_dir else Path(platformdirs.user_cache_dir("transitio"))
     )
@@ -162,7 +226,8 @@ def fetch_pbf(
     filename = url.rsplit("/", 1)[-1]
 
     if crop:
-        target = out_dir / _crop_filename(aoi, geometry)
+        # A grown place name is named by its geometry, not by the name alone.
+        target = out_dir / _crop_filename(geometry if buffer_m else aoi, geometry)
         extract_path = extract_dir / filename
     else:
         target = out_dir / filename

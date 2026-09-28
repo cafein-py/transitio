@@ -37,6 +37,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   <day>"` instead of `"no service on the requested day (actual window
   ...)"`. A `reference_date` that disagrees with `when` raises
   `ValueError`.
+- `fetch(place=...)` fetches the OSM extract after the feeds, for the
+  place's parts that hold a stop of a delivered feed (the whole place when
+  none does or a delivered feed's stops cannot be read), each part grown by
+  1.6 km. Remote parts no delivered feed
+  serves, such as Tokyo's Pacific islands, no longer widen the extract.
+  `FetchResult.osm_area` holds the grown area, and the selection record
+  notes the parts left out (`"OSM area: 1 of 47 parts (1783 of 2188
+  km²)"`). Area fetches are unchanged.
+- `fetch_pbf(..., buffer_m=0)` grows the AOI by `buffer_m` metres before
+  the extract is picked and cropped, each part in the UTM zone of its
+  centroid; the provenance sidecar's `aoi_bounds` are the grown AOI's. A
+  part is not grown across the antimeridian, with a `UserWarning`. The
+  docstring now states that the crop is pyrosm's envelope crop, not the
+  true polygon.
 
 ## 0.16.0 — 2026-09-27
 

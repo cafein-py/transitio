@@ -33,6 +33,9 @@ _MODES_BYTE_CAP = 64 * 1024 * 1024
 # Seconds a conditional HEAD probe may take before it counts as unanswered.
 _PROBE_TIMEOUT = 5.0
 
+# Metres the place path grows the OSM area by: cafein's default snap distance.
+_OSM_BUFFER_M = 1600
+
 # The fields of a selection-record entry, in selection_table's column order.
 _SELECTION_FIELDS = (
     "feed_id",
@@ -67,15 +70,18 @@ class FetchResult:
     # feeds, from the index's contained_in (schema 10); empty otherwise.
     contained: dict = dataclasses.field(default_factory=dict)
     # One entry per candidate feed, in candidate order, with its decision;
-    # ``skipped`` lists the same skips.
+    # ``skipped`` lists the same skips. A last entry with feed_id None notes
+    # the place parts the OSM extract leaves out.
     selection: list = dataclasses.field(default_factory=list)
+    # The WGS84 area the OSM extract was fetched for; None without one.
+    osm_area: object = None
 
     def __iter__(self):  # convenient (pbf, feeds) unpacking
         return iter((self.osm_pbf, self.feeds))
 
     def selection_table(self):
         """The selection record as a ``pandas.DataFrame``, one row per
-        candidate feed."""
+        candidate feed, then the OSM-area note row when there is one."""
         import pandas as pd
 
         return pd.DataFrame(self.selection, columns=list(_SELECTION_FIELDS))
@@ -623,9 +629,13 @@ def fetch(
         Spatially crop each feed to the area: to its polygon when it has
         one (a place's boundary included), otherwise to its bounding box.
     osm : bool, default True
-        Fetch the OSM extract for the AOI. With ``osm=False`` the OSM stage
-        is skipped and the result's ``osm_pbf`` is None, for callers who
-        want only the GTFS feeds; ``to_pyrosm`` then raises and
+        Fetch the OSM extract for the AOI. With ``place``, it is fetched
+        after the feeds, for the place's parts that hold a stop of a
+        delivered feed (the whole place when none does, nothing was
+        delivered or a delivered feed's stops.txt cannot be read), each part
+        grown by 1.6 km, cafein's default snap distance. With ``osm=False``
+        the OSM stage is skipped and the result's ``osm_pbf`` is None, for
+        callers who want only the GTFS feeds; ``to_pyrosm`` then raises and
         ``to_cafein`` builds without a walking network.
     refresh_token, cache_dir, directory, country_code
         Passed to the catalog and OSM layers.
@@ -654,7 +664,11 @@ def fetch(
         ``same_as`` and ``contained_in`` (the feed ids a same-content or a
         containment skip names), ``version_of`` (None; reserved for version
         skips) and ``path`` (the delivered feed). Windows are ISO dates.
-        ``FetchResult.selection_table()`` returns it as a DataFrame.
+        When the OSM extract leaves out parts of the place, a last entry
+        with ``feed_id`` None notes them, e.g. ``"OSM area: 1 of 47 parts
+        (1783 of 2188 km²)"``. ``FetchResult.selection_table()`` returns it
+        as a DataFrame. ``osm_area`` is the WGS84 geometry the OSM extract
+        was fetched for (None with ``osm=False``).
     """
     from transitio.catalog import MobilityDatabase
     from transitio.catalog._models import as_date
@@ -843,6 +857,7 @@ def fetch(
         repairs=repairs,
         skipped=_skipped(record),
         selection=record,
+        osm_area=geometry if osm else None,
     )
 
 
@@ -898,6 +913,50 @@ def _untrusted_action(policy, exclude, on_unknown):
     return "skip" if on_unknown == "exclude" else "whole"
 
 
+def _osm_parts(geometry, feeds):
+    """The parts of ``geometry`` the OSM extract is fetched for: the union of
+    those holding a stop of a delivered feed in ``feeds``, read from each
+    one's stops.txt, else the whole geometry. A feed whose stops.txt cannot
+    be read could serve any part, so it also yields the whole geometry."""
+    import shapely
+
+    from transitio.index.fingerprint import _member_coords
+
+    parts = shapely.get_parts(geometry)
+    tree = shapely.STRtree(parts)
+    held = set()
+    for path in feeds:
+        try:
+            with zipfile.ZipFile(path) as archive:
+                coords = _member_coords(archive)
+        except Exception:  # noqa: B902 — unreadable, like an absent stops.txt
+            coords = None
+        if coords is None:
+            return geometry
+        if coords:
+            points = shapely.points(list(coords.values()))
+            held.update(tree.query(points, predicate="intersects")[1].tolist())
+    if len(held) in (0, len(parts)):
+        return geometry
+    return shapely.union_all(parts[sorted(held)])
+
+
+def _osm_note(geometry, parts):
+    """The selection-record note on the parts of ``geometry`` that ``parts``
+    leaves out, None when it leaves out none."""
+    import shapely
+
+    from transitio.osm._fetch import _area_km2
+
+    total, kept = shapely.get_num_geometries([geometry, parts])
+    if kept == total:
+        return None
+    return (
+        f"OSM area: {kept} of {total} parts "
+        f"({_area_km2(parts):.0f} of {_area_km2(geometry):.0f} km²)"
+    )
+
+
 def _fetch_place(
     place,
     *,
@@ -925,7 +984,8 @@ def _fetch_place(
     a bundled feed is cropped to the routes its matched tiers select, the drop
     recorded in ``selections``. A feed whose index window misses ``day`` is
     skipped before download when a probe proves the archive unchanged since
-    indexed; ``window_day`` is what the computed window is tested against."""
+    indexed; ``window_day`` is what the computed window is tested against.
+    The OSM extract comes last, for the parts the delivered feeds serve."""
     import shapely
 
     from transitio import __version__
@@ -940,6 +1000,7 @@ def _fetch_place(
     )
     from transitio.index.feeds import _parse
     from transitio.osm import fetch_pbf
+    from transitio.osm._fetch import _buffered
 
     if isinstance(place, Place):
         place_obj = place
@@ -971,10 +1032,6 @@ def _fetch_place(
             sort_keys=True,
         ).encode()
     ).hexdigest()[:16]
-
-    osm_pbf = (
-        fetch_pbf(geometry, cache_dir=cache_dir, directory=directory) if osm else None
-    )
 
     offered = place_obj.feeds(tiers=tiers, exclude=exclude, on_unknown=on_unknown)
     kept = _containers_first(offered) if contained == "drop" else offered
@@ -1229,6 +1286,17 @@ def _fetch_place(
         if feed.feed_id in delivered_ids
     }
 
+    osm_pbf = osm_area = None
+    if osm:
+        parts = _osm_parts(geometry, feeds)
+        osm_pbf = fetch_pbf(
+            parts, buffer_m=_OSM_BUFFER_M, cache_dir=cache_dir, directory=directory
+        )
+        osm_area = _buffered(parts, _OSM_BUFFER_M)
+        note = _osm_note(geometry, parts)
+        if note is not None:
+            record.append({**_entry(None, None), "note": note})
+
     return FetchResult(
         osm_pbf=osm_pbf,
         feeds=feeds,
@@ -1240,4 +1308,5 @@ def _fetch_place(
         snapshot=provenance["snapshot"],
         contained={feed_id: ids for feed_id, ids in pairs.items() if ids},
         selection=record,
+        osm_area=osm_area,
     )
