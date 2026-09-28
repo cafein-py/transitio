@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- A zip with up to 64 KiB of bytes after its end-of-central-directory
+  record is read instead of refused as "not a readable zip: no
+  end-of-central-directory record found", so validation, cropping and
+  repair accept it. The feeds of Réseau de transport de Longueuil and CRT
+  Lanaudière carry one and two such bytes; Python's `zipfile` reads both.
+
 ## 0.16.0 — 2026-09-27
 
 ### Added
