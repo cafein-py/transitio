@@ -31,6 +31,11 @@ const MAX_CENTRAL_DIRECTORY_BYTES: u64 = 256 * 1024 * 1024;
 /// indexing allocation; a GTFS feed holds a few dozen files.
 const MAX_ARCHIVE_ENTRIES: u64 = 4096;
 
+/// Bytes after the end-of-central-directory record that the archive-tail
+/// read has room for even behind the longest comment; some published feeds
+/// carry a few.
+const TRAILING_BYTES_ROOM: u64 = 64 * 1024;
+
 /// Recognized non-CSV GTFS files: not unknown, content out of the
 /// structural tier's scope.
 const NON_CSV_FILES: &[&str] = &["locations.geojson"];
@@ -149,14 +154,21 @@ pub fn scan_reader_streaming<R: Read + Seek>(
     // invisible through its API. GTFS files duplicated in the archive are
     // ambiguous (other readers may take the first occurrence); walk the
     // central directory directly to detect and refuse them.
-    let duplicated =
+    let (duplicated, archive_end) =
         duplicated_gtfs_entries(&mut reader).map_err(|e| format!("not a readable zip: {e}"))?;
     reader
         .seek(SeekFrom::Start(0))
         .map_err(|e| format!("cannot rewind archive: {e}"))?;
 
+    // Bytes after the end-of-central-directory record are hidden, so the
+    // zip crate reads the archive the walker checked.
+    let bounded = Bounded {
+        inner: reader,
+        len: archive_end,
+        pos: 0,
+    };
     let mut archive =
-        zip::ZipArchive::new(reader).map_err(|e| format!("not a readable zip: {e}"))?;
+        zip::ZipArchive::new(bounded).map_err(|e| format!("not a readable zip: {e}"))?;
     let mut notices = Vec::new();
     let mut tables = BTreeMap::new();
     let mut incomplete = std::collections::BTreeSet::new();
@@ -296,56 +308,32 @@ pub fn scan_reader_streaming<R: Read + Seek>(
 }
 
 /// Walk the central directory and return the root-level GTFS filenames that
-/// occur more than once. The end-of-central-directory record is located by
-/// its signature in the archive tail; ZIP64 archives are followed through
-/// the ZIP64 locator.
+/// occur more than once, with the offset where the archive ends. The
+/// end-of-central-directory record is located by its signature in the
+/// archive tail, where trailing bytes may follow it; ZIP64 archives are
+/// followed through the ZIP64 locator.
 fn duplicated_gtfs_entries<R: Read + Seek>(
     reader: &mut R,
-) -> Result<BTreeSet<&'static str>, String> {
+) -> Result<(BTreeSet<&'static str>, u64), String> {
     let file_len = reader
         .seek(SeekFrom::End(0))
         .map_err(|e| format!("cannot read archive length: {e}"))?;
     // EOCD is 22 bytes plus a comment of at most 65535 bytes; the ZIP64
-    // locator (20 bytes) sits directly before the EOCD when present.
-    let tail_len = file_len.min(22 + 65_535 + 20);
+    // locator (20 bytes) sits directly before the EOCD when present, and
+    // trailing bytes may follow it.
+    let tail_len = file_len.min(20 + 22 + 65_535 + TRAILING_BYTES_ROOM);
+    let tail_start = file_len - tail_len;
     reader
-        .seek(SeekFrom::Start(file_len - tail_len))
+        .seek(SeekFrom::Start(tail_start))
         .map_err(|e| format!("cannot seek archive tail: {e}"))?;
     let mut tail = vec![0u8; tail_len as usize];
     reader
         .read_exact(&mut tail)
         .map_err(|e| format!("cannot read archive tail: {e}"))?;
 
-    let eocd_pos = find_eocd(&tail).ok_or("no end-of-central-directory record found")?;
-    let eocd = &tail[eocd_pos..];
-    let mut total_entries = u16::from_le_bytes([eocd[10], eocd[11]]) as u64;
-    let mut cd_size = u32::from_le_bytes([eocd[12], eocd[13], eocd[14], eocd[15]]) as u64;
-    let mut cd_offset = u32::from_le_bytes([eocd[16], eocd[17], eocd[18], eocd[19]]) as u64;
-
-    if total_entries == 0xFFFF || cd_size == 0xFFFF_FFFF || cd_offset == 0xFFFF_FFFF {
-        // ZIP64: the locator directly precedes the EOCD.
-        let locator_pos = eocd_pos
-            .checked_sub(20)
-            .ok_or("truncated ZIP64 end-of-central-directory locator")?;
-        let locator = &tail[locator_pos..eocd_pos];
-        if locator[0..4] != [0x50, 0x4b, 0x06, 0x07] {
-            return Err("missing ZIP64 end-of-central-directory locator".to_string());
-        }
-        let zip64_eocd_offset = u64::from_le_bytes(locator[8..16].try_into().unwrap());
-        reader
-            .seek(SeekFrom::Start(zip64_eocd_offset))
-            .map_err(|e| format!("cannot seek ZIP64 record: {e}"))?;
-        let mut zip64 = [0u8; 56];
-        reader
-            .read_exact(&mut zip64)
-            .map_err(|e| format!("cannot read ZIP64 record: {e}"))?;
-        if zip64[0..4] != [0x50, 0x4b, 0x06, 0x06] {
-            return Err("invalid ZIP64 end-of-central-directory record".to_string());
-        }
-        total_entries = u64::from_le_bytes(zip64[32..40].try_into().unwrap());
-        cd_size = u64::from_le_bytes(zip64[40..48].try_into().unwrap());
-        cd_offset = u64::from_le_bytes(zip64[48..56].try_into().unwrap());
-    }
+    let (record, (total_entries, cd_size, cd_offset)) =
+        find_eocd(reader, &tail, tail_start)?.ok_or("no end-of-central-directory record found")?;
+    let archive_end = tail_start + record.end as u64;
     if cd_size > MAX_CENTRAL_DIRECTORY_BYTES {
         return Err(format!(
             "central directory of {cd_size} bytes exceeds the {MAX_CENTRAL_DIRECTORY_BYTES}-byte limit"
@@ -390,23 +378,125 @@ fn duplicated_gtfs_entries<R: Read + Seek>(
         cursor += 46 + name_len + extra_len + comment_len;
     }
 
-    Ok(counts
+    let duplicated = counts
         .into_iter()
         .filter(|(_, count)| *count > 1)
         .map(|(name, _)| name)
-        .collect())
+        .collect();
+    Ok((duplicated, archive_end))
 }
 
-fn find_eocd(tail: &[u8]) -> Option<usize> {
-    // Scan backwards for the EOCD signature at a position whose comment
-    // length is consistent with the record ending at the archive tail.
+/// A central directory's entry count, size and offset.
+type Directory = (u64, u64, u64);
+
+/// The span within `tail` of the last EOCD record that fits in it and whose
+/// central directory checks out, with that directory. `tail_start` is the
+/// tail's offset in the archive. A stray signature inside entry data or
+/// trailing bytes fails the check.
+fn find_eocd<R: Read + Seek>(
+    reader: &mut R,
+    tail: &[u8],
+    tail_start: u64,
+) -> Result<Option<(std::ops::Range<usize>, Directory)>, String> {
     let sig = [0x50, 0x4b, 0x05, 0x06];
-    (0..tail.len().saturating_sub(21)).rev().find(|&pos| {
-        tail[pos..pos + 4] == sig && {
-            let comment_len = u16::from_le_bytes([tail[pos + 20], tail[pos + 21]]) as usize;
-            pos + 22 + comment_len == tail.len()
+    for pos in (0..tail.len().saturating_sub(21)).rev() {
+        if tail[pos..pos + 4] != sig {
+            continue;
         }
-    })
+        let comment_len = u16::from_le_bytes([tail[pos + 20], tail[pos + 21]]) as usize;
+        let record = pos..pos + 22 + comment_len;
+        if record.end > tail.len() {
+            continue;
+        }
+        if let Some(directory) = central_directory(reader, tail, tail_start, pos)? {
+            return Ok(Some((record, directory)));
+        }
+    }
+    Ok(None)
+}
+
+/// The central directory described by the EOCD record at `pos` in `tail`,
+/// or None unless the directory ends where the record starts. A ZIP64
+/// record is followed through the locator directly before the EOCD, and
+/// the directory must end where the ZIP64 record starts.
+fn central_directory<R: Read + Seek>(
+    reader: &mut R,
+    tail: &[u8],
+    tail_start: u64,
+    pos: usize,
+) -> Result<Option<Directory>, String> {
+    let eocd = &tail[pos..pos + 22];
+    let entries = u16::from_le_bytes([eocd[10], eocd[11]]) as u64;
+    let cd_size = u32::from_le_bytes([eocd[12], eocd[13], eocd[14], eocd[15]]) as u64;
+    let cd_offset = u32::from_le_bytes([eocd[16], eocd[17], eocd[18], eocd[19]]) as u64;
+    if entries != 0xFFFF && cd_size != 0xFFFF_FFFF && cd_offset != 0xFFFF_FFFF {
+        let consistent = cd_offset + cd_size == tail_start + pos as u64;
+        return Ok(consistent.then_some((entries, cd_size, cd_offset)));
+    }
+
+    let Some(locator_pos) = pos.checked_sub(20) else {
+        return Ok(None);
+    };
+    let locator = &tail[locator_pos..pos];
+    if locator[0..4] != [0x50, 0x4b, 0x06, 0x07] {
+        return Ok(None);
+    }
+    // The 56-byte ZIP64 record must lie before its locator.
+    let zip64_offset = u64::from_le_bytes(locator[8..16].try_into().unwrap());
+    let locator_offset = tail_start + locator_pos as u64;
+    if locator_offset < 56 || zip64_offset > locator_offset - 56 {
+        return Ok(None);
+    }
+    reader
+        .seek(SeekFrom::Start(zip64_offset))
+        .map_err(|e| format!("cannot seek ZIP64 record: {e}"))?;
+    let mut zip64 = [0u8; 56];
+    reader
+        .read_exact(&mut zip64)
+        .map_err(|e| format!("cannot read ZIP64 record: {e}"))?;
+    if zip64[0..4] != [0x50, 0x4b, 0x06, 0x06] {
+        return Ok(None);
+    }
+    let entries = u64::from_le_bytes(zip64[32..40].try_into().unwrap());
+    let cd_size = u64::from_le_bytes(zip64[40..48].try_into().unwrap());
+    let cd_offset = u64::from_le_bytes(zip64[48..56].try_into().unwrap());
+    let consistent = cd_offset.checked_add(cd_size) == Some(zip64_offset);
+    Ok(consistent.then_some((entries, cd_size, cd_offset)))
+}
+
+/// A reader over the first `len` bytes of `inner`, whose position it
+/// tracks as `pos`.
+struct Bounded<R> {
+    inner: R,
+    len: u64,
+    pos: u64,
+}
+
+impl<R: Read> Read for Bounded<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let limit = self.len.saturating_sub(self.pos).min(buf.len() as u64) as usize;
+        let read = self.inner.read(&mut buf[..limit])?;
+        self.pos += read as u64;
+        Ok(read)
+    }
+}
+
+impl<R: Seek> Seek for Bounded<R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let target = match pos {
+            SeekFrom::Start(offset) => Some(offset),
+            SeekFrom::End(delta) => self.len.checked_add_signed(delta),
+            SeekFrom::Current(delta) => self.pos.checked_add_signed(delta),
+        }
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid seek to a negative or overflowing position",
+            )
+        })?;
+        self.pos = self.inner.seek(SeekFrom::Start(target))?;
+        Ok(self.pos)
+    }
 }
 
 fn read_table(
@@ -991,13 +1081,27 @@ mod tests {
     use super::*;
 
     fn zip_with(files: &[(&str, &[u8])]) -> Cursor<Vec<u8>> {
+        zip_written(files, zip::write::SimpleFileOptions::default(), false)
+    }
+
+    /// `zip_with` under the given entry options, with a ZIP64 footer when
+    /// `zip64` is set.
+    fn zip_written(
+        files: &[(&str, &[u8])],
+        options: zip::write::SimpleFileOptions,
+        zip64: bool,
+    ) -> Cursor<Vec<u8>> {
         let mut cursor = Cursor::new(Vec::new());
         {
             let mut writer = zip::ZipWriter::new(&mut cursor);
-            let options = zip::write::SimpleFileOptions::default();
             for (name, content) in files {
                 writer.start_file(*name, options).unwrap();
                 std::io::Write::write_all(&mut writer, content).unwrap();
+            }
+            if zip64 {
+                // Any extensible data sector, even an empty one, makes the
+                // writer emit the ZIP64 footer.
+                writer.set_raw_zip64_extensible_data_sector(Box::new([]));
             }
             writer.finish().unwrap();
         }
@@ -1357,6 +1461,63 @@ mod tests {
     #[test]
     fn not_a_zip_is_an_error() {
         assert!(scan_reader(Cursor::new(b"plain text".to_vec())).is_err());
+    }
+
+    #[test]
+    fn bytes_after_the_end_record_are_tolerated() {
+        let feed: Vec<(&str, &[u8])> = minimal()
+            .into_iter()
+            .map(|(name, content)| (name, content.as_bytes()))
+            .collect();
+        let deflated = zip::write::SimpleFileOptions::default();
+        let archive = zip_written(&feed, deflated, false).into_inner();
+        let zip64 = zip_written(&feed, deflated, true).into_inner();
+        let appended = |extra: &[u8]| [archive.as_slice(), extra].concat();
+        let mut truncated = archive.clone();
+        truncated.pop();
+        // An end record whose entry count defers to a missing ZIP64 record.
+        let mut zip64_like = [0u8; 22];
+        zip64_like[..4].copy_from_slice(&[0x50, 0x4b, 0x05, 0x06]);
+        zip64_like[10..12].copy_from_slice(&[0xff, 0xff]);
+        // A stored entry holding an empty end record, cut before the real
+        // central directory: the stray record claims a directory that does
+        // not end where it starts.
+        let mut record = [0u8; 22];
+        record[..4].copy_from_slice(&[0x50, 0x4b, 0x05, 0x06]);
+        let stored = deflated.compression_method(zip::CompressionMethod::Stored);
+        let mut stray = zip_written(&[("notes.bin", &record)], stored, false).into_inner();
+        let end = stray.len();
+        let cd_offset = u32::from_le_bytes(stray[end - 6..end - 2].try_into().unwrap());
+        stray.truncate(cd_offset as usize);
+
+        let mut names: Vec<&str> = minimal().iter().map(|(name, _)| *name).collect();
+        names.sort_unstable();
+        let cases = [
+            ("none", archive.clone(), true),
+            ("one byte", appended(&[0]), true),
+            ("two bytes", appended(&[0, 0]), true),
+            ("64 KiB", appended(&[0; 64 * 1024]), true),
+            ("zip64", [zip64.as_slice(), &[0, 0]].concat(), true),
+            ("zip64-like trailer", appended(&zip64_like), true),
+            ("stray record", stray, false),
+            ("truncated", truncated, false),
+        ];
+        for (case, bytes, accepted) in cases {
+            match scan_reader(Cursor::new(bytes)) {
+                Ok(result) => {
+                    assert!(accepted, "{case}: expected a refusal");
+                    let listed: Vec<&str> = result.tables.keys().map(String::as_str).collect();
+                    assert_eq!(listed, names, "{case}");
+                }
+                Err(error) => {
+                    assert!(!accepted, "{case}: {error}");
+                    assert_eq!(
+                        error, "not a readable zip: no end-of-central-directory record found",
+                        "{case}"
+                    );
+                }
+            }
+        }
     }
 
     struct Streamed {

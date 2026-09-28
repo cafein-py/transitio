@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A zip with up to 64 KiB of bytes after its end-of-central-directory
+  record is read instead of refused as "not a readable zip: no
+  end-of-central-directory record found", so validation, cropping and
+  repair accept it. The feeds of Réseau de transport de Longueuil and CRT
+  Lanaudière carry one and two such bytes; Python's `zipfile` reads both.
 - `FeedEditor` reads header names without surrounding whitespace, so
   `merge_feeds`, `patch_feed` and a saved feed write `agency_name` where the
   source header says ` agency_name`. Columns that then share a name fold into
