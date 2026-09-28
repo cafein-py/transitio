@@ -76,17 +76,11 @@ pub fn repair(path: &Path, output: &Path, options: ScanOptions) -> Result<Repair
     semantics::run_semantics(&mut result, &options);
 
     // Repairing a truncated snapshot would silently rewrite a subset of
-    // the feed as if it were whole; refuse instead.
-    if !result.incomplete.is_empty()
-        || result
-            .notices
-            .iter()
-            .any(|n| matches!(n.code, "too_many_rows" | "notice_limit_reached"))
-    {
-        // Sampled notices would leave defects invisibly unrepaired.
-        return Err(
-            "feed exceeds the scan or notice budgets; raise the limits to repair it".to_string(),
-        );
+    // the feed as if it were whole, and sampled notices would leave
+    // defects invisibly unrepaired; refuse both.
+    let incomplete = result.incomplete.iter().map(String::as_str);
+    if let Some(reason) = scan::refusal(&result.notices, incomplete, &options, true, "repair") {
+        return Err(reason);
     }
 
     if output
@@ -510,4 +504,53 @@ fn retain_rows(
     }
     table.rows = kept;
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::notice::{Notice, Severity};
+    use crate::scan::tests::{build_zip, minimal};
+
+    #[test]
+    fn a_notice_cap_refuses_the_repair() {
+        let dir = std::env::temp_dir().join(format!("transitio-repair-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut files = minimal();
+        files.retain(|(name, _)| *name != "stops.txt");
+        files.push((
+            "stops.txt",
+            "stop_id,stop_name,stop_lat,stop_lon\n\
+             s1,Kamppi ,60.169,24.931\ns2,Steissi ,60.171,24.941\n",
+        ));
+        let source = dir.join("source.zip");
+        std::fs::write(&source, build_zip(&files).into_inner()).unwrap();
+        let options = ScanOptions {
+            max_notices_per_file: 1,
+            reference_date: chrono::NaiveDate::from_ymd_opt(2026, 6, 1),
+            ..ScanOptions::default()
+        };
+        let output = dir.join("repaired.zip");
+        let error = match repair(&source, &output, options) {
+            Err(error) => error,
+            Ok(_) => panic!("repaired despite sampled notices"),
+        };
+        assert_eq!(
+            error,
+            "stops.txt exceeds max_notices_per_file (1); raise it to repair this feed"
+        );
+        assert!(!output.exists());
+        // the block overlap cap is not a budget
+        let capped = Notice::new("notice_limit_reached", Severity::Warning)
+            .with("filename", "trips.txt")
+            .with("blockId", "b1");
+        assert_eq!(
+            scan::refusal(&[capped], [], &options, true, "repair").as_deref(),
+            Some(
+                "trips.txt reaches the block overlap check cap that no budget raises; \
+                 cannot repair this feed"
+            )
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -37,6 +37,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   <day>"` instead of `"no service on the requested day (actual window
   ...)"`. A `reference_date` that disagrees with `when` raises
   `ValueError`.
+- `fetch(place=...)` fetches the OSM extract after the feeds, for the
+  place's parts that hold a stop of a delivered feed (the whole place when
+  none does or a delivered feed's stops cannot be read), each part grown by
+  1.6 km. Remote parts no delivered feed
+  serves, such as Tokyo's Pacific islands, no longer widen the extract.
+  `FetchResult.osm_area` holds the grown area, and the selection record
+  notes the parts left out (`"OSM area: 1 of 47 parts (1783 of 2188
+  km²)"`). Area fetches are unchanged.
+- `fetch_pbf(..., buffer_m=0)` grows the AOI by `buffer_m` metres before
+  the extract is picked and cropped, each part in the UTM zone of its
+  centroid; the provenance sidecar's `aoi_bounds` are the grown AOI's. A
+  part is not grown across the antimeridian, with a `UserWarning`. The
+  docstring now states that the crop is pyrosm's envelope crop, not the
+  true polygon.
+- `merge_feeds` and `merge_tables` leave out an input's trips that repeat
+  trips kept from the inputs before it (`duplicate_trips="drop"`, the
+  default; `"keep"` keeps them). Trips repeat when their route key, stops,
+  times and pickup and drop-off behaviour match, on dates the earlier trips
+  run, one earlier trip per later trip and date; trips sharing a `block_id`
+  go together. A dropped trip's stops still served by a kept trip are linked
+  to the earlier trip's stops by transfers, and the report counts drops
+  under `"duplicate_trips"`. A regional aggregate merged with an operator's
+  own feed, as in London and Augsburg, carried the operator's trips twice.
 - `fetch(place=...)` delivers one copy per service. `contained` defaults to
   `"drop"`, leaving out a contained feed when a container was delivered
   whole and `HEAD` probes prove both archives unchanged since indexed. A
@@ -61,6 +84,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `crop_feed` refuses a feed only when a table the crop depends on is cut
+  short, by a row, byte or column budget or an unreadable entry, in the
+  source or in the cropped feed. A reached notice cap (`max_notices_per_file`
+  or the block overlap check cap) no longer refuses it; the cropped feed's
+  notices then include `notice_limit_reached`. São Paulo's SPTrans feed and
+  Westchester's Bee-Line could not be cropped with the default budgets.
+- The refusals of `crop_feed` and `repair_feed` name each file and the
+  budget it exceeded with its value, such as "stops.txt exceeds max_rows
+  (20000000); raise it to crop this feed", instead of "feed exceeds the scan
+  or notice budgets". `repair_feed` still refuses a feed whose notices were
+  sampled, and says so when the cap is one that no budget raises. An
+  `unreadable_file` notice for a violated budget lists it under `budgets`.
+- A zip with up to 64 KiB of bytes after its end-of-central-directory
+  record is read instead of refused as "not a readable zip: no
+  end-of-central-directory record found", so validation, cropping and
+  repair accept it. The feeds of Réseau de transport de Longueuil and CRT
+  Lanaudière carry one and two such bytes; Python's `zipfile` reads both.
 - `FeedEditor` reads header names without surrounding whitespace, so
   `merge_feeds`, `patch_feed` and a saved feed write `agency_name` where the
   source header says ` agency_name`. Columns that then share a name fold into

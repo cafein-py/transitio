@@ -96,6 +96,7 @@ def test_fetch_end_to_end(pipeline_env):
             reference_date="20260601",
         )
     assert result.osm_pbf == fake_pbf
+    assert result.osm_area.bounds == (24.6, 60.1, 25.2, 60.4)
     assert len(result.feeds) == 1
     assert "-cropped-" in result.feeds[0].name
     assert result.feeds[0].suffix == ".zip"
@@ -1219,6 +1220,82 @@ def test_fetch_place_output_names_differ_by_geometry(tmp_path, monkeypatch):
     place_obj._record["geometry"] = shapely.box(10.0, 50.0, 10.2, 50.2)
     second = fetch(place=place_obj, directory=out)
     assert first.feeds[0].name != second.feeds[0].name
+
+
+# A two-part place: the first part holds the GTFS fixture's stops.
+_SERVED = (24.9, 60.1, 25.1, 60.3)
+_REMOTE = (26.0, 61.0, 26.2, 61.2)
+
+
+@pytest.mark.parametrize(
+    "stops, expected",
+    [
+        pytest.param([[(60.169, 24.931)]], "served", id="one-part"),
+        pytest.param([[(60.169, 24.931)], [(61.1, 26.1)]], "whole", id="both-parts"),
+        pytest.param([[(59.0, 24.0)]], "whole", id="no-part"),
+        pytest.param([], "whole", id="nothing-delivered"),
+        # A feed whose stops cannot be read could serve the remote part.
+        pytest.param([[(60.169, 24.931)], None], "whole", id="unreadable-stops"),
+    ],
+)
+def test_osm_parts_are_those_holding_a_delivered_stop(tmp_path, stops, expected):
+    import shapely
+
+    from transitio.pipeline._fetch import _osm_parts
+
+    geometry = shapely.union_all([shapely.box(*_SERVED), shapely.box(*_REMOTE)])
+    feeds = []
+    for number, coords in enumerate(stops):
+        path = tmp_path / f"{number}.zip"
+        if coords is None:
+            path.write_bytes(_zip({"agency.txt": GTFS["agency.txt"]}))
+        else:
+            rows = "".join(f"s{i},{y},{x}\n" for i, (y, x) in enumerate(coords))
+            path.write_bytes(_zip({"stops.txt": "stop_id,stop_lat,stop_lon\n" + rows}))
+        feeds.append(path)
+    parts = _osm_parts(geometry, feeds)
+    assert parts.equals(shapely.box(*_SERVED) if expected == "served" else geometry)
+
+
+def test_fetch_place_fetches_the_osm_extract_last_for_the_served_parts(
+    tmp_path, monkeypatch
+):
+    import shapely
+
+    import transitio
+    from transitio.osm._fetch import _buffered
+
+    index = _place_index(
+        tmp_path, {"atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}}}
+    )
+    fake_pbf = _stub_pbf_and_atlas(monkeypatch, tmp_path, _gtfs_payload())
+    download = transitio.catalog.TransitlandAtlas.download
+    events = []
+
+    def recorded_download(self, feed, directory=None):
+        events.append("feed")
+        return download(self, feed, directory=directory)
+
+    def recorded_fetch_pbf(aoi, **kwargs):
+        events.append((aoi, kwargs["buffer_m"]))
+        return fake_pbf
+
+    monkeypatch.setattr(
+        "transitio.catalog.TransitlandAtlas.download", recorded_download
+    )
+    monkeypatch.setattr("transitio.osm.fetch_pbf", recorded_fetch_pbf)
+    served = shapely.box(*_SERVED)
+    place_obj = transitio.place("Q1757", index=index)
+    place_obj._record["geometry"] = shapely.union_all([served, shapely.box(*_REMOTE)])
+    result = fetch(place=place_obj, directory=tmp_path / "out", crop=False)
+
+    feed, (aoi, buffer_m) = events
+    assert feed == "feed" and aoi.equals(served) and buffer_m == 1600
+    assert result.osm_pbf == fake_pbf
+    assert result.osm_area.equals(_buffered(served, 1600))
+    *_, note = result.selection
+    assert note["feed_id"] is None and note["decision"] is None
+    assert note["note"].startswith("OSM area: 1 of 2 parts (")
 
 
 # route -> (agency, stop, trip, route_type); a1 carries local+regional.
