@@ -504,3 +504,173 @@ def test_argument_errors():
         merge_tables([feed, feed], prefixes=["x", "y:z"])
     with pytest.raises(ValueError, match="prefixes"):
         merge_tables([feed, feed], prefixes=["x"])
+
+
+SERVICES = {
+    "jan": ("20260101", "20260131"),
+    "jan1": ("20260101", "20260115"),
+    "jan2": ("20260116", "20260131"),
+    "mid": ("20260105", "20260120"),
+    "late": ("20260120", "20260210"),
+    "long": ("20260101", "20370101"),
+    "huge": ("19000101", "20991231"),
+}
+LATER = ("09:00:00", "09:10:00")
+
+
+def _trips(*specs):
+    return [{"trip_id": f"t{i}", **spec} for i, spec in enumerate(specs, start=1)]
+
+
+def _repeats(trips, rows=(), continuous=""):
+    builder = FeedBuilder()
+    builder.add_agency("a", "Agency", "https://a.example", HEL)
+    stops = {"s1": 60.1, "s2": 60.11, "s3": 60.12, "s4": 60.10001, "s5": 60.100001}
+    for stop, lat in stops.items():
+        builder.add_stop(stop, stop, lat, 24.9)
+    builder.add_route("r1", 3, "1", agency_id="a", continuous_pickup=continuous)
+    builder.add_route("r2", 3, "2", agency_id="a")
+    builder.add_route("r3", 3, "1", agency_id="a", continuous_pickup="0")
+    for service in sorted({trip.get("service", "jan") for trip in trips}):
+        builder.add_service(service, "daily", *SERVICES[service])
+    for trip in trips:
+        names = ("block_id", "shape_id", "trip_headsign")
+        fields = {key: trip[key] for key in names if key in trip}
+        if "shape_id" in fields:
+            builder.add_shape(fields["shape_id"], [(60.10, 24.9), (60.11, 24.9)])
+        times = trip.get("times", ("08:00:00", "08:10:00"))
+        stops = list(zip(trip.get("stops", ("s1", "s2")), times, times))
+        route, service = trip.get("route", "r1"), trip.get("service", "jan")
+        builder.add_trip(route, service, trip["trip_id"], stops, **fields)
+        first = len(builder.tables["stop_times.txt"]) - len(stops)
+        for column, values in trip.get("stop_fields", {}).items():
+            for offset, value in enumerate(values):
+                builder.set_value("stop_times.txt", first + offset, column, value)
+    for name, row in rows:
+        builder.insert_rows(name, [row])
+    return builder
+
+
+@pytest.mark.parametrize(
+    "variant, expected",
+    [
+        ({}, "equal"),
+        ({"times": ("08:00:00", "08:11:00")}, "differs"),
+        ({"stop_fields": {"pickup_type": ("1", "")}}, "differs"),
+        ({"route": "r2"}, "differs"),
+        ({"stops": ("s4", "s2")}, "differs"),
+        ({"stops": ("s5", "s2")}, "equal"),
+        ({"route": "r3"}, "differs"),
+        ({"shape_id": "sa"}, "equal"),
+        ({"trip_headsign": "Centre"}, "equal"),
+        ({"stops": ("s9", "s2")}, "absent"),
+        ({"stop_fields": {"stop_sequence": ("1", "1")}}, "absent"),
+        ({"route": "r9"}, "absent"),
+        ({"trip_id": "t1"}, "absent"),
+        ({"stop_fields": {"stop_sequence": ("0" * 19 + "1", "2")}}, "equal"),
+    ],
+    ids=(
+        "identical other-time other-pickup other-route-key moved-stop "
+        "moved-within-rounding route-continuous-pickup other-shape "
+        "other-headsign unknown-stop repeated-sequence unknown-route "
+        "listed-twice padded-sequence"
+    ).split(),
+)
+def test_trip_signatures(variant, expected):
+    from transitio.gtfs._schedule import trip_signatures
+
+    signed = trip_signatures(_repeats(_trips({}, variant)).tables)
+    signatures = dict(zip(signed["trip_id"], signed["signature"]))
+    if expected == "absent":
+        assert "t2" not in signatures
+        # A feed of such trips alone has no signatures at all.
+        assert trip_signatures(_repeats(_trips(variant, variant)).tables).empty
+        return
+    assert set(signed["service_id"]) == {"jan"}
+    assert len(signatures["t1"]) == 32  # 128 bits in hex
+    assert (signatures["t2"] == signatures["t1"]) is (expected == "equal")
+
+
+def _calendar(*rows):
+    """calendar.txt from ``(service_id, weekday flags from Monday, start,
+    end)`` rows."""
+    columns = ["service_id", "flags", "start_date", "end_date"]
+    table = pd.DataFrame(list(rows), columns=columns, dtype=str)
+    for position, day in enumerate(
+        ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    ):
+        table[day] = table["flags"].str[position]
+    return table.drop(columns="flags")
+
+
+MON_TUE = ("wk", "1100000", "20260105", "20260113")
+JAN_1_TO_5 = ["20260101", "20260102", "20260103", "20260104", "20260105"]
+
+
+@pytest.mark.parametrize(
+    "calendar, exceptions, budget, expected, unexpanded",
+    [
+        (
+            [MON_TUE],
+            [],
+            None,
+            {"wk": ["20260105", "20260106", "20260112", "20260113"]},
+            set(),
+        ),
+        (
+            [MON_TUE],
+            [("wk", "20260106", "2"), ("wk", "20260301", "1")],
+            None,
+            {"wk": ["20260105", "20260112", "20260113", "20260301"]},
+            set(),
+        ),
+        ([], [("x", "20260401", "1")], None, {"x": ["20260401"]}, set()),
+        ([("huge", "1111111", "19000101", "20991231")], [], None, {}, {"huge"}),
+        (
+            [("bad", "1111111", "2026x", "20260110")],
+            [("wk", "2026-01-01", "1")],
+            None,
+            {},
+            {"bad", "wk"},
+        ),
+        ([MON_TUE], [("wk", "20260106", None)], None, {}, {"wk"}),
+        (
+            [("bad", "11x0000", "20260105", "20260113"), MON_TUE],
+            [("x", "20260401", "3")],
+            None,
+            {"wk": ["20260105", "20260106", "20260112", "20260113"]},
+            {"bad", "x"},
+        ),
+        (
+            [
+                ("bad", "x111111", "20260101", "20260103"),
+                ("short", "1111111", "20260101", "20260105"),
+                ("long", *MON_TUE[1:]),
+            ],
+            [],
+            5,
+            {"short": JAN_1_TO_5},
+            {"bad", "long"},
+        ),
+    ],
+    ids=(
+        "weekdays exceptions dates-only over-40000-days unparseable "
+        "missing-column bad-values budget"
+    ).split(),
+)
+def test_service_dates(monkeypatch, calendar, exceptions, budget, expected, unexpanded):
+    from transitio.gtfs import _schedule
+
+    if budget:
+        monkeypatch.setattr(_schedule, "MAX_EXPANDED_DAYS", budget)
+    tables = {}
+    if calendar:
+        tables["calendar.txt"] = _calendar(*calendar)
+    if exceptions:
+        columns = ("service_id", "date", "exception_type")
+        table = pd.DataFrame(exceptions, columns=columns)
+        tables["calendar_dates.txt"] = table.dropna(axis="columns")
+    dates, left_out = _schedule.service_dates(tables)
+    days = dates["date"].dt.strftime("%Y%m%d").groupby(dates["service_id"])
+    assert {service: sorted(found) for service, found in days} == expected
+    assert left_out == unexpanded
