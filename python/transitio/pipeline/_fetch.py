@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import dataclasses
+import datetime
 import hashlib
 import io
 import json
@@ -29,6 +30,24 @@ _MODE_TYPES = {
 # routes.txt is far smaller, and validation applies the full budgets later.
 _MODES_BYTE_CAP = 64 * 1024 * 1024
 
+# Seconds a conditional HEAD probe may take before it counts as unanswered.
+_PROBE_TIMEOUT = 5.0
+
+# The fields of a selection-record entry, in selection_table's column order.
+_SELECTION_FIELDS = (
+    "feed_id",
+    "name",
+    "decision",
+    "reason",
+    "note",
+    "index_window",
+    "feed_window",
+    "same_as",
+    "contained_in",
+    "version_of",
+    "path",
+)
+
 
 @dataclasses.dataclass
 class FetchResult:
@@ -47,9 +66,19 @@ class FetchResult:
     # {feed id: [ids of delivered feeds containing it]} over the delivered
     # feeds, from the index's contained_in (schema 10); empty otherwise.
     contained: dict = dataclasses.field(default_factory=dict)
+    # One entry per candidate feed, in candidate order, with its decision;
+    # ``skipped`` lists the same skips.
+    selection: list = dataclasses.field(default_factory=list)
 
     def __iter__(self):  # convenient (pbf, feeds) unpacking
         return iter((self.osm_pbf, self.feeds))
+
+    def selection_table(self):
+        """The selection record as a ``pandas.DataFrame``, one row per
+        candidate feed."""
+        import pandas as pd
+
+        return pd.DataFrame(self.selection, columns=list(_SELECTION_FIELDS))
 
     def to_cafein(self, **options):
         """Build a routable ``cafein.TransportNetwork`` from this result.
@@ -150,37 +179,109 @@ def _rank(feed):
     )
 
 
-def _covers(service_window, ymd):
-    """Whether a validation service window covers a YYYYMMDD day.
+def _today():
+    return datetime.date.today()
 
-    An unknown window (``None``: unreliable calendars or a truncated
-    scan) counts as covering — absence of service cannot be proven.
+
+def _window(start, end):
+    """``[start, end]`` as ISO date strings, None when both are unknown."""
+    if start is None and end is None:
+        return None
+    return [None if day is None else day.isoformat() for day in (start, end)]
+
+
+def _misses(start, end, day, study):
+    """Why a service window from ``start`` to ``end`` misses ``day``, or None.
+
+    With a ``study`` day the window must cover it; otherwise it must only not
+    end before it. An unknown bound (``None``) cannot miss.
     """
-    if not service_window:
-        return True
-    start, end = service_window
-    return start <= ymd <= end
+    if end is not None and end < day:
+        return f"service ended {end.isoformat()}"
+    if study and start is not None and start > day:
+        return f"service starts {start.isoformat()}, after {day.isoformat()}"
+    return None
+
+
+def _idle(validation, day):
+    """Whether a validation report proves that nothing runs on ``day``: its
+    ``moment`` for the day counts no active trip and it carries the
+    ``no_service_on_reference_date`` notice. A report without a moment for
+    the day proves nothing."""
+    moment = validation.get("moment") or {}
+    return (
+        moment.get("referenceDate") == day.strftime("%Y%m%d")
+        and moment.get("activeTrips") == 0
+        and any(
+            notice.get("code") == "no_service_on_reference_date"
+            for notice in validation.get("notices") or ()
+        )
+    )
+
+
+def _entry(feed_id, name, index_window=None):
+    """An undecided selection-record entry for one candidate feed."""
+    entry = dict.fromkeys(_SELECTION_FIELDS)
+    entry.update(
+        feed_id=feed_id,
+        name=name,
+        index_window=index_window,
+        same_as=[],
+        contained_in=[],
+    )
+    return entry
+
+
+def _skip(entry, reason, **fields):
+    entry.update(decision="skipped", reason=reason, **fields)
+
+
+def _skipped(selection):
+    """The ``(feed id, reason)`` pairs of the skipped entries."""
+    return [
+        (entry["feed_id"], entry["reason"])
+        for entry in selection
+        if entry["decision"] == "skipped"
+    ]
 
 
 class _SkipFeed(Exception):
-    """A per-feed reason to skip, carried out of the shared processing."""
+    """A per-feed reason to skip, carried out of the shared processing with
+    the feed's computed service window when it was validated."""
 
-    def __init__(self, reason):
+    def __init__(self, reason, window=None):
         super().__init__(reason)
         self.reason = reason
+        self.window = window
 
 
 def _process_feed(
-    path, *, geometry, tag, repair, crop, modes, when_ymd, hosted, budgets, routes=None
+    path,
+    *,
+    geometry,
+    tag,
+    repair,
+    crop,
+    modes,
+    day,
+    study,
+    hosted,
+    budgets,
+    routes=None,
 ):
     """Crop, repair, mode-filter, validate and report one downloaded feed.
 
-    Returns ``(path, report, fixes, present_routes)``; ``present_routes`` is the
-    set of ``route_id`` values in the downloaded feed as it enters the route
-    crop, or ``None`` when a ``routes`` filter is not applied or that
+    The computed service window is tested against ``day`` (None tests
+    nothing): with a ``study`` day it must cover the day and the validation
+    report must not prove the day idle; otherwise it must not end before it.
+
+    Returns ``(path, report, fixes, present_routes, window)``; ``present_routes``
+    is the set of ``route_id`` values in the downloaded feed as it enters the
+    route crop, or ``None`` when a ``routes`` filter is not applied or that
     feed's routes.txt cannot be read — so a caller records an *undetermined*
-    drop rather than a false empty one. Raises :class:`_SkipFeed` when the feed
-    drops out. Shared by the AOI and the place paths.
+    drop rather than a false empty one — and ``window`` the computed service
+    window as ISO dates, None when unknown. Raises :class:`_SkipFeed` when the
+    feed drops out. Shared by the AOI and the place paths.
     """
     from transitio.gtfs import crop_feed
     from transitio.repair import repair_feed
@@ -218,14 +319,21 @@ def _process_feed(
         if not served & modes:
             raise _SkipFeed(f"serves {sorted(served)}, not {sorted(modes)}")
     validation = validate_feed(path, **budgets)
-    if when_ymd and not _covers(validation["service_window"], when_ymd):
-        window = validation["service_window"]
-        raise _SkipFeed(
-            "no service on the requested day (actual window "
-            f"{window[0]}..{window[1]})"
+    start = end = None
+    if validation["service_window"]:
+        start, end = (
+            datetime.datetime.strptime(value, "%Y%m%d").date()
+            for value in validation["service_window"]
         )
+    window = _window(start, end)
+    if day is not None:
+        reason = _misses(start, end, day, study)
+        if reason is None and study and _idle(validation, day):
+            reason = f"no service on {day.isoformat()}"
+        if reason is not None:
+            raise _SkipFeed(reason, window)
     report = build_report(validation, hosted=hosted, provenance=provenance)
-    return path, report, fixes, present_routes
+    return path, report, fixes, present_routes, window
 
 
 def _hash_stream(handle):
@@ -383,6 +491,34 @@ def _download_indexed(feed, db, atlas, base_dir):
     raise DownloadError(f"feed {feed.feed_id} has no downloadable url")
 
 
+def _unchanged_since_indexed(feed, http):
+    """Whether the archive the index crawled for an indexed feed is still the
+    one served: a conditional ``HEAD`` to the URL the crawl reads (the Atlas
+    static feed, else the Mobility Database direct download), carrying the
+    ETag and Last-Modified it recorded, answers 304 Not Modified. Any other
+    answer, a failed probe or no recorded validator is no proof."""
+    from transitio.catalog._atlas import STATIC_URL
+    from transitio.index.feeds import _parse, _scalar
+
+    atlas = (_parse(feed._row.get("atlas")) or {}).get("urls") or {}
+    mdb = (_parse(feed._row.get("mdb")) or {}).get("urls") or {}
+    url = atlas.get(STATIC_URL) or mdb.get("direct_download")
+    headers = {}
+    etag = _scalar(feed._row.get("etag"))
+    last_modified = _scalar(feed._row.get("last_modified"))
+    if etag:
+        headers["If-None-Match"] = etag
+    if last_modified:
+        headers["If-Modified-Since"] = last_modified
+    if not url or not headers:
+        return False
+    try:
+        response = http.head(url, headers=headers, timeout=_PROBE_TIMEOUT)
+    except Exception:  # noqa: B902 — an unanswered probe proves nothing
+        return False
+    return response.status_code == 304
+
+
 def fetch(
     aoi=None,
     when=None,
@@ -395,6 +531,7 @@ def fetch(
     contained="keep",
     index=None,
     modes=None,
+    expired="skip",
     repair=False,
     crop=True,
     osm=True,
@@ -448,16 +585,37 @@ def fetch(
         Area of interest (place names are geocoded via Nominatim once,
         and the resulting geometry drives every stage).
     when : str or datetime.date, optional
-        Service day the feeds must cover, ``YYYY-MM-DD``. Dataset-version
-        selection needs an API token; with or without one, feeds whose
-        computed service window (the outer bounds of actual calendar
-        activity, not the published range) does not include the day are
-        skipped. Exact-day activity is not checked yet.
+        Study day the feeds must run on, ``YYYY-MM-DD``. Dataset-version
+        selection needs an API token; with or without one, a feed is
+        skipped when its computed service window (the outer bounds of
+        actual calendar activity, not the published range) ends before the
+        day (``"service ended <end>"``) or starts after it (``"service
+        starts <start>, after <day>"``), or when its validation report for
+        the day counts no active trip and carries the
+        ``no_service_on_reference_date`` notice (``"no service on
+        <day>"``). Without ``when`` there is no study day, only today: a
+        feed is skipped only when its computed window ended before today,
+        and one that starts later or runs on other weekdays stays. An
+        unknown window passes the window checks, and a report without a
+        ``moment`` for the day passes the day check.
     modes : str or list of str, optional
         Keep only feeds serving at least one of ``tram``, ``subway``,
         ``rail``, ``bus``, ``ferry`` — decided from the delivered
         (post-crop) feed's routes.txt, since the catalog carries no mode
         metadata. Unknown mode names raise ``ValueError``.
+    expired : {"skip", "keep"}, default "skip"
+        With ``"skip"``, on the place path, an indexed feed whose index
+        service window misses the day (ends before it, or starts after the
+        study day) is skipped before download when a conditional ``HEAD``
+        to the URL the index crawled, carrying the ETag or Last-Modified it
+        recorded, answers 304 Not Modified: the served archive is still the
+        one the index saw, and the reason ends ``"; unchanged since
+        indexed"``. Any other answer, or no recorded validator, downloads
+        the feed and leaves the decision to its computed window, as does a
+        feed downloaded as a catalogued dataset (with an API token).
+        ``"keep"`` sends no probe and, without ``when``, keeps a feed whose
+        computed window ended; with ``when`` the window and day checks
+        still apply.
     repair : bool, default False
         Repair each feed (gtfstidy contract) after the crop, before use;
         conservative default leaves feeds untouched.
@@ -472,20 +630,34 @@ def fetch(
     refresh_token, cache_dir, directory, country_code
         Passed to the catalog and OSM layers.
     **budgets
-        The ``validate_feed`` keyword arguments.
+        The ``validate_feed`` keyword arguments. With ``when``,
+        ``reference_date`` is the study day; a different one raises
+        ``ValueError``.
 
     Returns
     -------
     FetchResult
         ``osm_pbf``, validated ``feeds`` (paths), merged ``reports`` and
         repair ``repairs`` (fix logs, empty without ``repair=True``) per
-        kept feed, ``skipped`` (feed id, reason) pairs and, on the place
-        path, the ``contained`` pairs among the delivered feeds. Reports merge
-        the local validation of the delivered feed with the hosted report
-        of the published dataset, so after cropping or repair the hosted
-        side describes the pre-transform original.
+        kept feed, ``skipped`` (feed id, reason) pairs, the ``selection``
+        record and, on the place path, the ``contained`` pairs among the
+        delivered feeds. Reports merge the local validation of the delivered
+        feed with the hosted report of the published dataset, so after
+        cropping or repair the hosted side describes the pre-transform
+        original. ``selection`` has one entry per candidate feed, in
+        candidate order: ``feed_id``, ``name``, ``decision``
+        (``"delivered"`` or ``"skipped"``), ``reason`` (why it was skipped),
+        ``note`` (about a delivered feed, such as the routes it was cut to),
+        ``index_window`` (the index's ``[start, end]``; None undated or on
+        the area path), ``feed_window`` (the computed window of a validated
+        download, delivered or not; None otherwise or when unknown),
+        ``same_as`` and ``contained_in`` (the feed ids a same-content or a
+        containment skip names), ``version_of`` (None; reserved for version
+        skips) and ``path`` (the delivered feed). Windows are ISO dates.
+        ``FetchResult.selection_table()`` returns it as a DataFrame.
     """
     from transitio.catalog import MobilityDatabase
+    from transitio.catalog._models import as_date
     from transitio.osm import fetch_pbf
     from transitio.osm._fetch import _as_geometry
 
@@ -505,6 +677,8 @@ def fetch(
         )
     if contained not in ("keep", "drop"):
         raise ValueError("contained= must be 'keep' or 'drop'")
+    if expired not in ("skip", "keep"):
+        raise ValueError("expired= must be 'skip' or 'keep'")
     if place is not None and country_code is not None:
         raise ValueError("country_code= applies only with aoi=")
     if on_untrusted_selector not in ("auto", "whole", "drop", "error"):
@@ -523,6 +697,18 @@ def fetch(
                 f"valid modes are {sorted(_MODE_TYPES)}"
             )
 
+    # The day the date rules test: the study day, else today. A downloaded
+    # feed's computed window is tested against it unless expired="keep"
+    # leaves nothing to test without a study day.
+    study = when is not None
+    day = as_date(when) if study else _today()
+    window_day = day if study or expired == "skip" else None
+    if study:
+        existing = budgets.get("reference_date")
+        if existing is not None and existing != day.strftime("%Y%m%d"):
+            raise ValueError("when and reference_date disagree; pass only one")
+    budgets.setdefault("reference_date", day.strftime("%Y%m%d") if study else None)
+
     if place is not None:
         return _fetch_place(
             place,
@@ -533,6 +719,9 @@ def fetch(
             contained=contained,
             index=index,
             when=when,
+            day=day,
+            window_day=window_day,
+            expired=expired,
             modes=modes,
             repair=repair,
             crop=crop,
@@ -544,13 +733,6 @@ def fetch(
         )
 
     geometry = _as_geometry(aoi)
-
-    when_ymd = None
-    if when is not None:
-        from transitio.catalog._models import as_date
-
-        when_ymd = as_date(when).strftime("%Y%m%d")
-    budgets.setdefault("reference_date", when_ymd)
 
     # Transformed outputs carry a parameter digest so calls for different
     # AOIs or reference dates never overwrite each other's artefacts.
@@ -571,7 +753,7 @@ def fetch(
 
     from transitio.catalog._atlas import _feed_dir
 
-    feeds, reports, repairs, skipped = [], [], [], []
+    feeds, reports, repairs, record = [], [], [], []
     delivered = _Delivered()
     with MobilityDatabase(refresh_token, cache_dir=cache_dir) as db:
         if when is not None and not db._refresh_token:
@@ -585,15 +767,15 @@ def fetch(
             db.search_feeds(aoi=geometry, country_code=country_code), key=_rank
         )
         for feed in candidates:
+            entry = _entry(feed.id, feed.raw.get("feed_name") or feed.provider)
+            record.append(entry)
             dataset = None
             if db._refresh_token:
                 try:
                     if when is not None:
                         dataset = db.dataset_for(feed, when)
                         if dataset is None:
-                            skipped.append(
-                                (feed.id, "no dataset covers the requested day")
-                            )
+                            _skip(entry, "no dataset covers the requested day")
                             continue
                     else:
                         # Prefer a versioned dataset (checksum, hosted
@@ -601,7 +783,7 @@ def fetch(
                         versions = db.datasets(feed)
                         dataset = versions[0] if versions else None
                 except Exception as error:  # noqa: B902
-                    skipped.append((feed.id, f"dataset selection failed: {error}"))
+                    _skip(entry, f"dataset selection failed: {error}")
                     continue
             # Each feed downloads into its own digest-named folder, so two
             # hosted latest.zip files never overwrite each other.
@@ -612,11 +794,11 @@ def fetch(
                 else:
                     path = db.download_latest(feed, directory=target)
             except Exception as error:  # noqa: B902
-                skipped.append((feed.id, f"download failed: {error}"))
+                _skip(entry, f"download failed: {error}")
                 continue
             twin = delivered.same_as(path)
             if twin is not None:
-                skipped.append((feed.id, f"same content as {twin}"))
+                _skip(entry, f"same content as {twin}", same_as=[twin])
                 continue
             download = path
             hosted = None
@@ -630,23 +812,25 @@ def fetch(
                 # Modes are read from the delivered feed, after cropping, so an
                 # aggregate serving buses only outside the AOI does not pass a
                 # bus filter.
-                path, report, fixes, _ = _process_feed(
+                path, report, fixes, _, window = _process_feed(
                     path,
                     geometry=geometry,
                     tag=tag,
                     repair=repair,
                     crop=crop,
                     modes=modes,
-                    when_ymd=when_ymd,
+                    day=window_day,
+                    study=study,
                     hosted=hosted,
                     budgets=budgets,
                 )
             except _SkipFeed as skip:
-                skipped.append((feed.id, skip.reason))
+                _skip(entry, skip.reason, feed_window=skip.window)
                 continue
             except Exception as error:  # noqa: B902 — isolate per-feed failures
-                skipped.append((feed.id, f"processing failed: {error}"))
+                _skip(entry, f"processing failed: {error}")
                 continue
+            entry.update(decision="delivered", feed_window=window, path=path)
             reports.append(report)
             repairs.append(fixes)
             feeds.append(path)
@@ -657,7 +841,8 @@ def fetch(
         feeds=feeds,
         reports=reports,
         repairs=repairs,
-        skipped=skipped,
+        skipped=_skipped(record),
+        selection=record,
     )
 
 
@@ -723,6 +908,9 @@ def _fetch_place(
     contained,
     index,
     when,
+    day,
+    window_day,
+    expired,
     modes,
     repair,
     crop,
@@ -735,7 +923,9 @@ def _fetch_place(
     """The ``fetch(place=...)`` path: the place geometry is the AOI, feeds come
     from the index by tier, each is downloaded MDB-then-Atlas (decision I), and
     a bundled feed is cropped to the routes its matched tiers select, the drop
-    recorded in ``selections``."""
+    recorded in ``selections``. A feed whose index window misses ``day`` is
+    skipped before download when a probe proves the archive unchanged since
+    indexed; ``window_day`` is what the computed window is tested against."""
     import shapely
 
     from transitio import __version__
@@ -767,13 +957,7 @@ def _fetch_place(
         raise ValueError(f"place {place_obj.id} has no geometry to fetch for")
     if isinstance(geometry, (bytes, bytearray)):
         geometry = shapely.from_wkb(bytes(geometry))
-
-    when_ymd = None
-    if when is not None:
-        from transitio.catalog._models import as_date
-
-        when_ymd = as_date(when).strftime("%Y%m%d")
-    budgets.setdefault("reference_date", when_ymd)
+    study = when is not None
 
     tag = hashlib.sha256(
         json.dumps(
@@ -792,16 +976,30 @@ def _fetch_place(
         fetch_pbf(geometry, cache_dir=cache_dir, directory=directory) if osm else None
     )
 
-    kept = place_obj.feeds(tiers=tiers, exclude=exclude, on_unknown=on_unknown)
-    if contained == "drop":
-        kept = _containers_first(kept)
-    feeds, reports, repairs, skipped, selections = [], [], [], [], []
+    offered = place_obj.feeds(tiers=tiers, exclude=exclude, on_unknown=on_unknown)
+    kept = _containers_first(offered) if contained == "drop" else offered
+    feeds, reports, repairs, selections, record = [], [], [], [], []
     delivered = _Delivered()
     delivered_ids = []
+    entries = {}
+
+    def entry_for(feed):
+        # The record follows candidate order, whatever order they are processed in.
+        if feed.feed_id not in entries:
+            window = _window(feed.service_start, feed.service_end)
+            entries[feed.feed_id] = _entry(feed.feed_id, feed.name, window)
+            record.append(entries[feed.feed_id])
+        return entries[feed.feed_id]
+
     if on_unknown == "exclude":
         included = place_obj.feeds(tiers=tiers, exclude=exclude, on_unknown="include")
-        for dropped in {f.feed_id for f in included} - {f.feed_id for f in kept}:
-            skipped.append((dropped, "only unknown-tier edges"))
+        kept_ids = {f.feed_id for f in kept}
+        for feed in included:
+            entry = entry_for(feed)
+            if feed.feed_id not in kept_ids:
+                _skip(entry, "only unknown-tier edges")
+    for feed in offered:
+        entry_for(feed)
 
     import platformdirs
 
@@ -823,12 +1021,13 @@ def _fetch_place(
                 stacklevel=2,
             )
         for feed in kept:
+            entry = entry_for(feed)
             if contained == "drop":
-                container = next(
-                    (c for c in feed.contained_in if c in delivered_ids), None
-                )
-                if container is not None:
-                    skipped.append((feed.feed_id, f"contained in {container}"))
+                containers = [c for c in feed.contained_in if c in delivered_ids]
+                if containers:
+                    _skip(
+                        entry, f"contained in {containers[0]}", contained_in=containers
+                    )
                     continue
             dataset = None
             errors = []
@@ -840,12 +1039,7 @@ def _fetch_place(
                         if when is not None:
                             dataset = db.dataset_for(mdb_feed, when)
                             if dataset is None:
-                                skipped.append(
-                                    (
-                                        feed.feed_id,
-                                        "no dataset covers the requested day",
-                                    )
-                                )
+                                _skip(entry, "no dataset covers the requested day")
                                 continue
                         else:
                             versions = db.datasets(mdb_feed)
@@ -864,6 +1058,14 @@ def _fetch_place(
                     from_dataset = True
                 except Exception as error:  # noqa: B902 — try the fallback next
                     errors.append(f"mdb dataset: {error}")
+            # Index metadata describes the archive the index crawled, so it
+            # decides a feed only before a download from the indexed URLs, and
+            # only once a probe proves that archive unchanged.
+            if path is None and expired == "skip":
+                missed = _misses(feed.service_start, feed.service_end, day, study)
+                if missed and _unchanged_since_indexed(feed, atlas._http):
+                    _skip(entry, f"{missed}; unchanged since indexed")
+                    continue
             if path is None:
                 try:
                     path = _download_indexed(feed, db, atlas, base_dir)
@@ -871,7 +1073,7 @@ def _fetch_place(
                     errors.append(str(error))
             if path is None:
                 joined = "; ".join(e for e in errors if e)
-                skipped.append((feed.feed_id, f"download failed: {joined}"))
+                _skip(entry, f"download failed: {joined}")
                 continue
             hosted = None
             if from_dataset:
@@ -926,9 +1128,7 @@ def _fetch_place(
                         "selected_by": selected_by,
                     }
                     if action == "skip":
-                        skipped.append(
-                            (feed.feed_id, f"untrustworthy selector ({reason})")
-                        )
+                        _skip(entry, f"untrustworthy selector ({reason})")
                         selections.append(selection)
                         continue
                     # action == "whole": deliver unfiltered (routes stays None),
@@ -958,7 +1158,7 @@ def _fetch_place(
                     }
             twin = delivered.same_as(path, routes)
             if twin is not None:
-                skipped.append((feed.feed_id, f"same content as {twin}"))
+                _skip(entry, f"same content as {twin}", same_as=[twin])
                 if selection is not None:
                     selections.append(selection)
                 continue
@@ -973,25 +1173,26 @@ def _fetch_place(
                     ).encode()
                 ).hexdigest()[:16]
             try:
-                path, report, fixes, present = _process_feed(
+                path, report, fixes, present, window = _process_feed(
                     path,
                     geometry=geometry,
                     tag=feed_tag,
                     repair=repair,
                     crop=crop,
                     modes=modes,
-                    when_ymd=when_ymd,
+                    day=window_day,
+                    study=study,
                     hosted=hosted,
                     budgets=budgets,
                     routes=routes,
                 )
             except _SkipFeed as skip:
-                skipped.append((feed.feed_id, skip.reason))
+                _skip(entry, skip.reason, feed_window=skip.window)
                 if selection is not None:
                     selections.append(selection)
                 continue
             except Exception as error:  # noqa: B902 — isolate per-feed failures
-                skipped.append((feed.feed_id, f"processing failed: {error}"))
+                _skip(entry, f"processing failed: {error}")
                 if selection is not None:
                     selections.append(selection)
                 continue
@@ -1011,6 +1212,9 @@ def _fetch_place(
                 selection["dropped"] = (
                     None if present is None else sorted(present - routes)
                 )
+            entry.update(decision="delivered", feed_window=window, path=path)
+            if routes is not None:
+                entry["note"] = "cut to routes " + ", ".join(sorted(routes))
             reports.append(report)
             repairs.append(fixes)
             feeds.append(path)
@@ -1030,9 +1234,10 @@ def _fetch_place(
         feeds=feeds,
         reports=reports,
         repairs=repairs,
-        skipped=skipped,
+        skipped=_skipped(record),
         selections=selections,
         provenance=provenance,
         snapshot=provenance["snapshot"],
         contained={feed_id: ids for feed_id, ids in pairs.items() if ids},
+        selection=record,
     )

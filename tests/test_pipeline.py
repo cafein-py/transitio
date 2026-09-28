@@ -1,3 +1,4 @@
+import datetime
 import zipfile
 
 import httpx
@@ -41,6 +42,14 @@ CSV_BODY = (
     "https://example.com/hsl.zip,https://files.example.com/mdb-10/latest.zip,"
     "https://example.com/license\n"
 )
+
+
+@pytest.fixture(autouse=True)
+def _today(monkeypatch):
+    # A Monday inside the fixture feeds' 2026 calendars.
+    monkeypatch.setattr(
+        "transitio.pipeline._fetch._today", lambda: datetime.date(2026, 6, 1)
+    )
 
 
 @pytest.fixture
@@ -155,6 +164,10 @@ def test_an_area_fetch_delivers_the_same_content_once(pipeline_env, monkeypatch)
     ((feed_id, reason),) = result.skipped
     other = ({"mdb-10", "mdb-11"} - {feed_id}).pop()
     assert reason == f"same content as {other}"
+    first, second = result.selection
+    assert first["decision"] == "delivered" and first["path"] == result.feeds[0]
+    assert (second["feed_id"], second["same_as"]) == (feed_id, [other])
+    assert first["index_window"] is None and first["name"] in {"HSL", "HKL"}
 
 
 OTHER_TRIPS = {**GTFS, "trips.txt": "route_id,service_id,trip_id\nr1,wk,t2\n"}
@@ -261,10 +274,8 @@ def test_fetch_skips_day_outside_service_window(pipeline_env):
             directory=tmp_path,
         )
     assert result.feeds == []
-    ((feed_id, reason),) = result.skipped
-    assert feed_id == "mdb-10"
-    assert "no service on the requested day" in reason
-    assert "20260101..20261231" in reason
+    assert result.skipped == [("mdb-10", "service ended 2026-12-31")]
+    assert result.selection[0]["feed_window"] == ["2026-01-01", "2026-12-31"]
 
 
 def test_feed_modes_undeterminable(tmp_path):
@@ -542,6 +553,8 @@ def test_fetch_place_selects_downloads_and_processes(tmp_path, monkeypatch):
     ((feed_id, reason),) = result.skipped
     assert reason == f"same content as {({'f-a', 'f-b'} - {feed_id}).pop()}"
     assert result.selections == []
+    first, second = result.selection
+    assert second["same_as"] == [first["feed_id"]]
 
 
 def test_fetch_aoi_rejects_place_only_arguments():
@@ -555,28 +568,31 @@ def test_fetch_aoi_rejects_place_only_arguments():
             fetch((0, 0, 1, 1), **kwargs)
     with pytest.raises(ValueError, match="'keep' or 'drop'"):
         fetch(place="X", contained="maybe")
+    with pytest.raises(ValueError, match="'skip' or 'keep'"):
+        fetch(place="X", expired="maybe")
+    with pytest.raises(ValueError, match="disagree"):
+        fetch(place="X", when="2026-06-01", reference_date="20260602")
 
 
-@pytest.mark.parametrize("contained", ["keep", "drop"])
-def test_a_contained_feed_is_reported_or_left_out(tmp_path, monkeypatch, contained):
-    import pathlib
-
+def _partitioned_index(tmp_path, monkeypatch, feeds, contained=None):
+    """A schema-10 index serving Q1757 with ``feeds`` (``{feed id: extra
+    columns}``), each a local feed at ``https://feeds.example/<feed id>``."""
     import transitio.index as transitio_index
     from index_fixture import HULL, PLACES, covered_feed, edge, write_partitioned_index
 
     monkeypatch.setattr(
         "transitio.__version__", transitio_index.MIN_READER_VERSIONS[10]
     )
-    ids = ("f-a", "f-b")
-    feeds = [
+    rows = [
         {
             **covered_feed(feed_id, coverage_source="crawl"),
             "coverage": HULL,
             "home_country": "FI",
             "scope": "domestic",
             "atlas": {"urls": {"static_current": f"https://feeds.example/{feed_id}"}},
+            **extra,
         }
-        for feed_id in ids
+        for feed_id, extra in feeds.items()
     ]
     edges = [
         edge(
@@ -587,14 +603,25 @@ def test_a_contained_feed_is_reported_or_left_out(tmp_path, monkeypatch, contain
             relevance=0.5,
             cross_border=False,
         )
-        for feed_id in ids
+        for feed_id in feeds
     ]
     directory = write_partitioned_index(
         tmp_path / "index",
-        feeds=feeds,
+        feeds=rows,
         places=[PLACES[0]],
         edges=edges,
-        contained={"f-a": ["f-b"]},
+        contained=contained or {},
+    )
+    return transitio_index.read_index(directory)
+
+
+@pytest.mark.parametrize("contained", ["keep", "drop"])
+def test_a_contained_feed_is_reported_or_left_out(tmp_path, monkeypatch, contained):
+    import pathlib
+
+    ids = ("f-a", "f-b")
+    index = _partitioned_index(
+        tmp_path, monkeypatch, dict.fromkeys(ids, {}), contained={"f-a": ["f-b"]}
     )
     other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "HKL")}
     payloads = {"f-a": _zip(GTFS), "f-b": _zip(other)}
@@ -615,19 +642,141 @@ def test_a_contained_feed_is_reported_or_left_out(tmp_path, monkeypatch, contain
     monkeypatch.setattr("transitio.osm._fetch.fetch_pbf", lambda *a, **k: fake_pbf)
     result = fetch(
         place="Q1757",
-        index=transitio_index.read_index(directory),
+        index=index,
         directory=tmp_path / "out",
         crop=False,
         contained=contained,
         reference_date="20260601",
     )
+    decisions = [
+        (e["feed_id"], e["decision"], e["contained_in"]) for e in result.selection
+    ]
     if contained == "keep":
         assert sorted(fetched) == list(ids) and len(result.feeds) == 2
         assert result.contained == {"f-a": ["f-b"]}
+        assert decisions == [(i, "delivered", []) for i in ids]
     else:
         # The container comes first; the contained feed is never downloaded.
         assert fetched == ["f-b"] and result.skipped == [("f-a", "contained in f-b")]
         assert result.contained == {}
+        # The record keeps candidate order.
+        assert decisions == [("f-a", "skipped", ["f-b"]), ("f-b", "delivered", [])]
+
+
+def _calendar(start, end, days="1111111"):
+    """GTFS whose one service runs on ``days`` (Monday first) from ``start``
+    to ``end``."""
+    return {
+        **GTFS,
+        "calendar.txt": "service_id,monday,tuesday,wednesday,thursday,friday,"
+        f"saturday,sunday,start_date,end_date\nwk,{','.join(days)},{start},{end}\n",
+    }
+
+
+DAY = "2026-06-07"  # the study day, a Sunday
+ENDED, NOW = ("2021-01-01", "2021-12-31"), ("2026-01-01", "2026-12-31")
+LATER, NEXT = ("2027-01-01", "2027-12-31"), ("2026-07-01", "2026-12-31")
+SPRING = ("2026-01-01", "2026-05-01")
+ETAG, MODIFIED = {"etag": '"v1"'}, {"last_modified": "Tue, 01 Jun 2021 00:00:00 GMT"}
+# The skip reasons the cases expect.
+R_ENDED, R_SPRING = "service ended 2021-12-31", "service ended 2026-05-01"
+R_STARTS = "service starts 2027-01-01, after 2026-06-07"
+R_IDLE, SAME = f"no service on {DAY}", "; unchanged since indexed"
+
+
+@pytest.mark.filterwarnings("ignore:no Mobility Database API token")
+@pytest.mark.parametrize(
+    "indexed, validators, probe, served, when, expired, downloaded, reason, window",
+    [
+        (ENDED, ETAG, 304, ENDED, DAY, "skip", False, R_ENDED + SAME, None),
+        (ENDED, ETAG, 200, NOW, DAY, "skip", True, None, NOW),
+        (ENDED, ETAG, "timeout", ENDED, DAY, "skip", True, R_ENDED, ENDED),
+        (ENDED, {}, 304, NOW, DAY, "skip", True, None, NOW),
+        (LATER, MODIFIED, 304, LATER, DAY, "skip", False, R_STARTS + SAME, None),
+        (NOW, ETAG, 304, (*NOW, "1111100"), DAY, "skip", True, R_IDLE, NOW),
+        (NOW, {}, 200, (*NOW, "0000000"), DAY, "skip", True, R_IDLE, None),
+        # Past the validator's calendar expansion guard: no window, no moment.
+        (NOW, {}, 200, ("1900-01-01", "2099-12-31"), DAY, "skip", True, None, None),
+        (LATER, ETAG, 200, LATER, DAY, "skip", True, R_STARTS, LATER),
+        (NEXT, ETAG, 304, NEXT, None, "skip", True, None, NEXT),
+        (NOW, ETAG, 304, SPRING, None, "skip", True, R_SPRING, SPRING),
+        (NOW, ETAG, 304, NOW, DAY, "skip", True, None, NOW),
+        (ENDED, ETAG, 304, ENDED, None, "keep", True, None, ENDED),
+    ],
+    ids=[
+        "ended-unchanged",
+        "ended-renewed",
+        "ended-probe-timeout",
+        "ended-no-validators",
+        "starts-after-unchanged",
+        "weekdays-on-sunday",
+        "unknown-window-idle",
+        "unknown-window-no-moment",
+        "starts-after-renewed",
+        "no-study-day-starts-next-month",
+        "no-study-day-served-ended",
+        "current",
+        "keep-unchanged",
+    ],
+)
+def test_date_rules_decide_before_and_after_download(
+    tmp_path,
+    monkeypatch,
+    indexed,
+    validators,
+    probe,
+    served,
+    when,
+    expired,
+    downloaded,
+    reason,
+    window,
+):
+    from transitio.catalog import TransitlandAtlas
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    columns = {"service_start": indexed[0], "service_end": indexed[1], **validators}
+    index = _partitioned_index(tmp_path, monkeypatch, {"f-a": columns})
+    start, end, *days = (value.replace("-", "") for value in served)
+    payload = _zip(_calendar(start, end, *days))
+    downloads = []
+
+    def handler(request):
+        if request.method == "GET":
+            downloads.append(request.url)
+            return httpx.Response(200, content=payload)
+        if probe == "timeout":
+            raise httpx.ReadTimeout("slow host", request=request)
+        # A 304 answers only the validators the index recorded.
+        sent = {
+            "etag": request.headers.get("If-None-Match"),
+            "last_modified": request.headers.get("If-Modified-Since"),
+        }
+        matched = validators and all(sent[k] == v for k, v in validators.items())
+        return httpx.Response(probe if matched else 200)
+
+    class Served(TransitlandAtlas):
+        def __init__(self, **kwargs):
+            super().__init__(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas", Served)
+    result = fetch(
+        place="Q1757",
+        index=index,
+        directory=tmp_path / "out",
+        crop=False,
+        osm=False,
+        when=when,
+        expired=expired,
+    )
+    (entry,) = result.selection
+    expected = (downloaded, reason, window and list(window))
+    assert (bool(downloads), entry["reason"], entry["feed_window"]) == expected
+    assert entry["decision"] == ("skipped" if reason else "delivered")
+    assert entry["index_window"] == list(indexed)
+    assert (entry["path"] is not None) == (entry["decision"] == "delivered")
+    assert result.skipped == [("f-a", reason)] * bool(reason)
+    assert result.selection_table().to_dict("records") == result.selection
 
 
 def test_fetch_place_rejects_country_code():
@@ -1063,6 +1212,7 @@ def test_fetch_place_crops_bundles_to_the_selected_routes(
     assert ("unexpected_enum_value" in codes) == (not repair)
     (selection,) = result.selections
     assert selection["feed_id"] == "f-a"
+    assert result.selection[0]["note"] == "cut to routes r-local, r-reg"
     assert selection["selector_state"] == "complete"
     assert selection["trusted"] is True and selection["reason"] is None
     assert selection["kept"] == ["r-local", "r-reg"]
