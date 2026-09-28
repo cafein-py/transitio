@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+
 - `crop_feed` refuses a feed only when a table the crop depends on is cut
   short, by a row, byte or column budget or an unreadable entry, in the
   source or in the cropped feed. A reached notice cap (`max_notices_per_file`
@@ -21,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or notice budgets". `repair_feed` still refuses a feed whose notices were
   sampled, and says so when the cap is one that no budget raises. An
   `unreadable_file` notice for a violated budget lists it under `budgets`.
+- A zip with up to 64 KiB of bytes after its end-of-central-directory
+  record is read instead of refused as "not a readable zip: no
+  end-of-central-directory record found", so validation, cropping and
+  repair accept it. The feeds of Réseau de transport de Longueuil and CRT
+  Lanaudière carry one and two such bytes; Python's `zipfile` reads both.
 
 ## 0.16.0 — 2026-09-27
 
