@@ -76,16 +76,11 @@ pub fn crop(
         std::fs::File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     let mut result = scan::scan_reader_streaming(reopen(&source)?, options, STREAMED)?;
     // The tables parsed whole must be whole: a truncated stops.txt would
-    // crop silently wrong. The cropped feed is validated below.
-    if !result.incomplete.is_empty()
-        || result
-            .notices
-            .iter()
-            .any(|n| matches!(n.code, "too_many_rows" | "notice_limit_reached"))
-    {
-        return Err(
-            "feed exceeds the scan or notice budgets; raise the limits to crop it".to_string(),
-        );
+    // crop silently wrong. Sampled notices do not matter, as the crop reads
+    // no notices. The cropped feed is validated below.
+    let incomplete = result.incomplete.iter().map(String::as_str);
+    if let Some(reason) = scan::refusal(&result.notices, incomplete, &options, false, "crop") {
+        return Err(reason);
     }
     if output
         .symlink_metadata()
@@ -170,19 +165,13 @@ pub fn crop(
             return Err(error);
         }
     };
-    // A cropped feed the budgets cannot validate whole is not published:
-    // its report would describe only part of it.
-    if !validation.incomplete.is_empty()
-        || validation
-            .notices
-            .iter()
-            .any(|n| matches!(n.code, "too_many_rows" | "notice_limit_reached"))
-    {
+    // A cropped feed the budgets cannot read whole is not published: its
+    // report would describe only part of it. Sampled notices stay in the
+    // report, whose notice_limit_reached says so.
+    let incomplete = validation.incomplete.iter().map(String::as_str);
+    if let Some(reason) = scan::refusal(&validation.notices, incomplete, &options, false, "crop") {
         let _ = std::fs::remove_file(&staging);
-        return Err(
-            "cropped feed exceeds the scan or notice budgets; raise the limits to crop it"
-                .to_string(),
-        );
+        return Err(reason);
     }
     std::fs::rename(&staging, output)
         .map_err(|e| format!("cannot move cropped feed into place: {e}"))?;
@@ -360,7 +349,7 @@ fn stream_table<'a>(
     match TableReader::open(spec, guarded, options, u64::MAX, &mut notices) {
         Ok(reader) => Ok(Some(reader)),
         Err(NoTable::Empty) => Ok(None),
-        Err(NoTable::Unreadable) => Err(unreadable(name, &notices)),
+        Err(NoTable::Unreadable) => Err(unreadable(name, &notices, options)),
     }
 }
 
@@ -381,20 +370,17 @@ fn whole<R: std::io::Read>(
     reader: &TableReader<R>,
     name: &str,
     notices: &[crate::notice::Notice],
+    options: &ScanOptions,
 ) -> Result<(), String> {
     if reader.truncated() {
-        return Err(unreadable(name, notices));
+        return Err(unreadable(name, notices, options));
     }
     Ok(())
 }
 
-fn unreadable(name: &str, notices: &[crate::notice::Notice]) -> String {
-    let message = notices
-        .iter()
-        .rev()
-        .find_map(|n| n.context.get("message").and_then(|v| v.as_str()))
-        .unwrap_or("unreadable");
-    format!("{name} cannot be streamed: {message}")
+fn unreadable(name: &str, notices: &[crate::notice::Notice], options: &ScanOptions) -> String {
+    scan::refusal(notices, [name], options, false, "crop")
+        .unwrap_or_else(|| format!("{name} cannot be read whole; cannot crop this feed"))
 }
 
 /// The stops inside the crop area, or None without a spatial crop.
@@ -497,7 +483,7 @@ fn trips_touching(
             touched.insert(row.fields[trip].clone());
         }
     }
-    whole(&reader, "stop_times.txt", &notices)?;
+    whole(&reader, "stop_times.txt", &notices, options)?;
     if full_trips_only && !touched.is_empty() {
         // A trip's outside stop may come before its inside one, so the
         // touched set is complete first and pruned in a second pass.
@@ -513,7 +499,7 @@ fn trips_touching(
                 partly_outside.insert(row.fields[trip].clone());
             }
         }
-        whole(&reader, "stop_times.txt", &notices)?;
+        whole(&reader, "stop_times.txt", &notices, options)?;
         touched.retain(|trip| !partly_outside.contains(trip));
     }
     Ok(touched)
@@ -570,7 +556,7 @@ fn select_trips(
             fields: row.fields,
         });
     }
-    whole(&reader, "trips.txt", &notices)?;
+    whole(&reader, "trips.txt", &notices, options)?;
     Ok((kept, Table { headers, rows }))
 }
 
@@ -606,7 +592,7 @@ fn write_cropped(
                 })
                 .map(|row| row.fields);
             let count = zip.rows("stop_times.txt", &headers, rows)?;
-            whole(&reader, "stop_times.txt", &notices)?;
+            whole(&reader, "stop_times.txt", &notices, options)?;
             counts.insert("stop_times.txt".to_string(), count);
         }
     }
@@ -636,7 +622,7 @@ fn write_cropped(
                 .filter(|row| shape.is_some_and(|i| kept_shapes.contains(&row.fields[i])))
                 .map(|row| row.fields);
             let count = zip.rows("shapes.txt", &headers, rows)?;
-            whole(&reader, "shapes.txt", &notices)?;
+            whole(&reader, "shapes.txt", &notices, options)?;
             counts.insert("shapes.txt".to_string(), count);
         }
     }
@@ -949,5 +935,109 @@ mod tests {
             Ok(_) => panic!("crop accepted both a bbox and a polygon"),
         };
         assert!(error.contains("not both"), "{error}");
+    }
+
+    #[test]
+    fn only_a_table_cut_short_refuses_the_crop() {
+        let dir = std::env::temp_dir().join(format!("transitio-crop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut files = crate::scan::tests::minimal();
+        files.retain(|(name, _)| *name != "stops.txt");
+        // two warnings in the source (empty rows) and two in the cropped
+        // feed (padded names)
+        files.push((
+            "stops.txt",
+            "stop_id,stop_name,stop_lat,stop_lon\n\
+             s1,Kamppi ,60.169,24.931\n,,,\ns2,Steissi ,60.171,24.941\n,,,\n",
+        ));
+        let flooded = format!(
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n{}\n",
+            ",".repeat(5000)
+        );
+        let crop_options = CropOptions {
+            bbox: Some((24.9, 60.1, 25.0, 60.2)),
+            polygon: None,
+            start_date: None,
+            end_date: None,
+            full_trips_only: false,
+            routes: None,
+        };
+        let defaults = ScanOptions::default();
+        // the options, a streamed stop_times.txt, and the refusal
+        let cases = [
+            (
+                ScanOptions {
+                    max_notices_per_file: 1,
+                    ..defaults
+                },
+                None,
+                None,
+            ),
+            (
+                ScanOptions {
+                    max_rows: 1,
+                    ..defaults
+                },
+                None,
+                Some("stops.txt exceeds max_rows (1); raise it to crop this feed"),
+            ),
+            (
+                ScanOptions {
+                    max_entry_bytes: 100,
+                    ..defaults
+                },
+                None,
+                Some("calendar.txt exceeds max_entry_bytes (100); raise it to crop this feed"),
+            ),
+            // 146 bytes are read before calendar.txt (123) and stops.txt (95)
+            (
+                ScanOptions {
+                    max_entry_bytes: 100,
+                    max_total_bytes: 160,
+                    ..defaults
+                },
+                None,
+                Some(
+                    "calendar.txt exceeds max_entry_bytes (100), \
+                     calendar.txt exceeds max_total_bytes (160), \
+                     stops.txt exceeds max_total_bytes (160); raise them to crop this feed",
+                ),
+            ),
+            (
+                defaults,
+                Some(flooded.as_str()),
+                Some("stop_times.txt exceeds max_columns (1000); raise it to crop this feed"),
+            ),
+        ];
+        for (options, stop_times, expected) in cases {
+            let mut files = files.clone();
+            if let Some(stop_times) = stop_times {
+                files.retain(|(name, _)| *name != "stop_times.txt");
+                files.push(("stop_times.txt", stop_times));
+            }
+            let source = dir.join("source.zip");
+            std::fs::write(&source, crate::scan::tests::build_zip(&files).into_inner()).unwrap();
+            let output = dir.join("cropped.zip");
+            let _ = std::fs::remove_file(&output);
+            match (crop(&source, &output, options, &crop_options), expected) {
+                (Ok(result), None) => {
+                    let capped: Vec<&str> = result
+                        .validation
+                        .notices
+                        .iter()
+                        .filter(|n| n.code == "notice_limit_reached")
+                        .filter_map(|n| n.context["filename"].as_str())
+                        .collect();
+                    assert_eq!(capped, ["stops.txt"]);
+                }
+                (Err(error), Some(expected)) => {
+                    assert_eq!(error, expected);
+                    assert!(!output.exists());
+                }
+                (Ok(_), Some(expected)) => panic!("cropped despite {expected}"),
+                (Err(error), None) => panic!("refused: {error}"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
