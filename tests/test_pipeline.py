@@ -774,9 +774,11 @@ def test_date_rules_decide_before_and_after_download(
     assert result.selection_table().to_dict("records") == result.selection
 
 
-def _network(agency="HSL", start="20260101", stops=range(10), hours=(8,), **options):
+def _network(agency="HSL", start="20260101", stops=None, hours=(8,), **options):
     """GTFS of ``agency`` whose ``routes`` each run a trip from s2 to s3 at
-    each of ``hours``, daily from ``start`` through 2026, among stops s<i>."""
+    each of ``hours``, daily from ``start`` through 2026, among stops s<i>
+    (s0 to s9 unless ``stops`` names them)."""
+    stops = range(10) if stops is None else stops
     trips = [(r, h) for r in options.get("routes", ("r1",)) for h in hours]
     times = (
         "{0}{1},{1:02}:00:00,{1:02}:00:00,s2,1\n{0}{1},{1:02}:10:00,{1:02}:10:00,s3,2"
