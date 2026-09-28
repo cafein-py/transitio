@@ -232,17 +232,30 @@ pub fn scan_reader_streaming<R: Read + Seek>(
         };
         // An entry may never read past the remaining cumulative budget, so
         // the total limit holds while reading, not after the fact.
-        let budget = options
-            .max_entry_bytes
-            .min(options.max_total_bytes.saturating_sub(total_bytes));
+        let remaining = options.max_total_bytes.saturating_sub(total_bytes);
+        let budget = options.max_entry_bytes.min(remaining);
+        // Every budget a size is over, since raising one alone may not do.
+        let over = |size: u64| {
+            let mut budgets = Vec::new();
+            if size > options.max_entry_bytes {
+                budgets.push("max_entry_bytes");
+            }
+            if size > remaining {
+                budgets.push("max_total_bytes");
+            }
+            budgets
+        };
         if entry.size() > budget {
-            notices.push(unreadable_file(
-                spec.name,
-                &format!(
-                    "declares {} uncompressed bytes, over the {budget}-byte budget",
-                    entry.size()
-                ),
-            ));
+            notices.push(
+                unreadable_file(
+                    spec.name,
+                    &format!(
+                        "declares {} uncompressed bytes, over the {budget}-byte budget",
+                        entry.size()
+                    ),
+                )
+                .with("budgets", over(entry.size())),
+            );
             present.insert(spec.name);
             incomplete.insert(spec.name.to_string());
             continue;
@@ -263,10 +276,10 @@ pub fn scan_reader_streaming<R: Read + Seek>(
             continue;
         }
         if bytes.len() as u64 > budget {
-            notices.push(unreadable_file(
-                spec.name,
-                &format!("exceeds the {budget}-byte budget"),
-            ));
+            notices.push(
+                unreadable_file(spec.name, &format!("exceeds the {budget}-byte budget"))
+                    .with("budgets", over(bytes.len() as u64)),
+            );
             present.insert(spec.name);
             incomplete.insert(spec.name.to_string());
             continue;
@@ -292,6 +305,96 @@ pub fn scan_reader_streaming<R: Read + Seek>(
         unparsed_entries,
         readiness: None,
         moment: None,
+    })
+}
+
+/// Why a feed cannot be taken whole to `verb` it, or None when it can,
+/// from the notices of its scan and the files it left incomplete: each
+/// file cut short, with every budget it exceeded and that budget's value
+/// ("stops.txt exceeds max_rows (5)"), and with `notice_caps` each file
+/// whose notices were sampled.
+pub fn refusal<'a>(
+    notices: &[Notice],
+    incomplete: impl IntoIterator<Item = &'a str>,
+    options: &ScanOptions,
+    notice_caps: bool,
+    verb: &str,
+) -> Option<String> {
+    let mut reasons = BTreeSet::new();
+    let mut budgets = BTreeSet::new();
+    let mut explained = HashSet::new();
+    let mut raisable = true;
+    for notice in notices {
+        let Some(file) = notice.context.get("filename").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let exceeded: Vec<&str> = match notice.code {
+            "too_many_rows" => vec!["max_rows"],
+            "unreadable_file" => notice
+                .context
+                .get("budgets")
+                .and_then(|v| v.as_array())
+                .map(|names| names.iter().filter_map(|n| n.as_str()).collect())
+                .unwrap_or_default(),
+            "notice_limit_reached" if notice_caps => {
+                if notice.context.contains_key("blockId") {
+                    reasons.insert(format!(
+                        "{file} reaches the block overlap check cap that no budget raises"
+                    ));
+                    raisable = false;
+                    continue;
+                }
+                vec!["max_notices_per_file"]
+            }
+            _ => continue,
+        };
+        for budget in exceeded {
+            let value = match budget {
+                "max_entry_bytes" => options.max_entry_bytes,
+                "max_total_bytes" => options.max_total_bytes,
+                "max_rows" => options.max_rows,
+                "max_columns" => options.max_columns as u64,
+                "max_notices_per_file" => options.max_notices_per_file,
+                _ => continue,
+            };
+            reasons.insert(format!("{file} exceeds {budget} ({value})"));
+            budgets.insert(budget);
+            if notice.code != "notice_limit_reached" {
+                explained.insert(file);
+            }
+        }
+    }
+    for file in incomplete {
+        if explained.contains(file) {
+            continue;
+        }
+        // A duplicated, corrupt or header-unparseable entry, or a guard no
+        // budget raises: nothing reads it whole.
+        let cause = notices.iter().rev().find(|n| {
+            matches!(
+                n.code,
+                "unreadable_file" | "csv_parsing_failed" | "duplicate_zip_entry"
+            ) && n.context.get("filename").and_then(|v| v.as_str()) == Some(file)
+        });
+        let detail = cause.map_or("unreadable", |n| {
+            n.context
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or(n.code)
+        });
+        reasons.insert(format!("{file} cannot be read whole: {detail}"));
+        raisable = false;
+    }
+    if reasons.is_empty() {
+        return None;
+    }
+    let list = reasons.into_iter().collect::<Vec<_>>().join(", ");
+    Some(if !raisable {
+        format!("{list}; cannot {verb} this feed")
+    } else if budgets.len() > 1 {
+        format!("{list}; raise them to {verb} this feed")
+    } else {
+        format!("{list}; raise it to {verb} this feed")
     })
 }
 
@@ -431,13 +534,16 @@ fn read_table(
     for (line_index, line) in bytes.split(|b| *b == b'\n').enumerate() {
         let delimiters = line.iter().filter(|b| **b == b',').count();
         if delimiters > delimiter_guard {
-            notices.push(unreadable_file(
-                spec.name,
-                &format!(
-                    "line {} has {delimiters} delimiters, over the {delimiter_guard} guard",
-                    line_index + 1
-                ),
-            ));
+            notices.push(
+                unreadable_file(
+                    spec.name,
+                    &format!(
+                        "line {} has {delimiters} delimiters, over the {delimiter_guard} guard",
+                        line_index + 1
+                    ),
+                )
+                .with("budgets", vec!["max_columns"]),
+            );
             return (None, true);
         }
     }
@@ -536,7 +642,7 @@ impl<R: Read> TableReader<R> {
                 return Err(NoTable::Empty);
             }
             Some(Err(error)) if error.is_io_error() => {
-                notices.push(unreadable_file(spec.name, &error.to_string()));
+                notices.push(read_failure(spec.name, &error));
                 return Err(NoTable::Unreadable);
             }
             Some(Err(error)) => {
@@ -549,14 +655,17 @@ impl<R: Read> TableReader<R> {
                 .collect(),
         };
         if headers.len() > options.max_columns {
-            notices.push(unreadable_file(
-                spec.name,
-                &format!(
-                    "{} columns exceed the {}-column limit",
-                    headers.len(),
-                    options.max_columns
-                ),
-            ));
+            notices.push(
+                unreadable_file(
+                    spec.name,
+                    &format!(
+                        "{} columns exceed the {}-column limit",
+                        headers.len(),
+                        options.max_columns
+                    ),
+                )
+                .with("budgets", vec!["max_columns"]),
+            );
             return Err(NoTable::Unreadable);
         }
         if headers.iter().any(|h| h.contains('\u{FFFD}')) {
@@ -652,7 +761,7 @@ impl<R: Read> TableReader<R> {
                 if error.is_io_error() {
                     // The source itself failed; retrying would fail again,
                     // and the failure is not a row.
-                    notices.push(unreadable_file(self.spec.name, &error.to_string()));
+                    notices.push(read_failure(self.spec.name, error));
                     self.truncated = true;
                     self.finish(notices);
                     return None;
@@ -755,8 +864,24 @@ pub struct DelimiterGuard<R: Read> {
     /// removes (`TableReader::open` skips one, the csv reader a second);
     /// `LEADING_MARK_BYTES` once they are complete or ruled out.
     leading: usize,
-    tripped: Option<String>,
+    tripped: Option<Tripped>,
 }
+
+/// Why a `DelimiterGuard` stopped, and the `ScanOptions` field that
+/// raises its limit, if any.
+#[derive(Clone, Debug)]
+struct Tripped {
+    reason: String,
+    budget: Option<&'static str>,
+}
+
+impl std::fmt::Display for Tripped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for Tripped {}
 
 const BYTE_ORDER_MARK: [u8; 3] = [0xef, 0xbb, 0xbf];
 const LEADING_MARK_BYTES: usize = 2 * BYTE_ORDER_MARK.len();
@@ -788,8 +913,8 @@ impl<R: Read> DelimiterGuard<R> {
 
 impl<R: Read> Read for DelimiterGuard<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if let Some(reason) = &self.tripped {
-            return Err(std::io::Error::other(reason.clone()));
+        if let Some(tripped) = &self.tripped {
+            return Err(std::io::Error::other(tripped.clone()));
         }
         let read = self.inner.read(buf)?;
         for (offset, &byte) in buf[..read].iter().enumerate() {
@@ -834,18 +959,24 @@ impl<R: Read> Read for DelimiterGuard<R> {
             if delimiter {
                 self.delimiters += 1;
             }
-            let reason = if self.delimiters > self.guard {
-                format!("a record has more than {} delimiters", self.guard)
+            let tripped = if self.delimiters > self.guard {
+                Tripped {
+                    reason: format!("a record has more than {} delimiters", self.guard),
+                    budget: Some("max_columns"),
+                }
             } else if self.record_bytes > MAX_RECORD_BYTES {
-                format!("a record is longer than {MAX_RECORD_BYTES} bytes")
+                Tripped {
+                    reason: format!("a record is longer than {MAX_RECORD_BYTES} bytes"),
+                    budget: None,
+                }
             } else {
                 continue;
             };
-            self.tripped = Some(reason.clone());
+            self.tripped = Some(tripped.clone());
             // Hand back what precedes the flood; the next read fails. An
             // empty read would pass for a clean end.
             return if offset == 0 {
-                Err(std::io::Error::other(reason))
+                Err(std::io::Error::other(tripped))
             } else {
                 Ok(offset)
             };
@@ -859,11 +990,29 @@ fn empty_file(filename: &'static str) -> Notice {
 }
 
 /// transitio-specific (no canonical equivalent): the entry exists but
-/// cannot be safely read — corrupt member, or a violated size/column guard.
+/// cannot be safely read — corrupt member, or a violated size/column guard,
+/// whose `ScanOptions` fields the caller adds as `budgets`.
 fn unreadable_file(filename: &'static str, message: &str) -> Notice {
     Notice::new("unreadable_file", Severity::Error)
         .with("filename", filename)
         .with("message", message)
+}
+
+/// `unreadable_file` for a read that failed, naming the budget when a
+/// `DelimiterGuard` stopped it.
+fn read_failure(filename: &'static str, error: &csv::Error) -> Notice {
+    let notice = unreadable_file(filename, &error.to_string());
+    let budget = match error.kind() {
+        csv::ErrorKind::Io(io) => io
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<Tripped>())
+            .and_then(|tripped| tripped.budget),
+        _ => None,
+    };
+    match budget {
+        Some(budget) => notice.with("budgets", vec![budget]),
+        None => notice,
+    }
 }
 
 fn invalid_character(filename: &'static str, csv_row: u64) -> Notice {
@@ -985,7 +1134,7 @@ fn duplicate_key_checks(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::Cursor;
 
     use super::*;
@@ -1005,7 +1154,7 @@ mod tests {
         cursor
     }
 
-    fn build_zip(files: &[(&str, &str)]) -> Cursor<Vec<u8>> {
+    pub(crate) fn build_zip(files: &[(&str, &str)]) -> Cursor<Vec<u8>> {
         let bytes: Vec<(&str, &[u8])> = files
             .iter()
             .map(|(name, content)| (*name, content.as_bytes()))
@@ -1013,7 +1162,7 @@ mod tests {
         zip_with(&bytes)
     }
 
-    fn minimal() -> Vec<(&'static str, &'static str)> {
+    pub(crate) fn minimal() -> Vec<(&'static str, &'static str)> {
         vec![
             (
                 "agency.txt",
@@ -1578,20 +1727,23 @@ mod tests {
         marked_header.extend(row);
         let twice_marked_header: Vec<u8> = [&BYTE_ORDER_MARK[..], &marked_header[..]].concat();
         // the flooded row arriving right after the last allowed row is a
-        // read failure, not the row cap
-        for (bytes, max_rows, rows_before) in [
-            (flooded_row, 1, 1),
-            (flooded_header, u64::MAX, 0),
-            (quoted, u64::MAX, 1),
-            (oversized, u64::MAX, 1),
-            (marked_header, u64::MAX, 0),
-            (twice_marked_header, u64::MAX, 0),
+        // read failure, not the row cap; only the delimiter guard follows a
+        // budget
+        let columns = Some(serde_json::json!(["max_columns"]));
+        for (bytes, max_rows, rows_before, budgets) in [
+            (flooded_row, 1, 1, columns.clone()),
+            (flooded_header, u64::MAX, 0, columns),
+            (quoted, u64::MAX, 1, None),
+            (oversized, u64::MAX, 1, None),
+            (marked_header, u64::MAX, 0, None),
+            (twice_marked_header, u64::MAX, 0, None),
         ] {
             let streamed = stream(&bytes, &ScanOptions::default(), max_rows);
             // the rows before the flood are usable; nothing after it is read
             assert_eq!(streamed.rows.len(), rows_before);
             assert!(streamed.truncated);
             assert_eq!(notice_codes(&streamed.notices), ["unreadable_file"]);
+            assert_eq!(streamed.notices[0].context.get("budgets"), budgets.as_ref());
         }
     }
 

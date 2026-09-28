@@ -103,7 +103,13 @@ def crop_feed(
         ``reference_date``, ``reference_time``). The budgets bound the
         tables parsed whole and the cropped feed; stop_times.txt, trips.txt
         and shapes.txt are streamed from the archive, so a national feed
-        crops to a city within the defaults.
+        crops to a city within the defaults. A table that a row, byte or
+        column budget cuts short, in the source or the cropped feed, refuses
+        the crop with an ``OSError`` naming the file and the budget to
+        raise; so does a table that cannot be read. A reached
+        ``max_notices_per_file`` does not: the cropped feed's notices are
+        then sampled, and a ``notice_limit_reached`` notice among them says
+        so.
 
     Returns
     -------

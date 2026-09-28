@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- `crop_feed` refuses a feed only when a table the crop depends on is cut
+  short, by a row, byte or column budget or an unreadable entry, in the
+  source or in the cropped feed. A reached notice cap (`max_notices_per_file`
+  or the block overlap check cap) no longer refuses it; the cropped feed's
+  notices then include `notice_limit_reached`. São Paulo's SPTrans feed and
+  Westchester's Bee-Line could not be cropped with the default budgets.
+- The refusals of `crop_feed` and `repair_feed` name each file and the
+  budget it exceeded with its value, such as "stops.txt exceeds max_rows
+  (20000000); raise it to crop this feed", instead of "feed exceeds the scan
+  or notice budgets". `repair_feed` still refuses a feed whose notices were
+  sampled, and says so when the cap is one that no budget raises. An
+  `unreadable_file` notice for a violated budget lists it under `budgets`.
+
 ## 0.16.0 — 2026-09-27
 
 ### Added
