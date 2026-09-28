@@ -250,9 +250,12 @@ class _SkipFeed(Exception):
     the feed's computed service window when it was validated."""
 
     def __init__(self, reason, window=None):
-        super().__init__(reason)
+        super().__init__(reason, window)
         self.reason = reason
         self.window = window
+
+    def __str__(self):
+        return self.reason
 
 
 def _process_feed(
