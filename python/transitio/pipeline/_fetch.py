@@ -33,6 +33,12 @@ _MODES_BYTE_CAP = 64 * 1024 * 1024
 # Seconds a conditional HEAD probe may take before it counts as unanswered.
 _PROBE_TIMEOUT = 5.0
 
+# Two delivered feeds are versions of one service when their route keys and
+# their stops, at these decimals, overlap (Jaccard) this much or more.
+_ROUTE_OVERLAP = 0.9
+_STOP_OVERLAP = 0.8
+_STOP_DECIMALS = 3
+
 # The fields of a selection-record entry, in selection_table's column order.
 _SELECTION_FIELDS = (
     "feed_id",
@@ -236,6 +242,11 @@ def _skip(entry, reason, **fields):
     entry.update(decision="skipped", reason=reason, **fields)
 
 
+def _note(entry, text):
+    """Add ``text`` to an entry's note, after any note it has."""
+    entry["note"] = text if entry["note"] is None else f"{entry['note']}; {text}"
+
+
 def _skipped(selection):
     """The ``(feed id, reason)`` pairs of the skipped entries."""
     return [
@@ -250,9 +261,12 @@ class _SkipFeed(Exception):
     the feed's computed service window when it was validated."""
 
     def __init__(self, reason, window=None):
-        super().__init__(reason)
+        super().__init__(reason, window)
         self.reason = reason
         self.window = window
+
+    def __str__(self):
+        return self.reason
 
 
 def _process_feed(
@@ -387,9 +401,9 @@ def _entry_digests(path, digest):
 
 class _Delivered:
     """The downloads a call has delivered, with the route filter each was
-    cropped to: a later download with the same content under the same filter
-    would deliver the same file again. Each download is described as it was
-    when checked, before it was processed."""
+    cropped to (None: all routes), so a later download with the same content
+    can be matched with them. Each download is described as it was when
+    checked, before it was processed."""
 
     def __init__(self):
         self._feeds = []
@@ -406,31 +420,64 @@ class _Delivered:
             self._entries[path] = _entry_digests(path, self._facts[path][0])
         return self._entries[path]
 
-    def same_as(self, path, routes=None):
-        """The id of a delivered feed whose download holds the same content
-        as ``path`` and was cropped to the same ``routes``, else None. Same
-        content: equal archive digests, or equal entry listings (name, CRC-32,
-        size) confirmed by equal SHA-256 digests of every entry. An archive
-        that cannot be read, or that changed since it was checked, matches
+    def same_as(self, path):
+        """The ``(feed id, routes)`` of each delivered feed whose download
+        holds the same content as ``path``, in delivery order. Same content:
+        equal archive digests, or equal entry listings (name, CRC-32, size)
+        confirmed by equal SHA-256 digests of every entry. An archive that
+        cannot be read, or that changed since it was checked, matches
         nothing."""
         facts = self._about(path)
         if facts is None:
-            return None
+            return []
+        found = []
         for feed_id, other, cropped_to in self._feeds:
             recorded = self._facts[other]
-            if cropped_to != routes or recorded is None:
+            if recorded is None:
                 continue
             if facts[0] == recorded[0]:
-                return feed_id
-            if facts[1] and facts[1] == recorded[1]:
+                found.append((feed_id, cropped_to))
+            elif facts[1] and facts[1] == recorded[1]:
                 mine = self._digests(path)
                 if mine is not None and mine == self._digests(other):
-                    return feed_id
-        return None
+                    found.append((feed_id, cropped_to))
+        return found
 
     def add(self, feed_id, path, routes=None):
         self._about(path)
         self._feeds.append((feed_id, path, routes))
+
+
+def _covers(twins, routes):
+    """Whether the deliveries ``twins`` (``(feed id, routes)`` of one archive)
+    carry every route of ``routes``; None stands for all routes."""
+    cuts = [cut for _, cut in twins]
+    if any(cut is None for cut in cuts):
+        return True
+    return bool(cuts) and routes is not None and routes <= set().union(*cuts)
+
+
+def _containers(feed, entries, carriers, cropped, current):
+    """``(proven, notes)``: a candidate's containers carried whole and
+    proven unchanged before download, and why each other decided one drops
+    nothing."""
+    proven, notes = [], []
+    for container in feed.contained_in:
+        if container == feed.feed_id or container not in entries:
+            continue
+        decision = entries[container]["decision"]
+        if decision is None:
+            continue
+        if container in carriers:
+            if current.get(container):
+                proven.append(container)
+            else:
+                notes.append("kept: containment not proven current")
+        elif container in cropped:
+            notes.append(f"kept: container {container} cropped to selected routes")
+        else:
+            notes.append(f"kept: container {container} skipped")
+    return proven, notes
 
 
 def _containers_first(feeds):
@@ -452,6 +499,141 @@ def _containers_first(feeds):
         return depth[feed.feed_id]
 
     return sorted(feeds, key=level)
+
+
+def _service(path, day=None, max_total_bytes=None):
+    """A delivered feed's route keys, rounded stop coordinates and trip
+    count; with a ``day``, the signatures of its trips running then that are
+    not frequency-based, whether those are all of them, and whether it has
+    transfers or pathways, from those tables only, read as ``FeedEditor``
+    does. None when they are over ``max_total_bytes``, a route key has a
+    blank part, a stop or station lacks coordinates, or with a ``day`` its
+    calendars cannot be read."""
+    import pandas as pd
+
+    from transitio.edit._editor import _MAX_TOTAL_BYTES, _normalise_headers
+    from transitio.gtfs._schedule import route_keys, service_dates, trip_signatures
+
+    names = {"agency.txt", "routes.txt", "stops.txt", "trips.txt"}
+    if day is not None:
+        names |= {"stop_times.txt", "calendar.txt", "calendar_dates.txt"}
+        names |= {"frequencies.txt", "transfers.txt", "pathways.txt"}
+    limit = _MAX_TOTAL_BYTES if max_total_bytes is None else max_total_bytes
+    csv = {"dtype": str, "keep_default_na": False, "encoding": "utf-8-sig"}
+    try:
+        with zipfile.ZipFile(path) as archive:
+            members = [m for m in archive.infolist() if m.filename in names]
+            if sum(m.file_size for m in members) > limit:
+                return None
+            tables = {
+                m.filename: _normalise_headers(pd.read_csv(archive.open(m), **csv))[0]
+                for m in members
+            }
+        keys = route_keys(tables)[["agency", "name", "type"]]
+        stops = tables["stops.txt"]
+        points = stops[["stop_lat", "stop_lon"]].apply(pd.to_numeric, errors="coerce")
+        # Stops and stations need coordinates; other location types may lack them.
+        kind = stops.get("location_type", pd.Series("", index=stops.index))
+        located = points[kind.str.strip().isin(("", "0", "1"))]
+        if (keys == "").any(axis=None) or located.isna().any(axis=None):
+            return None
+        points = points.round(_STOP_DECIMALS).add(0.0).dropna()
+        trips = tables.get("trips.txt", pd.DataFrame(columns=["trip_id", "service_id"]))
+        found = {
+            "routes": set(keys.itertuples(index=False, name=None)),
+            "stops": set(points.itertuples(index=False, name=None)),
+            "trips": len(trips),
+        }
+        if not (found["routes"] and found["stops"]):
+            return None
+        if day is None:
+            return found
+        dates, unexpanded = service_dates(tables)
+        if unexpanded or dates.empty:
+            return None
+        running = dates.loc[dates["date"] == pd.Timestamp(day), "service_id"]
+        on_day = trips.loc[trips["service_id"].isin(running), "trip_id"]
+        signed = trip_signatures(tables)
+        repeated = tables.get("frequencies.txt", pd.DataFrame(columns=["trip_id"]))
+        signed = signed[
+            signed["trip_id"].isin(on_day)
+            & ~signed["trip_id"].isin(repeated["trip_id"])
+        ]
+    except Exception:  # noqa: B902 — an unreadable feed is never grouped
+        return None
+    found.update(
+        day=set(signed["signature"]),
+        complete=len(signed) == len(on_day),
+        linked=any(len(tables.get(n, ())) for n in ("transfers.txt", "pathways.txt")),
+    )
+    return found
+
+
+def _settle_versions(record, services, protected, day):
+    """Settle the versions among the delivered feeds ``services`` (``{feed
+    id: _service(...)}``) as :func:`fetch` describes, the connected
+    components of the version pairs being the groups, and note or skip
+    their entries in ``record``; returns the ids of the feeds left out."""
+    entries = {entry["feed_id"]: entry for entry in record}
+    order = {feed_id: position for position, feed_id in enumerate(entries)}
+
+    def rank(feed_id):
+        start = (entries[feed_id]["feed_window"] or [None])[0]
+        later = -datetime.date.fromisoformat(start).toordinal() if start else 0
+        return (start is None, later, -services[feed_id]["trips"], order[feed_id])
+
+    ids = sorted(services, key=rank)
+    pairs = {feed_id: {} for feed_id in ids}
+    for position, one in enumerate(ids):
+        for other in ids[position + 1 :]:
+            overlaps = tuple(
+                len(services[one][key] & services[other][key])
+                / len(services[one][key] | services[other][key])
+                for key in ("routes", "stops")
+            )
+            if overlaps[0] >= _ROUTE_OVERLAP and overlaps[1] >= _STOP_OVERLAP:
+                pairs[one][other] = pairs[other][one] = overlaps
+    removed, grouped = set(), set()
+    for top in ids:
+        if top in grouped or not pairs[top]:
+            continue
+        group, frontier = {top}, [top]
+        while frontier:
+            for partner in pairs[frontier.pop()]:
+                if partner not in group:
+                    group.add(partner)
+                    frontier.append(partner)
+        grouped |= group
+        members = [feed_id for feed_id in ids if feed_id in group]
+        if day is None:
+            for member in members:
+                partner = next(other for other in ids if other in pairs[member])
+                _note(entries[member], f"similar to {partner}; kept, no study day")
+            continue
+        kept = [m for m in members if m == top or m in protected]
+        covered = set().union(*(services[m]["day"] for m in kept))
+        for member in members:
+            if member in kept:
+                continue
+            service = services[member]
+            partners = [other for other in kept if other in pairs[member]]
+            adds = not (service["complete"] and service["day"] <= covered)
+            if partners and not adds and not service["linked"]:
+                removed.add(member)
+                continue
+            if partners:
+                why = "; kept, has transfers or pathways"
+                why = f" but adds service on {day}" if adds else why
+                _note(entries[member], f"similar to {partners[0]}{why}")
+            kept = sorted([*kept, member], key=ids.index)
+            covered |= service["day"]
+        for member in [m for m in members if m in removed]:
+            partner = next(other for other in kept if other in pairs[member])
+            route, stop = (round(share, 3) for share in pairs[member][partner])
+            version = {"feed_id": partner, "route_overlap": route, "stop_overlap": stop}
+            reason = f"another version of {partner}"
+            _skip(entries[member], reason, note=None, path=None, version_of=version)
+    return removed
 
 
 def _download_indexed(feed, db, atlas, base_dir):
@@ -495,8 +677,9 @@ def _unchanged_since_indexed(feed, http):
     """Whether the archive the index crawled for an indexed feed is still the
     one served: a conditional ``HEAD`` to the URL the crawl reads (the Atlas
     static feed, else the Mobility Database direct download), carrying the
-    ETag and Last-Modified it recorded, answers 304 Not Modified. Any other
-    answer, a failed probe or no recorded validator is no proof."""
+    ETag and Last-Modified it recorded, answers 304 Not Modified. Returns
+    that URL, or None: any other answer, a failed probe or no recorded
+    validator is no proof."""
     from transitio.catalog._atlas import STATIC_URL
     from transitio.index.feeds import _parse, _scalar
 
@@ -511,12 +694,12 @@ def _unchanged_since_indexed(feed, http):
     if last_modified:
         headers["If-Modified-Since"] = last_modified
     if not url or not headers:
-        return False
+        return None
     try:
         response = http.head(url, headers=headers, timeout=_PROBE_TIMEOUT)
     except Exception:  # noqa: B902 — an unanswered probe proves nothing
-        return False
-    return response.status_code == 304
+        return None
+    return url if response.status_code == 304 else None
 
 
 def fetch(
@@ -528,7 +711,7 @@ def fetch(
     exclude=None,
     on_unknown="include",
     on_untrusted_selector="auto",
-    contained="keep",
+    contained="drop",
     index=None,
     modes=None,
     expired="skip",
@@ -557,12 +740,18 @@ def fetch(
     ``"whole"`` always delivers it whole; ``"drop"`` always skips it;
     ``"error"`` raises :class:`~transitio.exceptions.StaleSelectorError`.
     A schema-10 index records the larger feeds whose stops and routes contain
-    a feed's; ``contained="keep"`` (default) delivers every feed and reports
-    the delivered pairs in ``FetchResult.contained``, ``contained="drop"``
-    leaves a feed out when a feed containing it is delivered in the call,
-    before downloading it (containers are fetched first). Containment is a
-    heuristic, not proof that every trip is carried, so nothing is left out
-    by default.
+    a feed's, and ``FetchResult.contained`` reports the delivered pairs. With
+    ``contained="drop"`` (default) containers are processed first, and a
+    contained feed is left out before download (``"contained in <id>"``)
+    when a container was delivered whole (not cut to a route selection) or
+    skipped as the same content as a feed delivered whole, and conditional
+    ``HEAD`` probes (as for ``expired``) prove both archives unchanged since
+    indexed: the container's, sent before its download, and the contained
+    feed's. A container downloaded as a catalogued dataset proves nothing.
+    Otherwise the feed is processed as usual and its ``note`` says why:
+    ``"kept: containment not proven current"``, ``"kept: container <id>
+    skipped"`` or ``"kept: container <id> cropped to selected routes"``.
+    ``contained="keep"`` leaves no feed out for containment.
 
     Resolves and crops the OSM extract, discovers the GTFS feeds (overlapping
     the AOI, or the place's indexed feeds), downloads each feed, spatially
@@ -575,9 +764,23 @@ def fetch(
     sidecar as such. Every overlapping feed is processed, in a
     deterministic order with official feeds first; one broken feed never
     aborts the others — it lands in ``skipped`` with its reason. A download
-    whose content equals a feed already delivered in the call (cropped to the
-    same routes) is not delivered twice: it is skipped as ``"same content as
-    <feed id>"``.
+    whose content equals a feed already delivered in the call is skipped as
+    ``"same content as <feed id>"`` when its routes are within those
+    delivered from that archive (a feed delivered whole carries all);
+    otherwise it is delivered cut to its own routes, ``same_as`` naming the
+    earlier feed.
+
+    On the place path, delivered feeds whose route keys (agency name, route
+    short else long name, type) and stops (coordinates at 3 decimals) share
+    0.9 and 0.8 or more are versions, ranked by later start, more trips,
+    then candidate order. With ``when``, one is left out as ``"another
+    version of <id>"`` when a kept version pairs with it and kept versions
+    run, by trip signature, every non-frequency trip it runs on the day;
+    the top version and the containers a left-out feed relied on stay, as
+    does one with transfers or pathways. A left-out version's fares are not
+    delivered. Without ``when`` none is left out; similar feeds are noted.
+    A feed whose routes, stops or, with ``when``, calendars cannot be read
+    is never a version.
 
     Parameters
     ----------
@@ -647,13 +850,16 @@ def fetch(
         original. ``selection`` has one entry per candidate feed, in
         candidate order: ``feed_id``, ``name``, ``decision``
         (``"delivered"`` or ``"skipped"``), ``reason`` (why it was skipped),
-        ``note`` (about a delivered feed, such as the routes it was cut to),
+        ``note`` (about a delivered feed: the routes it was cut to, why a
+        contained feed was kept, a similar feed; several join with ``"; "``),
         ``index_window`` (the index's ``[start, end]``; None undated or on
         the area path), ``feed_window`` (the computed window of a validated
         download, delivered or not; None otherwise or when unknown),
-        ``same_as`` and ``contained_in`` (the feed ids a same-content or a
-        containment skip names), ``version_of`` (None; reserved for version
-        skips) and ``path`` (the delivered feed). Windows are ISO dates.
+        ``same_as`` (earlier deliveries of the same archive) and
+        ``contained_in`` (the containers a containment skip names),
+        ``version_of`` (for a left-out version, ``{"feed_id", "route_overlap",
+        "stop_overlap"}`` against the highest-ranked kept version it pairs
+        with) and ``path`` (the delivered feed). Windows are ISO dates.
         ``FetchResult.selection_table()`` returns it as a DataFrame.
     """
     from transitio.catalog import MobilityDatabase
@@ -669,7 +875,7 @@ def fetch(
         or index is not None
         or on_unknown != "include"
         or on_untrusted_selector != "auto"
-        or contained != "keep"
+        or contained != "drop"
     ):
         raise ValueError(
             "tiers=, exclude=, on_unknown=, on_untrusted_selector=, contained= "
@@ -796,9 +1002,9 @@ def fetch(
             except Exception as error:  # noqa: B902
                 _skip(entry, f"download failed: {error}")
                 continue
-            twin = delivered.same_as(path)
-            if twin is not None:
-                _skip(entry, f"same content as {twin}", same_as=[twin])
+            twins = [twin for twin, _ in delivered.same_as(path)]
+            if twins:
+                _skip(entry, f"same content as {', '.join(twins)}", same_as=twins)
                 continue
             download = path
             hosted = None
@@ -925,7 +1131,8 @@ def _fetch_place(
     a bundled feed is cropped to the routes its matched tiers select, the drop
     recorded in ``selections``. A feed whose index window misses ``day`` is
     skipped before download when a probe proves the archive unchanged since
-    indexed; ``window_day`` is what the computed window is tested against."""
+    indexed; ``window_day`` is what the computed window is tested against.
+    The versions among the delivered feeds are settled last."""
     import shapely
 
     from transitio import __version__
@@ -982,6 +1189,12 @@ def _fetch_place(
     delivered = _Delivered()
     delivered_ids = []
     entries = {}
+    # Containment state: the feeds carried by a feed delivered whole (itself,
+    # or the feed whose content it repeats), those delivered cut to routes,
+    # and whether a container's probe proved it unchanged before download.
+    carriers, cropped, current, protected = {}, set(), {}, set()
+    container_ids = {c for feed in kept for c in feed.contained_in}
+    probes, services, budget = {}, {}, budgets.get("max_total_bytes")
 
     def entry_for(feed):
         # The record follows candidate order, whatever order they are processed in.
@@ -1020,15 +1233,25 @@ def _fetch_place(
                 UserWarning,
                 stacklevel=2,
             )
+
+        def unchanged(feed):
+            # One probe per feed, shared by the date and containment rules.
+            if feed.feed_id not in probes:
+                probes[feed.feed_id] = _unchanged_since_indexed(feed, atlas._http)
+            return probes[feed.feed_id]
+
+        def expired_unchanged(feed, entry):
+            # Index metadata describes the archive the index crawled, so it
+            # decides a feed only before a download from the indexed URLs,
+            # and only once a probe proves that archive unchanged.
+            missed = _misses(feed.service_start, feed.service_end, day, study)
+            if expired == "skip" and missed and unchanged(feed):
+                _skip(entry, f"{missed}; unchanged since indexed")
+                return True
+            return False
+
         for feed in kept:
             entry = entry_for(feed)
-            if contained == "drop":
-                containers = [c for c in feed.contained_in if c in delivered_ids]
-                if containers:
-                    _skip(
-                        entry, f"contained in {containers[0]}", contained_in=containers
-                    )
-                    continue
             dataset = None
             errors = []
             if db._refresh_token:
@@ -1046,6 +1269,17 @@ def _fetch_place(
                             dataset = versions[0] if versions else None
                     except Exception as error:  # noqa: B902 — fall back to the urls
                         errors.append(f"dataset selection: {error}")
+            if dataset is None and expired_unchanged(feed, entry):
+                continue
+            notes = []
+            if contained == "drop":
+                proven, notes = _containers(feed, entries, carriers, cropped, current)
+                if proven and dataset is None and unchanged(feed):
+                    _skip(entry, f"contained in {proven[0]}", contained_in=proven)
+                    protected.update(carriers[c] for c in proven)
+                    continue
+                if proven:
+                    notes.append("kept: containment not proven current")
             # The hosted validation report only describes the dataset's own
             # bytes, so it is attached only when the dataset supplied them.
             path = None
@@ -1058,17 +1292,18 @@ def _fetch_place(
                     from_dataset = True
                 except Exception as error:  # noqa: B902 — try the fallback next
                     errors.append(f"mdb dataset: {error}")
-            # Index metadata describes the archive the index crawled, so it
-            # decides a feed only before a download from the indexed URLs, and
-            # only once a probe proves that archive unchanged.
-            if path is None and expired == "skip":
-                missed = _misses(feed.service_start, feed.service_end, day, study)
-                if missed and _unchanged_since_indexed(feed, atlas._http):
-                    _skip(entry, f"{missed}; unchanged since indexed")
+                if path is None and expired_unchanged(feed, entry):
                     continue
             if path is None:
+                probed = contained == "drop" and feed.feed_id in container_ids
+                probed = probed and unchanged(feed)
                 try:
                     path = _download_indexed(feed, db, atlas, base_dir)
+                    if probed:
+                        # The proof covers only a download from the probed URL.
+                        sidecar = path.with_suffix(".provenance.json").read_text()
+                        source = json.loads(sidecar).get("source_url")
+                        current[feed.feed_id] = source == probed
                 except Exception as error:  # noqa: B902
                     errors.append(str(error))
             if path is None:
@@ -1156,9 +1391,13 @@ def _fetch_place(
                         "declared_as": None,
                         "selected_by": selected_by,
                     }
-            twin = delivered.same_as(path, routes)
-            if twin is not None:
-                _skip(entry, f"same content as {twin}", same_as=[twin])
+            twins = delivered.same_as(path)
+            same_as = [twin for twin, _ in twins]
+            if _covers(twins, routes):
+                _skip(entry, f"same content as {', '.join(same_as)}", same_as=same_as)
+                whole = [twin for twin, cut in twins if cut is None]
+                if whole:
+                    carriers[feed.feed_id] = whole[0]
                 if selection is not None:
                     selections.append(selection)
                 continue
@@ -1212,9 +1451,16 @@ def _fetch_place(
                 selection["dropped"] = (
                     None if present is None else sorted(present - routes)
                 )
-            entry.update(decision="delivered", feed_window=window, path=path)
+            entry.update(
+                decision="delivered", feed_window=window, path=path, same_as=same_as
+            )
             if routes is not None:
-                entry["note"] = "cut to routes " + ", ".join(sorted(routes))
+                notes.insert(0, "cut to routes " + ", ".join(sorted(routes)))
+                cropped.add(feed.feed_id)
+            else:
+                carriers[feed.feed_id] = feed.feed_id
+            for text in dict.fromkeys(notes):
+                _note(entry, text)
             reports.append(report)
             repairs.append(fixes)
             feeds.append(path)
@@ -1222,7 +1468,15 @@ def _fetch_place(
             delivered_ids.append(feed.feed_id)
             if selection is not None:
                 selections.append(selection)
+            service = _service(path, day if study else None, budget)
+            if service is not None:
+                services[feed.feed_id] = service
 
+    removed = _settle_versions(record, services, protected, day if study else None)
+    rows = [n for n, feed_id in enumerate(delivered_ids) if feed_id not in removed]
+    delivered_ids, feeds, reports, repairs = (
+        [column[n] for n in rows] for column in (delivered_ids, feeds, reports, repairs)
+    )
     pairs = {
         feed.feed_id: sorted(set(feed.contained_in) & set(delivered_ids))
         for feed in kept

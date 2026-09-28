@@ -37,6 +37,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   <day>"` instead of `"no service on the requested day (actual window
   ...)"`. A `reference_date` that disagrees with `when` raises
   `ValueError`.
+- `fetch(place=...)` delivers one copy per service. `contained` defaults to
+  `"drop"`, leaving out a contained feed when a container was delivered
+  whole and `HEAD` probes prove both archives unchanged since indexed. A
+  download equal to a delivered archive is skipped when its routes are
+  within those delivered from it. With `when`, a feed whose route keys and
+  stops largely match a kept one is left out as `"another version of <id>"`
+  when kept feeds run every trip it runs on the day. `note` says why a
+  feed was kept; several notes join with `"; "`.
 - `merge_feeds` and `merge_tables` merge inputs whose `agency_timezone` names
   differ but denote the same clock, such as `CET` and `Europe/Paris` (Paris),
   or `America/Montreal` and `America/Toronto` (Montréal). Two names are
