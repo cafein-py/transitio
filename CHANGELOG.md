@@ -7,8 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- `FetchResult.selection` records one entry per candidate feed, in
+  candidate order, for area and place fetches: `feed_id`, `name`, the
+  `decision` (`"delivered"` or `"skipped"`), the `reason` for a skip, a
+  `note` about a delivered feed (the routes it was cut to), the index's
+  service window (`index_window`, place fetches only), the computed window
+  of every validated download (`feed_window`), the feeds a same-content or
+  containment skip names (`same_as`, `contained_in`), `version_of` and the
+  delivered `path`. `FetchResult.selection_table()` returns it as a pandas
+  DataFrame; `skipped` lists the same skips.
+
 ### Changed
 
+- `fetch` skips expired feeds by default (`expired="skip"`). Without `when`,
+  a feed whose computed service window ended before today is skipped as
+  `"service ended <end>"`; a feed that starts later or runs on other
+  weekdays stays. On the place path, a feed whose index service window
+  misses the day is skipped before download when a conditional `HEAD` to
+  the URL the index crawled, carrying the recorded ETag or Last-Modified,
+  answers 304 Not Modified (`"service ended <end>; unchanged since
+  indexed"`); any other answer downloads it. `expired="keep"` sends no
+  probe and, without `when`, delivers expired feeds as before.
+- With `when`, a feed whose validation report for the day counts no active
+  trip and carries the `no_service_on_reference_date` notice is skipped as
+  `"no service on <day>"`, and a computed window that misses the day is
+  skipped as `"service ended <end>"` or `"service starts <start>, after
+  <day>"` instead of `"no service on the requested day (actual window
+  ...)"`. A `reference_date` that disagrees with `when` raises
+  `ValueError`.
 - `merge_feeds` and `merge_tables` merge inputs whose `agency_timezone` names
   differ but denote the same clock, such as `CET` and `Europe/Paris` (Paris),
   or `America/Montreal` and `America/Toronto` (Montréal). Two names are
