@@ -633,9 +633,13 @@ def fetch(
     refresh_token, cache_dir, directory, country_code
         Passed to the catalog and OSM layers.
     **budgets
-        The ``validate_feed`` keyword arguments. With ``when``,
-        ``reference_date`` is the study day; a different one raises
-        ``ValueError``.
+        The ``validate_feed`` keyword arguments. A feed with a table that a
+        budget cuts short cannot be cropped and lands in ``skipped``, the
+        reason naming the file and the budget to raise. A reached
+        ``max_notices_per_file`` does not stop the crop (the feed's report
+        then carries ``notice_limit_reached``), but it does stop
+        ``repair=True``. With ``when``, ``reference_date`` is the study day;
+        a different one raises ``ValueError``.
 
     Returns
     -------

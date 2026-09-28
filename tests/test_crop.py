@@ -433,8 +433,8 @@ def test_streamed_tables_are_cropped_without_a_row_cap(tmp_path):
     with zipfile.ZipFile(output) as archive:
         shapes = archive.read("shapes.txt").decode().splitlines()
     assert shapes[1:] == ["s-in,60.169,24.931,1", "s-in,60.171,24.941,2"]
-    # a cropped feed the budgets cannot validate whole is not published
-    with pytest.raises(OSError, match="cropped feed exceeds"):
+    # a cropped feed the budgets cannot read whole is not published
+    with pytest.raises(OSError, match=r"stop_times.txt exceeds max_rows \(3\)"):
         crop_feed(source, tmp_path / "over.zip", aoi=CITY_BBOX, max_rows=3)
     assert not (tmp_path / "over.zip").exists()
     # a trip_id repeated in trips.txt is ambiguous, and uncapped it could
