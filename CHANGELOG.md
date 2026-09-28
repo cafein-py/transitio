@@ -7,13 +7,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- `FetchResult.selection` records one entry per candidate feed, in
+  candidate order, for area and place fetches: `feed_id`, `name`, the
+  `decision` (`"delivered"` or `"skipped"`), the `reason` for a skip, a
+  `note` about a delivered feed (the routes it was cut to), the index's
+  service window (`index_window`, place fetches only), the computed window
+  of every validated download (`feed_window`), the feeds a same-content or
+  containment skip names (`same_as`, `contained_in`), `version_of` and the
+  delivered `path`. `FetchResult.selection_table()` returns it as a pandas
+  DataFrame; `skipped` lists the same skips.
+
+### Changed
+
+- `fetch` skips expired feeds by default (`expired="skip"`). Without `when`,
+  a feed whose computed service window ended before today is skipped as
+  `"service ended <end>"`; a feed that starts later or runs on other
+  weekdays stays. On the place path, a feed whose index service window
+  misses the day is skipped before download when a conditional `HEAD` to
+  the URL the index crawled, carrying the recorded ETag or Last-Modified,
+  answers 304 Not Modified (`"service ended <end>; unchanged since
+  indexed"`); any other answer downloads it. `expired="keep"` sends no
+  probe and, without `when`, delivers expired feeds as before.
+- With `when`, a feed whose validation report for the day counts no active
+  trip and carries the `no_service_on_reference_date` notice is skipped as
+  `"no service on <day>"`, and a computed window that misses the day is
+  skipped as `"service ended <end>"` or `"service starts <start>, after
+  <day>"` instead of `"no service on the requested day (actual window
+  ...)"`. A `reference_date` that disagrees with `when` raises
+  `ValueError`.
+- `fetch(place=...)` fetches the OSM extract after the feeds, for the
+  place's parts that hold a stop of a delivered feed (the whole place when
+  none does or a delivered feed's stops cannot be read), each part grown by
+  1.6 km. Remote parts no delivered feed
+  serves, such as Tokyo's Pacific islands, no longer widen the extract.
+  `FetchResult.osm_area` holds the grown area, and the selection record
+  notes the parts left out (`"OSM area: 1 of 47 parts (1783 of 2188
+  km²)"`). Area fetches are unchanged.
+- `fetch_pbf(..., buffer_m=0)` grows the AOI by `buffer_m` metres before
+  the extract is picked and cropped, each part in the UTM zone of its
+  centroid; the provenance sidecar's `aoi_bounds` are the grown AOI's. A
+  part is not grown across the antimeridian, with a `UserWarning`. The
+  docstring now states that the crop is pyrosm's envelope crop, not the
+  true polygon.
+- `merge_feeds` and `merge_tables` leave out an input's trips that repeat
+  trips kept from the inputs before it (`duplicate_trips="drop"`, the
+  default; `"keep"` keeps them). Trips repeat when their route key, stops,
+  times and pickup and drop-off behaviour match, on dates the earlier trips
+  run, one earlier trip per later trip and date; trips sharing a `block_id`
+  go together. A dropped trip's stops still served by a kept trip are linked
+  to the earlier trip's stops by transfers, and the report counts drops
+  under `"duplicate_trips"`. A regional aggregate merged with an operator's
+  own feed, as in London and Augsburg, carried the operator's trips twice.
+- `merge_feeds` and `merge_tables` merge inputs whose `agency_timezone` names
+  differ but denote the same clock, such as `CET` and `Europe/Paris` (Paris),
+  or `America/Montreal` and `America/Toronto` (Montréal). Two names are
+  equivalent when the tz database knows both and their UTC offsets agree at
+  every quarter hour of the inputs' service, from the earliest service date
+  to the latest plus its latest stop time, within 20 years before and 10
+  years after today. `timezones="skip"` counts equivalent names as one zone.
+  The merged `agency.txt` uses the name most inputs declare, and the report
+  gains `"timezone_interval"` (the UTC instants compared) and
+  `"timezone_aliases"` (each name replaced and the name used). A refusal now
+  names each input with its zones, by position, prefix and path: New York's
+  merge of 45 feeds stopped on `America/New_York` and `UTC` without saying
+  which feed declared `UTC`.
+
 ### Fixed
 
+- `crop_feed` refuses a feed only when a table the crop depends on is cut
+  short, by a row, byte or column budget or an unreadable entry, in the
+  source or in the cropped feed. A reached notice cap (`max_notices_per_file`
+  or the block overlap check cap) no longer refuses it; the cropped feed's
+  notices then include `notice_limit_reached`. São Paulo's SPTrans feed and
+  Westchester's Bee-Line could not be cropped with the default budgets.
+- The refusals of `crop_feed` and `repair_feed` name each file and the
+  budget it exceeded with its value, such as "stops.txt exceeds max_rows
+  (20000000); raise it to crop this feed", instead of "feed exceeds the scan
+  or notice budgets". `repair_feed` still refuses a feed whose notices were
+  sampled, and says so when the cap is one that no budget raises. An
+  `unreadable_file` notice for a violated budget lists it under `budgets`.
 - A zip with up to 64 KiB of bytes after its end-of-central-directory
   record is read instead of refused as "not a readable zip: no
   end-of-central-directory record found", so validation, cropping and
   repair accept it. The feeds of Réseau de transport de Longueuil and CRT
   Lanaudière carry one and two such bytes; Python's `zipfile` reads both.
+- `FeedEditor` reads header names without surrounding whitespace, so
+  `merge_feeds`, `patch_feed` and a saved feed write `agency_name` where the
+  source header says ` agency_name`. Columns that then share a name fold into
+  one, each row keeping the first non-blank value. A merge used to write both
+  names, which cafein could not read, and a padded id column escaped the
+  per-feed prefix. The merge report lists the changed names under
+  `"header_fixes"`, and `patch_feed` logs them as `normalise_headers` actions.
+  One of Greater London's feeds has such a header.
 
 ## 0.16.0 — 2026-09-27
 

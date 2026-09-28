@@ -103,6 +103,28 @@ def test_replaces_broken_trip_with_donor(tmp_path):
     assert read_member(base, "trips.txt") == BASE["trips.txt"]
 
 
+def test_padded_base_header_is_logged(tmp_path):
+    padded = dict(BASE)
+    padded["agency.txt"] = BASE["agency.txt"].replace(
+        "agency_id,agency_name", " agency_id , agency_name", 1
+    )
+    base = write_zip(tmp_path / "base.zip", padded)
+    donor = write_zip(tmp_path / "donor.zip", DONOR)
+    output = tmp_path / "patched.zip"
+    report = patch_feed(base, donor, output)
+    assert report["patches"][0] == {
+        "action": "normalise_headers",
+        "file": "agency.txt",
+        "columns": [
+            {"from": [" agency_id "], "to": "agency_id"},
+            {"from": [" agency_name"], "to": "agency_name"},
+        ],
+    }
+    assert [p["action"] for p in report["patches"][1:]] == ["replace_trip"]
+    header = read_member(output, "agency.txt").splitlines()[0]
+    assert header == "agency_id,agency_name,agency_url,agency_timezone"
+
+
 def test_no_match_raises_with_report_and_written_output(tmp_path):
     base = write_zip(tmp_path / "base.zip", BASE)
     lonely = dict(

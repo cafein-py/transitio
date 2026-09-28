@@ -140,6 +140,42 @@ def _safe_entry_name(name):
     return all(part not in ("", ".", "..") for part in parts)
 
 
+def _normalise_headers(table):
+    """Strip whitespace around a table's header names.
+
+    Columns whose names then coincide fold into one at the first one's
+    position, each row keeping the first non-blank value in column
+    order. Returns the table and one ``{"from": [<original names>],
+    "to": <name>}`` per changed name, in header order.
+    """
+    names = [str(name) for name in table.columns]
+    stripped = [name.strip() for name in names]
+    if stripped == names:
+        return table, []
+    groups = {}
+    for name, target in zip(names, stripped):
+        groups.setdefault(target, []).append(name)
+    fixes = [
+        {"from": sources, "to": target}
+        for target, sources in groups.items()
+        if sources != [target]
+    ]
+    if len(groups) == len(names):
+        table = table.copy(deep=False)
+        table.columns = stripped
+        return table, fixes
+    columns = {}
+    for position, target in enumerate(stripped):
+        values = table.iloc[:, position]
+        if target not in columns:
+            columns[target] = values
+            continue
+        kept = columns[target]
+        take = (kept.str.strip() == "") & (values.str.strip() != "")
+        columns[target] = kept.mask(take, values)
+    return pd.DataFrame(columns, index=table.index), fixes
+
+
 class FeedBuilder:
     """Build a GTFS feed from scratch, one entity at a time.
 
@@ -798,7 +834,10 @@ class FeedEditor(FeedBuilder):
 
     Loads every root-level ``.txt`` table into a string DataFrame in
     :attr:`tables`; anything else in the archive (``locations.geojson``,
-    nested or unknown entries) is preserved verbatim on save. All
+    nested or unknown entries) is preserved verbatim on save. Header
+    names lose surrounding whitespace on load, and columns that then
+    share a name fold into one (the first non-blank value per row wins),
+    so a saved feed writes the normalised header. All
     :class:`FeedBuilder` helpers work for additions, and
     :meth:`~FeedBuilder.save` validates the result.
     """
@@ -806,6 +845,7 @@ class FeedEditor(FeedBuilder):
     def __init__(self, path, *, max_total_bytes=_MAX_TOTAL_BYTES):
         super().__init__()
         self.source = Path(path)
+        self._header_fixes = {}  # filename -> changed header names
         import hashlib
 
         digest = hashlib.sha256()
@@ -831,12 +871,17 @@ class FeedEditor(FeedBuilder):
                 if (info.external_attr >> 16) & 0o170000 == 0o120000:
                     continue  # never carry symlink entries along
                 if name in _GTFS_TABLES:
-                    self.tables[name] = pd.read_csv(
-                        archive.open(name),
-                        dtype=str,
-                        keep_default_na=False,
-                        encoding="utf-8-sig",
+                    table, fixes = _normalise_headers(
+                        pd.read_csv(
+                            archive.open(name),
+                            dtype=str,
+                            keep_default_na=False,
+                            encoding="utf-8-sig",
+                        )
                     )
+                    self.tables[name] = table
+                    if fixes:
+                        self._header_fixes[name] = fixes
                 else:
                     # Unknown files (any extension) are preserved verbatim,
                     # never parsed and rewritten.
