@@ -1,9 +1,14 @@
+import datetime
+import re
+import struct
+
 import pandas as pd
 import pytest
 
 pytest.importorskip("transitio._core")
 
 from transitio.edit import FeedBuilder, FeedEditor  # noqa: E402
+from transitio.exceptions import InvalidFeedError  # noqa: E402
 from transitio.gtfs import merge_feeds, merge_tables  # noqa: E402
 
 
@@ -191,6 +196,7 @@ def _city_in(zone, agency_id="hsl"):
 
 
 HEL, UTC, OSLO = "Europe/Helsinki", "UTC", "Europe/Oslo"
+CET, PARIS, NYC = "CET", "Europe/Paris", "America/New_York"
 
 
 @pytest.mark.parametrize(
@@ -206,8 +212,23 @@ HEL, UTC, OSLO = "Europe/Helsinki", "UTC", "Europe/Oslo"
         ),
         ([HEL, UTC, OSLO], "skip", "fewer than two", None),
         ([HEL, HEL], "maybe", "must be", None),
+        (
+            [UTC, NYC],
+            "refuse",
+            re.escape(f"feed 0 (f1): {UTC}; feed 1 (f2): {NYC}"),
+            None,
+        ),
+        ([UTC, CET, PARIS], "skip", None, [{"feed": 0, "timezones": [UTC]}]),
     ],
-    ids=["refused", "outlier-left-out", "tie-earliest", "too-few-left", "bad-option"],
+    ids=[
+        "refused",
+        "outlier-left-out",
+        "tie-earliest",
+        "too-few-left",
+        "bad-option",
+        "refusal-names-inputs",
+        "equivalent-class-wins",
+    ],
 )
 def test_feeds_of_another_time_zone(tmp_path, zones, timezones, error, skipped):
     feeds = [_city_in(zone, f"a{i}") for i, zone in enumerate(zones)]
@@ -220,8 +241,209 @@ def test_feeds_of_another_time_zone(tmp_path, zones, timezones, error, skipped):
     assert report["skipped_feeds"] == skipped
     # The feeds kept keep the prefixes they had among all the inputs.
     left = {entry["feed"] for entry in skipped}
-    agencies = set(FeedEditor(output).tables["agency.txt"]["agency_id"])
-    assert agencies == {f"f{i + 1}:a{i}" for i in range(len(zones)) if i not in left}
+    agency = FeedEditor(output).tables["agency.txt"]
+    assert set(agency["agency_id"]) == {
+        f"f{i + 1}:a{i}" for i in range(len(zones)) if i not in left
+    }
+    assert agency["agency_timezone"].nunique() == 1
+
+
+def test_equivalent_zone_names_merge_under_the_earliest(tmp_path):
+    output = tmp_path / "merged.zip"
+    feeds = [_city_in(f" {PARIS} ", "a0"), _city_in(CET, "a1")]
+    report = merge_feeds(feeds, output, reference_date="20260601")
+    assert report["timezone_aliases"] == {CET: PARIS}
+    assert set(FeedEditor(output).tables["agency.txt"]["agency_timezone"]) == {PARIS}
+
+
+def _utc(*fields):
+    return datetime.datetime(*fields, tzinfo=datetime.timezone.utc)
+
+
+@pytest.mark.parametrize(
+    "first, second, year, equivalent",
+    [
+        (CET, PARIS, 2026, True),
+        ("America/Montreal", "America/Toronto", 2026, True),
+        (UTC, NYC, 2026, False),
+        ("Mars/Olympus", "Mars/Olympus", 2026, True),
+        ("Mars/Olympus", UTC, 2026, False),
+        ("America/Indiana/Indianapolis", NYC, 2005, False),
+    ],
+    ids=["alias", "link", "other-offset", "unknown-self", "unknown-known", "history"],
+)
+def test_zone_equivalence(first, second, year, equivalent):
+    from transitio.gtfs._merge import _zone_classes
+
+    classes = _zone_classes({first, second}, (_utc(year, 1, 1), _utc(year + 1, 1, 1)))
+    assert (classes[first] == classes[second]) is equivalent
+
+
+def _tzif(changes):
+    """TZif (version 1) bytes of a zone taking each UTC offset from its UTC
+    instant on: ``[(instant, offset seconds), ...]``."""
+    offsets = sorted({offset for _, offset in changes})
+    counts = (0, 0, 0, len(changes), len(offsets), 4)
+    data = [struct.pack(">4sc15x6l", b"TZif", b"\0", *counts)]
+    data += [struct.pack(">l", int(instant.timestamp())) for instant, _ in changes]
+    data.append(bytes(offsets.index(offset) for _, offset in changes))
+    data += [struct.pack(">lBB", offset, 0, 0) for offset in offsets]
+    data.append(b"TST\0")
+    return b"".join(data)
+
+
+@pytest.fixture
+def test_zones(tmp_path):
+    import zoneinfo
+
+    epoch = _utc(1970, 1, 1)
+    summer = [(_utc(2000, 10, 29, 1), 3600)]
+    zones = {
+        "One": [(epoch, 3600)],
+        "OneUntil2012": [(epoch, 3600), (_utc(2012, 1, 1), 7200)],
+        "Early": [(epoch, 3600), (_utc(2000, 3, 26, 1), 7200), *summer],
+        "Late": [(epoch, 3600), (_utc(2000, 3, 26, 1, 30), 7200), *summer],
+        "At0105": [(epoch, 3600), (_utc(2000, 3, 26, 1, 5), 7200), *summer],
+        "At0110": [(epoch, 3600), (_utc(2000, 3, 26, 1, 10), 7200), *summer],
+    }
+    root = tmp_path / "zoneinfo"
+    (root / "Test").mkdir(parents=True)
+    for name, changes in zones.items():
+        (root / "Test" / name).write_bytes(_tzif(changes))
+    original = zoneinfo.TZPATH
+    zoneinfo.reset_tzpath(to=[str(root), *original])
+    zoneinfo.ZoneInfo.clear_cache()
+    yield
+    zoneinfo.reset_tzpath(to=original)
+    zoneinfo.ZoneInfo.clear_cache()
+
+
+def _timed_city(index, zone, dates, last, frequency_end, days, removed):
+    builder = FeedBuilder()
+    builder.add_agency(f"a{index}", "Agency", "https://a.example", zone)
+    builder.add_stop("s1", "First", 60.169, 24.931)
+    builder.add_stop("s2", "Second", 60.171, 24.941)
+    builder.add_route("r1", 0, "1", agency_id=f"a{index}")
+    builder.add_service("wk", days, *dates)
+    if removed:
+        row = {"service_id": "wk", "date": removed, "exception_type": "2"}
+        builder.insert_rows("calendar_dates.txt", [row])
+    if frequency_end:
+        stops = [("s1", 0), ("s2", "01:30:00")]
+        builder.add_frequency_trip(
+            "r1", "wk", "t1", stops, start=0, end=frequency_end, headway=600
+        )
+    else:
+        stops = [("s1", "08:00:00", "08:00:00"), ("s2", last, last)]
+        builder.add_trip("r1", "wk", "t1", stops)
+    return builder
+
+
+Y2000, H1_2000 = ("20000101", "20001231"), ("20000101", "20000630")
+FROM_2000 = "1999-12-31T10:00:00+00:00"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(
+            {
+                "dates": [("20000101", "20201231")] * 2,
+                "interval": [FROM_2000, "2010-01-01T00:00:00+00:00"],
+            },
+            id="differs-after-clip",
+        ),
+        pytest.param({"zones": ["Test/Early", "Test/Late"]}, id="changes-30-min-apart"),
+        pytest.param(
+            {
+                "zones": ["Test/At0105", "Test/At0110"],
+                "interval": [FROM_2000, "2001-01-01T12:00:00+00:00"],
+            },
+            id="differs-between-quarters",
+        ),
+        pytest.param(
+            {
+                "dates": [H1_2000] * 2,
+                "last": "49:10:00",
+                "interval": [FROM_2000, "2000-07-03T12:00:00+00:00"],
+            },
+            id="late-stop-time",
+        ),
+        pytest.param(
+            {
+                "dates": [H1_2000] * 2,
+                "last": "1234567:00:00",
+                "interval": [FROM_2000, "2010-01-01T00:00:00+00:00"],
+            },
+            id="seven-digit-hour",
+        ),
+        pytest.param(
+            {
+                "dates": [H1_2000] * 2,
+                "frequency_end": "47:00:00",
+                "interval": [FROM_2000, "2000-07-03T12:00:00+00:00"],
+            },
+            id="late-frequency",
+        ),
+        pytest.param(
+            {
+                "days": "weekdays",
+                "removed": "20000103",
+                "interval": ["2000-01-03T10:00:00+00:00", "2000-12-30T12:00:00+00:00"],
+            },
+            id="first-and-last-running-days",
+        ),
+        pytest.param(
+            {
+                "dates": [("19700101", "19751231")] * 2,
+                "interval": ["2000-01-01T00:00:00+00:00", "2001-01-01T00:00:00+00:00"],
+            },
+            id="service-before-clip",
+        ),
+        pytest.param(
+            {
+                "dates": [("19700101", "19751231"), ("20150101", "20151231")],
+                "interval": ["2000-01-01T00:00:00+00:00", "2001-01-01T00:00:00+00:00"],
+            },
+            id="service-around-clip",
+        ),
+    ],
+)
+def test_timezone_interval(tmp_path, monkeypatch, test_zones, case):
+    case = {
+        "zones": ["Test/One", "Test/OneUntil2012"],
+        "dates": [Y2000] * 2,
+        "last": "08:05:00",
+        "frequency_end": None,
+        "days": "daily",
+        "removed": None,
+        "interval": None,
+        **case,
+    }
+    monkeypatch.setattr(
+        "transitio.gtfs._merge._today", lambda: datetime.date(2000, 1, 1)
+    )
+    paths = []
+    for index, (zone, dates) in enumerate(zip(case["zones"], case["dates"])):
+        builder = _timed_city(
+            index,
+            zone,
+            dates,
+            case["last"],
+            case["frequency_end"],
+            case["days"],
+            case["removed"],
+        )
+        paths.append(tmp_path / f"in{index}.zip")
+        builder.save(paths[-1], check=False)
+    output = tmp_path / "merged.zip"
+    if case["interval"] is None:
+        names = re.escape(f"feed 0 (f1, {paths[0]}): {case['zones'][0]}")
+        with pytest.raises(InvalidFeedError, match=names):
+            merge_feeds(paths, output, check=False)
+        return
+    report = merge_feeds(paths, output, check=False)
+    assert report["timezone_interval"] == case["interval"]
 
 
 def test_zones_tied_in_one_feed_resolve_by_name():

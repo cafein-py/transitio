@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+
+- `merge_feeds` and `merge_tables` merge inputs whose `agency_timezone` names
+  differ but denote the same clock, such as `CET` and `Europe/Paris` (Paris),
+  or `America/Montreal` and `America/Toronto` (Montréal). Two names are
+  equivalent when the tz database knows both and their UTC offsets agree at
+  every quarter hour of the inputs' service, from the earliest service date
+  to the latest plus its latest stop time, within 20 years before and 10
+  years after today. `timezones="skip"` counts equivalent names as one zone.
+  The merged `agency.txt` uses the name most inputs declare, and the report
+  gains `"timezone_interval"` (the UTC instants compared) and
+  `"timezone_aliases"` (each name replaced and the name used). A refusal now
+  names each input with its zones, by position, prefix and path: New York's
+  merge of 45 feeds stopped on `America/New_York` and `UTC` without saying
+  which feed declared `UTC`.
+
 ### Fixed
 
 - `FeedEditor` reads header names without surrounding whitespace, so

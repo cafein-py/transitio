@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import datetime
+import math
+
 import pandas as pd
 
 from transitio.exceptions import InvalidFeedError
@@ -80,6 +83,18 @@ _ID_COLUMNS = {
 # Per-source-feed metadata that cannot describe a merger (feed_info) or
 # whose record references break under id renaming (translations).
 _DROPPED_TABLES = ("feed_info.txt", "translations.txt")
+
+# UTC offsets reach from -12:00 to +14:00, so these margins take in every
+# zone's local service day.
+_EAST_MARGIN = datetime.timedelta(hours=14)
+_WEST_MARGIN = datetime.timedelta(hours=12)
+# Time zones are compared no further back and ahead of today than this.
+_PAST_YEARS = 20
+_FUTURE_YEARS = 10
+
+
+class _TimezoneRefusal(InvalidFeedError, ValueError):
+    """Inputs whose agency time zones cannot share one dataset."""
 
 
 def _clean_prefixes(prefixes, count):
@@ -190,6 +205,20 @@ def merge_tables(table_sets, *, prefixes=None, extra_entries=None):
     widen from "this feed" to the whole merged feed, as does a
     dataset-wide (all-blank) ``attributions.txt`` row.
 
+    The inputs' ``agency_timezone`` names must be equivalent, or the
+    merge raises :class:`~transitio.exceptions.InvalidFeedError`, which is
+    also a ``ValueError``, naming each input's zones. Two names are
+    equivalent when the tz database (``zoneinfo``) knows both and their
+    UTC offsets are equal at every quarter hour of one interval: from the
+    earliest service date's start anywhere on Earth to the latest service
+    date's end, extended by the latest stop time (or frequency window end
+    plus its trip's span) in days, rounded up. Only service dates from 20
+    years before today to 10 years after count, and the interval is
+    clipped to them; with no service dates there, it is today and the
+    year after. An unknown name is equivalent only to itself. The
+    merged ``agency.txt`` then uses the name most inputs declare (ties:
+    the earliest input's) for every agency; ``stop_timezone`` is kept.
+
     Parameters
     ----------
     table_sets : sequence of dict
@@ -209,6 +238,19 @@ def merge_tables(table_sets, *, prefixes=None, extra_entries=None):
         ``(tables, dropped)`` — the merged tables dict and the sorted
         list of file names discarded by the merge.
     """
+    tables, dropped, _ = _merge_tables(
+        table_sets, prefixes=prefixes, extra_entries=extra_entries
+    )
+    return tables, dropped
+
+
+def _merge_tables(
+    table_sets, *, prefixes, extra_entries, interval=None, classes=None, labels=None
+):
+    """:func:`merge_tables`, plus the time zone details the merge report
+    carries; ``interval`` and ``classes`` may come from a caller that
+    compared the zones already, and ``labels`` name the inputs in a
+    refusal."""
     table_sets = list(table_sets)
     if len(table_sets) < 2:
         raise ValueError("need at least two feeds to merge")
@@ -220,22 +262,34 @@ def merge_tables(table_sets, *, prefixes=None, extra_entries=None):
         if len(extra_entries) != len(table_sets):
             raise ValueError("extra_entries must match the number of feeds")
 
-    timezones = set()
+    if labels is None:
+        labels = [f"feed {i} ({prefix})" for i, prefix in enumerate(prefixes)]
     defaulted = 0
     for tables, extras, prefix in zip(table_sets, extra_entries, prefixes):
         _reject_flex(tables, extras, prefix)
-        agency = tables.get("agency.txt")
-        if agency is not None and "agency_timezone" in agency.columns:
-            timezones |= {
-                value.strip() for value in agency["agency_timezone"] if value.strip()
-            }
         riders = tables.get("rider_categories.txt")
         if riders is not None and "is_default_fare_category" in riders.columns:
             if (riders["is_default_fare_category"].str.strip() == "1").any():
                 defaulted += 1
-    if len(timezones) > 1:
-        # The spec requires one agency_timezone across a dataset.
-        raise ValueError(f"agency timezones differ across feeds: {sorted(timezones)}")
+    declared = [_timezones(tables) for tables in table_sets]
+    zones = set().union(*declared)
+    aliases = {}
+    if len(zones) > 1:
+        if classes is None:
+            interval = _timezone_interval(table_sets)
+            classes = _zone_classes(zones, interval)
+        if len({classes[zone] for zone in zones}) > 1:
+            # The spec requires one agency_timezone across a dataset.
+            raise _TimezoneRefusal(
+                "agency timezones differ across feeds: "
+                + "; ".join(
+                    f"{label}: {', '.join(sorted(found))}"
+                    for label, found in zip(labels, declared)
+                    if found
+                )
+            )
+        used = _most_declared(declared)
+        aliases = {zone: used for zone in sorted(zones) if zone != used}
     if defaulted > 1:
         raise ValueError(
             "more than one feed declares a default rider category "
@@ -253,7 +307,17 @@ def merge_tables(table_sets, *, prefixes=None, extra_entries=None):
         for filename, tables in parts.items()
     }
     _normalise_networks(merged)
-    return merged, sorted(dropped)
+    if aliases:
+        agency = merged["agency.txt"]
+        filled = agency["agency_timezone"].str.strip() != ""
+        agency.loc[filled, "agency_timezone"] = used
+    details = {
+        "timezone_interval": (
+            None if interval is None else [instant.isoformat() for instant in interval]
+        ),
+        "timezone_aliases": aliases,
+    }
+    return merged, sorted(dropped), details
 
 
 def _timezones(tables):
@@ -263,24 +327,132 @@ def _timezones(tables):
     return {value.strip() for value in agency["agency_timezone"] if value.strip()}
 
 
-def _timezone_outliers(table_sets):
-    """``{position: [time zones]}`` for the feeds declaring a time zone other
-    than the one most feeds declare (ties: the earliest feed's, then the
-    first by name); a feed that declares none differs from nothing."""
-    declared = [_timezones(tables) for tables in table_sets]
+def _most_declared(declared):
+    """The key most inputs declare (ties: the earliest input's, then the
+    least key), from one set of keys per input."""
     counts, first = {}, {}
-    for position, zones in enumerate(declared):
-        for zone in zones:
-            counts[zone] = counts.get(zone, 0) + 1
-            first.setdefault(zone, position)
-    if len(counts) < 2:
+    for position, keys in enumerate(declared):
+        for key in keys:
+            counts[key] = counts.get(key, 0) + 1
+            first.setdefault(key, position)
+    return min(counts, key=lambda key: (-counts[key], first[key], key))
+
+
+def _timezone_outliers(table_sets, classes=None):
+    """``{position: [time zones]}`` for the feeds declaring a time zone not
+    equivalent to the one most feeds declare (ties: the earliest feed's,
+    then the first by name); a feed that declares none differs from
+    nothing."""
+    declared = [_timezones(tables) for tables in table_sets]
+    zones = set().union(*declared)
+    if len(zones) < 2:
         return {}
-    common = min(counts, key=lambda zone: (-counts[zone], first[zone], zone))
+    if classes is None:
+        classes = _zone_classes(zones, _timezone_interval(table_sets))
+    grouped = [{classes[zone] for zone in found} for found in declared]
+    if len(set().union(*grouped)) < 2:
+        return {}
+    common = _most_declared(grouped)
     return {
-        position: sorted(zones)
-        for position, zones in enumerate(declared)
-        if zones - {common}
+        position: sorted(found)
+        for position, (found, groups) in enumerate(zip(declared, grouped))
+        if groups - {common}
     }
+
+
+def _today():
+    return datetime.datetime.now(datetime.timezone.utc).date()
+
+
+def _years_on(day, years):
+    try:
+        return day.replace(year=day.year + years)
+    except ValueError:  # 29 February
+        return day.replace(year=day.year + years, day=28)
+
+
+def _midnight(day):
+    return datetime.datetime.combine(day, datetime.time(), datetime.timezone.utc)
+
+
+def _latest_service_time(tables):
+    """Seconds after midnight of the latest service: the largest stop time,
+    or a frequency window's end plus its template trip's span."""
+    from transitio.gtfs._schedule import clock_seconds
+
+    stop_times = tables.get("stop_times.txt", pd.DataFrame())
+    times = pd.DataFrame(
+        {
+            column: clock_seconds(stop_times[column])
+            for column in ("arrival_time", "departure_time")
+            if column in stop_times.columns
+        },
+        index=stop_times.index,
+    )
+    latest = [times.max().max()]
+    frequencies = tables.get("frequencies.txt")
+    if frequencies is not None and "end_time" in frequencies.columns:
+        span = 0.0
+        if "trip_id" in frequencies.columns and "trip_id" in stop_times.columns:
+            template = stop_times["trip_id"].isin(frequencies["trip_id"])
+            trips = stop_times.loc[template, "trip_id"]
+            rows = times[template]
+            spans = rows.max(axis=1).groupby(trips).max()
+            spans -= rows.min(axis=1).groupby(trips).min()
+            span = frequencies["trip_id"].map(spans).fillna(0.0)
+        latest.append((clock_seconds(frequencies["end_time"]) + span).max())
+    return max((value for value in latest if pd.notna(value)), default=0.0)
+
+
+def _timezone_interval(table_sets):
+    """The UTC instants ``(start, end)`` over which time zones are compared.
+
+    Service dates count from 20 years before today to 10 years after. The
+    interval runs from 00:00 UTC on the earliest of them, less 14 hours, to
+    00:00 UTC on the latest plus ``d`` days and 12 hours, ``d`` being the
+    latest service-relative time in days, rounded up and at least 1, and is
+    clipped to the same 30 years. Inputs with no service dates there use
+    today and the year after.
+    """
+    from transitio.gtfs._schedule import service_span
+
+    today = _today()
+    low, high = _years_on(today, -_PAST_YEARS), _years_on(today, _FUTURE_YEARS)
+    spans = [service_span(tables, (low, high)) for tables in table_sets]
+    spans = [span for span in spans if span is not None]
+    if not spans:
+        return _midnight(today), _midnight(_years_on(today, 1))
+    latest = max(_latest_service_time(tables) for tables in table_sets)
+    days = datetime.timedelta(days=max(1, math.ceil(latest / 86400)))
+    start = _midnight(min(first for first, _ in spans)) - _EAST_MARGIN
+    end = _midnight(max(last for _, last in spans)) + days + _WEST_MARGIN
+    return max(start, _midnight(low)), min(end, _midnight(high))
+
+
+def _zone_classes(names, interval):
+    """``{name: class}`` for time zone names, a class being the sorted names
+    whose UTC offsets agree at every quarter hour of ``interval``; a name the
+    tz database does not know forms a class of its own."""
+    import hashlib
+    import zoneinfo
+
+    known = zoneinfo.available_timezones()
+    instants = pd.date_range(*interval, freq="15min")
+    universal = instants.tz_localize(None)
+    classes = {}
+    for name in sorted(names):
+        key = ("unknown", name)
+        if name in known:
+            try:
+                zone = zoneinfo.ZoneInfo(name)
+            except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
+                zone = None
+            if zone is not None:
+                # Offset vectors compare by digest, so only one is held.
+                offsets = instants.tz_convert(zone).tz_localize(None) - universal
+                key = hashlib.sha256(offsets.to_numpy().tobytes()).digest()
+        classes.setdefault(key, []).append(name)
+    return {name: tuple(members) for members in classes.values() for name in members}
 
 
 def merge_feeds(
@@ -306,13 +478,15 @@ def merge_feeds(
         validator reports ERROR-severity notices (the report is on the
         exception and the file is still written).
     timezones : {"refuse", "skip"}, default "refuse"
-        Feeds declaring different ``agency_timezone`` values cannot share
-        one dataset. ``"refuse"`` raises ``ValueError``; ``"skip"`` leaves
-        out the feeds whose time zone differs from the one most feeds
-        declare (ties: the earliest feed's, then the first by name) and
-        merges the rest, each
-        keeping the prefix it had among all the inputs. Fewer than two
-        feeds left still raises.
+        Feeds declaring ``agency_timezone`` names that are not equivalent
+        (see :func:`merge_tables`) cannot share one dataset. ``"refuse"``
+        raises :class:`~transitio.exceptions.InvalidFeedError` (also a
+        ``ValueError``) naming each input with its zones, by position,
+        prefix and path; ``"skip"`` leaves out the feeds whose time zone is not
+        equivalent to the one most feeds declare (ties: the earliest
+        feed's, then the first by name) and merges the rest, each keeping
+        the prefix it had among all the inputs. Fewer than two feeds left
+        still raises.
     **budgets
         ``validate_feed`` keyword arguments.
 
@@ -327,6 +501,10 @@ def merge_feeds(
         an input was read (see :class:`~transitio.edit.FeedEditor`), one
         ``{"feed": <input position>, "file": ..., "columns": [{"from":
         [<original names>], "to": <name>}, ...]}`` per input and file.
+        ``"timezone_interval"`` gives the UTC instants ``[start, end]``
+        (ISO 8601) over which time zone names are compared, and
+        ``"timezone_aliases"`` maps each ``agency_timezone`` name replaced
+        to the name used.
     """
     from transitio.edit import FeedBuilder, FeedEditor
 
@@ -338,6 +516,7 @@ def merge_feeds(
     table_sets = []
     extra_entries = []
     header_fixes = []
+    sources = []
     for position, feed in enumerate(feeds):
         if getattr(feed, "tables", None) is None:
             feed = FeedEditor(feed)
@@ -348,35 +527,56 @@ def merge_feeds(
         )
         table_sets.append(feed.tables)
         extra_entries.append(list(getattr(feed, "_extra_entries", {})))
+        sources.append(getattr(feed, "source", None))
+    names = _clean_prefixes(prefixes, len(table_sets))
+    labels = [
+        (
+            f"feed {position} ({name})"
+            if source is None
+            else f"feed {position} ({name}, {source})"
+        )
+        for position, (name, source) in enumerate(zip(names, sources))
+    ]
+    interval, classes = _timezone_interval(table_sets), None
+    zones = set().union(*(_timezones(tables) for tables in table_sets))
+    if len(zones) > 1:
+        classes = _zone_classes(zones, interval)
     skipped = []
-    outliers = _timezone_outliers(table_sets) if timezones == "skip" else {}
+    outliers = _timezone_outliers(table_sets, classes) if timezones == "skip" else {}
     if outliers:
         kept = [i for i in range(len(table_sets)) if i not in outliers]
         if len(kept) < 2:
             raise ValueError(
                 f"fewer than two feeds share a time zone: {sorted(outliers.values())}"
             )
-        names = _clean_prefixes(prefixes, len(table_sets))
         skipped = [
             {"feed": position, "timezones": zones}
             for position, zones in sorted(outliers.items())
         ]
         table_sets = [table_sets[i] for i in kept]
         extra_entries = [extra_entries[i] for i in kept]
-        prefixes = [names[i] for i in kept]
-    tables, dropped = merge_tables(
-        table_sets, prefixes=prefixes, extra_entries=extra_entries
+        names = [names[i] for i in kept]
+        labels = [labels[i] for i in kept]
+    tables, dropped, details = _merge_tables(
+        table_sets,
+        prefixes=names,
+        extra_entries=extra_entries,
+        interval=interval,
+        classes=classes,
+        labels=labels,
     )
+    extra = {
+        "dropped_files": dropped,
+        "skipped_feeds": skipped,
+        "header_fixes": header_fixes,
+        **details,
+    }
     builder = FeedBuilder()
     builder.tables = tables
     try:
         report = builder.save(output, check=check, **budgets)
     except InvalidFeedError as error:
-        error.report["dropped_files"] = dropped
-        error.report["skipped_feeds"] = skipped
-        error.report["header_fixes"] = header_fixes
+        error.report.update(extra)
         raise
-    report["dropped_files"] = dropped
-    report["skipped_feeds"] = skipped
-    report["header_fixes"] = header_fixes
+    report.update(extra)
     return report
