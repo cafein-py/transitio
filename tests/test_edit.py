@@ -5,7 +5,11 @@ import pytest
 pytest.importorskip("transitio._core")
 
 from transitio.edit import FeedBuilder, FeedEditor  # noqa: E402
-from transitio.edit._editor import format_gtfs_time, parse_gtfs_time  # noqa: E402
+from transitio.edit._editor import (  # noqa: E402
+    _normalise_headers,
+    format_gtfs_time,
+    parse_gtfs_time,
+)
 from transitio.exceptions import InvalidFeedError  # noqa: E402
 
 
@@ -182,6 +186,40 @@ def test_gtfs_time_helpers():
         parse_gtfs_time("8h30")
     with pytest.raises(ValueError):
         format_gtfs_time(-1)
+
+
+@pytest.mark.parametrize(
+    "columns, expected, fixes",
+    [
+        (
+            {"agency_id": ["a"], " agency_name": ["A"]},
+            {"agency_id": ["a"], "agency_name": ["A"]},
+            [{"from": [" agency_name"], "to": "agency_name"}],
+        ),
+        (
+            {
+                "agency_name": ["A", "", " "],
+                "agency_url": ["u", "v", "w"],
+                " agency_name": ["X", "B", ""],
+            },
+            {"agency_name": ["A", "B", " "], "agency_url": ["u", "v", "w"]},
+            [{"from": ["agency_name", " agency_name"], "to": "agency_name"}],
+        ),
+        ({"stop_id": ["1"]}, {"stop_id": ["1"]}, []),
+        (
+            {" stop_id ": ["1"], "stop_name": ["K"]},
+            {"stop_id": ["1"], "stop_name": ["K"]},
+            [{"from": [" stop_id "], "to": "stop_id"}],
+        ),
+    ],
+    ids=["padded", "padded-duplicate", "clean", "padded-id"],
+)
+def test_normalise_headers(columns, expected, fixes):
+    import pandas as pd
+
+    table, changed = _normalise_headers(pd.DataFrame(columns, dtype=str))
+    pd.testing.assert_frame_equal(table, pd.DataFrame(expected, dtype=str))
+    assert changed == fixes
 
 
 def test_save_refuses_symlink_staging(tmp_path):

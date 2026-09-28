@@ -322,7 +322,11 @@ def merge_feeds(
         The ``validate_feed`` report of the written feed, with a
         ``"dropped_files"`` key listing what the merge discarded and a
         ``"skipped_feeds"`` key listing the feeds left out, one
-        ``{"feed": <input position>, "timezones": [...]}`` each.
+        ``{"feed": <input position>, "timezones": [...]}`` each, and a
+        ``"header_fixes"`` key listing the header names normalised when
+        an input was read (see :class:`~transitio.edit.FeedEditor`), one
+        ``{"feed": <input position>, "file": ..., "columns": [{"from":
+        [<original names>], "to": <name>}, ...]}`` per input and file.
     """
     from transitio.edit import FeedBuilder, FeedEditor
 
@@ -333,16 +337,17 @@ def merge_feeds(
         raise ValueError("need at least two feeds to merge")
     table_sets = []
     extra_entries = []
-    for feed in feeds:
-        tables = getattr(feed, "tables", None)
-        if tables is None:
-            editor = FeedEditor(feed)
-            tables = editor.tables
-            extras = editor._extra_entries
-        else:
-            extras = getattr(feed, "_extra_entries", {})
-        table_sets.append(tables)
-        extra_entries.append(list(extras))
+    header_fixes = []
+    for position, feed in enumerate(feeds):
+        if getattr(feed, "tables", None) is None:
+            feed = FeedEditor(feed)
+        fixes = getattr(feed, "_header_fixes", {})
+        header_fixes.extend(
+            {"feed": position, "file": name, "columns": fixes[name]}
+            for name in sorted(fixes)
+        )
+        table_sets.append(feed.tables)
+        extra_entries.append(list(getattr(feed, "_extra_entries", {})))
     skipped = []
     outliers = _timezone_outliers(table_sets) if timezones == "skip" else {}
     if outliers:
@@ -369,7 +374,9 @@ def merge_feeds(
     except InvalidFeedError as error:
         error.report["dropped_files"] = dropped
         error.report["skipped_feeds"] = skipped
+        error.report["header_fixes"] = header_fixes
         raise
     report["dropped_files"] = dropped
     report["skipped_feeds"] = skipped
+    report["header_fixes"] = header_fixes
     return report

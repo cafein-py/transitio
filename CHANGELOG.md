@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- `FeedEditor` reads header names without surrounding whitespace, so
+  `merge_feeds`, `patch_feed` and a saved feed write `agency_name` where the
+  source header says ` agency_name`. Columns that then share a name fold into
+  one, each row keeping the first non-blank value. A merge used to write both
+  names, which cafein could not read, and a padded id column escaped the
+  per-feed prefix. The merge report lists the changed names under
+  `"header_fixes"`, and `patch_feed` logs them as `normalise_headers` actions.
+  One of Greater London's feeds has such a header.
+
 ## 0.16.0 — 2026-09-27
 
 ### Added

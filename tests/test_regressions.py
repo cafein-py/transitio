@@ -335,3 +335,43 @@ def test_the_feed_margin_does_not_favour_an_alias_over_a_name():
     with pytest.raises(AmbiguousPlaceError):
         lookup.resolve("Kingston")
     assert lookup.resolve("Bogota").id == "c-bog"
+
+
+def test_padded_header_names_merge_into_one_column(tmp_path):
+    # A padded agency.txt header used to reach the merge verbatim, which
+    # then wrote both agency_name and " agency_name", and the padded id
+    # column escaped the per-feed prefix.
+    from transitio.edit import FeedEditor
+    from transitio.gtfs import merge_feeds
+
+    padded = dict(FEED)
+    padded["agency.txt"] = FEED["agency.txt"].replace(
+        "agency_id,agency_name", " agency_id , agency_name", 1
+    )
+    feeds = [
+        write_zip(tmp_path / "padded.zip", padded),
+        write_zip(tmp_path / "clean.zip", FEED),
+    ]
+    output = tmp_path / "merged.zip"
+    report = merge_feeds(feeds, output, reference_date="20260601")
+    assert not any(n["severity"] == "ERROR" for n in report["notices"])
+    header = read_entry(output, "agency.txt").decode().splitlines()[0]
+    assert header == "agency_id,agency_name,agency_url,agency_timezone"
+    merged = FeedEditor(output).tables
+    agencies = ["f1:hsl", "f1:espoo", "f2:hsl", "f2:espoo"]
+    assert list(merged["agency.txt"]["agency_id"]) == agencies
+    assert set(merged["routes.txt"]["agency_id"]) == set(agencies)
+    assert report["header_fixes"] == [
+        {
+            "feed": 0,
+            "file": "agency.txt",
+            "columns": [
+                {"from": [" agency_id "], "to": "agency_id"},
+                {"from": [" agency_name"], "to": "agency_name"},
+            ],
+        }
+    ]
+    clean = merge_feeds(
+        [feeds[1], feeds[1]], tmp_path / "twice.zip", reference_date="20260601"
+    )
+    assert clean["header_fixes"] == []

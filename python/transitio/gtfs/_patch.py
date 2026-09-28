@@ -71,7 +71,11 @@ def patch_feed(base, donor, output, *, when=None, check=True, **budgets):
     full referential closure, and every action is logged with donor
     provenance. The gtfstidy semantic-equivalence guarantee does NOT
     hold here: the donor timetable may genuinely differ, so patching is
-    opt-in and the report states what changed.
+    opt-in and the report states what changed. Header names are
+    normalised as the feeds are read (see
+    :class:`~transitio.edit.FeedEditor`); each base file whose header
+    changed is logged first, as ``{"action": "normalise_headers",
+    "file": ..., "columns": [{"from": [...], "to": ...}, ...]}``.
 
     Parameters
     ----------
@@ -202,6 +206,11 @@ def _patch(base, donor, output, broken, donor_bad, patches, check, budgets, Patc
 
     base_editor = FeedEditor(base)
     donor_editor = FeedEditor(donor)
+    fixes = base_editor._header_fixes
+    for name in sorted(fixes):
+        patches.append(
+            {"action": "normalise_headers", "file": name, "columns": fixes[name]}
+        )
     base_tables = base_editor.tables
     donor_tables = donor_editor.tables
     _reject_flex(base_tables, base_editor._extra_entries, "base feed")
