@@ -17,7 +17,12 @@ pub fn run_rules(result: &mut ScanResult, options: &ScanOptions) {
     for (name, table) in &result.tables {
         field_rules(name, table, &mut samplers, &mut notices);
     }
-    conditional_rules(&result.tables, &mut samplers, &mut notices);
+    conditional_rules(
+        &result.tables,
+        &result.incomplete,
+        &mut samplers,
+        &mut notices,
+    );
     reference_rules(
         &result.tables,
         &result.incomplete,
@@ -433,6 +438,7 @@ fn value<'t>(table: &'t Table, row: &'t crate::scan::Row, name: &str) -> &'t str
 
 fn conditional_rules(
     tables: &BTreeMap<String, Table>,
+    incomplete: &std::collections::BTreeSet<String>,
     samplers: &mut Samplers,
     notices: &mut Vec<Notice>,
 ) {
@@ -518,6 +524,24 @@ fn conditional_rules(
             .map(|agency| agency.rows.len() > 1)
             .unwrap_or(false);
         let sampler = samplers.file("routes.txt");
+        // A routes.txt network_id column forbids both network files; the
+        // column decides, not its values.
+        if column_index(routes, "network_id").is_some() {
+            for other in ["route_networks.txt", "networks.txt"] {
+                if tables.contains_key(other) || incomplete.contains(other) {
+                    sampler.push(
+                        notices,
+                        Notice::new(
+                            "route_networks_specified_in_more_than_one_file",
+                            Severity::Error,
+                        )
+                        .with("fileNameA", "routes.txt")
+                        .with("fileNameB", other)
+                        .with("fieldName", "network_id"),
+                    );
+                }
+            }
+        }
         for row in &routes.rows {
             // With multiple agencies every route must name its agency.
             if multiple_agencies && value(routes, row, "agency_id").is_empty() {
@@ -696,7 +720,6 @@ fn reference_rules(
     let fares = collect("fare_attributes.txt", "fare_id");
     let location_groups = collect("location_groups.txt", "location_group_id");
     let booking_rules = collect("booking_rules.txt", "booking_rule_id");
-    let networks = collect("networks.txt", "network_id");
     let mut services = collect("calendar.txt", "service_id");
     services.extend(collect("calendar_dates.txt", "service_id"));
     let services_incomplete =
@@ -741,13 +764,6 @@ fn reference_rules(
             "booking_rules.txt",
             "booking_rule_id",
             &booking_rules,
-        ),
-        (
-            "routes.txt",
-            "network_id",
-            "networks.txt",
-            "network_id",
-            &networks,
         ),
         (
             "stops.txt",
@@ -1106,6 +1122,52 @@ mod tests {
             .filter(|n| n.code == "foreign_key_violation")
             .collect();
         assert_eq!(violations.len(), 2, "got: {violations:?}");
+    }
+
+    #[test]
+    fn routes_network_id_forbids_network_files() {
+        let valued = "route_id,agency_id,route_short_name,route_type,network_id\nr1,hsl,1,3,cts\n";
+        let blank = "route_id,agency_id,route_short_name,route_type,network_id\nr1,hsl,1,3,\n";
+        let no_column = "route_id,agency_id,route_short_name,route_type\nr1,hsl,1,3\n";
+        let networks = ("networks.txt", "network_id,network_name\nother,Other\n");
+        let route_networks = ("route_networks.txt", "network_id,route_id\nother,r1\n");
+        // Over the delimiter guard: unreadable, so incomplete and not parsed.
+        let flooded: &'static str = Box::leak(format!("network_id{}\n", ",".repeat(5000)).into());
+        let cases = vec![
+            (valued, vec![], vec![]),
+            (valued, vec![networks], vec!["networks.txt"]),
+            (
+                valued,
+                vec![networks, route_networks],
+                vec!["route_networks.txt", "networks.txt"],
+            ),
+            (
+                valued,
+                vec![("networks.txt", flooded)],
+                vec!["networks.txt"],
+            ),
+            (blank, vec![route_networks], vec!["route_networks.txt"]),
+            (no_column, vec![route_networks], vec![]),
+        ];
+        for (routes, extra, expected) in cases {
+            let mut files = minimal();
+            replace(&mut files, "routes.txt", routes);
+            files.extend(extra);
+            let result = validate_zip(&files);
+            let named: Vec<_> = result
+                .notices
+                .iter()
+                .filter(|n| n.code == "route_networks_specified_in_more_than_one_file")
+                .map(|n| {
+                    assert_eq!(n.severity, Severity::Error);
+                    assert_eq!(n.context["fileNameA"], "routes.txt");
+                    assert_eq!(n.context["fieldName"], "network_id");
+                    n.context["fileNameB"].as_str().unwrap()
+                })
+                .collect();
+            assert_eq!(named, expected, "routes: {routes:?}");
+            assert!(!codes(&result).contains(&"foreign_key_violation"));
+        }
     }
 
     #[test]

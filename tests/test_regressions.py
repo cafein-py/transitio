@@ -1,5 +1,7 @@
 """Regression tests, one per fixed defect."""
 
+import csv
+import io
 import zipfile
 
 import pytest
@@ -165,6 +167,25 @@ def test_unparsed_entries_survive_rewrites(tmp_path):
     crop_feed(source, cropped, aoi=WIDE_BBOX, reference_date="20260601")
     assert read_entry(cropped, "locations.geojson") == geojson
     assert read_entry(cropped, "notes.md") == notes
+
+
+def test_route_network_ids_are_not_dangling_references(tmp_path):
+    # routes.network_id was checked against networks.txt, so a feed without
+    # that file had every value reported as a foreign_key_violation error,
+    # and repair cleared them all.
+    files = dict(FEED)
+    files["routes.txt"] = (
+        "route_id,agency_id,route_short_name,route_type,network_id\n"
+        "r-in,hsl,1,3,CTS\nr-out,espoo,2,3,CTS\n"
+    )
+    source = write_zip(tmp_path / "feed.zip", files)
+    repaired = tmp_path / "repaired.zip"
+    result = repair_feed(source, repaired, reference_date="20260601")
+    assert not any(
+        n["code"] == "foreign_key_violation" for n in result["remaining_notices"]
+    )
+    routes = csv.DictReader(io.StringIO(read_entry(repaired, "routes.txt").decode()))
+    assert [row["network_id"] for row in routes] == ["CTS", "CTS"]
 
 
 def test_bytes_after_the_end_record_do_not_refuse_the_archive(tmp_path):

@@ -37,7 +37,6 @@ const FIELD_DEFAULTS: &[(&str, &str, &str)] = &[
 const CLEARABLE_REFERENCES: &[(&str, &str)] = &[
     ("trips.txt", "shape_id"),
     ("stops.txt", "level_id"),
-    ("routes.txt", "network_id"),
     ("fare_attributes.txt", "agency_id"),
     ("attributions.txt", "agency_id"),
     ("attributions.txt", "route_id"),
