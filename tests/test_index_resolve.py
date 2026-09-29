@@ -193,11 +193,6 @@ def test_new_york_alone_is_ambiguous_across_kinds(idx):
     assert {c.id for c in caught.value.candidates} == {"Q60", "Q1384", "Q1109190"}
 
 
-def test_no_match_raises_place_not_found(idx):
-    with pytest.raises(PlaceNotFoundError):
-        transitio_index.place("Atlantis", index=idx)
-
-
 def test_places_lists_candidates_ranked_by_match_then_kind(idx):
     found = transitio_index.places("new york", index=idx)
     # Exact matches (city, then region by kind precedence) before the token-subset
@@ -325,9 +320,32 @@ def test_a_suggestion_names_the_label_that_matched_and_the_one_to_show(idx):
         transitio_index.suggest("new", limit=1.5, index=idx)
 
 
-def test_a_prefix_and_a_diacritic_insensitive_match_resolve(idx):
-    assert transitio_index.place("Helsi", index=idx).id == "Q1757"
-    assert transitio_index.place("zurich", index=idx).id == "Q-zur"
+@pytest.mark.parametrize(
+    ("query", "expected", "partial"),
+    [
+        ("zurich", "Q-zur", None),  # diacritics fold: an exact match
+        ("Helsi", None, ["Q1757"]),  # a prefix
+        ("york", None, ["Q1109190", "Q60", "Q1384"]),  # a subset of the words
+        ("Atlantis", None, []),
+    ],
+)
+def test_only_an_exact_match_resolves(idx, query, expected, partial):
+    if expected is not None:
+        assert transitio_index.place(query, index=idx).id == expected
+        return
+    with pytest.raises(PlaceNotFoundError) as caught:
+        transitio_index.place(query, index=idx)
+    # The partial matches are the candidates, as places() ranks them.
+    assert [c.id for c in caught.value.candidates] == partial
+    assert [p.id for p in transitio_index.places(query, index=idx)] == partial
+    if partial:
+        assert f"partial matches: Place({partial[0]}," in str(caught.value)
+
+
+def test_the_message_names_the_first_ten_partial_matches():
+    idx = _index([_p(f"c{n:02}", "city", f"Springfield {n:02}") for n in range(12)])
+    with pytest.raises(PlaceNotFoundError, match=r"'Springfield 09'\), and 2 more\Z"):
+        transitio_index.place("Springfield", index=idx)
 
 
 def test_a_non_english_label_resolves(idx):

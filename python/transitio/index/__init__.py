@@ -942,9 +942,16 @@ def place(query, *, kind=None, index=None):
     """Resolve ``query`` to a single :class:`Place`, or raise.
 
     ``query`` is a name, a QID, an own ``tp_`` id, or a :class:`Place`; an id
-    resolves through the place's former ids and the QIDs it carries. A name
-    shared by a city and the metros named after it in its country, or an
+    resolves through the place's former ids and the QIDs it carries. Only a
+    name matching a label in full resolves: a partial name ("Helsi") raises
+    :class:`~transitio.exceptions.PlaceNotFoundError` with the places it
+    partly matches as ``candidates``, and :func:`suggest` completes names. A
+    name shared by a city and the metros named after it in its country, or an
     area containing it with much the same service, resolves to the city;
+    other shared names go to the place with more than twice the runner-up's
+    feeds, unless a place of the name in another country is far better
+    known (by the languages its name is recorded in), since feed counts
+    measure how well each country's feeds are catalogued.
     ``kind`` pins the scope. A qualified name, "Name, Qualifier" with one or
     more qualifiers, keeps the places lying within a region or country each
     qualifier names ("London, Ontario", "City of London, UK"); a label that

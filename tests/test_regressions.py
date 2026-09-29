@@ -251,6 +251,32 @@ def test_area_search_ranks_local_feed_over_continental_aggregate(tmp_path):
     assert [feed.id for feed in search_csv(path, bounds=helsinki, limit=1)] == ["mdb-2"]
 
 
+def _place(place_id, kind, name, country, aliases=(), names=None, parent=None):
+    return {
+        "place_id": place_id,
+        "kind": kind,
+        "name": name,
+        "names": names or {"en": name},
+        "aliases": list(aliases),
+        "parent_id": parent,
+        "default_metro_id": None,
+        "metro_ids": [],
+        "member_ids": [],
+        "country_code": country,
+        "source_subtype": None,
+    }
+
+
+def _lookup(rows, feeds):
+    """A resolver over the place ``rows``, with the feed counts ``feeds``."""
+    pandas = pytest.importorskip("pandas")
+    from transitio.index.places import _PlaceLookup
+
+    return _PlaceLookup(
+        pandas.DataFrame(rows), feed_count=lambda place_id: feeds.get(place_id, 0)
+    )
+
+
 def test_a_city_is_not_outranked_by_the_places_named_after_it():
     # Augsburg's name is shared by three metros in its country, one per metro
     # definition, and by a containing region with about the same service;
@@ -258,24 +284,7 @@ def test_a_city_is_not_outranked_by_the_places_named_after_it():
     # in the UK; New York State carries far more service than the city; and
     # Hamilton's busier British metro must not win once the Canadian one, the
     # city's namesake, is set aside.
-    pandas = pytest.importorskip("pandas")
     from transitio.exceptions import AmbiguousPlaceError
-    from transitio.index.places import _PlaceLookup
-
-    def place(place_id, kind, name, country, parent=None):
-        return {
-            "place_id": place_id,
-            "kind": kind,
-            "name": name,
-            "names": {"en": name},
-            "aliases": [],
-            "parent_id": parent,
-            "default_metro_id": None,
-            "metro_ids": [],
-            "member_ids": [],
-            "country_code": country,
-            "source_subtype": None,
-        }
 
     feeds = {
         "c-aug": 30,
@@ -286,25 +295,23 @@ def test_a_city_is_not_outranked_by_the_places_named_after_it():
         "m-ham-ca": 40,
         "m-ham-gb": 60,
     }
-    lookup = _PlaceLookup(
-        pandas.DataFrame(
-            [
-                place("r-aug", "region", "Augsburg", "DE"),
-                place("c-aug", "city", "Augsburg", "DE", parent="r-aug"),
-                place("m-aug-1", "metro", "Augsburg", "DE"),
-                place("m-aug-2", "metro", "Augsburg", "DE"),
-                place("m-aug-3", "metro", "Augsburg", "DE"),
-                place("c-lon", "city", "London", "CA"),
-                place("m-lon-1", "metro", "London", "GB"),
-                place("m-lon-2", "metro", "London", "GB"),
-                place("r-ny", "region", "New York", "US"),
-                place("c-ny", "city", "New York", "US", parent="r-ny"),
-                place("c-ham", "city", "Hamilton", "CA"),
-                place("m-ham-ca", "metro", "Hamilton", "CA"),
-                place("m-ham-gb", "metro", "Hamilton", "GB"),
-            ]
-        ),
-        feed_count=lambda place_id: feeds.get(place_id, 0),
+    lookup = _lookup(
+        [
+            _place("r-aug", "region", "Augsburg", "DE"),
+            _place("c-aug", "city", "Augsburg", "DE", parent="r-aug"),
+            _place("m-aug-1", "metro", "Augsburg", "DE"),
+            _place("m-aug-2", "metro", "Augsburg", "DE"),
+            _place("m-aug-3", "metro", "Augsburg", "DE"),
+            _place("c-lon", "city", "London", "CA"),
+            _place("m-lon-1", "metro", "London", "GB"),
+            _place("m-lon-2", "metro", "London", "GB"),
+            _place("r-ny", "region", "New York", "US"),
+            _place("c-ny", "city", "New York", "US", parent="r-ny"),
+            _place("c-ham", "city", "Hamilton", "CA"),
+            _place("m-ham-ca", "metro", "Hamilton", "CA"),
+            _place("m-ham-gb", "metro", "Hamilton", "GB"),
+        ],
+        feeds,
     )
     assert lookup.resolve("Augsburg").id == "c-aug"
     for name in ("London", "New York", "Hamilton"):
@@ -317,49 +324,28 @@ def test_the_feed_margin_does_not_favour_an_alias_over_a_name():
     # São Paulo itself: the name stays ambiguous rather than naming Saint Paul,
     # and a qualifier picks São Paulo; a translation still reaches Vienna; and
     # a district listing its city's name as an alias is no rival to the city.
-    pandas = pytest.importorskip("pandas")
     from transitio.exceptions import AmbiguousPlaceError
-    from transitio.index.places import _PlaceLookup
-
-    def place(place_id, kind, name, country, aliases=(), names=None, parent=None):
-        return {
-            "place_id": place_id,
-            "kind": kind,
-            "name": name,
-            "names": names or {"en": name},
-            "aliases": list(aliases),
-            "parent_id": parent,
-            "default_metro_id": None,
-            "metro_ids": [],
-            "member_ids": [],
-            "country_code": country,
-            "source_subtype": None,
-        }
 
     # Kingston: an aliased city abroad would win the narrowed contest on feeds;
     # the veto must not hand the name to the busy metro set aside as a namesake.
     feeds = {"c-stp": 7, "c-sp": 2, "c-vie": 27, "m-wien": 30}
     feeds.update({"c-kin": 5, "c-kin-us": 30, "m-kin": 100})
     feeds.update({"c-bog": 6, "c-pa": 5, "m-bog": 6})
-    lookup = _PlaceLookup(
-        pandas.DataFrame(
-            [
-                place("br", "country", "Brazil", "BR"),
-                place("c-sp", "city", "São Paulo", "BR"),
-                place("c-stp", "city", "Saint Paul", "US", aliases=["São Paulo"]),
-                place("c-vie", "city", "Vienna", "AT", names={"de": "Wien"}),
-                place("m-wien", "metro", "Wien", "AT"),
-                place("c-kin", "city", "Kingston", "JM"),
-                place("m-kin", "metro", "Kingston", "JM"),
-                place("c-kin-us", "city", "Port Kingston", "US", aliases=["Kingston"]),
-                place("c-bog", "city", "Bogotá", "CO"),
-                place("m-bog", "metro", "Bogotá", "CO"),
-                place(
-                    "c-pa", "city", "Puente Aranda", "CO", ["Bogotá"], parent="c-bog"
-                ),
-            ]
-        ),
-        feed_count=lambda place_id: feeds.get(place_id, 0),
+    lookup = _lookup(
+        [
+            _place("br", "country", "Brazil", "BR"),
+            _place("c-sp", "city", "São Paulo", "BR"),
+            _place("c-stp", "city", "Saint Paul", "US", aliases=["São Paulo"]),
+            _place("c-vie", "city", "Vienna", "AT", names={"de": "Wien"}),
+            _place("m-wien", "metro", "Wien", "AT"),
+            _place("c-kin", "city", "Kingston", "JM"),
+            _place("m-kin", "metro", "Kingston", "JM"),
+            _place("c-kin-us", "city", "Port Kingston", "US", aliases=["Kingston"]),
+            _place("c-bog", "city", "Bogotá", "CO"),
+            _place("m-bog", "metro", "Bogotá", "CO"),
+            _place("c-pa", "city", "Puente Aranda", "CO", ["Bogotá"], parent="c-bog"),
+        ],
+        feeds,
     )
     with pytest.raises(AmbiguousPlaceError):
         lookup.resolve("Sao Paulo")
@@ -368,6 +354,96 @@ def test_the_feed_margin_does_not_favour_an_alias_over_a_name():
     with pytest.raises(AmbiguousPlaceError):
         lookup.resolve("Kingston")
     assert lookup.resolve("Bogota").id == "c-bog"
+
+
+@pytest.mark.parametrize(
+    ("name", "rows", "expected"),
+    [
+        # Each row: the place id, its kind, country, feeds and language labels.
+        pytest.param(
+            "Moscow",
+            [("us", "city", "US", 3, 77), ("ru", "city", "RU", 0, 336)],
+            None,
+            id="moscow",
+        ),
+        # Delhi, India, a region, ranks below two American townships.
+        pytest.param(
+            "Delhi",
+            [
+                ("us", "city", "US", 5, 31),
+                ("us-1", "city", "US", 1, 1),
+                ("us-2", "city", "US", 1, 1),
+                ("in", "region", "IN", 2, 101),
+            ],
+            None,
+            id="delhi",
+        ),
+        # An American metro leads and counts the labels of its country's city,
+        # too few against Russia's, and enough in the next case.
+        pytest.param(
+            "Saint Petersburg",
+            [
+                ("us-m", "metro", "US", 12, 1),
+                ("us", "city", "US", 0, 117),
+                ("ru", "region", "RU", 0, 264),
+            ],
+            None,
+            id="metro-leader",
+        ),
+        pytest.param(
+            "Saint Petersburg",
+            [
+                ("us-m", "metro", "US", 12, 1),
+                ("us", "city", "US", 0, 150),
+                ("ru", "region", "RU", 0, 264),
+            ],
+            "us-m",
+            id="metro-leader-known",
+        ),
+        pytest.param(
+            "Paris",
+            [("fr", "city", "FR", 55, 344), ("us", "city", "US", 1, 60)],
+            "fr",
+            id="paris",
+        ),
+        # Abroad below the floor; a better-known place at home is no rival.
+        pytest.param(
+            "Springfield",
+            [
+                ("us", "city", "US", 5, 30),
+                ("gb", "city", "GB", 0, 90),
+                ("us-2", "city", "US", 0, 336),
+            ],
+            "us",
+            id="floor",
+        ),
+        # Twice the leader's labels is not more than twice.
+        pytest.param(
+            "Springfield",
+            [("us", "city", "US", 5, 80), ("gb", "city", "GB", 0, 160)],
+            "us",
+            id="twice",
+        ),
+    ],
+)
+def test_a_feed_lead_does_not_beat_a_far_better_known_place_abroad(
+    name, rows, expected
+):
+    # Feed counts measure how well each country's feeds are catalogued: Moscow,
+    # Idaho, with three feeds, won over Moscow, Russia, with none. The labels a
+    # place carries in many languages mark it as known far beyond its country.
+    from transitio.exceptions import AmbiguousPlaceError
+
+    places = [
+        _place(pid, kind, name, country, names={f"l{n}": name for n in range(labels)})
+        for pid, kind, country, _, labels in rows
+    ]
+    lookup = _lookup(places, {row[0]: row[3] for row in rows})
+    if expected is None:
+        with pytest.raises(AmbiguousPlaceError):
+            lookup.resolve(name)
+    else:
+        assert lookup.resolve(name).id == expected
 
 
 def test_padded_header_names_merge_into_one_column(tmp_path):

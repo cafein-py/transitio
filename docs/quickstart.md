@@ -184,9 +184,15 @@ A name can match several places. A city wins over the metros in its country
 that carry its name, and over a same-named area containing it that runs much
 the same service: "Augsburg" is the city, not its three metros, and
 "Helsinki" the city, not the Helsinki sub-region. Other places sharing a name
-are decided as before, by the sole exact match or a clear lead in feeds; where
-neither holds, as for London in the UK and in Canada, or New York City and
-New York State, `place` raises `AmbiguousPlaceError`. A qualifier after a
+are decided by the sole exact match or a clear lead in feeds. Feed counts
+reflect how well each country's feeds are catalogued, so a lead in feeds does
+not decide against a place of that name abroad whose name is recorded in far
+more languages: "Moscow" is not Moscow, Idaho, however many more feeds it
+has than Moscow, Russia. Where nothing decides, as for London in the UK and in
+Canada, or New York City and New York State, `place` raises
+`AmbiguousPlaceError`. Only a full name resolves: a partial one such as
+`"Augs"` raises `PlaceNotFoundError`, whose `candidates` hold the places it
+partly matches, and `suggest` completes it. A qualifier after a
 comma names the region or country that holds the place — `"London, Ontario"`,
 `"London, Canada"`, `"City of London, UK"` — and is matched against the names,
 translations and aliases of the place's region and country, so codes such as

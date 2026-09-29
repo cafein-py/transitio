@@ -4,16 +4,18 @@ A query — a name, a QID or own ``tp_`` id (a former id or a carried QID
 included), or a :class:`Place` — resolves to one :class:`Place` through a
 defined ranking, never a guess: the query is normalised and matched
 against every place's labels and aliases in every language, candidates score on
-match strength then ``kind`` precedence then feed count, and a winner is taken
-only when it is the sole exact match or beats the runner-up by the ambiguity
-margin, which never favours a place reached only through an alias or a
-translation over one carrying the name as its own. A city's namesakes do not
+match strength then ``kind`` precedence then feed count, and only an exact
+match can win: the sole exact match, or one that beats the runner-up by the
+ambiguity margin. The margin never favours a place reached only through an
+alias or a translation over one carrying the name as its own, nor decides
+against a place of the name in another country known far more widely, by
+the languages its name is recorded in. A city's namesakes do not
 compete with it: a metro in its country
 shares its name because it is the city's metro or named after it, and a
 same-named area containing it that runs much the same service (no more than
 the margin beyond the city's feeds) is the city itself. Anything else
 raises :class:`AmbiguousPlaceError` with the candidates, or
-:class:`PlaceNotFoundError`.
+:class:`PlaceNotFoundError` with the partial matches, if any.
 """
 
 import json
@@ -82,6 +84,13 @@ _KIND_ORDER = {"metro": 0, "city": 1, "region": 2, "country": 3}
 # ``_decide``'s answer when the margin would favour an alias over a name: no
 # decision, and no other contest may overturn it.
 _VETOED = object()
+
+# A place abroad with at least this many language labels, and more than
+# twice the leader's, keeps the feed margin from deciding.
+_WELL_KNOWN = 100
+
+# The partial matches a PlaceNotFoundError message names; all are candidates.
+_PARTIAL_SHOWN = 10
 
 _QID = re.compile(r"\AQ[1-9][0-9]*\Z")
 # The index's own place id (schema 6); a query in this form is an id lookup.
@@ -624,13 +633,24 @@ class _PlaceLookup:
         name, scored = self._qualified(query, kind)
         if not scored:
             raise PlaceNotFoundError(f"no place matches {query!r}")
+        if all(tier != _EXACT for tier, _ in scored):
+            partial = [self.get(pid) for _, pid in scored]
+            shown = ", ".join(repr(p) for p in partial[:_PARTIAL_SHOWN])
+            if len(partial) > _PARTIAL_SHOWN:
+                shown += f", and {len(partial) - _PARTIAL_SHOWN} more"
+            error = PlaceNotFoundError(
+                f"no place is named {query!r}; partial matches: {shown}"
+            )
+            error.candidates = tuple(partial)
+            raise error
         return self.get(self._winner(query, scored, name))
 
     def _winner(self, query, scored, name):
+        exact = [pid for tier, pid in scored if tier == _EXACT]
         namesakes = self._namesakes(scored, name)
         winner = None
         if namesakes:
-            narrowed = [item for item in scored if item[1] not in namesakes]
+            narrowed = [pid for pid in exact if pid not in namesakes]
             winner = self._decide(narrowed, name)
             # Setting namesakes aside only lets a city win; any other winner
             # there would be one the full contest never chose.
@@ -639,7 +659,7 @@ class _PlaceLookup:
                     return winner
                 winner = None
         if winner is not _VETOED:  # a veto stands; the full contest may not overturn it
-            winner = self._decide(scored, name)
+            winner = self._decide(exact, name)
         if winner is not None and winner is not _VETOED:
             return winner
         candidates = [self.get(pid) for _, pid in scored]
@@ -650,20 +670,18 @@ class _PlaceLookup:
         error.candidates = tuple(candidates)
         raise error
 
-    def _decide(self, scored, name):
-        """The sole candidate, the sole exact match, or a top candidate that
-        beats the runner-up by the margin; None when none of these holds, and
-        ``_VETOED`` when the margin alone would decide against the name. The
-        margin never favours a place reached only through an alias or a
-        translation over one carrying ``name`` as its own: Saint Paul,
-        Minnesota, whose aliases include São Paulo, has more feeds than São
-        Paulo itself in a thinly covered index."""
-        if len(scored) == 1:
-            return scored[0][1]
-        exact = [pid for tier, pid in scored if tier == _EXACT]
-        if len(exact) == 1:
-            return exact[0]
-        top_id, runner_id = scored[0][1], scored[1][1]
+    def _decide(self, exact, name):
+        """Among the exact matches ``exact``, ranked: the sole one, or the top
+        one when it beats the runner-up by the margin; None when neither
+        holds or a better-known place abroad bars the margin, and ``_VETOED``
+        when the margin alone would decide against the name. The margin never
+        favours a place reached only through an alias or a translation over
+        one carrying ``name`` as its own: Saint Paul, Minnesota, whose aliases
+        include São Paulo, has more feeds than São Paulo itself in a thinly
+        covered index."""
+        if len(exact) < 2:
+            return exact[0] if exact else None
+        top_id, runner_id = exact[0], exact[1]
         top_feeds = self._feed_count(top_id)
         # The default margin: the runner-up has fewer than half the winner's
         # feeds, i.e. the winner carries strictly more than twice as many. With no
@@ -676,8 +694,40 @@ class _PlaceLookup:
             }
             if own and top_id not in own:
                 return _VETOED
+            if self._better_known_abroad(top_id, exact, name):
+                return None
             return top_id
         return None
+
+    def _better_known_abroad(self, top_id, exact, name):
+        """Whether an exact match in another country, not a metro, carrying
+        ``name`` as its name, has at least ``_WELL_KNOWN`` language labels
+        and more than twice the leader's. A metro carries at most one label,
+        so a metro leader counts those of the best-labelled such place in its
+        own country, or none. Feed counts compare service within one
+        country's coverage; labels in many languages mark a place known far
+        beyond it, as Moscow, Russia, is beside Moscow, Idaho."""
+        records = self._records
+        norm = _normalize(name)
+        named = [
+            pid
+            for pid in exact
+            if records[pid]["kind"] != "metro"
+            and _normalize(records[pid]["name"]) == norm
+        ]
+        country = records[top_id].get("country_code")
+        leaders = [top_id]
+        if records[top_id]["kind"] == "metro":
+            leaders = [
+                pid for pid in named if records[pid].get("country_code") == country
+            ]
+        labels = max((len(records[pid]["names"]) for pid in leaders), default=0)
+        return any(
+            len(records[pid]["names"]) >= _WELL_KNOWN
+            and len(records[pid]["names"]) > 2 * labels
+            for pid in named
+            if records[pid].get("country_code") != country
+        )
 
     def _namesakes(self, scored, name):
         """The exact matches that share an exact-match city's name because of
