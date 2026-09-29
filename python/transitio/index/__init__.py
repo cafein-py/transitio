@@ -955,7 +955,12 @@ def place(query, *, kind=None, index=None):
     other shared names go to the place with more than twice the runner-up's
     feeds, unless a place of the name in another country is far better
     known (by the languages its name is recorded in), since feed counts
-    measure how well each country's feeds are catalogued.
+    measure how well each country's feeds are catalogued. A place's own
+    names are its name and its labels in its country's languages or
+    English; where a place carries the name as its own, one reaching it
+    only through a label in another language does not compete unless it is
+    far better known: "München" is Munich, and "Meksyk", Polish for Mexico,
+    stays ambiguous rather than naming a place in Poland called Meksyk.
     ``kind`` pins the scope. A qualified name, "Name, Qualifier" with one or
     more qualifiers, keeps the places lying within a region or country each
     qualifier names ("London, Ontario", "City of London, UK"); a label that
@@ -979,8 +984,9 @@ def suggest(prefix, *, limit=10, kinds=None, country=None, lang=None, index=None
     languages and its aliases — normalised as :func:`place` normalises a
     query, so ``hels`` and ``helsingf`` both reach Helsinki. Places rank by
     an exact label first, then kind precedence as :func:`places` ranks it,
-    the label's source (the name, a translation, an alias), more feeds, the
-    label and the id; one :class:`Suggestion` per place, at most ``limit``.
+    the label's source (the name, a name in the place's own languages or
+    English, an alias, a name in another language), more feeds, the label
+    and the id; one :class:`Suggestion` per place, at most ``limit``.
     ``kinds`` keeps only those kinds, ``country`` one ISO code or several,
     and ``lang`` picks the label to show (the place's name in that language
     when it has one, else its name). An empty prefix suggests nothing. The

@@ -1,6 +1,9 @@
 # Attribution and licensing
 
-transitio itself is licensed under the MIT License.
+transitio itself is licensed under the MIT License. The languages of each
+country, which place lookup reads, come from the
+[Unicode CLDR](https://cldr.unicode.org/) 47, © Unicode, Inc., under the
+[Unicode License v3](https://www.unicode.org/license.txt).
 
 The feed index that transitio installs with {func}`transitio.index.refresh`
 is *derived data*, compiled from several open sources. Release wheels ship

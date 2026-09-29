@@ -187,6 +187,11 @@ the same service: "Augsburg" is the city, not its three metros, and
 in its country that list its name only as an alias: "Taipei" is the city, not
 New Taipei or Taiwan. Where no city carries a name, a region or country of
 that name takes the city's place: "Istanbul" is the province, not its metro.
+Names count in a place's own languages, those of its country, and in English:
+"München" is Munich, and a place abroad that carries "Buenos Aires" only as a
+label in another language is no rival to the Argentine capital. A label in
+another language still counts for a place known far more widely, so "Meksyk",
+Polish for Mexico, stays ambiguous rather than naming a place in Poland.
 Other places sharing a name
 are decided by the sole exact match or a clear lead in feeds. Feed counts
 reflect how well each country's feeds are catalogued, so a lead in feeds does

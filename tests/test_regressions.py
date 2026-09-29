@@ -338,7 +338,8 @@ def test_the_feed_margin_does_not_favour_an_alias_over_a_name():
     # and a qualifier picks São Paulo; a translation still reaches Vienna; and
     # a district listing its city's name as an alias is no rival to the city,
     # nor are a region and a country listing Taipei, or a county listing Los
-    # Angeles, whose metros would otherwise win on feeds.
+    # Angeles as an alias and in Croatian and Nahuatl, whose metros would
+    # otherwise win on feeds.
     from transitio.exceptions import AmbiguousPlaceError
 
     # Kingston: an aliased city abroad would win the narrowed contest on feeds;
@@ -365,7 +366,14 @@ def test_the_feed_margin_does_not_favour_an_alias_over_a_name():
             _place("m-tpe", "metro", "Taipei", "TW"),
             _place("r-ntpe", "region", "New Taipei", "TW", aliases=["Taipei"]),
             _place("tw", "country", "Taiwan", "TW", aliases=["Taipei"]),
-            _place("r-la", "region", "Los Angeles County", "US", ["Los Angeles"]),
+            _place(
+                "r-la",
+                "region",
+                "Los Angeles County",
+                "US",
+                ["Los Angeles"],
+                {"en": "Los Angeles County", "hr": "Los Angeles", "nah": "Los Angeles"},
+            ),
             _place("c-la", "city", "Los Angeles", "US", parent="r-la"),
             _place("m-la", "metro", "Los Angeles", "US"),
         ],
@@ -380,6 +388,78 @@ def test_the_feed_margin_does_not_favour_an_alias_over_a_name():
     assert lookup.resolve("Bogota").id == "c-bog"
     assert lookup.resolve("Taipei").id == "c-tpe"
     assert lookup.resolve("Los Angeles").id == "c-la"
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        # Pinto, Spain, lists the name only in Irish.
+        ("Buenos Aires", "c-ba"),
+        # Munich carries the name in German, a village as its name.
+        ("München", "c-muc"),
+        # Paris, known far more widely, stays a rival through its Finnish label;
+        # so does Mexico through its Polish one against a town of that name in
+        # Mexico, where a country reaching the name by an alias would be the
+        # town's namesake.
+        ("Pariisi", None),
+        ("Meksyk", None),
+    ],
+)
+def test_a_label_in_another_language_does_not_compete_with_an_own_name(name, expected):
+    # Every label counted as a place's own name, so a place abroad carrying a
+    # capital's name in a language not its own kept the capital ambiguous, and
+    # a feed lead on a German label was vetoed in favour of a village's name.
+    from transitio.exceptions import AmbiguousPlaceError
+
+    known = {f"l{n}": f"label {n}" for n in range(150)}
+    lookup = _lookup(
+        [
+            _place("c-ba", "city", "Buenos Aires", "AR"),
+            _place("c-pinto", "city", "Pinto", "ES", names={"ga": "Buenos Aires"}),
+            _place("c-muc", "city", "Munich", "DE", names={"de": "München"}),
+            _place("c-mue", "city", "München", "DE"),
+            _place("c-par", "city", "Paris", "FR", names={**known, "fi": "Pariisi"}),
+            _place("c-pariisi", "city", "Pariisi", "EE"),
+            _place("mx", "country", "Mexico", "MX", names={**known, "pl": "Meksyk"}),
+            _place("c-mek", "city", "Meksyk", "MX"),
+        ],
+        {
+            "c-ba": 30,
+            "c-pinto": 20,
+            "c-muc": 39,
+            "c-mue": 3,
+            "c-par": 55,
+            "c-pariisi": 1,
+            "mx": 2,
+            "c-mek": 2,
+        },
+    )
+    if expected is None:
+        with pytest.raises(AmbiguousPlaceError):
+            lookup.resolve(name)
+    else:
+        assert lookup.resolve(name).id == expected
+
+
+def test_suggestions_rank_a_label_in_another_language_after_aliases():
+    # An American Vienna listing "Wien" in Low German outranked Vienna, whose
+    # German label came after its own Low German one, on feeds alone.
+    lookup = _lookup(
+        [
+            _place(
+                "c-vie", "city", "Vienna", "AT", names={"nds": "Wien", "de": "Wien"}
+            ),
+            _place("c-al", "city", "Neudorf", "AT", aliases=["Wien"]),
+            _place("c-vie-us", "city", "Vienna", "US", names={"nds": "Wien"}),
+        ],
+        {"c-vie": 24, "c-al": 27, "c-vie-us": 30},
+    )
+    hits = lookup.suggest("wien", limit=3)
+    assert [(hit.place.id, hit.source) for hit in hits] == [
+        ("c-vie", "de"),
+        ("c-al", "alias"),
+        ("c-vie-us", "nds"),
+    ]
 
 
 @pytest.mark.parametrize(
