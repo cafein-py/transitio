@@ -946,8 +946,12 @@ def place(query, *, kind=None, index=None):
     name matching a label in full resolves: a partial name ("Helsi") raises
     :class:`~transitio.exceptions.PlaceNotFoundError` with the places it
     partly matches as ``candidates``, and :func:`suggest` completes names. A
-    name shared by a city and the metros named after it in its country, or an
-    area containing it with much the same service, resolves to the city;
+    name shared by a city and the metros named after it in its country, an
+    area containing it with much the same service, or places inside it or
+    areas in its country listing its name only as an alias, resolves to the
+    city ("Taipei" is the city, not New Taipei or Taiwan); where no city
+    matches, a region or country of the name stands as the city ("Istanbul"
+    is the province, not its metro);
     other shared names go to the place with more than twice the runner-up's
     feeds, unless a place of the name in another country is far better
     known (by the languages its name is recorded in), since feed counts

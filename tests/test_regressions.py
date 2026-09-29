@@ -283,7 +283,9 @@ def test_a_city_is_not_outranked_by_the_places_named_after_it():
     # London's only exact-match city is in Canada, the metros sharing its name
     # in the UK; New York State carries far more service than the city; and
     # Hamilton's busier British metro must not win once the Canadian one, the
-    # city's namesake, is set aside.
+    # city's namesake, is set aside. Where no city matches, Istanbul's province
+    # stands as the city against its metro; Lagos's Portuguese town keeps the
+    # Nigerian state from standing as one, so the Nigerian metro stays a rival.
     from transitio.exceptions import AmbiguousPlaceError
 
     feeds = {
@@ -294,6 +296,11 @@ def test_a_city_is_not_outranked_by_the_places_named_after_it():
         "c-ham": 5,
         "m-ham-ca": 40,
         "m-ham-gb": 60,
+        "r-ist": 6,
+        "m-ist": 4,
+        "m-lag": 1,
+        "r-lag": 1,
+        "c-lag": 5,
     }
     lookup = _lookup(
         [
@@ -310,11 +317,17 @@ def test_a_city_is_not_outranked_by_the_places_named_after_it():
             _place("c-ham", "city", "Hamilton", "CA"),
             _place("m-ham-ca", "metro", "Hamilton", "CA"),
             _place("m-ham-gb", "metro", "Hamilton", "GB"),
+            _place("r-ist", "region", "Istanbul", "TR"),
+            _place("m-ist", "metro", "Istanbul", "TR"),
+            _place("m-lag", "metro", "Lagos", "NG"),
+            _place("r-lag", "region", "Lagos", "NG"),
+            _place("c-lag", "city", "Lagos", "PT"),
         ],
         feeds,
     )
     assert lookup.resolve("Augsburg").id == "c-aug"
-    for name in ("London", "New York", "Hamilton"):
+    assert lookup.resolve("Istanbul").id == "r-ist"
+    for name in ("London", "New York", "Hamilton", "Lagos"):
         with pytest.raises(AmbiguousPlaceError):
             lookup.resolve(name)
 
@@ -323,7 +336,9 @@ def test_the_feed_margin_does_not_favour_an_alias_over_a_name():
     # Saint Paul, Minnesota carries "São Paulo" as an alias and more feeds than
     # São Paulo itself: the name stays ambiguous rather than naming Saint Paul,
     # and a qualifier picks São Paulo; a translation still reaches Vienna; and
-    # a district listing its city's name as an alias is no rival to the city.
+    # a district listing its city's name as an alias is no rival to the city,
+    # nor are a region and a country listing Taipei, or a county listing Los
+    # Angeles, whose metros would otherwise win on feeds.
     from transitio.exceptions import AmbiguousPlaceError
 
     # Kingston: an aliased city abroad would win the narrowed contest on feeds;
@@ -331,6 +346,8 @@ def test_the_feed_margin_does_not_favour_an_alias_over_a_name():
     feeds = {"c-stp": 7, "c-sp": 2, "c-vie": 27, "m-wien": 30}
     feeds.update({"c-kin": 5, "c-kin-us": 30, "m-kin": 100})
     feeds.update({"c-bog": 6, "c-pa": 5, "m-bog": 6})
+    feeds.update({"c-tpe": 1, "m-tpe": 4, "r-ntpe": 2, "tw": 9})
+    feeds.update({"c-la": 54, "r-la": 120, "m-la": 142})
     lookup = _lookup(
         [
             _place("br", "country", "Brazil", "BR"),
@@ -344,6 +361,13 @@ def test_the_feed_margin_does_not_favour_an_alias_over_a_name():
             _place("c-bog", "city", "Bogotá", "CO"),
             _place("m-bog", "metro", "Bogotá", "CO"),
             _place("c-pa", "city", "Puente Aranda", "CO", ["Bogotá"], parent="c-bog"),
+            _place("c-tpe", "city", "Taipei", "TW"),
+            _place("m-tpe", "metro", "Taipei", "TW"),
+            _place("r-ntpe", "region", "New Taipei", "TW", aliases=["Taipei"]),
+            _place("tw", "country", "Taiwan", "TW", aliases=["Taipei"]),
+            _place("r-la", "region", "Los Angeles County", "US", ["Los Angeles"]),
+            _place("c-la", "city", "Los Angeles", "US", parent="r-la"),
+            _place("m-la", "metro", "Los Angeles", "US"),
         ],
         feeds,
     )
@@ -354,6 +378,8 @@ def test_the_feed_margin_does_not_favour_an_alias_over_a_name():
     with pytest.raises(AmbiguousPlaceError):
         lookup.resolve("Kingston")
     assert lookup.resolve("Bogota").id == "c-bog"
+    assert lookup.resolve("Taipei").id == "c-tpe"
+    assert lookup.resolve("Los Angeles").id == "c-la"
 
 
 @pytest.mark.parametrize(

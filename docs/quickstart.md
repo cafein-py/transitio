@@ -183,7 +183,11 @@ transitio.suggest("augs")         # type-ahead over names, translations, aliases
 A name can match several places. A city wins over the metros in its country
 that carry its name, and over a same-named area containing it that runs much
 the same service: "Augsburg" is the city, not its three metros, and
-"Helsinki" the city, not the Helsinki sub-region. Other places sharing a name
+"Helsinki" the city, not the Helsinki sub-region. It also wins over the areas
+in its country that list its name only as an alias: "Taipei" is the city, not
+New Taipei or Taiwan. Where no city carries a name, a region or country of
+that name takes the city's place: "Istanbul" is the province, not its metro.
+Other places sharing a name
 are decided by the sole exact match or a clear lead in feeds. Feed counts
 reflect how well each country's feeds are catalogued, so a lead in feeds does
 not decide against a place of that name abroad whose name is recorded in far

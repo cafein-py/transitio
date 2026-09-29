@@ -9,11 +9,14 @@ match can win: the sole exact match, or one that beats the runner-up by the
 ambiguity margin. The margin never favours a place reached only through an
 alias or a translation over one carrying the name as its own, nor decides
 against a place of the name in another country known far more widely, by
-the languages its name is recorded in. A city's namesakes do not
-compete with it: a metro in its country
-shares its name because it is the city's metro or named after it, and a
-same-named area containing it that runs much the same service (no more than
-the margin beyond the city's feeds) is the city itself. Anything else
+the languages its name is recorded in. A city's namesakes do not compete
+with it: a metro in its country shares its name because it is the city's
+metro or named after it, a same-named area containing it that runs much the
+same service (no more than the margin beyond the city's feeds) is the city
+itself, and a place inside it or, not being a city, in its country that
+reaches its name only through an alias is named after it. Where no exact
+match is a city, a region or country of the name (a province, an emirate, a
+dependency) stands as the city. Anything else
 raises :class:`AmbiguousPlaceError` with the candidates, or
 :class:`PlaceNotFoundError` with the partial matches, if any.
 """
@@ -647,15 +650,15 @@ class _PlaceLookup:
 
     def _winner(self, query, scored, name):
         exact = [pid for tier, pid in scored if tier == _EXACT]
-        namesakes = self._namesakes(scored, name)
+        namesakes, anchors = self._namesakes(scored, name)
         winner = None
         if namesakes:
             narrowed = [pid for pid in exact if pid not in namesakes]
             winner = self._decide(narrowed, name)
-            # Setting namesakes aside only lets a city win; any other winner
+            # Setting namesakes aside only lets an anchor win; any other winner
             # there would be one the full contest never chose.
             if winner is not None and winner is not _VETOED:
-                if self._records[winner]["kind"] == "city":
+                if winner in anchors:
                     return winner
                 winner = None
         if winner is not _VETOED:  # a veto stands; the full contest may not overturn it
@@ -730,50 +733,64 @@ class _PlaceLookup:
         )
 
     def _namesakes(self, scored, name):
-        """The exact matches that share an exact-match city's name because of
-        that city: the metros in its country, the areas containing it whose
-        feeds stay within the margin of the city's, and the places inside a
-        city carrying ``name`` as a name of its own that reach it only through
-        an alias (Puente Aranda, a district of Bogotá, lists Bogotá). A metro
-        elsewhere shares the name by coincidence (London, UK against London,
-        Ontario), and a containing area with far more service is a place of
-        its own (New York State against New York City); both stay."""
+        """``(namesakes, anchors)``. The anchors are the exact-match cities or,
+        when no exact match is a city, the exact-match regions and countries,
+        which then stand as the city (Istanbul's province, the Hong Kong
+        dependency). An anchor's namesakes, sharing its name because of it,
+        are the metros in its country and the areas containing it whose feeds
+        stay within the margin of its own. A place reaching ``name`` only
+        through an alias is a namesake, never an anchor, when it lies inside a
+        city carrying ``name`` as a name of its own (Puente Aranda, a district
+        of Bogotá, lists Bogotá) or, not being a city, in such a city's
+        country (New Taipei and Taiwan list Taipei). A metro elsewhere shares
+        the name by coincidence (London, UK against London, Ontario), a
+        containing area with far more service is a place of its own (New York
+        State against New York City), and a city elsewhere may use an alias as
+        its everyday name (Newcastle for Newcastle upon Tyne); all stay."""
+        records = self._records
         exact = [pid for tier, pid in scored if tier == _EXACT]
         norm = _normalize(name)
-        named = {
+        own = {pid for pid in exact if norm in self._own_names(pid)}
+        named = {pid for pid in own if records[pid]["kind"] == "city"}
+        named_countries = {records[pid].get("country_code") for pid in named}
+        named_countries.discard(None)
+        aliased = {
             pid
             for pid in exact
-            if self._records[pid]["kind"] == "city" and norm in self._own_names(pid)
+            if pid not in own
+            and (
+                (
+                    records[pid]["kind"] != "city"
+                    and records[pid].get("country_code") in named_countries
+                )
+                or named & {place.id for place in self.get(pid).ancestors}
+            )
         }
-        inside = {
-            pid
-            for pid in exact
-            if norm not in self._own_names(pid)
-            and named & {place.id for place in self.get(pid).ancestors}
-        }
-        cities = [
-            pid
-            for pid in exact
-            if self._records[pid]["kind"] == "city" and pid not in inside
-        ]
-        if not cities:
-            return set()
-        countries = {self._records[pid].get("country_code") for pid in cities}
+        cities = [pid for pid in exact if records[pid]["kind"] == "city"]
+        if cities:
+            anchors = {pid for pid in cities if pid not in aliased}
+        else:
+            anchors = {
+                pid for pid in exact if records[pid]["kind"] in ("region", "country")
+            }
+        if not anchors:
+            return set(), anchors
+        countries = {records[pid].get("country_code") for pid in anchors}
         countries.discard(None)
-        namesakes = inside | {
+        namesakes = aliased | {
             pid
             for pid in exact
-            if self._records[pid]["kind"] == "metro"
-            and self._records[pid].get("country_code") in countries
+            if records[pid]["kind"] == "metro"
+            and records[pid].get("country_code") in countries
         }
-        for city in cities:
-            feeds = self._feed_count(city)
+        for anchor in anchors:
+            feeds = self._feed_count(anchor)
             if not feeds:
                 continue  # without feed counts the service cannot be compared
-            containing = {place.id for place in self.get(city).ancestors}
+            containing = {place.id for place in self.get(anchor).ancestors}
             namesakes.update(
                 pid
                 for pid in exact
                 if pid in containing and self._feed_count(pid) <= 2 * feeds
             )
-        return namesakes
+        return namesakes, anchors
