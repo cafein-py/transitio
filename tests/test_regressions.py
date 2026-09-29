@@ -386,3 +386,56 @@ def test_padded_header_names_merge_into_one_column(tmp_path):
         [feeds[1], feeds[1]], tmp_path / "twice.zip", reference_date="20260601"
     )
     assert clean["header_fixes"] == []
+
+
+@pytest.mark.parametrize(
+    "form", ["clean", "padded-lines", "space-after-comma", "bom", "repeated-name"]
+)
+def test_padded_header_names_keep_the_selector_trusted(tmp_path, form):
+    # A feed padding its header names, as Renfe pads every line and Metra each
+    # header comma, recomputed a fingerprint at fetch that differed from the
+    # build's, so its selector was judged stale.
+    from types import SimpleNamespace
+
+    from transitio.index import fingerprint
+    from transitio.pipeline._fetch import _selector_trusted
+
+    members = {
+        "routes.txt": "route_id,agency_id,route_type\nr1,a,3\nr2,a,2\n",
+        "stops.txt": (
+            "stop_id,stop_lon,stop_lat\ns1,24.9,60.2\ns2,25.0,60.3\ns3,25.1,60.4\n"
+        ),
+        "trips.txt": "route_id,trip_id,service_id\nr1,t1,wk\nr2,t2,wk\n",
+        "stop_times.txt": (
+            "trip_id,stop_id,stop_sequence,pickup_type,drop_off_type\n"
+            "t1,s1,1,0,0\nt1,s2,2,0,0\nt1,s3,3,1,1\nt2,s2,1,0,0\n"
+        ),
+    }
+    for name, text in members.items():
+        header, rows = text.split("\n", 1)
+        if form == "padded-lines":
+            members[name] = "".join(f"{line}  \n" for line in text.splitlines())
+        elif form == "space-after-comma":
+            members[name] = f"{header.replace(',', ', ')}\n{rows}"
+        elif form == "bom":
+            members[name] = "\N{BYTE ORDER MARK} " + text
+    if form == "repeated-name":
+        members["routes.txt"] = (
+            "route_id,agency_id,route_type, route_type\nr1,a,3,700\nr2,a,2,700\n"
+        )
+    stored = fingerprint.compute(
+        "route_stops",
+        {
+            "r1": {"route_type": 3, "agency_id": "a"},
+            "r2": {"route_type": 2, "agency_id": "a"},
+        },
+        {"s1": (24.9, 60.2), "s2": (25.0, 60.3), "s3": (25.1, 60.4)},
+        {"r1": {"s1", "s2"}, "r2": {"s2"}},
+    )
+    edge = SimpleNamespace(
+        fingerprint_kind="route_stops", classification_fingerprint=stored
+    )
+    feed = SimpleNamespace(edges={"e1": edge})
+    path = write_zip(tmp_path / "feed.zip", members)
+    trusted = _selector_trusted(path, feed, SimpleNamespace(state="complete"))
+    assert trusted == (True, None, {"r1", "r2"})
