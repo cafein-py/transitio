@@ -208,7 +208,15 @@ translations and aliases of the place's region and country, so codes such as
 `UK` or `USA` work; a name that itself contains a comma, such as an alias
 `"Queen's Park, Greater London"`, still matches as written. `kind` (`"city"`,
 `"metro"`, `"region"`, `"country"`) restricts the scope, and a Wikidata id or
-the index's own id picks one place.
+the index's own id picks one place. The metro definitions below each name a
+metro after its core city; with `kind="metro"`, one metro under several
+definitions (they share member places) answers with the first of
+`functional urban area`, `metropolitan statistical area`,
+`metropolitan region` and `city-region (FAO)`, so
+`transitio.place("Stockholm", kind="metro")` is its functional urban area,
+and `definition="metropolitan region"` picks another definition. A US
+metropolitan statistical area is named after its principal cities, so a
+city's name matches it only in part; the city's `metros` lists it.
 
 The index keys every place by its own id, a `tp_<n>` that never changes or
 gets reused, and keeps the external ids the place carries beside it:

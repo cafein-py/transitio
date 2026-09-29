@@ -1,3 +1,4 @@
+import re
 import sys
 from pathlib import Path
 
@@ -136,6 +137,21 @@ def test_kind_pins_the_scope(idx):
     assert place.id == "Q1109190"
     with pytest.raises(PlaceNotFoundError):
         transitio_index.place("New York metropolitan area", kind="city", index=idx)
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"kind": "city", "definition": "city-region (FAO)"}, "kind='city'"),
+        (
+            {"definition": "urban area"},
+            "'metropolitan statistical area', 'city-region (FAO)'",
+        ),
+    ],
+)
+def test_a_metro_definition_must_be_one_the_index_holds(idx, options, message):
+    with pytest.raises(ValueError, match=re.escape(message)):
+        transitio_index.place("Tri-State Metro", index=idx, **options)
 
 
 def test_a_qid_resolves_directly(idx):

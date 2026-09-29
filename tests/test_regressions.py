@@ -552,6 +552,47 @@ def test_a_feed_lead_does_not_beat_a_far_better_known_place_abroad(
         assert lookup.resolve(name).id == expected
 
 
+@pytest.mark.parametrize(
+    ("name", "options", "expected"),
+    [
+        ("Stockholm", {"kind": "metro"}, "m-fua"),
+        ("Stockholm", {"definition": "metropolitan region"}, "m-mr"),
+        ("Stockholm", {"definition": "city-region (FAO)"}, "m-fao"),
+        ("Athens", {"kind": "metro"}, None),
+    ],
+)
+def test_kind_metro_picks_one_definition_of_a_metro(name, options, expected):
+    # Each metro definition names its metro after the core city, so Stockholm's
+    # three metros tied under kind="metro". The FAO region shares a member only
+    # with the metropolitan region, and that one with the FUA; Athens, US and
+    # Greece, share none and stay rivals.
+    from transitio.exceptions import AmbiguousPlaceError
+
+    rows = [
+        ("m-fao", "Stockholm", "SE", "city-region (FAO)", ["a", "b"]),
+        ("m-mr", "Stockholm", "SE", "metropolitan region", ["b", "c"]),
+        ("m-fua", "Stockholm", "SE", "functional urban area", ["c", "d"]),
+        ("m-ath-us", "Athens", "US", "city-region (FAO)", ["e"]),
+        ("m-ath-gr", "Athens", "GR", "city-region (FAO)", ["f"]),
+    ]
+    lookup = _lookup(
+        [
+            {
+                **_place(pid, "metro", label, country),
+                "source_subtype": subtype,
+                "member_ids": members,
+            }
+            for pid, label, country, subtype, members in rows
+        ],
+        {row[0]: 3 for row in rows},
+    )
+    if expected is None:
+        with pytest.raises(AmbiguousPlaceError):
+            lookup.resolve(name, **options)
+    else:
+        assert lookup.resolve(name, **options).id == expected
+
+
 def test_padded_header_names_merge_into_one_column(tmp_path):
     # A padded agency.txt header used to reach the merge verbatim, which
     # then wrote both agency_name and " agency_name", and the padded id

@@ -938,7 +938,7 @@ def _lookup_for(index):
     return lookup
 
 
-def place(query, *, kind=None, index=None):
+def place(query, *, kind=None, definition=None, index=None):
     """Resolve ``query`` to a single :class:`Place`, or raise.
 
     ``query`` is a name, a QID, an own ``tp_`` id, or a :class:`Place`; an id
@@ -964,11 +964,27 @@ def place(query, *, kind=None, index=None):
     ``kind`` pins the scope. A qualified name, "Name, Qualifier" with one or
     more qualifiers, keeps the places lying within a region or country each
     qualifier names ("London, Ontario", "City of London, UK"); a label that
-    itself holds a comma still matches as written. Raises
+    itself holds a comma still matches as written.
+
+    A metro's definition is its ``subtype``. With ``kind="metro"``, metros
+    of the name sharing a member place are one metro under several
+    definitions, and the first in this order answers:
+    ``"functional urban area"`` (Eurostat Urban Audit),
+    ``"metropolitan statistical area"`` (US Census),
+    ``"metropolitan region"`` (Eurostat's NUTS-3 approximation),
+    ``"city-region (FAO)"``, then any other; "Stockholm" is its functional
+    urban area. ``definition`` names one instead and implies
+    ``kind="metro"``; it raises :class:`ValueError` when ``kind`` names
+    another kind or no metro of the index carries it. US metropolitan
+    statistical areas are named after their principal cities ("Los
+    Angeles–Long Beach–Anaheim metropolitan area"), so a city's name
+    matches one only in part and raises ``PlaceNotFoundError`` listing it;
+    the city's :attr:`Place.metros` holds it. Raises
     :class:`~transitio.exceptions.PlaceNotFoundError` or
     :class:`~transitio.exceptions.AmbiguousPlaceError`.
     """
-    return _lookup_for(_coerce_index(index)).resolve(query, kind=kind)
+    lookup = _lookup_for(_coerce_index(index))
+    return lookup.resolve(query, kind=kind, definition=definition)
 
 
 def places(query, *, index=None):

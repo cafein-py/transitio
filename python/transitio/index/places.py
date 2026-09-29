@@ -20,8 +20,11 @@ same service (no more than the margin beyond the city's feeds) is the city
 itself, and a place inside it or, not being a city, in its country that
 reaches its name only through an alias is named after it. Where no exact
 match is a city, a region or country of the name (a province, an emirate, a
-dependency) stands as the city. Anything else
-raises :class:`AmbiguousPlaceError` with the candidates, or
+dependency) stands as the city. With ``kind="metro"``, metros of the name
+sharing a member place are one metro under several definitions, and only
+those of the earliest definition in the default order compete; a named
+definition keeps only its metros. Anything else raises
+:class:`AmbiguousPlaceError` with the candidates, or
 :class:`PlaceNotFoundError` with the partial matches, if any.
 """
 
@@ -88,6 +91,25 @@ _EXACT, _PREFIX, _SUBSET = 3, 2, 1
 # kind precedence for the metro-default world: a metro outranks the city it
 # contains, which outranks the region, which outranks the country.
 _KIND_ORDER = {"metro": 0, "city": 1, "region": 2, "country": 3}
+
+# The metro definitions (a metro's ``source_subtype``) in the order
+# ``kind="metro"`` picks among one metro's: the commuting-based ones (Urban
+# Audit FUAs, US MSAs), Eurostat's NUTS-3 metropolitan regions, then the FAO
+# city-regions, global and with uneven boundaries. Any other ranks after these.
+_METRO_DEFINITIONS = (
+    "functional urban area",
+    "metropolitan statistical area",
+    "metropolitan region",
+    "city-region (FAO)",
+)
+
+
+def _definition_rank(definition):
+    """A metro definition's place in ``_METRO_DEFINITIONS``; any other after."""
+    if definition in _METRO_DEFINITIONS:
+        return _METRO_DEFINITIONS.index(definition)
+    return len(_METRO_DEFINITIONS)
+
 
 # ``_decide``'s answer when the margin would favour an alias over a name: no
 # decision, and no other contest may overturn it.
@@ -493,6 +515,7 @@ class _PlaceLookup:
         self._labels = {}
         self._children = defaultdict(list)
         self._countries = defaultdict(list)
+        self._definitions = set()  # the metro definitions the index holds
         self._name_index = None  # built on the first suggestion, under the lock
         self._name_lock = threading.Lock()
         # A former id or a QID the place carries resolves to it; a real id
@@ -525,6 +548,8 @@ class _PlaceLookup:
                 self._children[record["parent_id"]].append(place_id)
             if record["kind"] == "country" and record["country_code"]:
                 self._countries[record["country_code"]].append(place_id)
+            if record["kind"] == "metro" and record["source_subtype"]:
+                self._definitions.add(record["source_subtype"])
             qids = record["concordances"].get("wikidata", [])
             for alias in [*record["former_ids"], *qids]:
                 self._aliases.setdefault(alias, place_id)
@@ -583,13 +608,15 @@ class _PlaceLookup:
                 best = max(best, _SUBSET)
         return best
 
-    def _candidates(self, query, kind=None):
+    def _candidates(self, query, kind=None, definition=None):
         query_norm = _normalize(query)
         query_tokens = query_norm.split()
         scored = []
         for place_id, labels in self._labels.items():
             record = self._records[place_id]
             if kind is not None and record["kind"] != kind:
+                continue
+            if definition is not None and record["source_subtype"] != definition:
                 continue
             tier = self._tier(query_norm, query_tokens, labels)
             if tier:
@@ -607,13 +634,13 @@ class _PlaceLookup:
     def search(self, query, kind=None):
         return [self.get(place_id) for _, place_id in self._qualified(query, kind)[1]]
 
-    def _qualified(self, query, kind):
+    def _qualified(self, query, kind, definition=None):
         """The name the query asks for and its candidates: as written when a
         label matches it exactly, else, for "Name, Qualifier, ...", the
         candidates for the name that lie within a place each qualifier names —
         a region, a country or a country's code ("London, Ontario", "City of
         London, UK")."""
-        scored = self._candidates(query, kind)
+        scored = self._candidates(query, kind, definition)
         if "," not in query or any(tier == _EXACT for tier, _ in scored):
             return query, scored
         name, *rest = query.split(",")
@@ -622,7 +649,7 @@ class _PlaceLookup:
             return query, scored
         return name, [
             (tier, place_id)
-            for tier, place_id in self._candidates(name, kind)
+            for tier, place_id in self._candidates(name, kind, definition)
             if all(self._within(place_id, qualifier) for qualifier in qualifiers)
         ]
 
@@ -659,7 +686,19 @@ class _PlaceLookup:
             suggestions.append(Suggestion(Place(record, self), label, text, source))
         return suggestions
 
-    def resolve(self, query, kind=None):
+    def resolve(self, query, kind=None, definition=None):
+        if definition is not None:
+            if kind not in (None, "metro"):
+                raise ValueError(
+                    f"definition= names a metro definition, but kind={kind!r}"
+                )
+            if definition not in self._definitions:
+                held = sorted(self._definitions, key=lambda d: (_definition_rank(d), d))
+                raise ValueError(
+                    f"no metro in the index is a {definition!r}; its metro "
+                    f"definitions: {', '.join(map(repr, held)) or 'none'}"
+                )
+            kind = "metro"
         if isinstance(query, Place):
             return query
         if isinstance(query, str) and (_QID.match(query) or _OWN_ID.match(query)):
@@ -667,7 +706,9 @@ class _PlaceLookup:
             if place is None:
                 raise PlaceNotFoundError(f"no place with id {query!r} in the index")
             return place
-        name, scored = self._qualified(query, kind)
+        name, scored = self._qualified(query, kind, definition)
+        if kind == "metro" and definition is None:
+            scored = self._one_definition(scored)
         if not scored:
             raise PlaceNotFoundError(f"no place matches {query!r}")
         if all(tier != _EXACT for tier, _ in scored):
@@ -681,6 +722,41 @@ class _PlaceLookup:
             error.candidates = tuple(partial)
             raise error
         return self.get(self._winner(query, scored, name))
+
+    def _one_definition(self, scored):
+        """``scored`` less the exact metro matches another definition of the
+        same metro outranks. Exact matches sharing a member place, directly or
+        along a chain, are one metro under several definitions and keep those
+        of the earliest definition in ``_METRO_DEFINITIONS``. Shared members,
+        not country codes, group them: a cross-border metro may be filed
+        under a neighbour's code (Basel's FAO region under France), while
+        same-named metros of different countries (Athens, US and Greece) share
+        none and stay rivals."""
+        records = self._records
+        exact = [
+            pid
+            for tier, pid in scored
+            if tier == _EXACT and records[pid]["kind"] == "metro"
+        ]
+        members = {pid: set(records[pid]["member_ids"]) for pid in exact}
+        group = {}
+        for start in exact:
+            if start in group:
+                continue
+            group[start] = start
+            pending = [start]
+            while pending:
+                current = pending.pop()
+                for other in exact:
+                    if other not in group and members[current] & members[other]:
+                        group[other] = start
+                        pending.append(other)
+        rank = {pid: _definition_rank(records[pid]["source_subtype"]) for pid in exact}
+        best = {}
+        for pid in exact:
+            best[group[pid]] = min(rank[pid], best.get(group[pid], rank[pid]))
+        dropped = {pid for pid in exact if rank[pid] > best[group[pid]]}
+        return [(tier, pid) for tier, pid in scored if pid not in dropped]
 
     def _winner(self, query, scored, name):
         exact = self._contenders(scored, name)
