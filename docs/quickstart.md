@@ -16,8 +16,9 @@ The area of interest can be a place name (geocoded via Nominatim), a shapely
 geometry, a GeoDataFrame/GeoSeries, or a `(minx, miny, maxx, maxy)` bounding
 box in WGS84. The pipeline:
 
-1. downloads the smallest OpenStreetMap extract covering the area and crops
-   it to the AOI geometry (skipped with `osm=False`),
+1. downloads the smallest single OpenStreetMap extract that contains the
+   area (Geofabrik, BBBike or Movisda) and crops it to the area's bounding
+   box (skipped with `osm=False`),
 2. discovers every GTFS feed overlapping the area in the Mobility Database
    (official feeds first, then by spatial specificity) — or, for a place,
    takes the feeds the index lists for it,

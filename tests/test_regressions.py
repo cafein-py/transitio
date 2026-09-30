@@ -2,6 +2,7 @@
 
 import csv
 import io
+import sys
 import zipfile
 
 import pytest
@@ -1324,7 +1325,7 @@ def test_a_placeholder_calendar_is_an_older_version_of_the_dated_network(tmp_pat
     )
 
 
-@pytest.mark.parametrize("client", ["mdb", "atlas", "osm", "index"])
+@pytest.mark.parametrize("client", ["mdb", "atlas", "index"])
 def test_http_clients_identify_themselves_as_transitio(client, tmp_path):
     # Hosts that filter by user agent answered httpx's default
     # "python-httpx/<version>" with 403 Forbidden, so their feeds never
@@ -1337,7 +1338,6 @@ def test_http_clients_identify_themselves_as_transitio(client, tmp_path):
     from transitio.catalog import AtlasFeed, MobilityDatabase, TransitlandAtlas
     from transitio.catalog._models import Feed
     from transitio.index import _refresh
-    from transitio.osm._fetch import _download
 
     url = "https://feeds.example/gtfs.zip"
     sent = []
@@ -1357,8 +1357,6 @@ def test_http_clients_identify_themselves_as_transitio(client, tmp_path):
         )
         with TransitlandAtlas(cache_dir=tmp_path, transport=transport) as atlas:
             atlas.download(feed)
-    elif client == "osm":
-        _download(url, tmp_path / "extract.osm.pbf", False, transport)
     else:
         with _refresh._client("https://api.github.example", transport) as http:
             http.get("/repos/x/y/releases")
@@ -1372,31 +1370,171 @@ def test_http_clients_identify_themselves_as_transitio(client, tmp_path):
     )
 
 
-def test_a_stalled_extract_download_is_retried(tmp_path, monkeypatch):
-    # The OSM extract download made one attempt, so a read timeout on a slow
-    # host failed the fetch, and its fixed-name .part file was left behind.
+def test_an_area_across_a_border_gets_the_smallest_extract_containing_it(
+    tmp_path, monkeypatch
+):
+    # A place grown across a national border was given Geofabrik's
+    # whole-continent extract, since only Geofabrik extracts were ranked and
+    # one had to cover the area's envelope.
+    import json
+    import pathlib
+    import types
+
+    from shapely.geometry import box
+
+    from transitio.osm import fetch_pbf
+    from transitio.osm._fetch import _buffered
+
+    url = "https://download.bbbike.org/osm/bbbike/Basel/Basel.osm.pbf"
+    areas = []
+
+    def get_data_by_area(area, directory=None, **kwargs):
+        areas.append(area)
+        path = pathlib.Path(directory) / "bbbike_Basel.osm.pbf"
+        path.write_bytes(b"\x00pbf")
+        return types.SimpleNamespace(
+            path=str(path),
+            provider="BBBike",
+            extract="Basel",
+            url=url,
+            bytes=100138363,
+            failed=[],
+        )
+
+    def get_data_by_bbox(*args, **kwargs):
+        pytest.fail("the extract was ranked among Geofabrik extracts only")
+
+    monkeypatch.setattr("pyrosm.get_data_by_area", get_data_by_area)
+    monkeypatch.setattr("pyrosm.get_data_by_bbox", get_data_by_bbox)
+    polygon = box(7.55, 47.52, 7.65, 47.60)
+    path = fetch_pbf(polygon, crop=False, buffer_m=1600, cache_dir=tmp_path)
+    (area,) = areas
+    assert area.equals(_buffered(polygon, 1600))
+    sidecar = json.loads(path.with_suffix(".provenance.json").read_text())
+    assert (sidecar["provider"], sidecar["extract"], sidecar["source_url"]) == (
+        "BBBike",
+        "Basel",
+        url,
+    )
+
+
+def _finland_extract(path, update):
+    """An ``AreaExtract`` stand-in for Geofabrik's Finland extract at ``path``,
+    written as pyrosm would: when missing or on update."""
+    import types
+
+    if update or not path.exists():
+        path.write_bytes(b"\x00new" if update else b"\x00old")
+    return types.SimpleNamespace(
+        path=str(path),
+        provider="Geofabrik",
+        extract="finland",
+        url="https://download.geofabrik.de/europe/finland-latest.osm.pbf",
+        bytes=None,
+        failed=[],
+    )
+
+
+def test_fetches_sharing_a_cache_take_turns(tmp_path, monkeypatch):
+    # A fetch could replace the cached extract while another cropped it and
+    # took its checksum, or overwrite the other's sidecar, so a file's
+    # provenance could name bytes it was not made from.
+    import concurrent.futures
     import hashlib
-    import time
+    import json
+    import pathlib
+    import threading
 
-    import httpx
+    from transitio.osm import fetch_pbf
 
-    from transitio.osm._fetch import _download
+    extract = tmp_path / "osm" / "geofabrik_finland-latest.osm.pbf"
+    updates = []
+    cropping, release = threading.Event(), threading.Event()
 
-    payload = b"\x00pbf"
-    requests = []
+    def get_data_by_area(area, update=False, **kwargs):
+        updates.append(update)
+        return _finland_extract(extract, update)
 
-    def handler(request):
-        requests.append(request)
-        if len(requests) == 1:
-            raise httpx.ReadTimeout("timed out", request=request)
-        return httpx.Response(200, content=payload)
+    class OSM:
+        def __init__(self, filepath, bounding_box=None):
+            self.filepath = filepath
 
-    monkeypatch.setattr(time, "sleep", lambda seconds: None)
-    path = tmp_path / "extract.osm.pbf"
-    url = "https://download.example/extract.osm.pbf"
-    digest = _download(url, path, False, httpx.MockTransport(handler))
-    assert (path.read_bytes(), digest) == (payload, hashlib.sha256(payload).hexdigest())
-    assert (len(requests), list(tmp_path.glob("*.part"))) == (2, [])
+        def to_pbf(self, output_path=None):
+            source = pathlib.Path(self.filepath).read_bytes()
+            cropping.set()
+            release.wait(30)
+            pathlib.Path(output_path).write_bytes(b"crop of " + source)
+
+    monkeypatch.setattr("pyrosm.get_data_by_area", get_data_by_area)
+    monkeypatch.setattr("pyrosm.OSM", OSM)
+    bbox = (24.6, 60.1, 25.2, 60.4)
+    with concurrent.futures.ThreadPoolExecutor(2) as pool:
+        try:
+            crop = pool.submit(fetch_pbf, bbox, cache_dir=tmp_path)
+            assert cropping.wait(30)
+            full = pool.submit(
+                fetch_pbf, bbox, crop=False, update=True, cache_dir=tmp_path
+            )
+            assert not concurrent.futures.wait([full], timeout=0.5).done
+            assert updates == [False]
+        finally:
+            release.set()
+        paths = crop.result(30), full.result(30)
+    crop_sidecar, full_sidecar = (
+        json.loads(path.with_suffix(".provenance.json").read_text()) for path in paths
+    )
+    assert paths[0].read_bytes() == b"crop of \x00old"
+    assert crop_sidecar["extract_sha256"] == hashlib.sha256(b"\x00old").hexdigest()
+    assert full_sidecar["extract_sha256"] == hashlib.sha256(b"\x00new").hexdigest()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges")
+def test_a_crop_and_its_sidecar_replace_what_is_at_their_names(tmp_path, monkeypatch):
+    # The crop and its sidecar were written straight to their names, so a
+    # failed crop left a truncated file that later calls returned as cached,
+    # and a symlink at either name had its target overwritten.
+    import pathlib
+
+    from transitio.osm import fetch_pbf
+
+    fail = []
+
+    class OSM:
+        def __init__(self, filepath, bounding_box=None):
+            pass
+
+        def to_pbf(self, output_path=None):
+            pathlib.Path(output_path).write_bytes(b"\x00crop")
+            if fail:
+                raise RuntimeError("crop failed")
+
+    monkeypatch.setattr(
+        "pyrosm.get_data_by_area",
+        lambda area, update=False, directory=None, **kwargs: _finland_extract(
+            pathlib.Path(directory) / "geofabrik_finland-latest.osm.pbf", update
+        ),
+    )
+    monkeypatch.setattr("pyrosm.OSM", OSM)
+    bbox = (24.6, 60.1, 25.2, 60.4)
+    path = fetch_pbf(bbox, cache_dir=tmp_path)
+    names = path, path.with_suffix(".provenance.json")
+    for name in names:
+        outside = tmp_path / f"outside-{name.suffix}"
+        outside.write_text("do not clobber")
+        name.unlink()
+        name.symlink_to(outside)
+
+    fail.append(True)
+    with pytest.raises(RuntimeError, match="crop failed"):
+        fetch_pbf(bbox, cache_dir=tmp_path, update=True)
+    assert all(name.is_symlink() for name in names)
+    assert [p for p in path.parent.iterdir() if p.is_dir()] == []
+    fail.clear()
+    assert fetch_pbf(bbox, cache_dir=tmp_path, update=True) == path
+    assert not any(name.is_symlink() for name in names)
+    assert path.read_bytes() == b"\x00crop"
+    outside = sorted(tmp_path.glob("outside-*"))
+    assert [p.read_text() for p in outside] == ["do not clobber"] * 2
 
 
 @pytest.mark.parametrize("status", [200, 404])

@@ -64,11 +64,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - transitio's HTTP clients send `User-Agent: transitio/<version>
   (+https://github.com/cafein-py/transitio)` instead of httpx's default,
   which Metrolink's and Riverside Transit's hosts answered with 403.
-- Feed and OSM extract downloads retry dropped connections, read
-  timeouts, short bodies and retryable statuses (three failed attempts,
-  ten requests at most) and resume with `Range` when the server pins the
-  file with a strong ETag or a Last-Modified date; the read timeout is
-  60 s and the connect timeout 15 s.
+- Feed downloads retry dropped connections, read timeouts, short bodies
+  and retryable statuses (three failed attempts, ten requests at most)
+  and resume with `Range` when the server pins the file with a strong
+  ETag or a Last-Modified date; the read timeout is 60 s and the connect
+  timeout 15 s.
 - A region or country of at most 1,000 km² lists its primary feeds too
   by default, as a city does, so a town-sized municipality or small state
   offers its local feeds; `DISCOVERY_SEMANTICS_VERSION` is 3. When the
@@ -108,6 +108,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each trip that serves the area whole, so such stops can get no
   footpaths in cafein. cafein gave 3,418 of Glasgow's 10,026 stops no
   footpaths, and fetch did not say why.
+- `fetch_pbf`, and so `fetch`, downloads the smallest single OSM extract
+  that contains the area among Geofabrik and BBBike extracts and
+  Movisda's administrative areas and grid tiles, through
+  `pyrosm.get_data_by_area` (pyrosm `>=0.14.0`). pyrosm downloads it,
+  three attempts per extract, falling back to the next smallest. The
+  provenance sidecar gains `provider`, `extract`, `extract_bytes` and
+  `failed_extracts`, and its `retrieved_at` is when the extract was
+  downloaded, for a crop and a reused extract too. `fetch_pbf` loses its
+  `transport` argument and raises `ValueError` for an AOI without area.
+  Full extracts are cached as `<provider>_<file>.osm.pbf`, so extracts
+  cached before are downloaded again. Basel, Strasbourg, Baarle-Hertog,
+  Frankfurt (Oder), Tornio and Haparanda got Geofabrik's whole Europe
+  extract (35 GB); Basel now gets BBBike's 100 MB Basel extract.
 
 ### Fixed
 
@@ -164,6 +177,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A failed OSM extract download no longer loses the feeds `fetch` already
   fetched: they are delivered without an extract, with a `UserWarning`
   and a selection note. Baarle-Hertog's extract download timed out.
+- `fetch_pbf` calls sharing a cache or output directory take turns, and a
+  crop and its provenance sidecar replace their files only when complete,
+  so a file and its sidecar describe the same extract, and a failed crop
+  no longer leaves a truncated file that later calls return as cached.
 
 ## 0.17.0 — 2026-09-28
 
