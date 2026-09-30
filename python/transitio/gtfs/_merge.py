@@ -211,7 +211,11 @@ def merge_tables(
     in them go stale), and wildcard fare scopes — blank optional
     selectors in fare tables, or a fare with no ``fare_rules`` rows —
     widen from "this feed" to the whole merged feed, as does a
-    dataset-wide (all-blank) ``attributions.txt`` row.
+    dataset-wide (all-blank) ``attributions.txt`` row. Every input keeps
+    its default rider categories (``is_default_fare_category``), as GTFS
+    sets the default per fare product; a fare product with a blank
+    ``rider_category_id`` is one of those wildcard scopes and then sees
+    each input's default.
 
     The inputs' ``agency_timezone`` names must be equivalent, or the
     merge raises :class:`~transitio.exceptions.InvalidFeedError`, which is
@@ -303,13 +307,8 @@ def _merge_tables(
 
     if labels is None:
         labels = [f"feed {i} ({prefix})" for i, prefix in enumerate(prefixes)]
-    defaulted = 0
     for tables, extras, prefix in zip(table_sets, extra_entries, prefixes):
         _reject_flex(tables, extras, prefix)
-        riders = tables.get("rider_categories.txt")
-        if riders is not None and "is_default_fare_category" in riders.columns:
-            if (riders["is_default_fare_category"].str.strip() == "1").any():
-                defaulted += 1
     declared = [_timezones(tables) for tables in table_sets]
     zones = set().union(*declared)
     aliases = {}
@@ -329,11 +328,6 @@ def _merge_tables(
             )
         used = _most_declared(declared)
         aliases = {zone: used for zone in sorted(zones) if zone != used}
-    if defaulted > 1:
-        raise ValueError(
-            "more than one feed declares a default rider category "
-            "(is_default_fare_category); these fare defaults cannot be merged"
-        )
 
     dropped = set()
     parts = {}
@@ -354,8 +348,8 @@ def _merge_tables(
         agency.loc[filled, "agency_timezone"] = used
     duplicates = {"dropped": 0, "by_feed": {}, "unexpanded_services": 0}
     duplicates["stop_links"] = 0
+    at = range(len(prefixed)) if positions is None else positions
     if duplicate_trips == "drop":
-        at = range(len(prefixed)) if positions is None else positions
         duplicates = drop_duplicate_trips(merged, prefixed, at)
     details = {
         "timezone_interval": (
@@ -363,8 +357,51 @@ def _merge_tables(
         ),
         "timezone_aliases": aliases,
         "duplicate_trips": duplicates,
+        "rider_defaults": _rider_defaults(prefixed, at),
     }
     return merged, sorted(dropped), details
+
+
+def _ids_where(table, column, selector, value):
+    """The distinct non-blank ``column`` values, sorted, of the rows whose
+    ``selector`` is ``value`` once stripped; a missing ``selector`` is blank."""
+    if table is None or column not in table.columns:
+        return []
+    ids = table[column]
+    if selector in table.columns:
+        ids = ids[table[selector].str.strip() == value]
+    elif value:
+        return []
+    return sorted(set(ids[ids.str.strip() != ""]))
+
+
+def _rider_defaults(prefixed, positions):
+    """Each input's default rider categories and the fare products open to
+    every rider category, by input position, for the inputs with either;
+    ``[]`` unless two or more inputs declare a default."""
+    entries = [
+        {
+            "feed": position,
+            "defaults": _ids_where(
+                tables.get("rider_categories.txt"),
+                "rider_category_id",
+                "is_default_fare_category",
+                "1",
+            ),
+            "wildcard_products": _ids_where(
+                tables.get("fare_products.txt"),
+                "fare_product_id",
+                "rider_category_id",
+                "",
+            ),
+        }
+        for position, tables in zip(positions, prefixed)
+    ]
+    if sum(bool(entry["defaults"]) for entry in entries) < 2:
+        return []
+    return [
+        entry for entry in entries if entry["defaults"] or entry["wildcard_products"]
+    ]
 
 
 def _timezones(tables):
@@ -733,7 +770,14 @@ def merge_feeds(
         as repeats, ``{"dropped": <n>, "by_feed": {<input position>: <n>},
         "unexpanded_services": <n>, "stop_links": <n>}``: the services not
         expanded, whose trips were never compared, and the stop pairs
-        linked. ``"inherited_errors"`` lists the ERROR-severity notices
+        linked. ``"rider_defaults"`` is ``[]`` unless two or more inputs
+        declare a default rider category; it then lists one ``{"feed":
+        <input position>, "defaults": [<rider_category_id>, ...],
+        "wildcard_products": [<fare_product_id>, ...]}`` per input with a
+        default or with fare products left open to every rider category
+        (blank ``rider_category_id``), which the merged feed makes eligible
+        for several defaults; ids are the merged ones, sorted.
+        ``"inherited_errors"`` lists the ERROR-severity notices
         the written feed carries from its inputs, one ``{"feed": <input
         position>, "errors": <n>, "codes": {<code>: <n>}}`` per input with
         any, and ``"introduced_errors"`` counts the others, ``{"errors":

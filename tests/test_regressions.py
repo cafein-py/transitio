@@ -668,3 +668,63 @@ def test_merge_refuses_only_errors_it_introduced(
     assert output.exists()
     assert report["inherited_errors"] == inherited
     assert report["introduced_errors"] == introduced
+
+
+def _rider_entry(position, wildcards=()):
+    return {
+        "feed": position,
+        "defaults": [f"f{position + 1}:adult"],
+        "wildcard_products": list(wildcards),
+    }
+
+
+@pytest.mark.parametrize(
+    "defaults, open_products, expected",
+    [
+        (["1", "1"], [], [_rider_entry(0), _rider_entry(1)]),
+        (["1", "1"], ["day"], [_rider_entry(0, ["f1:day"]), _rider_entry(1)]),
+        (["", "1"], ["day"], []),
+    ],
+    ids=["a-default-each", "open-product", "one-default"],
+)
+def test_merge_keeps_each_inputs_default_rider_category(
+    tmp_path, defaults, open_products, expected
+):
+    # A merge refused inputs that each declared a default rider category,
+    # though GTFS sets the default per fare product, not per feed.
+    from transitio.edit import FeedBuilder, FeedEditor
+    from transitio.gtfs import merge_feeds
+
+    feeds = []
+    for default in defaults:
+        builder = FeedBuilder()
+        builder.insert_rows(
+            "rider_categories.txt",
+            [
+                {"rider_category_id": "adult", "is_default_fare_category": default},
+                {"rider_category_id": "child", "is_default_fare_category": "0"},
+            ],
+        )
+        builder.insert_rows(
+            "fare_products.txt",
+            [
+                {"fare_product_id": rider, "rider_category_id": rider}
+                for rider in ("adult", "child")
+            ],
+        )
+        feeds.append(builder)
+    feeds[0].insert_rows(
+        "fare_products.txt",
+        [
+            {"fare_product_id": product, "rider_category_id": ""}
+            for product in open_products
+        ],
+    )
+    output = tmp_path / "merged.zip"
+    report = merge_feeds(feeds, output, check=False)
+    riders = FeedEditor(output).tables["rider_categories.txt"]
+    flagged = riders["is_default_fare_category"] == "1"
+    assert list(riders.loc[flagged, "rider_category_id"]) == [
+        f"f{position}:adult" for position, flag in enumerate(defaults, 1) if flag
+    ]
+    assert report["rider_defaults"] == expected

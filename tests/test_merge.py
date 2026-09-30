@@ -468,18 +468,6 @@ def test_conflicting_agency_timezones():
         merge_tables([first, second])
 
 
-def test_conflicting_default_rider_categories():
-    def feed():
-        return {
-            "rider_categories.txt": frame(
-                rider_category_id=["rc"], is_default_fare_category=["1"]
-            )
-        }
-
-    with pytest.raises(ValueError, match="default rider category"):
-        merge_tables([feed(), feed()])
-
-
 def test_flex_feeds_are_refused():
     plain = {"stops.txt": frame(stop_id=["1"])}
     with_geojson = {"locations.geojson": frame(anything=["x"]), **plain}
