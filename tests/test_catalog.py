@@ -1,11 +1,14 @@
 import datetime
+import gzip
 import hashlib
 import json
+import time
 
 import httpx
 import pytest
 from shapely.geometry import box
 
+from transitio import _http
 from transitio.catalog import (
     TOKEN_ENV_VAR,
     AtlasFeed,
@@ -568,3 +571,153 @@ def test_atlas_download_namespaces_feeds_in_a_shared_directory(tmp_path):
     assert path_a != path_b
     assert path_a.read_bytes() == b"AAAA"
     assert path_b.read_bytes() == b"BBBB"
+
+
+URL = "https://feeds.example/gtfs.zip"
+# Incompressible, so its gzip encoding is longer than the decoded bytes.
+BODY = b"".join(hashlib.sha256(bytes([i])).digest() for i in range(64))
+STRONG, WEAK, MODIFIED = '"v1"', 'W/"v1"', "Tue, 01 Jun 2021 00:00:00 GMT"
+FRESH, RESUMED = (None, None), ("bytes=1024-", STRONG)
+
+
+class _Body(httpx.SyncByteStream):
+    """A response body cut by a ``ReadError`` after ``drop`` bytes, if given."""
+
+    def __init__(self, data, drop):
+        self._data, self._drop = data, drop
+
+    def __iter__(self):
+        yield self._data[: self._drop]
+        if self._drop is not None:
+            raise httpx.ReadError("connection reset")
+
+
+def _answer(status=200, body=b"", *, drop=None, size=None, **headers):
+    """A scripted answer; ``Content-Length`` is ``size``, else the body's."""
+    headers = {name.replace("_", "-"): value for name, value in headers.items()}
+    headers["Content-Length"] = str(len(body) if size is None else size)
+    return status, headers, body, drop
+
+
+def _rest(start, **headers):
+    total = len(BODY)
+    range_ = f"bytes {start}-{total - 1}/{total}"
+    return _answer(206, BODY[start:], content_range=range_, **headers)
+
+
+@pytest.mark.parametrize(
+    "script, expected, sent, waits",
+    [
+        pytest.param(
+            [_answer(body=BODY, drop=1024, etag=STRONG), _rest(1024, etag=STRONG)],
+            BODY,
+            [FRESH, RESUMED],
+            [],
+            id="drop-resumed-by-etag",
+        ),
+        pytest.param(
+            [
+                _answer(body=BODY[:1024], size=len(BODY), last_modified=MODIFIED),
+                _rest(1024, last_modified=MODIFIED),
+            ],
+            BODY,
+            [FRESH, ("bytes=1024-", MODIFIED)],
+            [],
+            id="short-body-resumed-by-last-modified",
+        ),
+        pytest.param(
+            [_answer(body=BODY, drop=1024, etag=WEAK), _answer(body=BODY)],
+            BODY,
+            [FRESH, FRESH],
+            [1.0],
+            id="weak-etag-restarts",
+        ),
+        pytest.param(
+            [_answer(body=BODY, drop=1024, etag=STRONG), _answer(body=BODY[::-1])],
+            BODY[::-1],
+            [FRESH, RESUMED],
+            [],
+            id="changed-file-restarts",
+        ),
+        pytest.param(
+            [
+                _answer(body=BODY, drop=1024, etag=STRONG),
+                _rest(512, etag=STRONG),
+                _answer(body=BODY),
+            ],
+            BODY,
+            [FRESH, RESUMED, FRESH],
+            [1.0],
+            id="misaligned-resume-restarts",
+        ),
+        pytest.param(
+            [_answer(body=gzip.compress(BODY, mtime=0), content_encoding="gzip")],
+            BODY,
+            [FRESH],
+            [],
+            id="gzip-encoded",
+        ),
+        pytest.param(
+            [_answer(503), httpx.ReadTimeout, _answer(body=BODY)],
+            BODY,
+            [FRESH] * 3,
+            [1.0, 2.0],
+            id="transient-failures",
+        ),
+        pytest.param(
+            [_answer(503)] * 3,
+            "HTTP 503 Service Unavailable (3 requests)",
+            [FRESH] * 3,
+            [1.0, 2.0],
+            id="retry-status-thrice",
+        ),
+        pytest.param(
+            [_answer(body=BODY[:1024], size=len(BODY))] * 3,
+            "body ended at 1024 of 2048 bytes (3 requests)",
+            [FRESH] * 3,
+            [1.0, 2.0],
+            id="unpinned-short-body-thrice",
+        ),
+        pytest.param(
+            [httpx.ConnectTimeout],
+            "ConnectTimeout: timed out",
+            [FRESH],
+            [],
+            id="connect-timeout",
+        ),
+        pytest.param([_answer(404)], "HTTP 404 Not Found", [FRESH], [], id="not-found"),
+        pytest.param(
+            [_answer(body=BODY, drop=1, etag=STRONG)] * 10,
+            "ReadError: connection reset (10 requests)",
+            [FRESH] + [("bytes=1-", STRONG)] * 9,
+            [],
+            id="request-cap",
+        ),
+    ],
+)
+def test_download_retries_and_resumes(
+    tmp_path, monkeypatch, script, expected, sent, waits
+):
+    requests, slept = [], []
+
+    def handler(request):
+        requests.append((request.headers.get("Range"), request.headers.get("If-Range")))
+        step = script[len(requests) - 1]
+        if isinstance(step, type):
+            raise step("timed out", request=request)
+        status, headers, body, drop = step
+        return httpx.Response(status, headers=headers, stream=_Body(body, drop))
+
+    monkeypatch.setattr(time, "sleep", slept.append)
+    path = tmp_path / "feed.zip"
+    with _http.client(transport=httpx.MockTransport(handler)) as client:
+        if isinstance(expected, bytes):
+            digest = _http.download(client, URL, path)
+            assert path.read_bytes() == expected
+            assert digest == hashlib.sha256(expected).hexdigest()
+        else:
+            with pytest.raises(DownloadError) as caught:
+                _http.download(client, URL, path)
+            assert str(caught.value) == f"{URL}: {expected}"
+            assert not list(tmp_path.iterdir())
+    assert (requests, slept) == (sent, waits)

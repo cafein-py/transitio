@@ -1146,3 +1146,30 @@ def test_http_clients_identify_themselves_as_transitio(client, tmp_path):
         r"transitio/\S+ \(\+https://github\.com/cafein-py/transitio\)",
         _http.USER_AGENT,
     )
+
+
+def test_a_stalled_extract_download_is_retried(tmp_path, monkeypatch):
+    # The OSM extract download made one attempt, so a read timeout on a slow
+    # host failed the fetch, and its fixed-name .part file was left behind.
+    import hashlib
+    import time
+
+    import httpx
+
+    from transitio.osm._fetch import _download
+
+    payload = b"\x00pbf"
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if len(requests) == 1:
+            raise httpx.ReadTimeout("timed out", request=request)
+        return httpx.Response(200, content=payload)
+
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    path = tmp_path / "extract.osm.pbf"
+    url = "https://download.example/extract.osm.pbf"
+    digest = _download(url, path, False, httpx.MockTransport(handler))
+    assert (path.read_bytes(), digest) == (payload, hashlib.sha256(payload).hexdigest())
+    assert (len(requests), list(tmp_path.glob("*.part"))) == (2, [])

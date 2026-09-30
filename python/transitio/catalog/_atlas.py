@@ -10,7 +10,7 @@ from pathlib import Path
 import platformdirs
 
 from transitio import _http
-from transitio.catalog._client import _stream_download, _write_provenance
+from transitio.catalog._client import _write_provenance
 from transitio.exceptions import DownloadError
 
 # The Atlas ``urls`` key that names a feed's current static GTFS download.
@@ -82,13 +82,13 @@ class TransitlandAtlas:
     cache_dir : str or pathlib.Path, optional
         Directory for downloaded feeds. Defaults to the platform user cache
         directory for transitio.
-    timeout : float, default 30.0
-        Per-request timeout in seconds.
+    timeout : float or httpx.Timeout, default 60 s, 15 s to connect
+        Per-request timeout, in seconds when a float.
     transport : httpx.BaseTransport, optional
         Custom transport, mainly for testing.
     """
 
-    def __init__(self, *, cache_dir=None, timeout=30.0, transport=None):
+    def __init__(self, *, cache_dir=None, timeout=_http.TIMEOUT, transport=None):
         self._cache_dir = (
             Path(cache_dir)
             if cache_dir
@@ -127,6 +127,12 @@ class TransitlandAtlas:
         -------
         pathlib.Path
             Path of the downloaded zip.
+
+        Raises
+        ------
+        DownloadError
+            When the feed has no static URL or its download fails (dropped
+            connections and transient HTTP errors are retried first).
         """
         if not feed.static_url:
             raise DownloadError(f"atlas feed {feed.feed_id} has no static download url")
@@ -134,7 +140,7 @@ class TransitlandAtlas:
         # Namespaced by the feed even under a caller's directory, so several
         # feeds downloaded into one directory never share ``latest.zip``.
         path = base / _feed_dir(feed.feed_id) / "latest.zip"
-        digest = _stream_download(self._http, feed.static_url, path)
+        digest = _http.download(self._http, feed.static_url, path)
         provenance = {
             "feed_id": feed.feed_id,
             "onestop_id": feed.onestop_id,

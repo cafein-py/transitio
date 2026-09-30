@@ -44,6 +44,7 @@ import pandas as pd
 import pyproj
 import shapely
 
+from transitio._http import sha256_file
 from transitio.edit._editor import _GTFS_TABLES, _normalise_table
 from transitio.exceptions import ShapeInferenceError
 from transitio.shapes import _graph, _levels, _match, _relations, _stitch
@@ -129,7 +130,7 @@ def infer_shapes(path, output, pbf, *, strictness="strict", modes=None, check=Tr
     # The extract is pinned by digest rather than copied — country
     # extracts are far too large to snapshot — and re-checked before
     # anything is published, so a run can never mix OSM versions.
-    extract_digest = _digest(pbf)
+    extract_digest = sha256_file(pbf)
     workdir = pathlib.Path(tempfile.mkdtemp(prefix="transitio-shapes-"))
     # The published file is staged in the OUTPUT directory: os.replace
     # is only atomic within one filesystem, and the system temp dir is
@@ -252,7 +253,7 @@ def _infer_into(
     report["osm_pbf"] = os.fspath(pbf)
     report["osm_pbf_sha256"] = extract_digest
     report["inherited"] = inherited
-    report["feed_sha256"] = _digest(staged)
+    report["feed_sha256"] = sha256_file(staged)
     _certify(snapshot, staged, report, check)
     return report
 
@@ -275,7 +276,7 @@ def _inherited_provenance(path, snapshot):
     # A sidecar is trusted only when it names these very bytes: an
     # adjacent file with the right name may describe a different feed
     # entirely, and false provenance is worse than none.
-    if record.get("feed_sha256") != _digest(snapshot):
+    if record.get("feed_sha256") != sha256_file(snapshot):
         return None, {}
     summary = {
         "level": record.get("level"),
@@ -320,7 +321,7 @@ def _allocate_shape_id(index, reserved):
 
 def _require_stable_extract(pbf, expected):
     """Refuse if the OSM extract changed while the run was reading it."""
-    if _digest(pbf) != expected:
+    if sha256_file(pbf) != expected:
         raise OSError("the OSM extract changed while inferring; nothing was written")
 
 
@@ -384,17 +385,6 @@ def _publish(staged, output, report):
     sidecar.unlink(missing_ok=True)
     os.replace(staged, output)
     _write_provenance(output, report)
-
-
-def _digest(path):
-    """The SHA-256 of a file, read in bounded chunks."""
-    import hashlib
-
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for block in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _same_entry(a, b):

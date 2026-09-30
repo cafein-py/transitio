@@ -169,6 +169,7 @@ def compare_feed_history(
     import shutil
     import tempfile
 
+    from transitio._http import sha256_file
     from transitio.catalog import MobilityDatabase
     from transitio.exceptions import DownloadError
 
@@ -241,7 +242,7 @@ def compare_feed_history(
                 raise DownloadError(f"refusing symlinked directory: {durable_dir}")
             durable = durable_dir / f"{digest}.zip"
             if durable.exists():
-                if durable.is_symlink() or _sha256_of(durable) != digest:
+                if durable.is_symlink() or sha256_file(durable) != digest:
                     raise DownloadError(
                         f"unexpected content at {durable}; refusing to replace it"
                     )
@@ -266,16 +267,6 @@ def compare_feed_history(
         row["provenance"] = provenance[row["label"]]
         row["path"] = str(installed[row["label"]])
     return result
-
-
-def _sha256_of(path):
-    import hashlib
-
-    digest = hashlib.sha256()
-    with open(path, "rb") as reader:
-        while chunk := reader.read(1 << 20):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _snapshot(source, target):
