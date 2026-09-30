@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import collections
 import json
 import os
+
+#: Per-file notice budget for validations whose notice sets are compared.
+#: High enough that an ordinary large feed is compared in full; a feed that
+#: still saturates it is refused rather than compared on a sample.
+CERTIFY_NOTICE_BUDGET = 1_000_000
 
 
 def validate_feed(
@@ -32,6 +38,12 @@ def validate_feed(
     provided by the upcoming report module, not by this function's flat
     notice list.
 
+    Header names and values are read without surrounding whitespace (the
+    characters ``str.strip()`` removes), so the rules see them trimmed. A
+    file that had any carries one ``leading_or_trailing_whitespaces``
+    warning naming the first occurrence, with ``trimmedCount`` the number
+    of header names and values trimmed.
+
     Parameters
     ----------
     path : str or pathlib.Path
@@ -46,7 +58,10 @@ def validate_feed(
         Rows retained per file (default 20 million); reading past the cap
         raises a ``too_many_rows`` notice and stops for that file.
     max_columns : int, optional
-        Column-count guard per file (default 1000).
+        Column-count guard per file (default 1000). It also sets the
+        delimiter guard: a record with more than 4 × ``max_columns`` (at
+        least 4096) delimiters outside quotes is ``unreadable_file``, and
+        the file keeps only the rows before it.
     max_notices_per_file : int, optional
         Row-level notices retained per file (default 10000); further
         occurrences are counted in a ``notice_limit_reached`` notice.
@@ -72,7 +87,8 @@ def validate_feed(
         ``moment`` (present when ``reference_date`` was passed and the
         inputs were reliable, else ``None``) measures the target:
         ``activeTrips``/``activeRoutes``/``stopsServed`` at the date
-        (or clock time), the feed's own ``baselineTrips`` mean and the
+        (or clock time), the feed's own ``baselineTrips`` mean (``None``
+        when a service-day expansion cap was reached) and the
         ``windowDays`` denominator — measurement only, judgement stays
         with the notices. ``incomplete`` lists files whose retained
         content was truncated or unreadable (their row counts are lower
@@ -119,4 +135,30 @@ def validate_feed(
             reference_date=reference_date,
             reference_time=reference_time,
         )
+    )
+
+
+def _unreliable(validation):
+    """Whether a validation saw less than the whole feed."""
+    return bool(validation.get("incomplete")) or any(
+        notice["code"] in ("notice_limit_reached", "too_many_rows")
+        for notice in validation.get("notices", [])
+    )
+
+
+def _errors(validation, key=None):
+    """Error-severity notices as a multiset of ``key(notice)``.
+
+    The default key is ``(code, context)``: identity, not just the code,
+    so fixing one occurrence while introducing another under the same code
+    must still count.
+    """
+    return collections.Counter(
+        (
+            (notice["code"], json.dumps(notice.get("context"), sort_keys=True))
+            if key is None
+            else key(notice)
+        )
+        for notice in validation.get("notices", [])
+        if notice["severity"] == "ERROR"
     )

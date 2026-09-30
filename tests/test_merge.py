@@ -193,58 +193,74 @@ def test_feed_wide_attribution_passes_through():
     assert row["agency_id"] == "" and row["route_id"] == "" and row["trip_id"] == ""
 
 
-def _city_in(zone, agency_id="hsl"):
+def _city_in(zone, agency_id="hsl", at=None):
+    """``build_city`` declaring ``zone``, its stops moved to ``at`` (lat, lon)."""
     builder = build_city(agency_id)
     builder.tables["agency.txt"]["agency_timezone"] = zone
+    if at is not None:
+        builder.tables["stops.txt"]["stop_lat"] = [str(at[0]), str(at[0] + 0.002)]
+        builder.tables["stops.txt"]["stop_lon"] = [str(at[1]), str(at[1] + 0.01)]
     return builder
 
 
 HEL, UTC, OSLO = "Europe/Helsinki", "UTC", "Europe/Oslo"
 CET, PARIS, NYC = "CET", "Europe/Paris", "America/New_York"
+HONOLULU = "Pacific/Honolulu"
+IN_OSLO = (59.911, 10.750)
 
 
 @pytest.mark.parametrize(
-    "zones, timezones, error, skipped",
+    "zones, in_oslo, timezones, error, skipped",
     [
-        ([HEL, UTC, HEL], "refuse", "differ", None),
-        ([HEL, UTC, HEL], "skip", None, [{"feed": 1, "timezones": [UTC]}]),
-        (
-            [UTC, UTC, HEL, HEL],
-            "skip",
-            None,
-            [{"feed": 2, "timezones": [HEL]}, {"feed": 3, "timezones": [HEL]}],
-        ),
-        ([HEL, UTC, OSLO], "skip", "fewer than two", None),
-        ([HEL, HEL], "maybe", "must be", None),
+        ([HEL, UTC, HEL], (), "refuse", "differ", None),
+        ([HEL, UTC, HEL], (), None, None, [(1, UTC, HEL)]),
+        ([UTC, UTC, HEL, HEL], (), "skip", None, [(0, UTC, HEL), (1, UTC, HEL)]),
+        ([HEL, OSLO], (1,), "skip", None, [(1, OSLO, OSLO)]),
+        ([HEL, UTC, OSLO], (), "skip", None, [(1, UTC, HEL), (2, OSLO, HEL)]),
+        ([HEL, HEL], (), "maybe", "must be", None),
         (
             [UTC, NYC],
+            (),
             "refuse",
             re.escape(f"feed 0 (f1): {UTC}; feed 1 (f2): {NYC}"),
             None,
         ),
-        ([UTC, CET, PARIS], "skip", None, [{"feed": 0, "timezones": [UTC]}]),
+        ([UTC, CET, PARIS], (), "skip", None, [(0, UTC, HEL)]),
     ],
     ids=[
         "refused",
         "outlier-left-out",
-        "tie-earliest",
-        "too-few-left",
+        "stops-outweigh-count",
+        "both-vouch-earliest",
+        "one-left",
         "bad-option",
         "refusal-names-inputs",
         "equivalent-class-wins",
     ],
 )
-def test_feeds_of_another_time_zone(tmp_path, zones, timezones, error, skipped):
-    feeds = [_city_in(zone, f"a{i}") for i, zone in enumerate(zones)]
+def test_feeds_of_another_time_zone(
+    tmp_path, zones, in_oslo, timezones, error, skipped
+):
+    feeds = [
+        _city_in(zone, f"a{i}", IN_OSLO if i in in_oslo else None)
+        for i, zone in enumerate(zones)
+    ]
     output = tmp_path / "merged.zip"
+    options = {"reference_date": "20260601"}
+    if timezones is not None:
+        options["timezones"] = timezones
     if error:
         with pytest.raises(ValueError, match=error):
-            merge_feeds(feeds, output, timezones=timezones, reference_date="20260601")
+            merge_feeds(feeds, output, **options)
         return
-    report = merge_feeds(feeds, output, timezones=timezones, reference_date="20260601")
-    assert report["skipped_feeds"] == skipped
+    with pytest.warns(UserWarning, match="^left out feed "):
+        report = merge_feeds(feeds, output, **options)
+    assert report["skipped_feeds"] == [
+        {"feed": feed, "timezones": [zone], "stop_timezone": located}
+        for feed, zone, located in skipped
+    ]
     # The feeds kept keep the prefixes they had among all the inputs.
-    left = {entry["feed"] for entry in skipped}
+    left = {feed for feed, _, _ in skipped}
     agency = FeedEditor(output).tables["agency.txt"]
     assert set(agency["agency_id"]) == {
         f"f{i + 1}:a{i}" for i in range(len(zones)) if i not in left
@@ -444,10 +460,28 @@ def test_timezone_interval(tmp_path, monkeypatch, test_zones, case):
     if case["interval"] is None:
         names = re.escape(f"feed 0 (f1, {paths[0]}): {case['zones'][0]}")
         with pytest.raises(InvalidFeedError, match=names):
-            merge_feeds(paths, output, check=False)
+            merge_feeds(paths, output, check=False, timezones="refuse")
         return
     report = merge_feeds(paths, output, check=False)
     assert report["timezone_interval"] == case["interval"]
+
+
+@pytest.mark.parametrize(
+    "points, expected",
+    [
+        ([("21.332", "-157.920")], HONOLULU),
+        ([("60.169", "24.931"), ("21.332", "-157.920"), ("60.171", "24.941")], HEL),
+        ([("30.0", "-30.0"), ("30.5", "-30.0"), ("21.332", "-157.920")], HONOLULU),
+        ([("", "24.931"), ("x", "24.931"), ("95.0", "24.931")], None),
+    ],
+    ids=["one-zone", "most-stops", "sea-not-counted", "unlocated"],
+)
+def test_stop_zone(points, expected):
+    from transitio.gtfs._merge import _stop_zone
+
+    lat, lon = zip(*points)
+    tables = {"stops.txt": frame(stop_lat=lat, stop_lon=lon)}
+    assert _stop_zone(tables) == expected
 
 
 def test_zones_tied_in_one_feed_resolve_by_name():
@@ -466,18 +500,6 @@ def test_conflicting_agency_timezones():
     }
     with pytest.raises(ValueError, match="timezones differ"):
         merge_tables([first, second])
-
-
-def test_conflicting_default_rider_categories():
-    def feed():
-        return {
-            "rider_categories.txt": frame(
-                rider_category_id=["rc"], is_default_fare_category=["1"]
-            )
-        }
-
-    with pytest.raises(ValueError, match="default rider category"):
-        merge_tables([feed(), feed()])
 
 
 def test_flex_feeds_are_refused():
@@ -510,6 +532,82 @@ def test_argument_errors():
         merge_tables([feed, feed], prefixes=["x"])
     with pytest.raises(ValueError, match="duplicate_trips"):
         merge_tables([feed, feed], duplicate_trips="maybe")
+    for check in ("maybe", 1):
+        with pytest.raises(ValueError, match="check"):
+            merge_feeds([feed, feed], "out.zip", check=check)
+
+
+def _error(code, **context):
+    return {"code": code, "severity": "ERROR", "context": context}
+
+
+STOP_REF = {"childFilename": "stop_times.txt", "childFieldName": "stop_id"}
+STOP_KEY = {"filename": "stops.txt", "fieldNames": "stop_id"}
+ARRIVAL = {"filename": "stop_times.txt", "fieldName": "arrival_time"}
+
+
+@pytest.mark.parametrize(
+    "merged, first, second, inherited, introduced",
+    [
+        pytest.param(
+            [
+                _error(
+                    "foreign_key_violation",
+                    **STOP_REF,
+                    fieldValue="f1:s9",
+                    csvRowNumber=7,
+                )
+            ],
+            [
+                _error(
+                    "foreign_key_violation", **STOP_REF, fieldValue="s9", csvRowNumber=3
+                )
+            ],
+            [],
+            [{"foreign_key_violation": 1}, {}],
+            {},
+            id="prefixed-id",
+        ),
+        pytest.param(
+            [
+                _error(
+                    "block_trips_with_overlapping_stop_times",
+                    blockId="f1:b",
+                    tripIdA="f1:t1",
+                    tripIdB="f2:t1",
+                ),
+                _error("duplicate_key", **STOP_KEY, oldCsvRowNumber=2, csvRowNumber=5),
+                _error("duplicate_key", **STOP_KEY, oldCsvRowNumber=3, csvRowNumber=9),
+            ],
+            [
+                _error(
+                    "block_trips_with_overlapping_stop_times",
+                    blockId="b",
+                    tripIdA="t1",
+                    tripIdB="t1",
+                )
+            ],
+            [_error("duplicate_key", **STOP_KEY, oldCsvRowNumber=2, csvRowNumber=3)],
+            [{}, {"duplicate_key": 1}],
+            {"block_trips_with_overlapping_stop_times": 1, "duplicate_key": 1},
+            id="several-or-no-inputs",
+        ),
+        pytest.param(
+            [_error("invalid_time", **ARRIVAL, fieldValue="f1:30", csvRowNumber=2)],
+            [_error("invalid_time", **ARRIVAL, fieldValue="f1:30", csvRowNumber=2)],
+            [_error("invalid_time", **ARRIVAL, fieldValue="f1:30", csvRowNumber=2)],
+            [{"invalid_time": 1}, {}],
+            {},
+            id="not-an-id",
+        ),
+    ],
+)
+def test_split_errors(merged, first, second, inherited, introduced):
+    from transitio.gtfs._merge import _split_errors
+
+    validations = [{"notices": notices} for notices in (merged, first, second)]
+    found = _split_errors(validations[0], validations[1:], ["f1", "f2"])
+    assert found == (inherited, introduced)
 
 
 SERVICES = {

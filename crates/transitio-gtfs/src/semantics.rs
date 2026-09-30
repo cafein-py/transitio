@@ -31,8 +31,9 @@ pub struct MomentSummary {
     pub active_routes: u64,
     #[serde(rename = "stopsServed")]
     pub stops_served: u64,
+    /// None when an expansion cap was reached.
     #[serde(rename = "baselineTrips")]
-    pub baseline_trips: f64,
+    pub baseline_trips: Option<f64>,
     #[serde(rename = "windowDays")]
     pub window_days: u64,
 }
@@ -52,16 +53,22 @@ const MOMENT_BASELINE_THRESHOLD: f64 = 0.5;
 /// the service-window days.
 const ROUTE_BASELINE_MIN_SHARE: f64 = 0.5;
 
-/// Active service dates for other passes (cropping); notices generated
-/// during the computation are discarded.
-pub(crate) fn active_service_dates(
+/// The services running on some day from `first` to `last`, for other
+/// passes (cropping); notices generated on the way are discarded.
+pub(crate) fn active_services_between(
     tables: &BTreeMap<String, Table>,
     options: &ScanOptions,
-) -> HashMap<String, Vec<NaiveDate>> {
+    first: NaiveDate,
+    last: NaiveDate,
+) -> HashSet<String> {
     let mut samplers = Samplers::new(options.max_notices_per_file);
     let mut scratch = Vec::new();
-    let (services, _) = service_calendars(tables, options, &mut samplers, &mut scratch);
-    services
+    service_calendars(tables, options, &mut samplers, &mut scratch)
+        .calendars
+        .into_iter()
+        .filter(|(_, calendar)| calendar.first_from(first).is_some_and(|day| day <= last))
+        .map(|(id, _)| id)
+        .collect()
 }
 
 pub fn run_semantics(result: &mut ScanResult, options: &ScanOptions) {
@@ -76,13 +83,11 @@ pub fn run_semantics(result: &mut ScanResult, options: &ScanOptions) {
         result.incomplete.contains("stop_times.txt") || result.incomplete.contains("trips.txt");
 
     let mut moment_summary = None;
-    let (services, expansion_truncated) =
-        service_calendars(&result.tables, options, &mut samplers, &mut notices);
-    // A truncated expansion under-covers, so the window is not published.
-    result.service_window = if calendars_unreliable || expansion_truncated {
+    let services = service_calendars(&result.tables, options, &mut samplers, &mut notices);
+    result.service_window = if calendars_unreliable {
         None
     } else {
-        service_window(&services)
+        service_window(&services.calendars)
     };
 
     if !stop_times_unreliable {
@@ -91,14 +96,13 @@ pub fn run_semantics(result: &mut ScanResult, options: &ScanOptions) {
             block_overlap_checks(
                 &result.tables,
                 &trips,
-                &services,
+                &services.expanded,
                 &mut samplers,
                 &mut notices,
             );
             // The moment pass additionally reads frequencies and routes;
             // any truncated input must suppress it like the calendars'.
-            let moment_inputs_unreliable = expansion_truncated
-                || result.incomplete.contains("frequencies.txt")
+            let moment_inputs_unreliable = result.incomplete.contains("frequencies.txt")
                 || result.incomplete.contains("routes.txt");
             if let Some(moment) = options.moment {
                 if !moment_inputs_unreliable {
@@ -136,15 +140,103 @@ fn parse_date(value: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(value.trim(), "%Y%m%d").ok()
 }
 
-/// Active service dates per service_id: calendar weekday patterns within
+fn weekday(day: NaiveDate) -> usize {
+    day.weekday().num_days_from_monday() as usize
+}
+
+/// One service's calendar rows and calendar_dates exceptions, queried by
+/// day without expanding its dates.
+#[derive(Default)]
+pub(crate) struct ServiceCalendar {
+    /// `(start_date, end_date, runs on each weekday from Monday)`.
+    rows: Vec<(NaiveDate, NaiveDate, [bool; 7])>,
+    /// The last exception row per date: true adds it, false removes it.
+    exceptions: BTreeMap<NaiveDate, bool>,
+}
+
+impl ServiceCalendar {
+    pub(crate) fn runs_on(&self, day: NaiveDate) -> bool {
+        self.exceptions.get(&day).copied().unwrap_or_else(|| {
+            self.rows.iter().any(|(start, end, weekdays)| {
+                *start <= day && day <= *end && weekdays[weekday(day)]
+            })
+        })
+    }
+
+    /// The first running day on or after `day`.
+    pub(crate) fn first_from(&self, day: NaiveDate) -> Option<NaiveDate> {
+        let added = self.exceptions.range(day..).find(|(_, added)| **added);
+        let limit = self.walk_limit();
+        let rows = self.rows.iter().filter_map(|(start, end, weekdays)| {
+            std::iter::successors(Some((*start).max(day)), NaiveDate::succ_opt)
+                .take_while(|date| date <= end)
+                .take(limit)
+                .find(|date| self.row_runs(weekdays, *date))
+        });
+        added.map(|(date, _)| *date).into_iter().chain(rows).min()
+    }
+
+    /// The last running day on or before `day`.
+    pub(crate) fn last_until(&self, day: NaiveDate) -> Option<NaiveDate> {
+        let added = self
+            .exceptions
+            .range(..=day)
+            .rev()
+            .find(|(_, added)| **added);
+        let limit = self.walk_limit();
+        let rows = self.rows.iter().filter_map(|(start, end, weekdays)| {
+            std::iter::successors(Some((*end).min(day)), NaiveDate::pred_opt)
+                .take_while(|date| date >= start)
+                .take(limit)
+                .find(|date| self.row_runs(weekdays, *date))
+        });
+        added.map(|(date, _)| *date).into_iter().chain(rows).max()
+    }
+
+    fn row_runs(&self, weekdays: &[bool; 7], day: NaiveDate) -> bool {
+        weekdays[weekday(day)] && self.exceptions.get(&day) != Some(&false)
+    }
+
+    /// Days a walk along a row needs to reach its next running day: a
+    /// week of running days holds one that no removal hides.
+    fn walk_limit(&self) -> usize {
+        7 * (1 + self.exceptions.values().filter(|added| !**added).count())
+    }
+
+    /// Merges overlapping rows of one weekday pattern, so that walks never
+    /// cross a day twice for duplicated rows.
+    fn merge_rows(&mut self) {
+        self.rows
+            .sort_unstable_by_key(|(start, _, weekdays)| (*weekdays, *start));
+        let mut merged: Vec<(NaiveDate, NaiveDate, [bool; 7])> = Vec::new();
+        for (start, end, weekdays) in self.rows.drain(..) {
+            match merged.last_mut() {
+                Some(last) if last.2 == weekdays && start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end, weekdays)),
+            }
+        }
+        self.rows = merged;
+    }
+}
+
+/// Each service's calendar, the per-day expansion of the same services
+/// under the hostile-input caps, and whether a cap was reached.
+struct Services {
+    calendars: HashMap<String, ServiceCalendar>,
+    expanded: HashMap<String, Vec<NaiveDate>>,
+    truncated: bool,
+}
+
+/// Service calendars per service_id: calendar weekday patterns within
 /// [start_date, end_date], plus calendar_dates exceptions (1 add, 2 remove).
 fn service_calendars(
     tables: &BTreeMap<String, Table>,
     options: &ScanOptions,
     samplers: &mut Samplers,
     notices: &mut Vec<Notice>,
-) -> (HashMap<String, Vec<NaiveDate>>, bool) {
-    let mut services: HashMap<String, HashSet<NaiveDate>> = HashMap::new();
+) -> Services {
+    let mut calendars: HashMap<String, ServiceCalendar> = HashMap::new();
+    let mut expanded: HashMap<String, HashSet<NaiveDate>> = HashMap::new();
     let mut calendar_rows: HashMap<String, u64> = HashMap::new();
     let mut total_days = 0i64;
     let mut truncated = false;
@@ -159,13 +251,12 @@ fn service_calendars(
             "sunday",
         ];
         let sampler = samplers.file("calendar.txt");
+        let mut calendar_days = 0i64;
+        let mut skipped = false;
         for row in &calendar.rows {
             let service_id = cell(calendar, row, "service_id");
-            let weekdays: Vec<bool> = weekday_columns
-                .iter()
-                .map(|day| cell(calendar, row, day).trim() == "1")
-                .collect();
-            if !weekdays.iter().any(|&active| active) {
+            let weekdays = weekday_columns.map(|day| cell(calendar, row, day).trim() == "1");
+            if !weekdays.contains(&true) {
                 sampler.push(
                     notices,
                     Notice::new("service_has_no_active_day_of_the_week", Severity::Warning)
@@ -180,9 +271,15 @@ fn service_calendars(
                 continue; // field tier already reported invalid dates
             };
             calendar_rows.insert(service_id.to_string(), row.csv_row);
+            calendars
+                .entry(service_id.to_string())
+                .or_default()
+                .rows
+                .push((start, end, weekdays));
+            calendar_days += ((end - start).num_days() + 1).max(0);
             if (end - start).num_days() >= MAX_SERVICE_DAYS {
-                // transitio-specific: the expansion is clamped, so the
-                // computed window under-covers this service.
+                // transitio-specific: the per-day expansion is clamped,
+                // so the per-day baseline under-covers this service.
                 sampler.push(
                     notices,
                     Notice::new("calendar_span_truncated", Severity::Warning)
@@ -192,15 +289,14 @@ fn service_calendars(
                 truncated = true;
             }
             if total_days >= MAX_TOTAL_SERVICE_DAYS {
-                truncated = true;
+                skipped = true;
                 continue; // global expansion budget exhausted
             }
-            let dates = services.entry(service_id.to_string()).or_default();
+            let dates = expanded.entry(service_id.to_string()).or_default();
             let mut date = start;
             let mut spanned = 0i64;
             while date <= end && spanned < MAX_SERVICE_DAYS {
-                let weekday = date.weekday().num_days_from_monday() as usize;
-                if weekdays[weekday] {
+                if weekdays[weekday(date)] {
                     dates.insert(date);
                 }
                 match date.succ_opt() {
@@ -211,68 +307,105 @@ fn service_calendars(
                 total_days += 1;
             }
         }
+        if skipped {
+            // transitio-specific: the rows after the budget ran out are
+            // left out of the per-day expansion. One per feed, so row
+            // notices filling the file's sample cannot crowd it out.
+            notices.push(
+                Notice::new("service_expansion_truncated", Severity::Warning)
+                    .with("maxServiceDays", MAX_TOTAL_SERVICE_DAYS)
+                    .with("calendarDays", calendar_days),
+            );
+            truncated = true;
+        }
+        for calendar in calendars.values_mut() {
+            calendar.merge_rows();
+        }
     }
     if let Some(exceptions) = tables.get("calendar_dates.txt") {
         for row in &exceptions.rows {
             let Some(date) = parse_date(cell(exceptions, row, "date")) else {
                 continue;
             };
-            let service_id = cell(exceptions, row, "service_id");
-            match cell(exceptions, row, "exception_type").trim() {
-                "1" => {
-                    services
-                        .entry(service_id.to_string())
-                        .or_default()
-                        .insert(date);
-                }
-                "2" => {
-                    if let Some(dates) = services.get_mut(service_id) {
-                        dates.remove(&date);
-                    }
-                }
-                _ => {}
-            }
+            let added = match cell(exceptions, row, "exception_type").trim() {
+                "1" => true,
+                "2" => false,
+                _ => continue,
+            };
+            calendars
+                .entry(cell(exceptions, row, "service_id").to_string())
+                .or_default()
+                .exceptions
+                .insert(date, added);
         }
     }
-    let sorted_services: HashMap<String, Vec<NaiveDate>> = services
-        .into_iter()
-        .map(|(id, dates)| {
-            let mut sorted: Vec<NaiveDate> = dates.into_iter().collect();
-            sorted.sort_unstable();
-            (id, sorted)
+    let expanded: HashMap<String, Vec<NaiveDate>> = calendars
+        .iter()
+        .map(|(id, calendar)| {
+            let mut dates: Vec<NaiveDate> = expanded
+                .remove(id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|date| calendar.exceptions.get(date) != Some(&false))
+                .chain(
+                    calendar
+                        .exceptions
+                        .iter()
+                        .filter(|(_, added)| **added)
+                        .map(|(date, _)| *date),
+                )
+                .collect();
+            dates.sort_unstable();
+            dates.dedup();
+            (id.clone(), dates)
         })
         .collect();
     // Canonical expiry accounts for calendar_dates exceptions, so it is
     // decided on each service's final post-exception active date.
     if let Some(reference) = options.reference_date {
-        if !truncated {
-            let sampler = samplers.file("calendar.txt");
-            let mut expired: Vec<(&String, &Vec<NaiveDate>)> = sorted_services
-                .iter()
-                .filter(|(_, dates)| dates.last().map(|d| *d < reference).unwrap_or(false))
-                .collect();
-            expired.sort_by_key(|(id, _)| id.as_str());
-            for (service_id, _) in expired {
-                let mut notice = Notice::new("expired_calendar", Severity::Warning)
-                    .with("serviceId", clip(service_id));
-                if let Some(csv_row) = calendar_rows.get(service_id) {
-                    notice = notice.with("csvRowNumber", *csv_row);
-                }
-                sampler.push(notices, notice);
+        let sampler = samplers.file("calendar.txt");
+        let mut expired: Vec<&String> = calendars
+            .iter()
+            .filter(|(_, calendar)| {
+                calendar
+                    .last_until(NaiveDate::MAX)
+                    .is_some_and(|day| day < reference)
+            })
+            .map(|(id, _)| id)
+            .collect();
+        expired.sort();
+        for service_id in expired {
+            let mut notice = Notice::new("expired_calendar", Severity::Warning)
+                .with("serviceId", clip(service_id));
+            if let Some(csv_row) = calendar_rows.get(service_id) {
+                notice = notice.with("csvRowNumber", *csv_row);
             }
+            sampler.push(notices, notice);
         }
     }
-    (sorted_services, truncated)
+    Services {
+        calendars,
+        expanded,
+        truncated,
+    }
 }
 
-fn window_dates(services: &HashMap<String, Vec<NaiveDate>>) -> Option<(NaiveDate, NaiveDate)> {
-    let first = services.values().filter_map(|d| d.first()).min()?;
-    let last = services.values().filter_map(|d| d.last()).max()?;
-    Some((*first, *last))
+/// The first and last running days over every service, exact whatever
+/// the expansion caps.
+fn window_dates(calendars: &HashMap<String, ServiceCalendar>) -> Option<(NaiveDate, NaiveDate)> {
+    let first = calendars
+        .values()
+        .filter_map(|calendar| calendar.first_from(NaiveDate::MIN))
+        .min()?;
+    let last = calendars
+        .values()
+        .filter_map(|calendar| calendar.last_until(NaiveDate::MAX))
+        .max()?;
+    Some((first, last))
 }
 
-fn service_window(services: &HashMap<String, Vec<NaiveDate>>) -> Option<(String, String)> {
-    let (first, last) = window_dates(services)?;
+fn service_window(calendars: &HashMap<String, ServiceCalendar>) -> Option<(String, String)> {
+    let (first, last) = window_dates(calendars)?;
     Some((
         first.format("%Y%m%d").to_string(),
         last.format("%Y%m%d").to_string(),
@@ -643,7 +776,7 @@ fn active_on(dates: &[NaiveDate], date: NaiveDate) -> bool {
 fn moment_checks(
     tables: &BTreeMap<String, Table>,
     spans: &HashMap<String, TripSpan>,
-    services: &HashMap<String, Vec<NaiveDate>>,
+    services: &Services,
     moment: Moment,
     samplers: &mut Samplers,
     notices: &mut Vec<Notice>,
@@ -653,12 +786,27 @@ fn moment_checks(
     };
     let target = moment.date;
     let target_ymd = target.format("%Y%m%d").to_string();
-    let has_service_on_target = services.values().any(|dates| active_on(dates, target));
+    // Target-day numbers query the calendars, exact whatever the caps;
+    // the per-day baseline and route shares count the expansion.
+    let running_on = |day: Option<NaiveDate>| -> HashSet<&str> {
+        day.map(|day| {
+            services
+                .calendars
+                .iter()
+                .filter(|(_, calendar)| calendar.runs_on(day))
+                .map(|(id, _)| id.as_str())
+                .collect()
+        })
+        .unwrap_or_default()
+    };
+    let on_target = running_on(Some(target));
+    let has_service_on_target = !on_target.is_empty();
+    let window = window_dates(&services.calendars);
 
     let no_service = |samplers: &mut Samplers, notices: &mut Vec<Notice>| {
         let mut notice = Notice::new("no_service_on_reference_date", Severity::Warning)
             .with("referenceDate", target_ymd.clone());
-        if let Some((first, last)) = window_dates(services) {
+        if let Some((first, last)) = window {
             notice = notice
                 .with("serviceWindowStart", first.format("%Y%m%d").to_string())
                 .with("serviceWindowEnd", last.format("%Y%m%d").to_string());
@@ -675,7 +823,7 @@ fn moment_checks(
         && column(trips_table, "route_id").is_some()
         && column(trips_table, "service_id").is_some();
     let reference_time_text = moment.time.map(format_time);
-    let Some((window_first, window_last)) = window_dates(services) else {
+    let Some((window_first, window_last)) = window else {
         no_service(samplers, notices);
         return summary_available.then(|| MomentSummary {
             reference_date: target_ymd.clone(),
@@ -683,7 +831,7 @@ fn moment_checks(
             active_trips: 0,
             active_routes: 0,
             stops_served: 0,
-            baseline_trips: 0.0,
+            baseline_trips: (!services.truncated).then_some(0.0),
             window_days: 0,
         });
     };
@@ -779,20 +927,17 @@ fn moment_checks(
             let mut service_trips: HashMap<&str, u64> = HashMap::new();
             for trip in &trips {
                 *service_trips.entry(trip.service_id).or_default() += 1;
-                if services
-                    .get(trip.service_id)
-                    .is_some_and(|dates| active_on(dates, target))
-                {
+                if on_target.contains(trip.service_id) {
                     operating.insert(trip.trip_id);
                 }
             }
-            target_count = services
+            target_count = service_trips
                 .iter()
-                .filter(|(_, dates)| active_on(dates, target))
-                .filter_map(|(id, _)| service_trips.get(id.as_str()))
+                .filter(|(id, _)| on_target.contains(*id))
+                .map(|(_, count)| count)
                 .sum();
             for (service_id, count) in &service_trips {
-                if let Some(dates) = services.get(*service_id) {
+                if let Some(dates) = services.expanded.get(*service_id) {
                     for date in dates {
                         *day_counts.entry(*date).or_default() += count;
                     }
@@ -837,22 +982,23 @@ fn moment_checks(
                     }
                 }
             }
+            let running: Vec<HashSet<&str>> = (0..=max_offset)
+                .map(|k| running_on(shift(target, -(k as i64))))
+                .collect();
             let mut count = 0u64;
+            let empty = Vec::new();
             for (service_id, counts) in &per_service {
-                if let Some(dates) = services.get(*service_id) {
-                    for (k, n) in counts.iter().enumerate() {
-                        if *n == 0 {
-                            continue;
-                        }
-                        if let Some(day) = shift(target, -(k as i64)) {
-                            if active_on(dates, day) {
-                                count += n;
-                            }
-                        }
-                        for date in dates {
-                            if let Some(day) = shift(*date, k as i64) {
-                                *day_counts.entry(day).or_default() += n;
-                            }
+                let dates = services.expanded.get(*service_id).unwrap_or(&empty);
+                for (k, n) in counts.iter().enumerate() {
+                    if *n == 0 {
+                        continue;
+                    }
+                    if running[k].contains(service_id) {
+                        count += n;
+                    }
+                    for date in dates {
+                        if let Some(day) = shift(*date, k as i64) {
+                            *day_counts.entry(day).or_default() += n;
                         }
                     }
                 }
@@ -860,11 +1006,8 @@ fn moment_checks(
             target_count = count;
             for trip in trips.iter().filter(|trip| trip.timed) {
                 let runs = (0..=max_offset).any(|k| {
-                    shift(target, -(k as i64)).is_some_and(|day| {
-                        services
-                            .get(trip.service_id)
-                            .is_some_and(|dates| active_on(dates, day))
-                    }) && operates_at(trip, time as u64 + k as u64 * 86400)
+                    running[k].contains(trip.service_id)
+                        && operates_at(trip, time as u64 + k as u64 * 86400)
                 });
                 if runs {
                     operating.insert(trip.trip_id);
@@ -891,7 +1034,7 @@ fn moment_checks(
         .filter(|(date, _)| **date >= window_first && **date <= window_last)
         .map(|(_, count)| *count)
         .sum();
-    let baseline = total as f64 / window_days;
+    let baseline = (!services.truncated).then_some(total as f64 / window_days);
 
     let mut stop_numbers: HashMap<&str, u32> = HashMap::new();
     let mut stops_served: HashSet<u32> = HashSet::new();
@@ -918,12 +1061,16 @@ fn moment_checks(
         active_trips: target_count,
         active_routes: active_routes.len() as u64,
         stops_served: stops_served.len() as u64,
-        baseline_trips: (baseline * 100.0).round() / 100.0,
+        baseline_trips: baseline.map(|baseline| (baseline * 100.0).round() / 100.0),
         window_days: window_days as u64,
     });
     if skip_rest {
         return summary;
     }
+    // A capped expansion under-counts the baseline and route shares.
+    let Some(baseline) = baseline else {
+        return summary;
+    };
     if (target_count as f64) < MOMENT_BASELINE_THRESHOLD * baseline {
         let mut notice = Notice::new("service_level_below_baseline", Severity::Warning)
             .with("referenceDate", target_ymd.clone())
@@ -956,7 +1103,7 @@ fn moment_checks(
         let mut days: HashSet<NaiveDate> = HashSet::new();
         let mut active_target = false;
         for service_id in &service_ids {
-            if let Some(dates) = services.get(*service_id) {
+            if let Some(dates) = services.expanded.get(*service_id) {
                 days.extend(dates.iter().copied());
                 if active_on(dates, target) {
                     active_target = true;
@@ -1708,7 +1855,8 @@ mod tests {
         assert_eq!(moment.active_routes, 1);
         assert_eq!(moment.stops_served, 2);
         assert_eq!(moment.window_days, 365);
-        assert!(moment.baseline_trips > 3.0 && moment.baseline_trips < 4.0);
+        let baseline = moment.baseline_trips.unwrap();
+        assert!(baseline > 3.0 && baseline < 4.0);
         // A weekday: everything runs.
         let result = validate_zip_at(&files, "20260601", None);
         let moment = result.moment.unwrap();
@@ -1851,6 +1999,141 @@ mod tests {
         assert_eq!(moment.active_trips, 0);
         assert_eq!(moment.active_routes, 0);
         assert_eq!(moment.window_days, 365);
+    }
+
+    #[test]
+    fn service_calendar_answers_day_queries() {
+        let date = |value: &str| parse_date(value).unwrap();
+        let weekdays = "s,1,1,1,1,1,0,0,20260105,20260130\n";
+        // (calendar rows; exception rows; the first running day from a
+        // day; the last until a day; a day and whether the service runs)
+        type Case<'a> = (
+            &'a str,
+            &'a str,
+            (&'a str, Option<&'a str>),
+            (&'a str, Option<&'a str>),
+            (&'a str, bool),
+        );
+        let cases: [Case; 8] = [
+            // A weekday pattern.
+            (
+                weekdays,
+                "",
+                ("20260110", Some("20260112")),
+                ("20260111", Some("20260109")),
+                ("20260110", false),
+            ),
+            // Its first and last running days removed.
+            (
+                weekdays,
+                "s,20260105,2\ns,20260130,2\n",
+                ("20260101", Some("20260106")),
+                ("20261231", Some("20260129")),
+                ("20260105", false),
+            ),
+            // Mondays only, the first three removed.
+            (
+                "s,1,0,0,0,0,0,0,20260105,20260130\n",
+                "s,20260105,2\ns,20260112,2\ns,20260119,2\n",
+                ("20260101", Some("20260126")),
+                ("20260125", None),
+                ("20260126", true),
+            ),
+            // Added dates outside the row.
+            (
+                weekdays,
+                "s,20251231,1\ns,20260202,1\n",
+                ("20251201", Some("20251231")),
+                ("20261231", Some("20260202")),
+                ("20260202", true),
+            ),
+            // A row with no weekday flag and one addition.
+            (
+                "s,0,0,0,0,0,0,0,20260105,20260130\n",
+                "s,20260115,1\n",
+                ("20260101", Some("20260115")),
+                ("20261231", Some("20260115")),
+                ("20260114", false),
+            ),
+            // Exceptions only.
+            (
+                "",
+                "s,20260110,1\ns,20260120,1\ns,20260115,2\n",
+                ("20260111", Some("20260120")),
+                ("20260119", Some("20260110")),
+                ("20260115", false),
+            ),
+            // A date added, then removed in row order.
+            (
+                weekdays,
+                "s,20260112,1\ns,20260112,2\n",
+                ("20260110", Some("20260113")),
+                ("20260112", Some("20260109")),
+                ("20260112", false),
+            ),
+            // Overlapping rows of one pattern beside a Saturday row.
+            (
+                "s,1,1,1,1,1,0,0,20260105,20260120\ns,1,1,1,1,1,0,0,20260112,20260130\ns,0,0,0,0,0,1,0,20260105,20260130\n",
+                "s,20260130,2\n",
+                ("20260110", Some("20260110")),
+                ("20261231", Some("20260129")),
+                ("20260117", true),
+            ),
+        ];
+        for (rows, exceptions, first, last, runs) in cases {
+            let calendar = format!(
+                "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n{rows}"
+            );
+            let exceptions_file = format!("service_id,date,exception_type\n{exceptions}");
+            let files = [
+                ("calendar.txt", calendar.as_str()),
+                ("calendar_dates.txt", exceptions_file.as_str()),
+            ];
+            let result = scan_reader(zip_cursor(&files)).unwrap();
+            let mut samplers = Samplers::new(100);
+            let services = service_calendars(
+                &result.tables,
+                &ScanOptions::default(),
+                &mut samplers,
+                &mut Vec::new(),
+            );
+            let calendar = &services.calendars["s"];
+            let case = format!("{rows:?} {exceptions:?}");
+            assert_eq!(
+                calendar.first_from(date(first.0)),
+                first.1.map(date),
+                "{case}"
+            );
+            assert_eq!(
+                calendar.last_until(date(last.0)),
+                last.1.map(date),
+                "{case}"
+            );
+            assert_eq!(calendar.runs_on(date(runs.0)), runs.1, "{case}");
+        }
+    }
+
+    #[test]
+    fn capped_expansion_keeps_the_window_and_target_day_exact() {
+        let mut files = minimal();
+        replace(
+            &mut files,
+            "calendar.txt",
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\nwk,1,1,1,1,1,1,1,20200101,20330908\n",
+        );
+        // 2032-06-01 lies past the row's 4,000th day, where its
+        // expansion stops.
+        let result = validate_zip_at(&files, "20320601", None);
+        let codes = codes(&result);
+        assert!(codes.contains(&"calendar_span_truncated"));
+        assert!(!codes.contains(&"service_level_below_baseline"));
+        assert_eq!(
+            result.service_window,
+            Some(("20200101".to_string(), "20330908".to_string()))
+        );
+        let moment = result.moment.unwrap();
+        assert_eq!(moment.active_trips, 1);
+        assert_eq!(moment.baseline_trips, None);
     }
 
     #[test]

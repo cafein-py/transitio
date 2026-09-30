@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import csv
 import dataclasses
 import datetime
 import hashlib
@@ -54,6 +53,8 @@ _SELECTION_FIELDS = (
     "same_as",
     "contained_in",
     "version_of",
+    "fetched_from",
+    "download_errors",
     "path",
 )
 
@@ -131,25 +132,39 @@ class FetchResult:
 
 
 def _feed_modes(path):
-    """Coarse modes served by a feed, from its routes.txt.
+    """Coarse modes served by a feed, from its routes.txt with values and
+    header names stripped as ``FeedEditor`` strips them; rows with extra
+    fields are skipped.
 
     Returns ``None`` when routes.txt cannot be read (missing, over the
     byte budget, or malformed) so the caller can report the feed as
     undeterminable rather than silently unfiltered.
     """
+    import pandas as pd
+
+    from transitio.edit._editor import _normalise_table
+
     try:
         with zipfile.ZipFile(path) as archive:
             with archive.open("routes.txt") as handle:
                 data = handle.read(_MODES_BYTE_CAP + 1)
         if len(data) > _MODES_BYTE_CAP:
             return None
-        text = data.decode("utf-8-sig", errors="replace")
-        types = set()
-        for row in csv.DictReader(io.StringIO(text)):
-            value = (row.get("route_type") or "").strip()
-            if value.lstrip("-").isdigit():
-                types.add(int(value))
-    except (OSError, KeyError, ValueError, zipfile.BadZipFile, csv.Error):
+        # Read headerless, so the header row sets the width: a row with
+        # extra fields is skipped wherever it is, never read as an index.
+        rows = pd.read_csv(
+            io.BytesIO(data),
+            header=None,
+            dtype=str,
+            keep_default_na=False,
+            encoding="utf-8-sig",
+            encoding_errors="replace",
+            on_bad_lines="skip",
+        )
+        routes = _normalise_table(rows.iloc[1:].set_axis(list(rows.iloc[0]), axis=1))[0]
+        values = routes.loc[:, routes.columns == "route_type"].to_numpy().ravel()
+        types = {int(value) for value in set(values) if value.lstrip("-").isdigit()}
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
         return None
     return {mode for mode, accepted in _MODE_TYPES.items() if types & accepted}
 
@@ -231,6 +246,29 @@ def _idle(validation, day):
     )
 
 
+def _missing_files(validation):
+    """Why a validation report makes a feed unreadable, or None: the required
+    files it lacks, and both calendar files when neither is present."""
+    notices = validation["notices"]
+    names = sorted(
+        {
+            notice["context"]["filename"]
+            for notice in notices
+            if notice.get("code") == "missing_required_file"
+        }
+    )
+    parts = []
+    if names:
+        noun = "file" if len(names) == 1 else "files"
+        parts.append(f"missing required {noun} {', '.join(names)}")
+    if any(
+        notice.get("code") == "missing_calendar_and_calendar_date_files"
+        for notice in notices
+    ):
+        parts.append("missing calendar.txt and calendar_dates.txt")
+    return "; ".join(parts) or None
+
+
 def _entry(feed_id, name, index_window=None):
     """An undecided selection-record entry for one candidate feed."""
     entry = dict.fromkeys(_SELECTION_FIELDS)
@@ -291,7 +329,8 @@ def _process_feed(
 ):
     """Crop, repair, mode-filter, validate and report one downloaded feed.
 
-    The computed service window is tested against ``day`` (None tests
+    A feed whose validation finds a required file missing drops out on any
+    day. The computed service window is tested against ``day`` (None tests
     nothing): with a ``study`` day it must cover the day and the validation
     report must not prove the day idle; otherwise it must not end before it.
 
@@ -313,6 +352,7 @@ def _process_feed(
     if sidecar.exists():
         provenance = json.loads(sidecar.read_text())
     present_routes = None
+    source_notices = []
     if crop or routes is not None:
         cropped = path.with_name(f"{path.stem}-cropped-{tag}.zip")
         report = crop_feed(
@@ -324,6 +364,9 @@ def _process_feed(
             # (routes.txt or its column absent) stays undetermined, not empty.
             source = report.get("source_routes")
             present_routes = None if source is None else set(source)
+        # The crop writes trimmed tables; the source's whitespace is
+        # reported with the feed.
+        source_notices = report["source_notices"]
         path = cropped
     # The crop comes first, so the repair works on the area's feed rather
     # than on the whole source.
@@ -346,12 +389,16 @@ def _process_feed(
             for value in validation["service_window"]
         )
     window = _window(start, end)
+    missing = _missing_files(validation)
+    if missing is not None:
+        raise _SkipFeed(missing, window)
     if day is not None:
         reason = _misses(start, end, day, study)
         if reason is None and study and _idle(validation, day):
             reason = f"no service on {day.isoformat()}"
         if reason is not None:
             raise _SkipFeed(reason, window)
+    validation["notices"].extend(source_notices)
     report = build_report(validation, hosted=hosted, provenance=provenance)
     return path, report, fixes, present_routes, window
 
@@ -507,6 +554,26 @@ def _containers_first(feeds):
     return sorted(feeds, key=level)
 
 
+def _read_tables(path, names, max_total_bytes=None):
+    """The tables ``names`` of a feed zip, read as ``FeedEditor`` does; None
+    when together they are over ``max_total_bytes`` (default: the
+    ``FeedEditor`` budget)."""
+    import pandas as pd
+
+    from transitio.edit._editor import _MAX_TOTAL_BYTES, _normalise_table
+
+    limit = _MAX_TOTAL_BYTES if max_total_bytes is None else max_total_bytes
+    csv = {"dtype": str, "keep_default_na": False, "encoding": "utf-8-sig"}
+    with zipfile.ZipFile(path) as archive:
+        members = [m for m in archive.infolist() if m.filename in names]
+        if sum(m.file_size for m in members) > limit:
+            return None
+        return {
+            m.filename: _normalise_table(pd.read_csv(archive.open(m), **csv))[0]
+            for m in members
+        }
+
+
 def _service(path, day=None, max_total_bytes=None):
     """A delivered feed's route keys, rounded stop coordinates and trip
     count; with a ``day``, the signatures of its trips running then that are
@@ -517,24 +584,16 @@ def _service(path, day=None, max_total_bytes=None):
     calendars cannot be read."""
     import pandas as pd
 
-    from transitio.edit._editor import _MAX_TOTAL_BYTES, _normalise_headers
     from transitio.gtfs._schedule import route_keys, service_dates, trip_signatures
 
     names = {"agency.txt", "routes.txt", "stops.txt", "trips.txt"}
     if day is not None:
         names |= {"stop_times.txt", "calendar.txt", "calendar_dates.txt"}
         names |= {"frequencies.txt", "transfers.txt", "pathways.txt"}
-    limit = _MAX_TOTAL_BYTES if max_total_bytes is None else max_total_bytes
-    csv = {"dtype": str, "keep_default_na": False, "encoding": "utf-8-sig"}
     try:
-        with zipfile.ZipFile(path) as archive:
-            members = [m for m in archive.infolist() if m.filename in names]
-            if sum(m.file_size for m in members) > limit:
-                return None
-            tables = {
-                m.filename: _normalise_headers(pd.read_csv(archive.open(m), **csv))[0]
-                for m in members
-            }
+        tables = _read_tables(path, names, max_total_bytes)
+        if tables is None:
+            return None
         keys = route_keys(tables)[["agency", "name", "type"]]
         stops = tables["stops.txt"]
         points = stops[["stop_lat", "stop_lon"]].apply(pd.to_numeric, errors="coerce")
@@ -573,6 +632,34 @@ def _service(path, day=None, max_total_bytes=None):
         linked=any(len(tables.get(n, ())) for n in ("transfers.txt", "pathways.txt")),
     )
     return found
+
+
+def _timezone_note(path, max_total_bytes=None):
+    """``"agency_timezone <names>; stops in <zone>"`` for a feed declaring no
+    time zone equivalent to the zone of most of its stops (:func:`_stop_zone`),
+    compared over today and the next year as no calendar is read; None when
+    one is, when either is unknown, or when agency.txt and stops.txt are
+    unreadable or over ``max_total_bytes``."""
+    from transitio.gtfs._merge import (
+        _stop_zone,
+        _timezone_interval,
+        _timezones,
+        _zone_classes,
+    )
+
+    try:
+        tables = _read_tables(path, {"agency.txt", "stops.txt"}, max_total_bytes)
+    except Exception:  # noqa: B902 — an unreadable feed gets no note
+        return None
+    if tables is None:
+        return None
+    declared, located = _timezones(tables), _stop_zone(tables)
+    if not declared or located is None:
+        return None
+    classes = _zone_classes(declared | {located}, _timezone_interval([tables]))
+    if any(classes[zone] == classes[located] for zone in declared):
+        return None
+    return f"agency_timezone {', '.join(sorted(declared))}; stops in {located}"
 
 
 def _settle_versions(record, services, protected, day):
@@ -643,40 +730,71 @@ def _settle_versions(record, services, protected, day):
 
 
 def _download_indexed(feed, db, atlas, base_dir):
-    """Download an indexed feed, preferring its Mobility Database URL over its
-    Transitland Atlas URL (decision I: MDB wins where a feed has both), and
-    falling back to Atlas when the MDB download fails. Each feed lands in its
-    own digest-named directory under ``base_dir``, so several never collide."""
+    """Download an indexed feed from the first of its URLs that serves a zip
+    archive: the Mobility Database direct download, the Transitland Atlas
+    static feed (decision I: MDB wins where a feed has both), then the
+    Mobility Database hosted copy (``urls.latest``). Each URL is tried once;
+    an attempt fails on any error or when the download is not a zip archive.
+    Each feed lands in its own digest-named directory under ``base_dir``, so
+    several never collide.
+
+    Returns ``(path, fetched_from, failures)``: ``fetched_from`` is
+    ``"producer"`` for the first two URLs and ``"mdb_latest"`` for the hosted
+    copy, ``failures`` the ``"<source>: <error>"`` of each failed attempt.
+    Raises :class:`DownloadError` naming the failures when every attempt
+    fails."""
     from transitio.catalog import AtlasFeed, Feed
     from transitio.catalog._atlas import _feed_dir
     from transitio.exceptions import DownloadError
     from transitio.index.feeds import _parse
 
-    mdb = _parse(feed._row.get("mdb")) or {}
-    mdb_urls = mdb.get("urls") or {}
-    mdb_url = mdb_urls.get("direct_download") or mdb_urls.get("latest")
+    mdb_urls = (_parse(feed._row.get("mdb")) or {}).get("urls") or {}
     atlas_feed = AtlasFeed.from_record(
         _parse(feed._row.get("atlas")) or {}, feed_id=feed.feed_id
     )
-    errors = []
-    if mdb_url:
+
+    def from_mdb(url):
+        proxy = Feed.from_api(
+            {"id": feed.feed_id, "latest_dataset": {"hosted_url": url}}
+        )
+        return db.download_latest(proxy, directory=base_dir / _feed_dir(feed.feed_id))
+
+    def from_atlas(url):
+        return atlas.download(atlas_feed, directory=base_dir)
+
+    attempts = (
+        ("mdb", "producer", mdb_urls.get("direct_download"), from_mdb),
+        ("atlas", "producer", atlas_feed.static_url, from_atlas),
+        ("mdb_latest", "mdb_latest", mdb_urls.get("latest"), from_mdb),
+    )
+    tried, failures = set(), []
+    for label, source, url, download in attempts:
+        if not url or url in tried:
+            continue
+        tried.add(url)
         try:
-            proxy = Feed.from_api(
-                {"id": feed.feed_id, "latest_dataset": {"hosted_url": mdb_url}}
-            )
-            return db.download_latest(
-                proxy, directory=base_dir / _feed_dir(feed.feed_id)
-            )
-        except Exception as error:  # noqa: B902 — fall through to the fallback
-            errors.append(f"mdb: {error}")
-    if atlas_feed.static_url:
-        try:
-            return atlas.download(atlas_feed, directory=base_dir)
-        except Exception as error:  # noqa: B902
-            errors.append(f"atlas: {error}")
-    if errors:
-        raise DownloadError("; ".join(errors))
+            path = download(url)
+        except Exception as error:  # noqa: B902 — try the next URL
+            failures.append(f"{label}: {error}")
+            continue
+        if zipfile.is_zipfile(path):
+            return path, source, failures
+        failures.append(f"{label}: not a zip archive")
+    if failures:
+        raise DownloadError("; ".join(failures))
     raise DownloadError(f"feed {feed.feed_id} has no downloadable url")
+
+
+def _record_source(path, fetched_from, errors):
+    """Add where a download came from and the failed attempts before it to
+    its provenance sidecar (created when absent); returns the sidecar."""
+    from transitio.catalog._client import _write_provenance
+
+    sidecar = path.with_suffix(".provenance.json")
+    provenance = json.loads(sidecar.read_text()) if sidecar.exists() else {}
+    provenance.update(fetched_from=fetched_from, download_errors=errors)
+    _write_provenance(sidecar, provenance)
+    return provenance
 
 
 def _unchanged_since_indexed(feed, http):
@@ -767,10 +885,20 @@ def fetch(
     (checksum-verified, with the hosted canonical-validator report);
     without one, the unversioned latest hosted zip is fetched — a moving
     target with no upstream checksum, documented in its provenance
-    sidecar as such. Every overlapping feed is processed, in a
-    deterministic order with official feeds first; one broken feed never
-    aborts the others — it lands in ``skipped`` with its reason. A download
-    whose content equals a feed already delivered in the call is skipped as
+    sidecar as such. On the place path, a feed without a catalogued dataset,
+    or whose dataset download fails, is read from the first of its indexed
+    URLs that serves a zip archive: the Mobility Database direct download,
+    the Transitland Atlas static feed, then the Mobility Database hosted
+    copy. The sidecar and the report's provenance carry ``fetched_from`` and
+    ``download_errors`` as ``selection`` does. Every overlapping feed is
+    processed, in a deterministic order with official feeds first; one
+    broken feed never aborts the others — it lands in ``skipped`` with its
+    reason. A feed lacking a file GTFS requires is skipped, with or without
+    ``when`` and ``repair``: ``"missing required file agency.txt"`` (several
+    names sorted, ``"missing required files ..."``) or ``"missing calendar.txt
+    and calendar_dates.txt"``, joined with ``"; "`` when both apply; a crop
+    that keeps no trip leaves both calendar files out. A download whose
+    content equals a feed already delivered in the call is skipped as
     ``"same content as <feed id>"`` when its routes are within those
     delivered from that archive (a feed delivered whole carries all);
     otherwise it is delivered cut to its own routes, ``same_as`` naming the
@@ -865,7 +993,11 @@ def fetch(
         candidate order: ``feed_id``, ``name``, ``decision``
         (``"delivered"`` or ``"skipped"``), ``reason`` (why it was skipped),
         ``note`` (about a delivered feed: the routes it was cut to, why a
-        contained feed was kept, a similar feed; several join with ``"; "``),
+        contained feed was kept, a similar feed, ``"from the Mobility
+        Database hosted copy"`` after a failed download, an
+        ``agency_timezone`` not equivalent to the zone of most of its stops,
+        e.g. ``"agency_timezone America/New_York; stops in
+        Pacific/Honolulu"``; several join with ``"; "``),
         ``index_window`` (the index's ``[start, end]``; None undated or on
         the area path), ``feed_window`` (the computed window of a validated
         download, delivered or not; None otherwise or when unknown),
@@ -873,7 +1005,14 @@ def fetch(
         ``contained_in`` (the containers a containment skip names),
         ``version_of`` (for a left-out version, ``{"feed_id", "route_overlap",
         "stop_overlap"}`` against the highest-ranked kept version it pairs
-        with) and ``path`` (the delivered feed). Windows are ISO dates.
+        with), ``fetched_from`` (where the download came from:
+        ``"mdb_dataset"`` a catalogued dataset, ``"producer"`` the feed's own
+        URL from the Mobility Database or Transitland Atlas, ``"mdb_latest"``
+        the Mobility Database hosted copy; None when nothing was
+        downloaded), ``download_errors`` (the failed download attempts before
+        the one that worked, or all of them when none did, joined with
+        ``"; "``; None when none failed) and ``path`` (the delivered feed).
+        Windows are ISO dates.
         When the OSM extract leaves out parts of the place, a last entry
         with ``feed_id`` None notes them, e.g. ``"OSM area: 1 of 47 parts
         (1783 of 2188 km²)"``. ``FetchResult.selection_table()`` returns it
@@ -1018,7 +1157,13 @@ def fetch(
                 else:
                     path = db.download_latest(feed, directory=target)
             except Exception as error:  # noqa: B902
-                _skip(entry, f"download failed: {error}")
+                _skip(entry, f"download failed: {error}", download_errors=str(error))
+                continue
+            entry["fetched_from"] = "mdb_latest" if dataset is None else "mdb_dataset"
+            try:
+                _record_source(path, entry["fetched_from"], None)
+            except Exception as error:  # noqa: B902 — isolate per-feed failures
+                _skip(entry, f"processing failed: {error}")
                 continue
             twins = [twin for twin, _ in delivered.same_as(path)]
             if twins:
@@ -1055,6 +1200,9 @@ def fetch(
                 _skip(entry, f"processing failed: {error}")
                 continue
             entry.update(decision="delivered", feed_window=window, path=path)
+            note = _timezone_note(path, budgets.get("max_total_bytes"))
+            if note is not None:
+                _note(entry, note)
             reports.append(report)
             repairs.append(fixes)
             feeds.append(path)
@@ -1190,8 +1338,9 @@ def _fetch_place(
     budgets,
 ):
     """The ``fetch(place=...)`` path: the place geometry is the AOI, feeds come
-    from the index by tier, each is downloaded MDB-then-Atlas (decision I), and
-    a bundled feed is cropped to the routes its matched tiers select, the drop
+    from the index by tier, each is downloaded MDB-then-Atlas (decision I) and
+    then from the MDB hosted copy (:func:`_download_indexed`), and a bundled
+    feed is cropped to the routes its matched tiers select, the drop
     recorded in ``selections``. A feed whose index window misses ``day`` is
     skipped before download when a probe proves the archive unchanged since
     indexed; ``window_day`` is what the computed window is tested against.
@@ -1343,14 +1492,13 @@ def _fetch_place(
                     notes.append("kept: containment not proven current")
             # The hosted validation report only describes the dataset's own
             # bytes, so it is attached only when the dataset supplied them.
-            path = None
-            from_dataset = False
+            path = fetched_from = probed = None
             if dataset is not None:
                 try:
                     path = db.download(
                         dataset, directory=base_dir / _feed_dir(feed.feed_id)
                     )
-                    from_dataset = True
+                    fetched_from = "mdb_dataset"
                 except Exception as error:  # noqa: B902 — try the fallback next
                     errors.append(f"mdb dataset: {error}")
                 if path is None and expired_unchanged(feed, entry):
@@ -1359,20 +1507,31 @@ def _fetch_place(
                 probed = contained == "drop" and feed.feed_id in container_ids
                 probed = probed and unchanged(feed)
                 try:
-                    path = _download_indexed(feed, db, atlas, base_dir)
-                    if probed:
-                        # The proof covers only a download from the probed URL.
-                        sidecar = path.with_suffix(".provenance.json").read_text()
-                        source = json.loads(sidecar).get("source_url")
-                        current[feed.feed_id] = source == probed
+                    path, fetched_from, failures = _download_indexed(
+                        feed, db, atlas, base_dir
+                    )
+                    errors.extend(failures)
                 except Exception as error:  # noqa: B902
                     errors.append(str(error))
+            # Set before the later checks, so a feed skipped after its
+            # download still records where it came from.
+            download_errors = "; ".join(e for e in errors if e) or None
+            entry.update(fetched_from=fetched_from, download_errors=download_errors)
             if path is None:
-                joined = "; ".join(e for e in errors if e)
-                _skip(entry, f"download failed: {joined}")
+                _skip(entry, f"download failed: {download_errors}")
                 continue
+            try:
+                sidecar = _record_source(path, fetched_from, download_errors)
+            except Exception as error:  # noqa: B902 — isolate per-feed failures
+                _skip(entry, f"processing failed: {error}")
+                continue
+            if probed:
+                # The proof covers only a download from the probed URL.
+                current[feed.feed_id] = sidecar.get("source_url") == probed
+            if fetched_from == "mdb_latest" and download_errors:
+                notes.append("from the Mobility Database hosted copy")
             hosted = None
-            if from_dataset:
+            if fetched_from == "mdb_dataset":
                 try:
                     hosted = db.validation_report(dataset)
                 except Exception:  # noqa: B902 — the hosted report is optional
@@ -1520,7 +1679,8 @@ def _fetch_place(
                 cropped.add(feed.feed_id)
             else:
                 carriers[feed.feed_id] = feed.feed_id
-            for text in dict.fromkeys(notes):
+            notes.append(_timezone_note(path, budget))
+            for text in dict.fromkeys(filter(None, notes)):
                 _note(entry, text)
             reports.append(report)
             repairs.append(fixes)

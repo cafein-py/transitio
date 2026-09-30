@@ -104,11 +104,24 @@ def test_header_only_required_file_is_not_clean(tmp_path):
     assert "stops.txt" not in report["row_counts"]
 
 
-def test_padded_header_not_silently_repaired(tmp_path):
+def test_padded_header_is_trimmed_with_one_notice(tmp_path):
     files = dict(MINIMAL, **{"trips.txt": " route_id,service_id,trip_id\nr1,wk,t1\n"})
     report = validate_feed(write_zip(tmp_path / "feed.zip", files))
-    assert "leading_or_trailing_whitespaces" in codes(report)
-    assert "missing_required_column" in codes(report)
+    padded = [
+        n["context"]
+        for n in report["notices"]
+        if n["code"] == "leading_or_trailing_whitespaces"
+    ]
+    assert padded == [
+        {
+            "filename": "trips.txt",
+            "csvRowNumber": 1,
+            "fieldName": "route_id",
+            "fieldValue": " route_id",
+            "trimmedCount": 1,
+        }
+    ]
+    assert "missing_required_column" not in codes(report)
 
 
 def test_duplicate_zip_entries_are_refused(tmp_path):

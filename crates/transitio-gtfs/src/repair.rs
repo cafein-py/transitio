@@ -37,7 +37,6 @@ const FIELD_DEFAULTS: &[(&str, &str, &str)] = &[
 const CLEARABLE_REFERENCES: &[(&str, &str)] = &[
     ("trips.txt", "shape_id"),
     ("stops.txt", "level_id"),
-    ("routes.txt", "network_id"),
     ("fare_attributes.txt", "agency_id"),
     ("attributions.txt", "agency_id"),
     ("attributions.txt", "route_id"),
@@ -98,7 +97,7 @@ pub fn repair(path: &Path, output: &Path, options: ScanOptions) -> Result<Repair
         return Err("output path aliases the source archive".to_string());
     }
 
-    let mut fixes = Vec::new();
+    let mut fixes = whitespace_fixes(&result);
     default_value_pass(&mut result, &mut fixes);
     drop_entities_pass(&mut result, &mut fixes);
 
@@ -143,6 +142,27 @@ pub fn repair(path: &Path, output: &Path, options: ScanOptions) -> Result<Repair
 
 fn column(table: &Table, name: &str) -> Option<usize> {
     table.headers.iter().position(|h| h == name)
+}
+
+/// One fix per file the reader trimmed whitespace in, at its first
+/// trimmed header name or value.
+fn whitespace_fixes(result: &ScanResult) -> Vec<Fix> {
+    result
+        .notices
+        .iter()
+        .filter(|n| n.code == "leading_or_trailing_whitespaces")
+        .filter_map(|n| {
+            Some(Fix {
+                action: "trim_whitespace",
+                filename: n.context.get("filename")?.as_str()?.to_string(),
+                csv_row: n.context.get("csvRowNumber")?.as_u64()?,
+                field: Some(n.context.get("fieldName")?.as_str()?.to_string()),
+                old_value: None,
+                new_value: None,
+                triggered_by: n.code.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Reset invalid values of optional enumerated fields to their spec
@@ -521,7 +541,7 @@ mod tests {
         files.push((
             "stops.txt",
             "stop_id,stop_name,stop_lat,stop_lon\n\
-             s1,Kamppi ,60.169,24.931\ns2,Steissi ,60.171,24.941\n",
+             s1,\"Ka\npi\",60.169,24.931\ns2,\"Ste\nsi\",60.171,24.941\n",
         ));
         let source = dir.join("source.zip");
         std::fs::write(&source, build_zip(&files).into_inner()).unwrap();
@@ -551,6 +571,43 @@ mod tests {
                  cannot repair this feed"
             )
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trimmed_whitespace_is_one_fix_per_file() {
+        let dir = std::env::temp_dir().join(format!("transitio-trim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut files = minimal();
+        files.retain(|(name, _)| !matches!(*name, "stops.txt" | "trips.txt"));
+        files.push((
+            "stops.txt",
+            "stop_id,stop_name,stop_lat,stop_lon\n\
+             s1,Kamppi ,60.169,24.931\ns2, Steissi,60.171,24.941\n",
+        ));
+        files.push(("trips.txt", " route_id,service_id,trip_id\nr1,wk,t1\n"));
+        let source = dir.join("source.zip");
+        std::fs::write(&source, build_zip(&files).into_inner()).unwrap();
+        let options = ScanOptions {
+            reference_date: chrono::NaiveDate::from_ymd_opt(2026, 6, 1),
+            ..ScanOptions::default()
+        };
+        let result = repair(&source, &dir.join("repaired.zip"), options).unwrap();
+        let trims: Vec<(&str, u64, Option<&str>)> = result
+            .fixes
+            .iter()
+            .filter(|fix| fix.action == "trim_whitespace")
+            .map(|fix| (fix.filename.as_str(), fix.csv_row, fix.field.as_deref()))
+            .collect();
+        assert_eq!(
+            trims,
+            [
+                ("stops.txt", 2, Some("stop_name")),
+                ("trips.txt", 1, Some("route_id"))
+            ]
+        );
+        let codes: Vec<&str> = result.validation.notices.iter().map(|n| n.code).collect();
+        assert!(!codes.contains(&"leading_or_trailing_whitespaces"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

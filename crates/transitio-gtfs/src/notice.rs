@@ -16,7 +16,7 @@ pub enum Severity {
 /// naming (notice class name minus `Notice`, snake_cased) so transitio
 /// reports stay mergeable with hosted reports; `context` carries the
 /// notice-specific fields.
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone)]
 pub struct Notice {
     pub code: &'static str,
     pub severity: Severity,

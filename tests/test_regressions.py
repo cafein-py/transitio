@@ -1,5 +1,7 @@
 """Regression tests, one per fixed defect."""
 
+import csv
+import io
 import zipfile
 
 import pytest
@@ -165,6 +167,25 @@ def test_unparsed_entries_survive_rewrites(tmp_path):
     crop_feed(source, cropped, aoi=WIDE_BBOX, reference_date="20260601")
     assert read_entry(cropped, "locations.geojson") == geojson
     assert read_entry(cropped, "notes.md") == notes
+
+
+def test_route_network_ids_are_not_dangling_references(tmp_path):
+    # routes.network_id was checked against networks.txt, so a feed without
+    # that file had every value reported as a foreign_key_violation error,
+    # and repair cleared them all.
+    files = dict(FEED)
+    files["routes.txt"] = (
+        "route_id,agency_id,route_short_name,route_type,network_id\n"
+        "r-in,hsl,1,3,CTS\nr-out,espoo,2,3,CTS\n"
+    )
+    source = write_zip(tmp_path / "feed.zip", files)
+    repaired = tmp_path / "repaired.zip"
+    result = repair_feed(source, repaired, reference_date="20260601")
+    assert not any(
+        n["code"] == "foreign_key_violation" for n in result["remaining_notices"]
+    )
+    routes = csv.DictReader(io.StringIO(read_entry(repaired, "routes.txt").decode()))
+    assert [row["network_id"] for row in routes] == ["CTS", "CTS"]
 
 
 def test_bytes_after_the_end_record_do_not_refuse_the_archive(tmp_path):
@@ -386,3 +407,534 @@ def test_padded_header_names_merge_into_one_column(tmp_path):
         [feeds[1], feeds[1]], tmp_path / "twice.zip", reference_date="20260601"
     )
     assert clean["header_fixes"] == []
+
+
+@pytest.mark.parametrize(
+    "form", ["clean", "padded-lines", "space-after-comma", "bom", "repeated-name"]
+)
+def test_padded_header_names_keep_the_selector_trusted(tmp_path, form):
+    # A feed padding its header names, as Renfe pads every line and Metra each
+    # header comma, recomputed a fingerprint at fetch that differed from the
+    # build's, so its selector was judged stale.
+    from types import SimpleNamespace
+
+    from transitio.index import fingerprint
+    from transitio.pipeline._fetch import _selector_trusted
+
+    members = {
+        "routes.txt": "route_id,agency_id,route_type\nr1,a,3\nr2,a,2\n",
+        "stops.txt": (
+            "stop_id,stop_lon,stop_lat\ns1,24.9,60.2\ns2,25.0,60.3\ns3,25.1,60.4\n"
+        ),
+        "trips.txt": "route_id,trip_id,service_id\nr1,t1,wk\nr2,t2,wk\n",
+        "stop_times.txt": (
+            "trip_id,stop_id,stop_sequence,pickup_type,drop_off_type\n"
+            "t1,s1,1,0,0\nt1,s2,2,0,0\nt1,s3,3,1,1\nt2,s2,1,0,0\n"
+        ),
+    }
+    for name, text in members.items():
+        header, rows = text.split("\n", 1)
+        if form == "padded-lines":
+            members[name] = "".join(f"{line}  \n" for line in text.splitlines())
+        elif form == "space-after-comma":
+            members[name] = f"{header.replace(',', ', ')}\n{rows}"
+        elif form == "bom":
+            members[name] = "\N{BYTE ORDER MARK} " + text
+    if form == "repeated-name":
+        members["routes.txt"] = (
+            "route_id,agency_id,route_type, route_type\nr1,a,3,700\nr2,a,2,700\n"
+        )
+    stored = fingerprint.compute(
+        "route_stops",
+        {
+            "r1": {"route_type": 3, "agency_id": "a"},
+            "r2": {"route_type": 2, "agency_id": "a"},
+        },
+        {"s1": (24.9, 60.2), "s2": (25.0, 60.3), "s3": (25.1, 60.4)},
+        {"r1": {"s1", "s2"}, "r2": {"s2"}},
+    )
+    edge = SimpleNamespace(
+        fingerprint_kind="route_stops", classification_fingerprint=stored
+    )
+    feed = SimpleNamespace(edges={"e1": edge})
+    path = write_zip(tmp_path / "feed.zip", members)
+    trusted = _selector_trusted(path, feed, SimpleNamespace(state="complete"))
+    assert trusted == (True, None, {"r1", "r2"})
+
+
+def test_padded_values_are_read_trimmed(tmp_path):
+    # Values were read as written: a feed padding every line, as Renfe pads
+    # its lines with about 150 spaces, had no calendar end_date, so fetch
+    # skipped it as idle, and a parent_station of one space, as York Region
+    # writes it, was a dangling reference.
+    import datetime
+
+    from transitio.gtfs import merge_feeds
+    from transitio.pipeline._fetch import _process_feed, _service
+
+    files = dict(
+        FEED,
+        **{
+            "stops.txt": (
+                "stop_id,stop_name,parent_station,stop_lat,stop_lon\n"
+                "in1,Kamppi, ,60.169,24.931\n"
+                "in2,Steissi,,60.171,24.941\n"
+                "out1,Espoo,,60.205,24.655\n"
+            )
+        },
+    )
+    padded = {
+        name: "".join(f"{line}{' ' * 150}\n" for line in text.splitlines())
+        for name, text in files.items()
+    }
+    source = write_zip(tmp_path / "padded.zip", padded)
+
+    def trimmed(notices):
+        return sorted(
+            n["context"]["filename"]
+            for n in notices
+            if n["code"] == "leading_or_trailing_whitespaces"
+        )
+
+    report = validate_feed(source, reference_date="20260601")
+    assert report["service_window"] == ["20260101", "20261231"]
+    assert report["moment"]["activeTrips"] == 2
+    assert "foreign_key_violation" not in {n["code"] for n in report["notices"]}
+    assert trimmed(report["notices"]) == sorted(padded)
+
+    cropped = crop_feed(
+        source, tmp_path / "cropped.zip", aoi=CITY_BBOX, reference_date="20260601"
+    )
+    assert trimmed(cropped["source_notices"]) == sorted(padded)
+
+    day = datetime.date(2026, 6, 1)
+    kept = _process_feed(
+        source,
+        geometry=CITY_BBOX,
+        tag="study",
+        repair=False,
+        crop=True,
+        modes={"bus"},
+        day=day,
+        study=True,
+        hosted=None,
+        budgets={"reference_date": "20260601"},
+    )
+    groups = {group["code"]: group for group in kept[1]["notices"]}
+    assert groups["leading_or_trailing_whitespaces"]["totalNotices"] == len(padded)
+    assert _service(source, day) is not None
+
+    clean = write_zip(tmp_path / "clean.zip", FEED)
+    merged = merge_feeds([source, clean], tmp_path / "merged.zip")
+    assert not any(n["severity"] == "ERROR" for n in merged["notices"])
+    assert [(entry["feed"], entry["file"]) for entry in merged["trimmed_values"]] == [
+        (0, name) for name in sorted(padded)
+    ]
+
+
+def test_cropped_fares_never_apply_more_widely(tmp_path):
+    # The crop kept fare_rules rows naming zones only removed stops carried,
+    # kept fares of a pruned agency, and dropped fares that had no rules.
+    files = dict(FEED)
+    files["stops.txt"] = (
+        "stop_id,stop_name,stop_lat,stop_lon,zone_id\n"
+        "in1,Kamppi,60.169,24.931,A\n"
+        "in2,Steissi,60.171,24.941,B\n"
+        "out1,Espoo,60.205,24.655,C\n"
+    )
+    files["fare_attributes.txt"] = (
+        "fare_id,price,currency_type,payment_method,transfers,agency_id\n"
+        + "".join(f"f{n},3.10,EUR,0,,hsl\n" for n in range(1, 9))
+        + "f9,2.00,EUR,0,,espoo\n"
+    )
+    files["fare_rules.txt"] = (
+        "fare_id,route_id,origin_id,destination_id,contains_id\n"
+        "f1,,A,B,\n"
+        "f2,,A,C,\n"
+        "f3,,,,A\nf3,,,,B\n"
+        "f4,,,,A\nf4,,,,C\nf4,r-in,,,\n"
+        "f5,r-in,,,\nf5,r-out,,,\n"
+        "f6,r-out,,,\nf6,,A,B,\n"
+        "f7,,Z,,\n"
+    )
+    source = write_zip(tmp_path / "feed.zip", files)
+    output = tmp_path / "cropped.zip"
+    result = crop_feed(source, output, aoi=CITY_BBOX, reference_date="20260601")
+
+    def rows(name):
+        return list(csv.DictReader(io.StringIO(read_entry(output, name).decode())))
+
+    assert [tuple(row.values()) for row in rows("fare_rules.txt")] == [
+        ("f1", "", "A", "B", ""),
+        ("f3", "", "", "", "A"),
+        ("f3", "", "", "", "B"),
+        ("f5", "r-in", "", "", ""),
+    ]
+    fares = [row["fare_id"] for row in rows("fare_attributes.txt")]
+    assert fares == ["f1", "f3", "f5", "f8"]
+    assert not any(
+        n["code"] == "foreign_key_violation" for n in result["remaining_notices"]
+    )
+
+
+INHERITED = [{"feed": 0, "errors": 1, "codes": {"foreign_key_violation": 1}}]
+
+
+@pytest.mark.parametrize(
+    "check, variant, refusal, inherited, introduced",
+    [
+        (True, None, None, INHERITED, {"errors": 0, "codes": {}}),
+        ("strict", None, "1 of them inherited", INHERITED, {"errors": 0, "codes": {}}),
+        (False, None, None, None, None),
+        (
+            True,
+            "dangling-stop",
+            r"introduced 1 .*\(foreign_key_violation 1\)",
+            INHERITED,
+            {"errors": 1, "codes": {"foreign_key_violation": 1}},
+        ),
+        (
+            True,
+            "input-changed-after-read",
+            r"introduced 1 .*\(foreign_key_violation 1\)",
+            INHERITED,
+            {"errors": 1, "codes": {"foreign_key_violation": 1}},
+        ),
+        (True, "capped", None, INHERITED, {"errors": 0, "codes": {}}),
+        (True, "sampled", "cannot tell", None, None),
+    ],
+    ids=[
+        "inherited",
+        "strict",
+        "unchecked",
+        "introduced",
+        "input-changed-after-read",
+        "capped",
+        "sampled",
+    ],
+)
+def test_merge_refuses_only_errors_it_introduced(
+    tmp_path, monkeypatch, check, variant, refusal, inherited, introduced
+):
+    # A merge refused every error-severity notice of the merged feed, those
+    # its inputs already carried included, so feeds merged clean only when
+    # every input was clean.
+    from transitio.edit import FeedBuilder
+    from transitio.exceptions import InvalidFeedError
+    from transitio.gtfs import _merge, merge_feeds
+
+    def feed(start, end):
+        builder = FeedBuilder()
+        builder.add_agency("a", "Agency", "https://a.example", "Europe/Helsinki")
+        builder.add_stop("s1", "First", 60.169, 24.931)
+        builder.add_stop("s2", "Second", 60.171, 24.941)
+        builder.add_route("r1", 3, "1", agency_id="a")
+        builder.add_service("wk", "weekdays", "20260101", "20261231")
+        builder.add_trip("r1", "wk", "t1", [("s1", start, start), ("s2", end, end)])
+        return builder
+
+    first = feed("08:00:00", "08:05:00")
+    first.insert_rows(
+        "attributions.txt",
+        [{"route_id": "gone", "organization_name": "Org", "is_operator": "1"}],
+    )
+    second = feed("09:00:00", "09:05:00")
+    if variant in ("dangling-stop", "input-changed-after-read"):
+        merge_tables = _merge._merge_tables
+
+        def dangling(*args, **kwargs):
+            tables, dropped, details = merge_tables(*args, **kwargs)
+            stops = tables["stops.txt"]
+            tables["stops.txt"] = stops[stops["stop_id"] != "f2:s2"]
+            if variant == "input-changed-after-read":
+                # The caller's feed now carries the error the merge introduced.
+                second.delete_rows("stops.txt", [1])
+            return tables, dropped, details
+
+        monkeypatch.setattr(_merge, "_merge_tables", dangling)
+    if variant == "sampled":
+        monkeypatch.setattr("transitio.validate._structure.CERTIFY_NOTICE_BUDGET", 0)
+    feeds = [first, second]
+    output = tmp_path / "merged.zip"
+    budgets = {"reference_date": "20260601"}
+    if variant == "capped":
+        budgets["max_notices_per_file"] = 0
+    if refusal is None:
+        report = merge_feeds(feeds, output, check=check, **budgets)
+    else:
+        with pytest.raises(InvalidFeedError, match=refusal) as refused:
+            merge_feeds(feeds, output, check=check, **budgets)
+        report = refused.value.report
+    assert output.exists()
+    assert report["inherited_errors"] == inherited
+    assert report["introduced_errors"] == introduced
+
+
+def _rider_entry(position, wildcards=()):
+    return {
+        "feed": position,
+        "defaults": [f"f{position + 1}:adult"],
+        "wildcard_products": list(wildcards),
+    }
+
+
+@pytest.mark.parametrize(
+    "defaults, open_products, expected",
+    [
+        (["1", "1"], [], [_rider_entry(0), _rider_entry(1)]),
+        (["1", "1"], ["day"], [_rider_entry(0, ["f1:day"]), _rider_entry(1)]),
+        (["", "1"], ["day"], []),
+    ],
+    ids=["a-default-each", "open-product", "one-default"],
+)
+def test_merge_keeps_each_inputs_default_rider_category(
+    tmp_path, defaults, open_products, expected
+):
+    # A merge refused inputs that each declared a default rider category,
+    # though GTFS sets the default per fare product, not per feed.
+    from transitio.edit import FeedBuilder, FeedEditor
+    from transitio.gtfs import merge_feeds
+
+    feeds = []
+    for default in defaults:
+        builder = FeedBuilder()
+        builder.insert_rows(
+            "rider_categories.txt",
+            [
+                {"rider_category_id": "adult", "is_default_fare_category": default},
+                {"rider_category_id": "child", "is_default_fare_category": "0"},
+            ],
+        )
+        builder.insert_rows(
+            "fare_products.txt",
+            [
+                {"fare_product_id": rider, "rider_category_id": rider}
+                for rider in ("adult", "child")
+            ],
+        )
+        feeds.append(builder)
+    feeds[0].insert_rows(
+        "fare_products.txt",
+        [
+            {"fare_product_id": product, "rider_category_id": ""}
+            for product in open_products
+        ],
+    )
+    output = tmp_path / "merged.zip"
+    report = merge_feeds(feeds, output, check=False)
+    riders = FeedEditor(output).tables["rider_categories.txt"]
+    flagged = riders["is_default_fare_category"] == "1"
+    assert list(riders.loc[flagged, "rider_category_id"]) == [
+        f"f{position}:adult" for position, flag in enumerate(defaults, 1) if flag
+    ]
+    assert report["rider_defaults"] == expected
+
+
+def test_merge_leaves_out_the_feed_whose_stops_lie_in_another_time_zone(tmp_path):
+    # Two feeds declaring different time zones were refused, and skipping one
+    # kept the earlier feed; RIO Limo declares America/New_York for its stops
+    # at Honolulu's airport, beside TheBus in Pacific/Honolulu.
+    import re
+
+    from transitio.edit import FeedEditor
+    from transitio.gtfs import merge_feeds
+
+    stops = (
+        "stop_id,stop_name,stop_lat,stop_lon\n"
+        "in1,Terminal 1,21.332,-157.920\n"
+        "in2,Terminal 2,21.334,-157.918\n"
+        "out1,Lot,21.336,-157.915\n"
+    )
+    feeds = [
+        write_zip(
+            tmp_path / f"{index}.zip",
+            {
+                **FEED,
+                "agency.txt": FEED["agency.txt"].replace("Europe/Helsinki", zone),
+                "stops.txt": stops,
+            },
+        )
+        for index, zone in enumerate(["America/New_York", "Pacific/Honolulu"])
+    ]
+    output = tmp_path / "merged.zip"
+    left = f"left out feed 0 (f1, {feeds[0]}): America/New_York, "
+    with pytest.warns(UserWarning, match=re.escape(left + "stops in Pacific/Honolulu")):
+        report = merge_feeds(feeds, output, reference_date="20260601")
+    assert report["skipped_feeds"] == [
+        {
+            "feed": 0,
+            "timezones": ["America/New_York"],
+            "stop_timezone": "Pacific/Honolulu",
+        }
+    ]
+    agency = FeedEditor(output).tables["agency.txt"]
+    assert list(agency["agency_id"]) == ["f2:hsl", "f2:espoo"]
+    assert set(agency["agency_timezone"]) == {"Pacific/Honolulu"}
+
+
+def test_quoted_commas_do_not_trip_the_delimiter_guard(tmp_path):
+    # The delimiter guard counted every comma on a line, so a two-column
+    # areas.txt whose quoted WKT polygon held over 4096 commas was refused as
+    # exceeding max_columns and the feed could not be cropped.
+    ring = ", ".join(f"24.{i:04d} 60.1" for i in range(4200))
+    areas = f'area_id,wkt\na1,"POLYGON(({ring}))"\na2,"POINT (24.9 60.1)"\n'
+    source = write_zip(tmp_path / "feed.zip", {**FEED, "areas.txt": areas})
+    output = tmp_path / "cropped.zip"
+    crop_feed(source, output, aoi=CITY_BBOX, reference_date="20260601")
+    cropped = read_entry(output, "areas.txt").decode()
+    assert list(csv.reader(io.StringIO(cropped))) == list(
+        csv.reader(io.StringIO(areas))
+    )
+
+
+def test_a_capped_calendar_expansion_keeps_the_window_and_target_day(tmp_path):
+    # Calendar rows past the 2,000,000-day expansion budget were skipped
+    # without a notice: the report lost its service window and moment, and
+    # a temporal crop dropped the trips of the skipped services.
+    files = dict(FEED)
+    daily, never = "1,1,1,1,1,1,1", "0,0,0,0,0,0,0"
+    files["calendar.txt"] += "".join(
+        f"s{i},{never if i == 0 else daily},20200101,20301212\n" for i in range(502)
+    )
+    files["trips.txt"] += "r-in,s501,t-last\n"
+    files[
+        "stop_times.txt"
+    ] += "t-last,10:00:00,10:00:00,in1,1\nt-last,10:05:00,10:05:00,in2,2\n"
+    source = write_zip(tmp_path / "feed.zip", files)
+    # The row notice of s0, which runs on no weekday, fills the budget of one.
+    report = validate_feed(source, reference_date="20280601", max_notices_per_file=1)
+    capped = [
+        n for n in report["notices"] if n["code"] == "service_expansion_truncated"
+    ]
+    assert [n["context"] for n in capped] == [
+        {"maxServiceDays": 2_000_000, "calendarDays": 365 + 502 * 3999}
+    ]
+    assert report["service_window"] == ["20200101", "20301212"]
+    assert report["moment"]["activeTrips"] == 1
+    assert report["moment"]["baselineTrips"] is None
+
+    output = tmp_path / "cropped.zip"
+    crop_feed(
+        source,
+        output,
+        start_date="20280601",
+        end_date="20280601",
+        reference_date="20280601",
+    )
+    assert "t-last" in read_entry(output, "trips.txt").decode()
+
+
+def test_a_failed_producer_download_falls_back_to_the_hosted_copy(
+    tmp_path, monkeypatch
+):
+    # A feed whose producer URL timed out or answered 404 was skipped as
+    # "download failed", though its index row names the Mobility Database
+    # hosted copy (urls.latest) the index itself was built from.
+    import json
+
+    import httpx
+
+    import transitio.index as transitio_index
+    from index_fixture import HULL, covered_feed, edge, write_index
+    from transitio.catalog import MobilityDatabase
+    from transitio.pipeline import fetch
+
+    direct = "https://producer.example/gtfs.zip"
+    latest = "https://files.example/mdb-9/latest.zip"
+    feed = {
+        **covered_feed("f-a", coverage_source="crawl"),
+        "coverage": HULL,
+        "mdb": {"urls": {"direct_download": direct, "latest": latest}},
+    }
+    edges = [edge("Q1757", "f-a", tier="local")]
+    index = transitio_index.read_index(
+        write_index(tmp_path / "index", feeds=[feed], edges=edges)
+    )
+    payload = write_zip(tmp_path / "feed.zip", FEED).read_bytes()
+
+    def handler(request):
+        if str(request.url) == latest:
+            return httpx.Response(200, content=payload)
+        return httpx.Response(404)
+
+    class Served(MobilityDatabase):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    monkeypatch.setattr("transitio.catalog.MobilityDatabase", Served)
+    result = fetch(
+        place="Q1757",
+        index=index,
+        directory=tmp_path / "out",
+        crop=False,
+        osm=False,
+        expired="keep",
+    )
+    (entry,) = result.selection
+    assert (entry["decision"], entry["fetched_from"], entry["note"]) == (
+        "delivered",
+        "mdb_latest",
+        "from the Mobility Database hosted copy",
+    )
+    errors = entry["download_errors"]
+    assert errors.startswith("mdb: ") and "404 Not Found" in errors
+    sidecar = result.feeds[0].with_suffix(".provenance.json")
+    provenance = result.reports[0]["summary"]["provenance"]
+    for record in (json.loads(sidecar.read_text()), provenance):
+        assert (record["fetched_from"], record["download_errors"]) == (
+            "mdb_latest",
+            errors,
+        )
+
+
+_YEAR = ["2026-01-01", "2026-12-31"]
+
+
+@pytest.mark.parametrize(
+    "dropped, reason, window",
+    [
+        pytest.param(
+            ["agency.txt"], "missing required file agency.txt", _YEAR, id="agency"
+        ),
+        pytest.param(
+            ["stops.txt", "agency.txt"],
+            "missing required files agency.txt, stops.txt",
+            _YEAR,
+            id="two-files",
+        ),
+        pytest.param(
+            ["calendar.txt", "calendar_dates.txt"],
+            "missing calendar.txt and calendar_dates.txt",
+            None,
+            id="calendars",
+        ),
+        pytest.param([], None, _YEAR, id="complete"),
+    ],
+)
+def test_a_feed_missing_a_required_file_is_skipped(tmp_path, dropped, reason, window):
+    # A feed without agency.txt was delivered, its report counting the
+    # error, and cafein then refused every delivered feed.
+    from transitio.pipeline._fetch import _process_feed, _SkipFeed
+
+    files = {name: text for name, text in FEED.items() if name not in dropped}
+    source = write_zip(tmp_path / "feed.zip", files)
+    options = dict(
+        geometry=None,
+        tag="t",
+        repair=False,
+        crop=False,
+        modes=None,
+        day=None,
+        study=False,
+        hosted=None,
+        # Feed-level notices bypass the per-file notice cap.
+        budgets={"max_notices_per_file": 0},
+    )
+    if reason is None:
+        path, report, *_, kept_window = _process_feed(source, **options)
+        assert (path, kept_window) == (source, window) and report["summary"]
+        return
+    with pytest.raises(_SkipFeed) as caught:
+        _process_feed(source, **options)
+    assert (caught.value.reason, caught.value.window) == (reason, window)

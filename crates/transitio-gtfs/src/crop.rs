@@ -1,13 +1,17 @@
 //! Spatial and temporal feed cropping: retain the service relevant to an
 //! area and date window and cascade everything else away, keeping the
 //! result referentially consistent. Times and attributes of retained
-//! trips are never altered.
+//! trips are never altered beyond the surrounding whitespace the reader
+//! trims.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
+use crate::notice::Notice;
 use crate::output::ZipOutput;
-use crate::scan::{DelimiterGuard, NoTable, Row, ScanOptions, ScanResult, Table, TableReader};
+use crate::scan::{
+    DelimiterGuard, NoTable, Row, ScanOptions, ScanResult, Table, TableReader, MAX_RECORD_BYTES,
+};
 use crate::{rules, scan, schema, semantics};
 
 /// Tables read from the archive row by row rather than parsed whole: the
@@ -50,6 +54,10 @@ pub struct CropResult {
     /// ``None`` when routes.txt or its ``route_id`` column is absent (the drop
     /// is then undetermined), never an empty vector standing in for it.
     pub source_routes: Option<Vec<String>>,
+    /// The whitespace the reader trimmed from the source, one notice per
+    /// file read, with rows numbered as in the source. shapes.txt is read
+    /// only when a kept trip has a shape.
+    pub source_notices: Vec<Notice>,
 }
 
 pub fn crop(
@@ -106,6 +114,7 @@ pub fn crop(
                 .collect()
         })
     });
+    let mut source_notices: Vec<Notice> = whitespace(&result.notices).collect();
     let inside = inside_stops(&result, crop_options, area.as_deref());
     let active = active_services(&result, &options, crop_options)?;
     let touched = match &inside {
@@ -123,6 +132,7 @@ pub fn crop(
         crop_options,
         touched.as_ref(),
         active.as_ref(),
+        &mut source_notices,
     )?;
     result.tables.insert("trips.txt".to_string(), trips);
 
@@ -147,6 +157,7 @@ pub fn crop(
         &mut result,
         &kept_trips,
         crop_options,
+        &mut source_notices,
     ) {
         Ok(counts) => counts,
         Err(error) => {
@@ -185,6 +196,7 @@ pub fn crop(
         row_counts,
         validation,
         source_routes,
+        source_notices,
     })
 }
 
@@ -331,8 +343,9 @@ pub fn validate_polygon(parts: &[PolygonRings]) -> Result<(), String> {
     Ok(())
 }
 
-/// The named table streamed from the archive under the stream guard, or
-/// None when the archive has no such entry or it is empty.
+/// The named table streamed from the archive under the delimiter guard,
+/// with records capped at `MAX_RECORD_BYTES` as no entry budget bounds
+/// them, or None when the archive has no such entry or it is empty.
 fn stream_table<'a>(
     archive: &'a mut zip::ZipArchive<std::fs::File>,
     name: &'static str,
@@ -345,7 +358,7 @@ fn stream_table<'a>(
     };
     let spec = schema::spec_for(name).expect("a streamed table is a known GTFS file");
     let mut notices = Vec::new();
-    let guarded = DelimiterGuard::new(entry, options);
+    let guarded = DelimiterGuard::new(entry, options, MAX_RECORD_BYTES);
     match TableReader::open(spec, guarded, options, u64::MAX, &mut notices) {
         Ok(reader) => Ok(Some(reader)),
         Err(NoTable::Empty) => Ok(None),
@@ -381,6 +394,14 @@ fn whole<R: std::io::Read>(
 fn unreadable(name: &str, notices: &[crate::notice::Notice], options: &ScanOptions) -> String {
     scan::refusal(notices, [name], options, false, "crop")
         .unwrap_or_else(|| format!("{name} cannot be read whole; cannot crop this feed"))
+}
+
+/// The notices of what the reader trimmed, among a pass's notices.
+fn whitespace(notices: &[Notice]) -> impl Iterator<Item = Notice> + '_ {
+    notices
+        .iter()
+        .filter(|n| n.code == "leading_or_trailing_whitespaces")
+        .cloned()
 }
 
 /// The stops inside the crop area, or None without a spatial crop.
@@ -435,7 +456,7 @@ fn active_services(
 ) -> Result<Option<HashSet<String>>, String> {
     // Temporal selection over actual service activity: weekday flags and
     // calendar_dates exceptions included, via the semantic tier's
-    // active-date computation.
+    // service calendars.
     match (&crop_options.start_date, &crop_options.end_date) {
         (None, None) => Ok(None),
         (start, end) => {
@@ -445,14 +466,12 @@ fn active_services(
             };
             let window_start = parse(start, "00010101")?;
             let window_end = parse(end, "99991231")?;
-            let dates = semantics::active_service_dates(&result.tables, options);
-            Ok(Some(
-                dates
-                    .into_iter()
-                    .filter(|(_, days)| days.iter().any(|d| *d >= window_start && *d <= window_end))
-                    .map(|(id, _)| id)
-                    .collect(),
-            ))
+            Ok(Some(semantics::active_services_between(
+                &result.tables,
+                options,
+                window_start,
+                window_end,
+            )))
         }
     }
 }
@@ -513,6 +532,7 @@ fn select_trips(
     crop_options: &CropOptions,
     touched: Option<&HashSet<String>>,
     active: Option<&HashSet<String>>,
+    source_notices: &mut Vec<Notice>,
 ) -> Result<(HashSet<String>, Table), String> {
     let mut archive = open_archive(source)?;
     let Some(mut reader) = stream_table(&mut archive, "trips.txt", options)? else {
@@ -557,6 +577,7 @@ fn select_trips(
         });
     }
     whole(&reader, "trips.txt", &notices, options)?;
+    source_notices.extend(whitespace(&notices));
     Ok((kept, Table { headers, rows }))
 }
 
@@ -571,6 +592,7 @@ fn write_cropped(
     result: &mut ScanResult,
     kept_trips: &HashSet<String>,
     crop_options: &CropOptions,
+    source_notices: &mut Vec<Notice>,
 ) -> Result<BTreeMap<String, usize>, String> {
     let mut zip = ZipOutput::create(staging)?;
     let mut counts = BTreeMap::new();
@@ -593,6 +615,7 @@ fn write_cropped(
                 .map(|row| row.fields);
             let count = zip.rows("stop_times.txt", &headers, rows)?;
             whole(&reader, "stop_times.txt", &notices, options)?;
+            source_notices.extend(whitespace(&notices));
             counts.insert("stop_times.txt".to_string(), count);
         }
     }
@@ -623,6 +646,7 @@ fn write_cropped(
                 .map(|row| row.fields);
             let count = zip.rows("shapes.txt", &headers, rows)?;
             whole(&reader, "shapes.txt", &notices, options)?;
+            source_notices.extend(whitespace(&notices));
             counts.insert("shapes.txt".to_string(), count);
         }
     }
@@ -790,19 +814,99 @@ fn retain(
             }
         }
     }
-    if let Some(fare_rules) = result.tables.get_mut("fare_rules.txt") {
-        if let Some(route) = column(fare_rules, "route_id") {
-            fare_rules.rows.retain(|row| {
-                let id = row.fields[route].as_str();
-                id.is_empty() || kept_routes.contains(id)
-            });
+    retain_fares(result, &kept_routes, &kept_agencies);
+}
+
+/// A fare rule naming a removed route or zone goes. Its fare goes whole,
+/// rules included, when that leaves the fare without the route rules or
+/// origin-destination rules it had, or without a contains zone it named,
+/// so no fare applies more widely than in the source; so does a fare of a
+/// pruned agency. A fare without rules applies everywhere and stays.
+fn retain_fares(
+    result: &mut ScanResult,
+    kept_routes: &HashSet<String>,
+    kept_agencies: &HashSet<String>,
+) {
+    fn value(row: &Row, index: Option<usize>) -> Option<&str> {
+        index
+            .map(|i| row.fields[i].as_str())
+            .filter(|id| !id.is_empty())
+    }
+    let kept_zones = referenced(result, "stops.txt", "zone_id");
+    let mut dropped: HashSet<String> = HashSet::new();
+    if !kept_agencies.is_empty() {
+        if let Some(fares) = result.tables.get("fare_attributes.txt") {
+            if let Some(id) = column(fares, "fare_id") {
+                let agency = column(fares, "agency_id");
+                dropped.extend(
+                    fares
+                        .rows
+                        .iter()
+                        .filter(|row| {
+                            value(row, agency).is_some_and(|a| !kept_agencies.contains(a))
+                        })
+                        .map(|row| row.fields[id].clone()),
+                );
+            }
         }
     }
-    // Fares referenced by surviving rules; feeds without fare_rules keep
-    // their fare_attributes untouched.
-    if result.tables.contains_key("fare_rules.txt") {
-        let kept_fares = referenced(result, "fare_rules.txt", "fare_id");
-        keep_rows(result, "fare_attributes.txt", "fare_id", &kept_fares);
+    if let Some(rules) = result.tables.get_mut("fare_rules.txt") {
+        let fare = column(rules, "fare_id");
+        let route = column(rules, "route_id");
+        let ends = [column(rules, "origin_id"), column(rules, "destination_id")];
+        let contains = column(rules, "contains_id");
+        let dead = |row: &Row| {
+            value(row, route).is_some_and(|id| !kept_routes.contains(id))
+                || [ends[0], ends[1], contains]
+                    .into_iter()
+                    .any(|zone| value(row, zone).is_some_and(|id| !kept_zones.contains(id)))
+        };
+        // Per fare: whether it had route rules and whether one survives, the
+        // same for origin-destination rules, and the contains zones of all
+        // its rules and of the surviving ones.
+        #[derive(Default)]
+        struct Selectors<'r> {
+            routes: [bool; 2],
+            pairs: [bool; 2],
+            zones: [HashSet<&'r str>; 2],
+        }
+        let mut selectors: BTreeMap<&str, Selectors> = BTreeMap::new();
+        for row in &rules.rows {
+            let live = !dead(row);
+            let entry = selectors.entry(value(row, fare).unwrap_or("")).or_default();
+            if value(row, route).is_some() {
+                entry.routes = [true, entry.routes[1] || live];
+            }
+            if ends.iter().any(|&end| value(row, end).is_some()) {
+                entry.pairs = [true, entry.pairs[1] || live];
+            }
+            if let Some(zone) = value(row, contains) {
+                entry.zones[0].insert(zone);
+                if live {
+                    entry.zones[1].insert(zone);
+                }
+            }
+        }
+        dropped.extend(
+            selectors
+                .into_iter()
+                .filter(|(_, s)| {
+                    s.routes == [true, false]
+                        || s.pairs == [true, false]
+                        || s.zones[0].len() > s.zones[1].len()
+                })
+                .map(|(id, _)| id.to_string()),
+        );
+        rules
+            .rows
+            .retain(|row| !dead(row) && !dropped.contains(value(row, fare).unwrap_or("")));
+    }
+    if !dropped.is_empty() {
+        if let Some(fares) = result.tables.get_mut("fare_attributes.txt") {
+            if let Some(id) = column(fares, "fare_id") {
+                fares.rows.retain(|row| !dropped.contains(&row.fields[id]));
+            }
+        }
     }
 }
 
@@ -944,11 +1048,11 @@ mod tests {
         let mut files = crate::scan::tests::minimal();
         files.retain(|(name, _)| *name != "stops.txt");
         // two warnings in the source (empty rows) and two in the cropped
-        // feed (padded names)
+        // feed (names with a line break)
         files.push((
             "stops.txt",
             "stop_id,stop_name,stop_lat,stop_lon\n\
-             s1,Kamppi ,60.169,24.931\n,,,\ns2,Steissi ,60.171,24.941\n,,,\n",
+             s1,\"Ka\npi\",60.169,24.931\n,,,\ns2,\"Ste\nsi\",60.171,24.941\n,,,\n",
         ));
         let flooded = format!(
             "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n{}\n",
@@ -1006,7 +1110,10 @@ mod tests {
             (
                 defaults,
                 Some(flooded.as_str()),
-                Some("stop_times.txt exceeds max_columns (1000); raise it to crop this feed"),
+                Some(
+                    "stop_times.txt line 2 has more than 4096 delimiters outside quotes, \
+                     the guard set by max_columns (1000); raise it to crop this feed",
+                ),
             ),
         ];
         for (options, stop_times, expected) in cases {

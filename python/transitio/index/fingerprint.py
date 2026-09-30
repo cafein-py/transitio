@@ -105,7 +105,8 @@ def from_feed(path, kind):
     member exceeds the build's size ceiling, or the download is unreadable — a
     feed that cannot produce the evidence the selector was built from, which
     the caller treats as a mismatch rather than a crash. The extraction mirrors
-    the build stage's: root-level members read by name, ids kept verbatim,
+    the build stage's: root-level members read by name, header names trimmed
+    (of two that trim alike, the first column is read), ids kept as written,
     coordinates range-checked, traversal-only stop-time rows excluded — so an
     unchanged feed recomputes the byte-identical digest.
     """
@@ -158,7 +159,8 @@ _MAX_MEMBER_BYTES = 2 * 1024 * 1024 * 1024
 
 @contextlib.contextmanager
 def _member(archive, name):
-    """A csv reader over a root member, or None when the archive lacks it."""
+    """A csv reader over a root member with its header names trimmed, or None
+    when the archive lacks it."""
     try:
         info = archive.getinfo(name)
     except KeyError:
@@ -168,9 +170,24 @@ def _member(archive, name):
         raise _MemberTooLarge(name)
     text = io.TextIOWrapper(archive.open(info), encoding="utf-8-sig", errors="strict")
     try:
-        yield csv.DictReader(text)
+        reader = csv.DictReader(text)
+        if reader.fieldnames is not None:
+            reader.fieldnames = _header_names(reader.fieldnames)
+        yield reader
     finally:
         text.close()
+
+
+def _header_names(names):
+    """``names`` stripped of surrounding whitespace; a name repeating an
+    earlier one once stripped becomes ``""``, so the first column keeps it."""
+    seen = set()
+    trimmed = []
+    for name in names:
+        name = name.strip()
+        trimmed.append("" if name in seen else name)
+        seen.add(name)
+    return trimmed
 
 
 def _member_routes(archive):

@@ -140,18 +140,27 @@ def _safe_entry_name(name):
     return all(part not in ("", ".", "..") for part in parts)
 
 
-def _normalise_headers(table):
-    """Strip whitespace around a table's header names.
+def _normalise_table(table):
+    """Strip whitespace around a table's values and header names.
 
-    Columns whose names then coincide fold into one at the first one's
-    position, each row keeping the first non-blank value in column
-    order. Returns the table and one ``{"from": [<original names>],
-    "to": <name>}`` per changed name, in header order.
+    Both are stripped with ``str.strip()``. Columns whose names then
+    coincide fold into one at the first one's position, each row keeping
+    the first non-blank value in column order. Returns the table, one
+    ``{"from": [<original names>], "to": <name>}`` per changed name, in
+    header order, and the number of values changed.
     """
+    written = [table.iloc[:, position] for position in range(table.shape[1])]
+    values = [column.str.strip() for column in written]
+    trimmed = sum(
+        int((before.notna() & (before != after)).sum())
+        for before, after in zip(written, values)
+    )
+    if trimmed:
+        table = pd.concat(values, axis=1)
     names = [str(name) for name in table.columns]
     stripped = [name.strip() for name in names]
     if stripped == names:
-        return table, []
+        return table, [], trimmed
     groups = {}
     for name, target in zip(names, stripped):
         groups.setdefault(target, []).append(name)
@@ -163,17 +172,16 @@ def _normalise_headers(table):
     if len(groups) == len(names):
         table = table.copy(deep=False)
         table.columns = stripped
-        return table, fixes
+        return table, fixes, trimmed
     columns = {}
     for position, target in enumerate(stripped):
-        values = table.iloc[:, position]
+        column = table.iloc[:, position]
         if target not in columns:
-            columns[target] = values
+            columns[target] = column
             continue
         kept = columns[target]
-        take = (kept.str.strip() == "") & (values.str.strip() != "")
-        columns[target] = kept.mask(take, values)
-    return pd.DataFrame(columns, index=table.index), fixes
+        columns[target] = kept.mask((kept == "") & (column != ""), column)
+    return pd.DataFrame(columns, index=table.index), fixes, trimmed
 
 
 class FeedBuilder:
@@ -834,10 +842,10 @@ class FeedEditor(FeedBuilder):
 
     Loads every root-level ``.txt`` table into a string DataFrame in
     :attr:`tables`; anything else in the archive (``locations.geojson``,
-    nested or unknown entries) is preserved verbatim on save. Header
-    names lose surrounding whitespace on load, and columns that then
-    share a name fold into one (the first non-blank value per row wins),
-    so a saved feed writes the normalised header. All
+    nested or unknown entries) is preserved verbatim on save. Values and
+    header names lose surrounding whitespace on load (``str.strip()``),
+    and columns that then share a name fold into one (the first non-blank
+    value per row wins), so a saved feed writes the normalised table. All
     :class:`FeedBuilder` helpers work for additions, and
     :meth:`~FeedBuilder.save` validates the result.
     """
@@ -846,6 +854,7 @@ class FeedEditor(FeedBuilder):
         super().__init__()
         self.source = Path(path)
         self._header_fixes = {}  # filename -> changed header names
+        self._value_fixes = {}  # filename -> count of trimmed values
         import hashlib
 
         digest = hashlib.sha256()
@@ -871,7 +880,7 @@ class FeedEditor(FeedBuilder):
                 if (info.external_attr >> 16) & 0o170000 == 0o120000:
                     continue  # never carry symlink entries along
                 if name in _GTFS_TABLES:
-                    table, fixes = _normalise_headers(
+                    table, fixes, trimmed = _normalise_table(
                         pd.read_csv(
                             archive.open(name),
                             dtype=str,
@@ -882,6 +891,8 @@ class FeedEditor(FeedBuilder):
                     self.tables[name] = table
                     if fixes:
                         self._header_fixes[name] = fixes
+                    if trimmed:
+                        self._value_fixes[name] = trimmed
                 else:
                     # Unknown files (any extension) are preserved verbatim,
                     # never parsed and rewritten.

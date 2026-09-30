@@ -3,6 +3,13 @@ Copyright (c) 2026 Henrikki Tenkanen
 
 This software is licensed under the MIT License; see LICENSE for the terms.
 
+transitio looks up the time zone at a feed's stops with tzfpy (MIT), whose
+time-zone boundary data, from timezone-boundary-builder, is licensed under the
+Open Database License (ODbL 1.0) and derived from OpenStreetMap
+(c) OpenStreetMap contributors. transitio ships none of that data.
+https://github.com/ringsaturn/tzfpy
+https://github.com/evansiroky/timezone-boundary-builder
+
 The feed index that transitio installs with transitio.index.refresh() is
 derived data compiled from several open sources; release wheels ship without
 an index. Every built index also carries its own NOTICE file,
