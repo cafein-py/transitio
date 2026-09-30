@@ -576,15 +576,23 @@ def _read_tables(path, names, max_total_bytes=None):
 
 def _service(path, day=None, max_total_bytes=None):
     """A delivered feed's route keys, rounded stop coordinates and trip
-    count; with a ``day``, the signatures of its trips running then that are
-    not frequency-based, whether those are all of them, and whether it has
-    transfers or pathways, from those tables only, read as ``FeedEditor``
-    does. None when they are over ``max_total_bytes``, a route key has a
-    blank part, a stop or station lacks coordinates, or with a ``day`` its
-    calendars cannot be read."""
+    count, and whether it is one ``unnamed`` agency; with a ``day``, the
+    signatures of its trips running then that are not frequency-based,
+    whether those are all of them, and whether it has transfers or pathways,
+    from those tables only, read as ``FeedEditor`` does. A feed is one
+    unnamed agency when it has at most one agency row, none named, and its
+    routes name at most one ``agency_id``. None when the tables are over
+    ``max_total_bytes``, a route key has a blank part (an unnamed agency's
+    blank agency aside), a stop or station lacks coordinates, or with a
+    ``day`` its calendars cannot be read."""
     import pandas as pd
 
-    from transitio.gtfs._schedule import route_keys, service_dates, trip_signatures
+    from transitio.gtfs._schedule import (
+        _column,
+        route_keys,
+        service_dates,
+        trip_signatures,
+    )
 
     names = {"agency.txt", "routes.txt", "stops.txt", "trips.txt"}
     if day is not None:
@@ -595,12 +603,17 @@ def _service(path, day=None, max_total_bytes=None):
         if tables is None:
             return None
         keys = route_keys(tables)[["agency", "name", "type"]]
+        agency = tables.get("agency.txt", pd.DataFrame())
+        named = (_column(agency, "agency_name").str.strip() != "").any()
+        ids = _column(tables.get("routes.txt", pd.DataFrame()), "agency_id").str.strip()
+        unnamed = len(agency) <= 1 and not named and ids[ids != ""].nunique() <= 1
         stops = tables["stops.txt"]
         points = stops[["stop_lat", "stop_lon"]].apply(pd.to_numeric, errors="coerce")
         # Stops and stations need coordinates; other location types may lack them.
         kind = stops.get("location_type", pd.Series("", index=stops.index))
         located = points[kind.str.strip().isin(("", "0", "1"))]
-        if (keys == "").any(axis=None) or located.isna().any(axis=None):
+        parts = keys[["name", "type"]] if unnamed else keys
+        if (parts == "").any(axis=None) or located.isna().any(axis=None):
             return None
         points = points.round(_STOP_DECIMALS).add(0.0).dropna()
         trips = tables.get("trips.txt", pd.DataFrame(columns=["trip_id", "service_id"]))
@@ -608,6 +621,7 @@ def _service(path, day=None, max_total_bytes=None):
             "routes": set(keys.itertuples(index=False, name=None)),
             "stops": set(points.itertuples(index=False, name=None)),
             "trips": len(trips),
+            "unnamed": unnamed,
         }
         if not (found["routes"] and found["stops"]):
             return None
@@ -676,14 +690,19 @@ def _settle_versions(record, services, protected, day):
         return (start is None, later, -services[feed_id]["trips"], order[feed_id])
 
     ids = sorted(services, key=rank)
+    # A pair with an unnamed agency compares routes by name and type only.
+    lines = {
+        feed_id: {key[1:] for key in services[feed_id]["routes"]} for feed_id in ids
+    }
     pairs = {feed_id: {} for feed_id in ids}
     for position, one in enumerate(ids):
         for other in ids[position + 1 :]:
-            overlaps = tuple(
-                len(services[one][key] & services[other][key])
-                / len(services[one][key] | services[other][key])
-                for key in ("routes", "stops")
-            )
+            unnamed = services[one]["unnamed"] or services[other]["unnamed"]
+            sides = [
+                (lines[f] if unnamed else services[f]["routes"], services[f]["stops"])
+                for f in (one, other)
+            ]
+            overlaps = tuple(len(a & b) / len(a | b) for a, b in zip(*sides))
             if overlaps[0] >= _ROUTE_OVERLAP and overlaps[1] >= _STOP_OVERLAP:
                 pairs[one][other] = pairs[other][one] = overlaps
     removed, grouped = set(), set()
@@ -907,14 +926,19 @@ def fetch(
     On the place path, delivered feeds whose route keys (agency name, route
     short else long name, type) and stops (coordinates at 3 decimals) share
     0.9 and 0.8 or more are versions, ranked by later start, more trips,
-    then candidate order. With ``when``, one is left out as ``"another
-    version of <id>"`` when a kept version pairs with it and kept versions
-    run, by trip signature, every non-frequency trip it runs on the day;
-    the top version and the containers a left-out feed relied on stay, as
-    does one with transfers or pathways. A left-out version's fares are not
-    delivered. Without ``when`` none is left out; similar feeds are noted.
-    A feed whose routes, stops or, with ``when``, calendars cannot be read
-    is never a version.
+    then candidate order. Agency names compare casefolded, without
+    diacritics, punctuation or a trailing legal form (``Ltd``, ``Oy``,
+    ``S.A.`` and the like). A feed with at most one agency row, none named,
+    whose routes name at most one ``agency_id`` is unnamed, and its pairs
+    compare routes by name and type only. With ``when``, one is left out as
+    ``"another version of <id>"`` when a kept version pairs with it and kept
+    versions run, by trip signature (which leaves out the agency), every
+    non-frequency trip it runs on the day; the top version and the
+    containers a left-out feed relied on stay, as does one with transfers or
+    pathways. A left-out version's fares are not delivered. Without ``when``
+    none is left out; similar feeds are noted. A feed whose routes, stops
+    or, with ``when``, calendars cannot be read, or with a blank agency name
+    that is not unnamed, is never a version.
 
     Parameters
     ----------

@@ -938,3 +938,48 @@ def test_a_feed_missing_a_required_file_is_skipped(tmp_path, dropped, reason, wi
     with pytest.raises(_SkipFeed) as caught:
         _process_feed(source, **options)
     assert (caught.value.reason, caught.value.window) == (reason, window)
+
+
+MIDLAND = {
+    "agency.txt": (
+        "agency_id,agency_name,agency_url,agency_timezone\n"
+        "1,Midland Bluebird,https://m.example,Europe/London\n"
+    ),
+    "stops.txt": (
+        "stop_id,stop_name,stop_lat,stop_lon\na,A,55.86,-4.25\nb,B,55.87,-4.26\n"
+    ),
+    "routes.txt": "route_id,agency_id,route_short_name,route_type\nx36,1,X36,3\n",
+    "trips.txt": "route_id,service_id,trip_id\nx36,wk,t1\n",
+    "stop_times.txt": (
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "t1,08:00:00,08:00:00,a,1\nt1,08:10:00,08:10:00,b,2\n"
+    ),
+    "calendar.txt": FEED["calendar.txt"],
+}
+
+
+def test_copies_of_a_trip_under_differently_named_agencies_are_one_service(tmp_path):
+    # Copies of one network under "Midland Bluebird" and "Midland Bluebird
+    # Ltd" were neither duplicates in the merge nor versions in fetch.
+    import datetime
+
+    from transitio.edit import FeedEditor
+    from transitio.gtfs import merge_tables
+    from transitio.pipeline._fetch import _service
+
+    agency = MIDLAND["agency.txt"]
+    renamed = {**MIDLAND, "agency.txt": agency.replace("Bluebird,", "Bluebird Ltd,")}
+    tables = [
+        FeedEditor(write_zip(tmp_path / f"{n}.zip", files)).tables
+        for n, files in enumerate((MIDLAND, renamed))
+    ]
+    merged, _ = merge_tables(tables)
+    assert list(merged["trips.txt"]["trip_id"]) == ["f1:t1"]
+    # Routes naming two agency ids under one blank-named agency, or without
+    # agency.txt, are not one unnamed agency.
+    routes = MIDLAND["routes.txt"] + "x37,2,X37,3\n"
+    blank = {**MIDLAND, "agency.txt": agency.replace("Midland Bluebird", "")}
+    absent = {name: text for name, text in MIDLAND.items() if name != "agency.txt"}
+    for n, files in enumerate((blank, absent)):
+        two = write_zip(tmp_path / f"two{n}.zip", {**files, "routes.txt": routes})
+        assert _service(two, datetime.date(2026, 6, 1)) is None

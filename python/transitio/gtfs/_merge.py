@@ -250,11 +250,12 @@ def merge_tables(
         are reported as dropped (``locations.geojson`` is refused).
     duplicate_trips : {"drop", "keep"}, default "drop"
         ``"drop"`` leaves out each input's trips that repeat trips kept
-        from the inputs before it: same route key, stops, times and pickup
-        and drop-off behaviour (see
-        :func:`~transitio.gtfs._schedule.trip_signatures`). Headsigns,
-        short names, ``shape_id`` and shape geometry, ``timepoint`` and
-        ``shape_dist_traveled`` may differ; the earlier trip's are kept.
+        from the inputs before it: same route name and type, stops, times
+        and pickup and drop-off behaviour (see
+        :func:`~transitio.gtfs._schedule.trip_signatures`). The agency,
+        headsigns, short names, ``shape_id`` and shape geometry,
+        ``timepoint`` and ``shape_dist_traveled`` may differ; the earlier
+        trip's are kept.
         On each date, one earlier trip covers one later trip, and a later
         trip goes only when covered on every date it runs; a block
         (``block_id``) of several trips goes only when one earlier block

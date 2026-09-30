@@ -911,6 +911,16 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
             DAY,
             {"A": "+", "B": "- another version of A [A 1.0 1.0]"},
         ),
+        (
+            {"A": NEW, "B": {**OLD, "agency": "HSL Oy."}},
+            DAY,
+            {"A": "+", "B": "- another version of A [A 1.0 1.0]"},
+        ),
+        (
+            {"A": NEW, "B": {**OLD, "agency": ""}},
+            DAY,
+            {"A": "+", "B": "- another version of A [A 1.0 1.0]"},
+        ),
         ({"A": NEW, "B": {**OLD, "hours": (8, 9)}}, DAY, {"A": "+", "B": ADDS}),
         ({"A": NEW, "B": {**OLD, "hours": (9,)}}, DAY, {"A": "+", "B": ADDS}),
         (
@@ -961,8 +971,9 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
         "identical identical-overlapping-routes container-renewed "
         "contained-renewed container-cropped container-expired "
         "partial-copy-first partial-copy-after version-covered "
-        "version-extra-trip version-other-times versions-three "
-        "versions-three-reversed version-chain version-protected-container "
+        "version-legal-form version-unnamed-agency version-extra-trip "
+        "version-other-times versions-three versions-three-reversed "
+        "version-chain version-protected-container "
         "version-same-content-container version-under-stop-threshold "
         "version-transfers versions-no-study-day"
     ).split(),

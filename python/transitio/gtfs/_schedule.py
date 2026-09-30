@@ -29,6 +29,10 @@ MAX_SERVICE_DAYS = 40_000
 MAX_EXPANDED_DAYS = 50_000_000
 # A trip signature joins two 64-bit hashes taken under these keys.
 _HASH_KEYS = ("transitio-trip-1", "transitio-trip-2")
+# Legal-form words an agency key drops from the end of a name.
+_LEGAL_FORMS = frozenset(
+    "ltd limited inc llc plc corp gmbh ag kg sa sas srl spa oy oyj ab as asa bv nv".split()
+)
 
 
 def _matching(text, pattern):
@@ -218,15 +222,33 @@ def _digest(frame, key):
     return pd.util.hash_pandas_object(frame, index=False, hash_key=key).to_numpy()
 
 
+def agency_keys(names):
+    """Each agency name of the series ``names`` as compared across feeds:
+    casefolded, diacritics and punctuation dropped, whitespace collapsed
+    (:func:`transitio.index.places._normalize`), then its trailing
+    legal-form words (``Ltd``, ``GmbH``, ``Oy``, ``S.A.`` and the like)
+    dropped, its first word always kept."""
+    from transitio.index.places import _normalize
+
+    def key(name):
+        words = _normalize(name).split()
+        while len(words) > 1 and words[-1] in _LEGAL_FORMS:
+            words.pop()
+        return " ".join(words)
+
+    return names.map(key)
+
+
 def route_keys(tables):
     """Each route's key, indexed by ``route_id`` (the first row of each id
-    kept): ``agency``, its agency name, and ``name``, its short name, else
-    long name, both casefolded; ``type``, its route type; and its
-    ``continuous_pickup`` and ``continuous_drop_off``, blank when unset."""
+    kept): ``agency``, its agency name as :func:`agency_keys` compares it;
+    ``name``, its short name, else long name, casefolded; ``type``, its
+    route type; and its ``continuous_pickup`` and ``continuous_drop_off``,
+    blank when unset."""
     agency, routes = (
         tables.get(name, pd.DataFrame()) for name in ("agency.txt", "routes.txt")
     )
-    names = _stripped(agency, "agency_name").str.casefold()
+    names = agency_keys(_stripped(agency, "agency_name"))
     route_agency = _column(routes, "agency_id")
     agency_names = route_agency.map(_keyed(names, _column(agency, "agency_id")))
     if len(agency) == 1:
@@ -250,14 +272,14 @@ def trip_signatures(tables):
     """The signature of each trip in a feed's tables.
 
     A signature is 128 bits, written as 32 hex digits, over the trip's route
-    key (agency name and route short name, else long name, both casefolded,
-    and route type), its ``wheelchair_accessible`` and ``bikes_allowed``
-    (blank as 0), and per stop, in ``stop_sequence`` order: the stop's
-    coordinates rounded to 5 decimals, arrival and departure times with
-    single-digit hours padded, ``pickup_type`` and ``drop_off_type`` (blank
-    as 0), and the effective ``continuous_pickup`` and ``continuous_drop_off``
-    (the stop time's value, else the route's, else 1). Headsigns, short
-    names, ``shape_id`` and shape geometry, ``timepoint`` and
+    short name, else long name, casefolded, and route type, its
+    ``wheelchair_accessible`` and ``bikes_allowed`` (blank as 0), and per
+    stop, in ``stop_sequence`` order: the stop's coordinates rounded to 5
+    decimals, arrival and departure times with single-digit hours padded,
+    ``pickup_type`` and ``drop_off_type`` (blank as 0), and the effective
+    ``continuous_pickup`` and ``continuous_drop_off`` (the stop time's value,
+    else the route's, else 1). The agency, headsigns, short names,
+    ``shape_id`` and shape geometry, ``timepoint`` and
     ``shape_dist_traveled`` are not part of it.
 
     Returns one ``trip_id``, ``service_id``, ``signature`` row per signed
@@ -337,7 +359,7 @@ def trip_signatures(tables):
         return pd.Series(values, index=signed_ids).reindex(trips.index).to_numpy()
 
     route = keys.reindex(_column(trips, "route_id").to_numpy())
-    whole = route[["agency", "name", "type"]].set_axis(trips.index)
+    whole = route[["name", "type"]].set_axis(trips.index)
     whole = whole.assign(
         wheelchair=_stripped(trips, "wheelchair_accessible", "0"),
         bikes=_stripped(trips, "bikes_allowed", "0"),

@@ -629,12 +629,14 @@ def _trips(*specs):
 def _repeats(trips, rows=(), continuous=""):
     builder = FeedBuilder()
     builder.add_agency("a", "Agency", "https://a.example", HEL)
+    builder.add_agency("b", "Other", "https://b.example", HEL)
     stops = {"s1": 60.1, "s2": 60.11, "s3": 60.12, "s4": 60.10001, "s5": 60.100001}
     for stop, lat in stops.items():
         builder.add_stop(stop, stop, lat, 24.9)
     builder.add_route("r1", 3, "1", agency_id="a", continuous_pickup=continuous)
     builder.add_route("r2", 3, "2", agency_id="a")
     builder.add_route("r3", 3, "1", agency_id="a", continuous_pickup="0")
+    builder.add_route("r4", 3, "1", agency_id="b")
     for service in sorted({trip.get("service", "jan") for trip in trips}):
         builder.add_service(service, "daily", *SERVICES[service])
     for trip in trips:
@@ -665,6 +667,7 @@ def _repeats(trips, rows=(), continuous=""):
         ({"stops": ("s4", "s2")}, "differs"),
         ({"stops": ("s5", "s2")}, "equal"),
         ({"route": "r3"}, "differs"),
+        ({"route": "r4"}, "equal"),
         ({"shape_id": "sa"}, "equal"),
         ({"trip_headsign": "Centre"}, "equal"),
         ({"stops": ("s9", "s2")}, "absent"),
@@ -675,7 +678,7 @@ def _repeats(trips, rows=(), continuous=""):
     ],
     ids=(
         "identical other-time other-pickup other-route-key moved-stop "
-        "moved-within-rounding route-continuous-pickup other-shape "
+        "moved-within-rounding route-continuous-pickup other-agency other-shape "
         "other-headsign unknown-stop repeated-sequence unknown-route "
         "listed-twice padded-sequence"
     ).split(),
@@ -693,6 +696,25 @@ def test_trip_signatures(variant, expected):
     assert set(signed["service_id"]) == {"jan"}
     assert len(signatures["t1"]) == 32  # 128 bits in hex
     assert (signatures["t2"] == signatures["t1"]) is (expected == "equal")
+
+
+def test_agency_keys():
+    from transitio.gtfs._schedule import agency_keys
+
+    cases = [
+        ("Midland Bluebird Ltd", "midland bluebird"),
+        ("MIDLAND BLUEBIRD Ltd.", "midland bluebird"),
+        ("Transportes S.A.", "transportes"),
+        ("Arriva B.V.", "arriva"),
+        ("Craig of Campbeltown Limited", "craig of campbeltown"),
+        ("Oy Pohjolan Liikenne Ab", "oy pohjolan liikenne"),
+        ("AB", "ab"),
+        ("Société", "societe"),
+        ("Societe", "societe"),
+        ("", ""),
+    ]
+    names, expected = zip(*cases)
+    assert list(agency_keys(pd.Series(names))) == list(expected)
 
 
 def _calendar(*rows):
