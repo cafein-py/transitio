@@ -525,6 +525,26 @@ def _containers_first(feeds):
     return sorted(feeds, key=level)
 
 
+def _read_tables(path, names, max_total_bytes=None):
+    """The tables ``names`` of a feed zip, read as ``FeedEditor`` does; None
+    when together they are over ``max_total_bytes`` (default: the
+    ``FeedEditor`` budget)."""
+    import pandas as pd
+
+    from transitio.edit._editor import _MAX_TOTAL_BYTES, _normalise_table
+
+    limit = _MAX_TOTAL_BYTES if max_total_bytes is None else max_total_bytes
+    csv = {"dtype": str, "keep_default_na": False, "encoding": "utf-8-sig"}
+    with zipfile.ZipFile(path) as archive:
+        members = [m for m in archive.infolist() if m.filename in names]
+        if sum(m.file_size for m in members) > limit:
+            return None
+        return {
+            m.filename: _normalise_table(pd.read_csv(archive.open(m), **csv))[0]
+            for m in members
+        }
+
+
 def _service(path, day=None, max_total_bytes=None):
     """A delivered feed's route keys, rounded stop coordinates and trip
     count; with a ``day``, the signatures of its trips running then that are
@@ -535,24 +555,16 @@ def _service(path, day=None, max_total_bytes=None):
     calendars cannot be read."""
     import pandas as pd
 
-    from transitio.edit._editor import _MAX_TOTAL_BYTES, _normalise_table
     from transitio.gtfs._schedule import route_keys, service_dates, trip_signatures
 
     names = {"agency.txt", "routes.txt", "stops.txt", "trips.txt"}
     if day is not None:
         names |= {"stop_times.txt", "calendar.txt", "calendar_dates.txt"}
         names |= {"frequencies.txt", "transfers.txt", "pathways.txt"}
-    limit = _MAX_TOTAL_BYTES if max_total_bytes is None else max_total_bytes
-    csv = {"dtype": str, "keep_default_na": False, "encoding": "utf-8-sig"}
     try:
-        with zipfile.ZipFile(path) as archive:
-            members = [m for m in archive.infolist() if m.filename in names]
-            if sum(m.file_size for m in members) > limit:
-                return None
-            tables = {
-                m.filename: _normalise_table(pd.read_csv(archive.open(m), **csv))[0]
-                for m in members
-            }
+        tables = _read_tables(path, names, max_total_bytes)
+        if tables is None:
+            return None
         keys = route_keys(tables)[["agency", "name", "type"]]
         stops = tables["stops.txt"]
         points = stops[["stop_lat", "stop_lon"]].apply(pd.to_numeric, errors="coerce")
@@ -591,6 +603,34 @@ def _service(path, day=None, max_total_bytes=None):
         linked=any(len(tables.get(n, ())) for n in ("transfers.txt", "pathways.txt")),
     )
     return found
+
+
+def _timezone_note(path, max_total_bytes=None):
+    """``"agency_timezone <names>; stops in <zone>"`` for a feed declaring no
+    time zone equivalent to the zone of most of its stops (:func:`_stop_zone`),
+    compared over today and the next year as no calendar is read; None when
+    one is, when either is unknown, or when agency.txt and stops.txt are
+    unreadable or over ``max_total_bytes``."""
+    from transitio.gtfs._merge import (
+        _stop_zone,
+        _timezone_interval,
+        _timezones,
+        _zone_classes,
+    )
+
+    try:
+        tables = _read_tables(path, {"agency.txt", "stops.txt"}, max_total_bytes)
+    except Exception:  # noqa: B902 — an unreadable feed gets no note
+        return None
+    if tables is None:
+        return None
+    declared, located = _timezones(tables), _stop_zone(tables)
+    if not declared or located is None:
+        return None
+    classes = _zone_classes(declared | {located}, _timezone_interval([tables]))
+    if any(classes[zone] == classes[located] for zone in declared):
+        return None
+    return f"agency_timezone {', '.join(sorted(declared))}; stops in {located}"
 
 
 def _settle_versions(record, services, protected, day):
@@ -883,7 +923,10 @@ def fetch(
         candidate order: ``feed_id``, ``name``, ``decision``
         (``"delivered"`` or ``"skipped"``), ``reason`` (why it was skipped),
         ``note`` (about a delivered feed: the routes it was cut to, why a
-        contained feed was kept, a similar feed; several join with ``"; "``),
+        contained feed was kept, a similar feed, an ``agency_timezone`` not
+        equivalent to the zone of most of its stops, e.g. ``"agency_timezone
+        America/New_York; stops in Pacific/Honolulu"``; several join with
+        ``"; "``),
         ``index_window`` (the index's ``[start, end]``; None undated or on
         the area path), ``feed_window`` (the computed window of a validated
         download, delivered or not; None otherwise or when unknown),
@@ -1073,6 +1116,9 @@ def fetch(
                 _skip(entry, f"processing failed: {error}")
                 continue
             entry.update(decision="delivered", feed_window=window, path=path)
+            note = _timezone_note(path, budgets.get("max_total_bytes"))
+            if note is not None:
+                _note(entry, note)
             reports.append(report)
             repairs.append(fixes)
             feeds.append(path)
@@ -1538,7 +1584,8 @@ def _fetch_place(
                 cropped.add(feed.feed_id)
             else:
                 carriers[feed.feed_id] = feed.feed_id
-            for text in dict.fromkeys(notes):
+            notes.append(_timezone_note(path, budget))
+            for text in dict.fromkeys(filter(None, notes)):
                 _note(entry, text)
             reports.append(report)
             repairs.append(fixes)

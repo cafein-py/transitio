@@ -728,3 +728,45 @@ def test_merge_keeps_each_inputs_default_rider_category(
         f"f{position}:adult" for position, flag in enumerate(defaults, 1) if flag
     ]
     assert report["rider_defaults"] == expected
+
+
+def test_merge_leaves_out_the_feed_whose_stops_lie_in_another_time_zone(tmp_path):
+    # Two feeds declaring different time zones were refused, and skipping one
+    # kept the earlier feed; RIO Limo declares America/New_York for its stops
+    # at Honolulu's airport, beside TheBus in Pacific/Honolulu.
+    import re
+
+    from transitio.edit import FeedEditor
+    from transitio.gtfs import merge_feeds
+
+    stops = (
+        "stop_id,stop_name,stop_lat,stop_lon\n"
+        "in1,Terminal 1,21.332,-157.920\n"
+        "in2,Terminal 2,21.334,-157.918\n"
+        "out1,Lot,21.336,-157.915\n"
+    )
+    feeds = [
+        write_zip(
+            tmp_path / f"{index}.zip",
+            {
+                **FEED,
+                "agency.txt": FEED["agency.txt"].replace("Europe/Helsinki", zone),
+                "stops.txt": stops,
+            },
+        )
+        for index, zone in enumerate(["America/New_York", "Pacific/Honolulu"])
+    ]
+    output = tmp_path / "merged.zip"
+    left = f"left out feed 0 (f1, {feeds[0]}): America/New_York, "
+    with pytest.warns(UserWarning, match=re.escape(left + "stops in Pacific/Honolulu")):
+        report = merge_feeds(feeds, output, reference_date="20260601")
+    assert report["skipped_feeds"] == [
+        {
+            "feed": 0,
+            "timezones": ["America/New_York"],
+            "stop_timezone": "Pacific/Honolulu",
+        }
+    ]
+    agency = FeedEditor(output).tables["agency.txt"]
+    assert list(agency["agency_id"]) == ["f2:hsl", "f2:espoo"]
+    assert set(agency["agency_timezone"]) == {"Pacific/Honolulu"}

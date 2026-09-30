@@ -193,58 +193,74 @@ def test_feed_wide_attribution_passes_through():
     assert row["agency_id"] == "" and row["route_id"] == "" and row["trip_id"] == ""
 
 
-def _city_in(zone, agency_id="hsl"):
+def _city_in(zone, agency_id="hsl", at=None):
+    """``build_city`` declaring ``zone``, its stops moved to ``at`` (lat, lon)."""
     builder = build_city(agency_id)
     builder.tables["agency.txt"]["agency_timezone"] = zone
+    if at is not None:
+        builder.tables["stops.txt"]["stop_lat"] = [str(at[0]), str(at[0] + 0.002)]
+        builder.tables["stops.txt"]["stop_lon"] = [str(at[1]), str(at[1] + 0.01)]
     return builder
 
 
 HEL, UTC, OSLO = "Europe/Helsinki", "UTC", "Europe/Oslo"
 CET, PARIS, NYC = "CET", "Europe/Paris", "America/New_York"
+HONOLULU = "Pacific/Honolulu"
+IN_OSLO = (59.911, 10.750)
 
 
 @pytest.mark.parametrize(
-    "zones, timezones, error, skipped",
+    "zones, in_oslo, timezones, error, skipped",
     [
-        ([HEL, UTC, HEL], "refuse", "differ", None),
-        ([HEL, UTC, HEL], "skip", None, [{"feed": 1, "timezones": [UTC]}]),
-        (
-            [UTC, UTC, HEL, HEL],
-            "skip",
-            None,
-            [{"feed": 2, "timezones": [HEL]}, {"feed": 3, "timezones": [HEL]}],
-        ),
-        ([HEL, UTC, OSLO], "skip", "fewer than two", None),
-        ([HEL, HEL], "maybe", "must be", None),
+        ([HEL, UTC, HEL], (), "refuse", "differ", None),
+        ([HEL, UTC, HEL], (), None, None, [(1, UTC, HEL)]),
+        ([UTC, UTC, HEL, HEL], (), "skip", None, [(0, UTC, HEL), (1, UTC, HEL)]),
+        ([HEL, OSLO], (1,), "skip", None, [(1, OSLO, OSLO)]),
+        ([HEL, UTC, OSLO], (), "skip", None, [(1, UTC, HEL), (2, OSLO, HEL)]),
+        ([HEL, HEL], (), "maybe", "must be", None),
         (
             [UTC, NYC],
+            (),
             "refuse",
             re.escape(f"feed 0 (f1): {UTC}; feed 1 (f2): {NYC}"),
             None,
         ),
-        ([UTC, CET, PARIS], "skip", None, [{"feed": 0, "timezones": [UTC]}]),
+        ([UTC, CET, PARIS], (), "skip", None, [(0, UTC, HEL)]),
     ],
     ids=[
         "refused",
         "outlier-left-out",
-        "tie-earliest",
-        "too-few-left",
+        "stops-outweigh-count",
+        "both-vouch-earliest",
+        "one-left",
         "bad-option",
         "refusal-names-inputs",
         "equivalent-class-wins",
     ],
 )
-def test_feeds_of_another_time_zone(tmp_path, zones, timezones, error, skipped):
-    feeds = [_city_in(zone, f"a{i}") for i, zone in enumerate(zones)]
+def test_feeds_of_another_time_zone(
+    tmp_path, zones, in_oslo, timezones, error, skipped
+):
+    feeds = [
+        _city_in(zone, f"a{i}", IN_OSLO if i in in_oslo else None)
+        for i, zone in enumerate(zones)
+    ]
     output = tmp_path / "merged.zip"
+    options = {"reference_date": "20260601"}
+    if timezones is not None:
+        options["timezones"] = timezones
     if error:
         with pytest.raises(ValueError, match=error):
-            merge_feeds(feeds, output, timezones=timezones, reference_date="20260601")
+            merge_feeds(feeds, output, **options)
         return
-    report = merge_feeds(feeds, output, timezones=timezones, reference_date="20260601")
-    assert report["skipped_feeds"] == skipped
+    with pytest.warns(UserWarning, match="^left out feed "):
+        report = merge_feeds(feeds, output, **options)
+    assert report["skipped_feeds"] == [
+        {"feed": feed, "timezones": [zone], "stop_timezone": located}
+        for feed, zone, located in skipped
+    ]
     # The feeds kept keep the prefixes they had among all the inputs.
-    left = {entry["feed"] for entry in skipped}
+    left = {feed for feed, _, _ in skipped}
     agency = FeedEditor(output).tables["agency.txt"]
     assert set(agency["agency_id"]) == {
         f"f{i + 1}:a{i}" for i in range(len(zones)) if i not in left
@@ -444,10 +460,28 @@ def test_timezone_interval(tmp_path, monkeypatch, test_zones, case):
     if case["interval"] is None:
         names = re.escape(f"feed 0 (f1, {paths[0]}): {case['zones'][0]}")
         with pytest.raises(InvalidFeedError, match=names):
-            merge_feeds(paths, output, check=False)
+            merge_feeds(paths, output, check=False, timezones="refuse")
         return
     report = merge_feeds(paths, output, check=False)
     assert report["timezone_interval"] == case["interval"]
+
+
+@pytest.mark.parametrize(
+    "points, expected",
+    [
+        ([("21.332", "-157.920")], HONOLULU),
+        ([("60.169", "24.931"), ("21.332", "-157.920"), ("60.171", "24.941")], HEL),
+        ([("30.0", "-30.0"), ("30.5", "-30.0"), ("21.332", "-157.920")], HONOLULU),
+        ([("", "24.931"), ("x", "24.931"), ("95.0", "24.931")], None),
+    ],
+    ids=["one-zone", "most-stops", "sea-not-counted", "unlocated"],
+)
+def test_stop_zone(points, expected):
+    from transitio.gtfs._merge import _stop_zone
+
+    lat, lon = zip(*points)
+    tables = {"stops.txt": frame(stop_lat=lat, stop_lon=lon)}
+    assert _stop_zone(tables) == expected
 
 
 def test_zones_tied_in_one_feed_resolve_by_name():

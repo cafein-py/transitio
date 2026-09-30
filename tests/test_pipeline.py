@@ -1096,6 +1096,60 @@ def test_fetch_place_records_index_provenance(tmp_path, monkeypatch):
     assert result.provenance["transitio_version"]
 
 
+NEW_YORK = "America/New_York"
+AIRPORT_STOPS = "stop_id,stop_name,stop_lat,stop_lon\ns1,Airport,21.332,-157.920\n"
+PARIS_STOPS = "stop_id,stop_name,stop_lat,stop_lon\ns1,Louvre,48.861,2.336\n"
+AIRPORT_NOTE = f"agency_timezone {NEW_YORK}; stops in Pacific/Honolulu"
+
+
+@pytest.mark.parametrize(
+    "zone, stops, budget, expected",
+    [
+        (NEW_YORK, AIRPORT_STOPS, None, AIRPORT_NOTE),
+        ("Pacific/Honolulu", AIRPORT_STOPS, None, None),
+        ("CET", PARIS_STOPS, None, None),
+        (NEW_YORK, None, None, None),
+        (NEW_YORK, AIRPORT_STOPS, 10, None),
+    ],
+    ids=["disagrees", "agrees", "equivalent", "no-stops", "over-budget"],
+)
+def test_timezone_note(tmp_path, zone, stops, budget, expected):
+    from transitio.pipeline._fetch import _timezone_note
+
+    files = {"agency.txt": GTFS["agency.txt"].replace("Europe/Helsinki", zone)}
+    if stops is not None:
+        files["stops.txt"] = stops
+    path = tmp_path / "feed.zip"
+    path.write_bytes(_zip(files))
+    assert _timezone_note(path, budget) == expected
+
+
+@pytest.mark.parametrize("path", ["area", "place"])
+def test_a_delivered_feed_notes_an_agency_timezone_its_stops_disagree_with(
+    pipeline_env, monkeypatch, path
+):
+    tmp_path, _ = pipeline_env
+    agency = GTFS["agency.txt"].replace("Europe/Helsinki", NEW_YORK)
+    payload = _zip({**GTFS, "agency.txt": agency})
+    if path == "area":
+        # mdb-10 serves the fixture feed, in Europe/Helsinki.
+        selection = _area_fetch(monkeypatch, tmp_path, payload).selection
+        notes = {entry["feed_id"]: entry["note"] for entry in selection}
+        assert notes.pop("mdb-10") is None
+    else:
+        index = _place_index(
+            tmp_path, {"atlas": {"urls": {"static_current": "https://f.example/a.zip"}}}
+        )
+        _stub_pbf_and_atlas(monkeypatch, tmp_path, payload)
+        selection = fetch(
+            place="Q1757", index=index, directory=tmp_path / "out"
+        ).selection
+        notes = {entry["feed_id"]: entry["note"] for entry in selection}
+    assert all(entry["decision"] == "delivered" for entry in selection)
+    (note,) = notes.values()
+    assert note.endswith(f"agency_timezone {NEW_YORK}; stops in Europe/Helsinki")
+
+
 def test_fetch_place_falls_back_to_atlas_when_the_dataset_download_fails(
     tmp_path, monkeypatch
 ):

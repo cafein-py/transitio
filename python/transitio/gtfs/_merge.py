@@ -8,6 +8,7 @@ import json
 import math
 import pathlib
 import tempfile
+import warnings
 
 import pandas as pd
 
@@ -97,6 +98,8 @@ _WEST_MARGIN = datetime.timedelta(hours=12)
 # Time zones are compared no further back and ahead of today than this.
 _PAST_YEARS = 20
 _FUTURE_YEARS = 10
+# Stops looked up per input to locate its time zone, one tzfpy call each.
+_ZONE_SAMPLE = 500
 
 
 class _TimezoneRefusal(InvalidFeedError, ValueError):
@@ -230,6 +233,8 @@ def merge_tables(
     year after. An unknown name is equivalent only to itself. The
     merged ``agency.txt`` then uses the name most inputs declare (ties:
     the earliest input's) for every agency; ``stop_timezone`` is kept.
+    :func:`merge_feeds` leaves out the inputs of another time zone instead
+    by default.
 
     Parameters
     ----------
@@ -285,17 +290,19 @@ def _merge_tables(
     classes=None,
     labels=None,
     positions=None,
+    allow_single=False,
 ):
     """:func:`merge_tables`, plus the details the merge report carries;
     ``interval`` and ``classes`` may come from a caller that compared the
-    zones already, ``labels`` name the inputs in a refusal, and
-    ``positions`` are their positions in the report."""
+    zones already, ``labels`` name the inputs in a refusal, ``positions``
+    are their positions in the report, and ``allow_single`` lets one input
+    through, prefixed as any other."""
     if duplicate_trips not in ("drop", "keep"):
         raise ValueError(
             f"duplicate_trips must be 'drop' or 'keep', not {duplicate_trips!r}"
         )
     table_sets = list(table_sets)
-    if len(table_sets) < 2:
+    if len(table_sets) < (1 if allow_single else 2):
         raise ValueError("need at least two feeds to merge")
     prefixes = _clean_prefixes(prefixes, len(table_sets))
     if extra_entries is None:
@@ -411,32 +418,70 @@ def _timezones(tables):
     return {value.strip() for value in agency["agency_timezone"] if value.strip()}
 
 
-def _most_declared(declared):
-    """The key most inputs declare (ties: the earliest input's, then the
-    least key), from one set of keys per input."""
+def _stop_zone(tables):
+    """The time zone holding most of an input's stops, by ``tzfpy``.
+
+    Up to 500 stops with parseable in-range coordinates are looked up,
+    evenly spaced by row; a stop at sea (an empty or ``Etc/`` answer) is not
+    counted, and a tie goes to the zone met first. None when stops.txt is
+    absent or no stop is located.
+    """
+    import tzfpy
+
+    stops = tables.get("stops.txt")
+    if stops is None or not {"stop_lat", "stop_lon"} <= set(stops.columns):
+        return None
+    lat = pd.to_numeric(stops["stop_lat"], errors="coerce")
+    lon = pd.to_numeric(stops["stop_lon"], errors="coerce")
+    inside = lat.between(-90.0, 90.0) & lon.between(-180.0, 180.0)
+    step = max(1, math.ceil(inside.sum() / _ZONE_SAMPLE))
+    points = zip(lon[inside].iloc[::step], lat[inside].iloc[::step])
+    found = (tzfpy.get_tz(x, y) for x, y in points)
+    counts = collections.Counter(z for z in found if z and not z.startswith("Etc/"))
+    return counts.most_common(1)[0][0] if counts else None
+
+
+def _most_declared(declared, vouched=None):
+    """The key most inputs vouch for, from one set of keys per input
+    (``vouched``: the keys its stops support); ties go to the key most
+    inputs declare, then the earliest input's, then the least key. Without
+    ``vouched``, the key most inputs declare."""
     counts, first = {}, {}
     for position, keys in enumerate(declared):
         for key in keys:
             counts[key] = counts.get(key, 0) + 1
             first.setdefault(key, position)
-    return min(counts, key=lambda key: (-counts[key], first[key], key))
+    support = collections.Counter(key for keys in vouched or () for key in keys)
+    return min(counts, key=lambda key: (-support[key], -counts[key], first[key], key))
 
 
-def _timezone_outliers(table_sets, classes=None):
+def _timezone_outliers(table_sets, classes=None, located=None):
     """``{position: [time zones]}`` for the feeds declaring a time zone not
-    equivalent to the one most feeds declare (ties: the earliest feed's,
-    then the first by name); a feed that declares none differs from
-    nothing."""
+    equivalent to the common one; a feed that declares none differs from
+    nothing.
+
+    A feed vouches for the declared zone its stops lie in (``located``, one
+    :func:`_stop_zone` per feed, which ``classes`` must cover). The common
+    zone is the one most feeds vouch for; ties go to the one most feeds
+    declare, then the earliest feed's, then the first by name.
+    """
     declared = [_timezones(tables) for tables in table_sets]
     zones = set().union(*declared)
     if len(zones) < 2:
         return {}
     if classes is None:
+        zones |= set(filter(None, located or ()))
         classes = _zone_classes(zones, _timezone_interval(table_sets))
     grouped = [{classes[zone] for zone in found} for found in declared]
     if len(set().union(*grouped)) < 2:
         return {}
-    common = _most_declared(grouped)
+    vouched = None
+    if located is not None:
+        vouched = [
+            {group for group in groups if zone in group}
+            for groups, zone in zip(grouped, located)
+        ]
+    common = _most_declared(grouped, vouched)
     return {
         position: sorted(found)
         for position, (found, groups) in enumerate(zip(declared, grouped))
@@ -697,7 +742,7 @@ def merge_feeds(
     *,
     prefixes=None,
     check=True,
-    timezones="refuse",
+    timezones="skip",
     duplicate_trips="drop",
     **budgets,
 ):
@@ -733,16 +778,20 @@ def merge_feeds(
         introduced ones, and ``True`` and ``"strict"`` both raise. Unless
         ``check`` is ``False``, the tables of in-memory inputs are copied
         first, so the merge holds them twice.
-    timezones : {"refuse", "skip"}, default "refuse"
+    timezones : {"skip", "refuse"}, default "skip"
         Feeds declaring ``agency_timezone`` names that are not equivalent
-        (see :func:`merge_tables`) cannot share one dataset. ``"refuse"``
-        raises :class:`~transitio.exceptions.InvalidFeedError` (also a
-        ``ValueError``) naming each input with its zones, by position,
-        prefix and path; ``"skip"`` leaves out the feeds whose time zone is not
-        equivalent to the one most feeds declare (ties: the earliest
-        feed's, then the first by name) and merges the rest, each keeping
-        the prefix it had among all the inputs. Fewer than two feeds left
-        still raises.
+        (see :func:`merge_tables`) cannot share one dataset. ``"skip"``
+        leaves out, with a ``UserWarning``, the feeds whose time zone is
+        not equivalent to the common one and merges the rest, each keeping
+        the prefix it had among all the inputs, even when one feed is left.
+        A feed vouches for the zone it declares when most of its stops lie
+        in an equivalent zone, by ``tzfpy`` over at most 500 of them; the
+        common zone is the one most feeds vouch for, then the one most
+        feeds declare, then the earliest feed's, then the first by name.
+        When every feed would be left out, it raises as ``"refuse"`` does.
+        ``"refuse"`` raises :class:`~transitio.exceptions.InvalidFeedError`
+        (also a ``ValueError``) naming each input with its zones, by
+        position, prefix and path.
     duplicate_trips : {"drop", "keep"}, default "drop"
         Whether to leave out the trips an input repeats from the inputs
         before it (see :func:`merge_tables`).
@@ -755,7 +804,8 @@ def merge_feeds(
         The ``validate_feed`` report of the written feed, with a
         ``"dropped_files"`` key listing what the merge discarded and a
         ``"skipped_feeds"`` key listing the feeds left out, one
-        ``{"feed": <input position>, "timezones": [...]}`` each, and a
+        ``{"feed": <input position>, "timezones": [...], "stop_timezone":
+        <zone of most of its stops, or None>}`` each, and a
         ``"header_fixes"`` key listing the header names normalised when
         an input was read (see :class:`~transitio.edit.FeedEditor`), one
         ``{"feed": <input position>, "file": ..., "columns": [{"from":
@@ -835,17 +885,31 @@ def merge_feeds(
         classes = _zone_classes(zones, interval)
     skipped = []
     positions = list(range(len(table_sets)))
-    outliers = _timezone_outliers(table_sets, classes) if timezones == "skip" else {}
-    if outliers:
-        kept = [i for i in range(len(table_sets)) if i not in outliers]
-        if len(kept) < 2:
-            raise ValueError(
-                f"fewer than two feeds share a time zone: {sorted(outliers.values())}"
-            )
+    outliers = {}
+    if timezones == "skip" and classes and len(set(classes.values())) > 1:
+        located = [_stop_zone(tables) for tables in table_sets]
+        more = set(filter(None, located)) - zones
+        if more:
+            classes = _zone_classes(zones | more, interval)
+        outliers = _timezone_outliers(table_sets, classes, located)
+    kept = [i for i in positions if i not in outliers]
+    # With every feed left out, the merge below refuses them all.
+    if outliers and kept:
         skipped = [
-            {"feed": position, "timezones": zones}
-            for position, zones in sorted(outliers.items())
+            {"feed": position, "timezones": found, "stop_timezone": located[position]}
+            for position, found in sorted(outliers.items())
         ]
+        left = "; ".join(
+            f"{labels[position]}: {', '.join(found)}"
+            + (f", stops in {located[position]}" if located[position] else "")
+            for position, found in sorted(outliers.items())
+        )
+        warnings.warn(
+            f"left out {left}; see report['skipped_feeds'] "
+            "(timezones='refuse' raises instead)",
+            UserWarning,
+            stacklevel=2,
+        )
         table_sets = [table_sets[i] for i in kept]
         extra_entries = [extra_entries[i] for i in kept]
         names = [names[i] for i in kept]
@@ -860,6 +924,7 @@ def merge_feeds(
         classes=classes,
         labels=labels,
         positions=positions,
+        allow_single=True,
     )
     extra = {
         "dropped_files": dropped,

@@ -23,6 +23,8 @@ dependencies = [
     # paths, cKDTree stop snapping).
     "scipy>=1.10",
     "shapely>=2.0",
+    # tzfpy locates the time zone of a feed's stops for merge and fetch.
+    "tzfpy>=1.0.1",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
