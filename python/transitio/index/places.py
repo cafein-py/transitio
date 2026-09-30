@@ -6,21 +6,29 @@ defined ranking, never a guess: the query is normalised and matched
 against every place's labels and aliases in every language, candidates score on
 match strength then ``kind`` precedence then feed count, and only an exact
 match can win: the sole exact match, or one that beats the runner-up by the
-ambiguity margin. The margin never favours a place reached only through an
-alias or a translation over one carrying the name as its own, nor decides
-against a place of the name in another country known far more widely, by
-the languages its name is recorded in. A city's namesakes do not compete
+ambiguity margin. A place's own names are its name and its labels in its
+country's languages (from Unicode CLDR) or English. Where a place carries the
+name as its own, one reaching it only through a label in another language
+does not compete unless it is known far more widely, by the languages its
+name is recorded in. The margin never favours a place reached only through
+an alias or a label in another language over one carrying the name as its
+own, nor decides against a place of the name in another country known far
+more widely. A city's namesakes do not compete
 with it: a metro in its country shares its name because it is the city's
 metro or named after it, a same-named area containing it that runs much the
 same service (no more than the margin beyond the city's feeds) is the city
 itself, and a place inside it or, not being a city, in its country that
 reaches its name only through an alias is named after it. Where no exact
 match is a city, a region or country of the name (a province, an emirate, a
-dependency) stands as the city. Anything else
-raises :class:`AmbiguousPlaceError` with the candidates, or
+dependency) stands as the city. With ``kind="metro"``, metros of the name
+sharing a member place are one metro under several definitions, and only
+those of the earliest definition in the default order compete; a named
+definition keeps only its metros. Anything else raises
+:class:`AmbiguousPlaceError` with the candidates, or
 :class:`PlaceNotFoundError` with the partial matches, if any.
 """
 
+import functools
 import json
 import math
 import re
@@ -84,12 +92,32 @@ _EXACT, _PREFIX, _SUBSET = 3, 2, 1
 # contains, which outranks the region, which outranks the country.
 _KIND_ORDER = {"metro": 0, "city": 1, "region": 2, "country": 3}
 
+# The metro definitions (a metro's ``source_subtype``) in the order
+# ``kind="metro"`` picks among one metro's: the commuting-based ones (Urban
+# Audit FUAs, US MSAs), Eurostat's NUTS-3 metropolitan regions, then the FAO
+# city-regions, global and with uneven boundaries. Any other ranks after these.
+_METRO_DEFINITIONS = (
+    "functional urban area",
+    "metropolitan statistical area",
+    "metropolitan region",
+    "city-region (FAO)",
+)
+
+
+def _definition_rank(definition):
+    """A metro definition's place in ``_METRO_DEFINITIONS``; any other after."""
+    if definition in _METRO_DEFINITIONS:
+        return _METRO_DEFINITIONS.index(definition)
+    return len(_METRO_DEFINITIONS)
+
+
 # ``_decide``'s answer when the margin would favour an alias over a name: no
 # decision, and no other contest may overturn it.
 _VETOED = object()
 
-# A place abroad with at least this many language labels, and more than
-# twice the leader's, keeps the feed margin from deciding.
+# A place with at least this many language labels, and more than twice
+# another's, is known far more widely: abroad it keeps the feed margin from
+# deciding, and a label in another language keeps it in the contest.
 _WELL_KNOWN = 100
 
 # The partial matches a PlaceNotFoundError message names; all are candidates.
@@ -103,8 +131,9 @@ _OWN_ID = re.compile(r"\Atp_[1-9][0-9]*\Z")
 # Slash and middot variants that, like every dash, join whole words.
 _SLASH_SEPARATORS = frozenset("/\\⁄∕·−")
 
-# Where a label comes from, ranked: the primary name, a translated name, an alias.
-_NAME, _TRANSLATION, _ALIAS = 0, 1, 2
+# Where a label comes from, ranked: the primary name, a name in the place's own
+# languages or English, an alias, a name in another language.
+_NAME, _TRANSLATION, _ALIAS, _RARE = 0, 1, 2, 3
 # Sorts after every character a normalised label can hold, so ``prefix + _AFTER``
 # bounds the labels that start with ``prefix``.
 _AFTER = "\U0010ffff"
@@ -139,6 +168,27 @@ def _normalize(text):
         elif _is_separator(char):
             kept.append(" ")
     return " ".join("".join(kept).split())
+
+
+@functools.cache
+def _country_languages():
+    """``{country code: base language codes}``: each country's official, de
+    facto official and official regional languages, from Unicode CLDR."""
+    from importlib.resources import files
+
+    path = files("transitio.index").joinpath("country_languages.json")
+    table = json.loads(path.read_text(encoding="utf-8"))
+    return {code: frozenset(languages) for code, languages in table.items()}
+
+
+@functools.cache
+def _own_language(country_code, language):
+    """Whether ``language``, a label's language code (``de``, ``de-at``,
+    ``zh-Latn-pinyin``), is one of a place's own: its base code is English,
+    Wikidata's multilingual ``mul``, or a language of ``country_code``. A
+    country the table lacks has English and ``mul`` only."""
+    base = str(language).lower().replace("_", "-").split("-", 1)[0]
+    return base in ("en", "mul") or base in _country_languages().get(country_code, ())
 
 
 # One delineation of a place: the place itself, an administrative ancestor
@@ -334,8 +384,10 @@ class Place:
 def _labels_of(record):
     """Each label a place carries, with its source and the source's rank."""
     yield record["name"], "name", _NAME
+    country = record["country_code"]
     for language, text in record["names"].items():
-        yield text, language, _TRANSLATION
+        own = _own_language(country, language)
+        yield text, language, _TRANSLATION if own else _RARE
     for text in record["aliases"]:
         yield text, "alias", _ALIAS
 
@@ -343,8 +395,8 @@ def _labels_of(record):
 class _NameIndex:
     """Every label of every place, normalised and sorted, for prefix queries.
 
-    One row per distinct normalised label per place (the first source in
-    name, translation, alias order winning), sorted by the label, with the
+    One row per distinct normalised label per place (its best-ranked source
+    winning, the first of equals), sorted by the label, with the
     place's kind, country and feed count beside it so a query ranks a slice
     without touching the records. The slice of labels starting with a prefix
     is found by two binary searches; a table of a few million rows answers
@@ -372,7 +424,7 @@ class _NameIndex:
             seen = {}
             for text, source, rank in _labels_of(record):
                 norm = _normalize(text)
-                if norm and norm not in seen:
+                if norm and (norm not in seen or rank < seen[norm][2]):
                     seen[norm] = (text, source, rank)
             count = feed_count(place_id)
             for norm, (text, source, rank) in seen.items():
@@ -463,6 +515,7 @@ class _PlaceLookup:
         self._labels = {}
         self._children = defaultdict(list)
         self._countries = defaultdict(list)
+        self._definitions = set()  # the metro definitions the index holds
         self._name_index = None  # built on the first suggestion, under the lock
         self._name_lock = threading.Lock()
         # A former id or a QID the place carries resolves to it; a real id
@@ -495,17 +548,23 @@ class _PlaceLookup:
                 self._children[record["parent_id"]].append(place_id)
             if record["kind"] == "country" and record["country_code"]:
                 self._countries[record["country_code"]].append(place_id)
+            if record["kind"] == "metro" and record["source_subtype"]:
+                self._definitions.add(record["source_subtype"])
             qids = record["concordances"].get("wikidata", [])
             for alias in [*record["former_ids"], *qids]:
                 self._aliases.setdefault(alias, place_id)
 
     def _own_names(self, place_id):
-        """The normalized name and language labels of a place, its aliases
-        left out."""
+        """The normalized name of a place and its labels in its own languages
+        (see ``_own_language``); its aliases and other labels left out."""
         record = self._records[place_id]
-        return {
-            _normalize(text) for text in [record["name"], *record["names"].values()]
-        }
+        country = record["country_code"]
+        own = [
+            text
+            for language, text in record["names"].items()
+            if _own_language(country, language)
+        ]
+        return {_normalize(text) for text in [record["name"], *own]}
 
     @staticmethod
     def _normalized_labels(record):
@@ -549,13 +608,15 @@ class _PlaceLookup:
                 best = max(best, _SUBSET)
         return best
 
-    def _candidates(self, query, kind=None):
+    def _candidates(self, query, kind=None, definition=None):
         query_norm = _normalize(query)
         query_tokens = query_norm.split()
         scored = []
         for place_id, labels in self._labels.items():
             record = self._records[place_id]
             if kind is not None and record["kind"] != kind:
+                continue
+            if definition is not None and record["source_subtype"] != definition:
                 continue
             tier = self._tier(query_norm, query_tokens, labels)
             if tier:
@@ -573,13 +634,13 @@ class _PlaceLookup:
     def search(self, query, kind=None):
         return [self.get(place_id) for _, place_id in self._qualified(query, kind)[1]]
 
-    def _qualified(self, query, kind):
+    def _qualified(self, query, kind, definition=None):
         """The name the query asks for and its candidates: as written when a
         label matches it exactly, else, for "Name, Qualifier, ...", the
         candidates for the name that lie within a place each qualifier names —
         a region, a country or a country's code ("London, Ontario", "City of
         London, UK")."""
-        scored = self._candidates(query, kind)
+        scored = self._candidates(query, kind, definition)
         if "," not in query or any(tier == _EXACT for tier, _ in scored):
             return query, scored
         name, *rest = query.split(",")
@@ -588,7 +649,7 @@ class _PlaceLookup:
             return query, scored
         return name, [
             (tier, place_id)
-            for tier, place_id in self._candidates(name, kind)
+            for tier, place_id in self._candidates(name, kind, definition)
             if all(self._within(place_id, qualifier) for qualifier in qualifiers)
         ]
 
@@ -625,7 +686,19 @@ class _PlaceLookup:
             suggestions.append(Suggestion(Place(record, self), label, text, source))
         return suggestions
 
-    def resolve(self, query, kind=None):
+    def resolve(self, query, kind=None, definition=None):
+        if definition is not None:
+            if kind not in (None, "metro"):
+                raise ValueError(
+                    f"definition= names a metro definition, but kind={kind!r}"
+                )
+            if definition not in self._definitions:
+                held = sorted(self._definitions, key=lambda d: (_definition_rank(d), d))
+                raise ValueError(
+                    f"no metro in the index is a {definition!r}; its metro "
+                    f"definitions: {', '.join(map(repr, held)) or 'none'}"
+                )
+            kind = "metro"
         if isinstance(query, Place):
             return query
         if isinstance(query, str) and (_QID.match(query) or _OWN_ID.match(query)):
@@ -633,7 +706,9 @@ class _PlaceLookup:
             if place is None:
                 raise PlaceNotFoundError(f"no place with id {query!r} in the index")
             return place
-        name, scored = self._qualified(query, kind)
+        name, scored = self._qualified(query, kind, definition)
+        if kind == "metro" and definition is None:
+            scored = self._one_definition(scored)
         if not scored:
             raise PlaceNotFoundError(f"no place matches {query!r}")
         if all(tier != _EXACT for tier, _ in scored):
@@ -648,9 +723,44 @@ class _PlaceLookup:
             raise error
         return self.get(self._winner(query, scored, name))
 
+    def _one_definition(self, scored):
+        """``scored`` less the exact metro matches another definition of the
+        same metro outranks. Exact matches sharing a member place, directly or
+        along a chain, are one metro under several definitions and keep those
+        of the earliest definition in ``_METRO_DEFINITIONS``. Shared members,
+        not country codes, group them: a cross-border metro may be filed
+        under a neighbour's code (Basel's FAO region under France), while
+        same-named metros of different countries (Athens, US and Greece) share
+        none and stay rivals."""
+        records = self._records
+        exact = [
+            pid
+            for tier, pid in scored
+            if tier == _EXACT and records[pid]["kind"] == "metro"
+        ]
+        members = {pid: set(records[pid]["member_ids"]) for pid in exact}
+        group = {}
+        for start in exact:
+            if start in group:
+                continue
+            group[start] = start
+            pending = [start]
+            while pending:
+                current = pending.pop()
+                for other in exact:
+                    if other not in group and members[current] & members[other]:
+                        group[other] = start
+                        pending.append(other)
+        rank = {pid: _definition_rank(records[pid]["source_subtype"]) for pid in exact}
+        best = {}
+        for pid in exact:
+            best[group[pid]] = min(rank[pid], best.get(group[pid], rank[pid]))
+        dropped = {pid for pid in exact if rank[pid] > best[group[pid]]}
+        return [(tier, pid) for tier, pid in scored if pid not in dropped]
+
     def _winner(self, query, scored, name):
-        exact = [pid for tier, pid in scored if tier == _EXACT]
-        namesakes, anchors = self._namesakes(scored, name)
+        exact = self._contenders(scored, name)
+        namesakes, anchors = self._namesakes(exact, name)
         winner = None
         if namesakes:
             narrowed = [pid for pid in exact if pid not in namesakes]
@@ -673,15 +783,43 @@ class _PlaceLookup:
         error.candidates = tuple(candidates)
         raise error
 
+    def _contenders(self, scored, name):
+        """The exact matches, ranked, less those reaching ``name`` only through
+        a label in a language not their own while another carries it as its
+        own (Pinto, Spain, lists Buenos Aires in Irish). A place with an alias
+        of the name stays, and so does one far better known than every
+        own-name match that is not a metro, so an exonym ("Meksyk", Polish for
+        Mexico) is not handed to a place in Poland of that name."""
+        records = self._records
+        exact = [pid for tier, pid in scored if tier == _EXACT]
+        norm = _normalize(name)
+        own = {pid for pid in exact if norm in self._own_names(pid)}
+        if not own:
+            return exact
+        named = [pid for pid in own if records[pid]["kind"] != "metro"]
+        labels = max((len(records[pid]["names"]) for pid in named), default=0)
+        return [
+            pid
+            for pid in exact
+            if pid in own
+            or self._has_alias(pid, norm)
+            or self._far_better_known(pid, labels)
+        ]
+
+    def _has_alias(self, place_id, norm):
+        """Whether a place carries an alias normalizing to ``norm``."""
+        aliases = self._records[place_id]["aliases"]
+        return any(_normalize(alias) == norm for alias in aliases)
+
     def _decide(self, exact, name):
         """Among the exact matches ``exact``, ranked: the sole one, or the top
         one when it beats the runner-up by the margin; None when neither
         holds or a better-known place abroad bars the margin, and ``_VETOED``
         when the margin alone would decide against the name. The margin never
-        favours a place reached only through an alias or a translation over
-        one carrying ``name`` as its own: Saint Paul, Minnesota, whose aliases
-        include São Paulo, has more feeds than São Paulo itself in a thinly
-        covered index."""
+        favours a place reached only through an alias or a label in another
+        language over one carrying ``name`` as its own (see ``_own_names``):
+        Saint Paul, Minnesota, whose aliases include São Paulo, has more feeds
+        than São Paulo itself in a thinly covered index."""
         if len(exact) < 2:
             return exact[0] if exact else None
         top_id, runner_id = exact[0], exact[1]
@@ -692,9 +830,7 @@ class _PlaceLookup:
         # genuinely tied names stay ambiguous rather than guessed.
         if top_feeds and top_feeds > 2 * self._feed_count(runner_id):
             norm = _normalize(name)
-            own = {
-                pid for pid in exact if _normalize(self._records[pid]["name"]) == norm
-            }
+            own = {pid for pid in exact if norm in self._own_names(pid)}
             if own and top_id not in own:
                 return _VETOED
             if self._better_known_abroad(top_id, exact, name):
@@ -726,13 +862,18 @@ class _PlaceLookup:
             ]
         labels = max((len(records[pid]["names"]) for pid in leaders), default=0)
         return any(
-            len(records[pid]["names"]) >= _WELL_KNOWN
-            and len(records[pid]["names"]) > 2 * labels
+            self._far_better_known(pid, labels)
             for pid in named
             if records[pid].get("country_code") != country
         )
 
-    def _namesakes(self, scored, name):
+    def _far_better_known(self, place_id, labels):
+        """Whether a place has at least ``_WELL_KNOWN`` language labels and
+        more than twice ``labels``."""
+        count = len(self._records[place_id]["names"])
+        return count >= _WELL_KNOWN and count > 2 * labels
+
+    def _namesakes(self, exact, name):
         """``(namesakes, anchors)``. The anchors are the exact-match cities or,
         when no exact match is a city, the exact-match regions and countries,
         which then stand as the city (Istanbul's province, the Hong Kong
@@ -748,7 +889,6 @@ class _PlaceLookup:
         State against New York City), and a city elsewhere may use an alias as
         its everyday name (Newcastle for Newcastle upon Tyne); all stay."""
         records = self._records
-        exact = [pid for tier, pid in scored if tier == _EXACT]
         norm = _normalize(name)
         own = {pid for pid in exact if norm in self._own_names(pid)}
         named = {pid for pid in own if records[pid]["kind"] == "city"}
@@ -758,6 +898,7 @@ class _PlaceLookup:
             pid
             for pid in exact
             if pid not in own
+            and self._has_alias(pid, norm)
             and (
                 (
                     records[pid]["kind"] != "city"

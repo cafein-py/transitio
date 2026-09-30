@@ -134,6 +134,18 @@ osm = result.to_pyrosm()      # pyrosm.OSM reader over the extract
 `cafein.TransportNetwork.from_gtfs`, so e.g. `result.to_cafein(ultra=True)`
 works as expected.
 
+The crop keeps each trip that serves the area whole, with all its stops, so
+some stops can lie beyond the area of the OSM extract (`result.osm_area`).
+cafein may then find no walking network near such a stop and give it no
+footpaths. A journey that starts and ends in the area is routed as before;
+only a walking transfer at such a stop can be lost. The `stops_outside_osm` column of
+`result.selection_table()` counts each delivered feed's located stops, those
+with usable coordinates, outside `osm_area`, and the last row of the record
+sums them. The count is geometric and can differ from the number cafein
+reports without footpaths, either way: the extract spans the bounding box
+of the area and cafein snaps a stop up to 1.6 km away, while a stop inside
+the area can still lie far from any street or path.
+
 ## Using the pieces separately
 
 Every pipeline stage is a standalone function:
@@ -187,6 +199,11 @@ the same service: "Augsburg" is the city, not its three metros, and
 in its country that list its name only as an alias: "Taipei" is the city, not
 New Taipei or Taiwan. Where no city carries a name, a region or country of
 that name takes the city's place: "Istanbul" is the province, not its metro.
+Names count in a place's own languages, those of its country, and in English:
+"München" is Munich, and a place abroad that carries "Buenos Aires" only as a
+label in another language is no rival to the Argentine capital. A label in
+another language still counts for a place known far more widely, so "Meksyk",
+Polish for Mexico, stays ambiguous rather than naming a place in Poland.
 Other places sharing a name
 are decided by the sole exact match or a clear lead in feeds. Feed counts
 reflect how well each country's feeds are catalogued, so a lead in feeds does
@@ -203,7 +220,15 @@ translations and aliases of the place's region and country, so codes such as
 `UK` or `USA` work; a name that itself contains a comma, such as an alias
 `"Queen's Park, Greater London"`, still matches as written. `kind` (`"city"`,
 `"metro"`, `"region"`, `"country"`) restricts the scope, and a Wikidata id or
-the index's own id picks one place.
+the index's own id picks one place. The metro definitions below each name a
+metro after its core city; with `kind="metro"`, one metro under several
+definitions (they share member places) answers with the first of
+`functional urban area`, `metropolitan statistical area`,
+`metropolitan region` and `city-region (FAO)`, so
+`transitio.place("Stockholm", kind="metro")` is its functional urban area,
+and `definition="metropolitan region"` picks another definition. A US
+metropolitan statistical area is named after its principal cities, so a
+city's name matches it only in part; the city's `metros` lists it.
 
 The index keys every place by its own id, a `tp_<n>` that never changes or
 gets reused, and keeps the external ids the place carries beside it:

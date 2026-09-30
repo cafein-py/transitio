@@ -61,6 +61,7 @@ include = [
     "python/transitio/index/*.parquet",
     "python/transitio/index/snapshot.json",
     "python/transitio/index/NOTICE",
+    "python/transitio/index/country_languages.json",
 ]
 
 [tool.black]

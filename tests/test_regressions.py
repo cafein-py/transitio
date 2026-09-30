@@ -338,7 +338,8 @@ def test_the_feed_margin_does_not_favour_an_alias_over_a_name():
     # and a qualifier picks São Paulo; a translation still reaches Vienna; and
     # a district listing its city's name as an alias is no rival to the city,
     # nor are a region and a country listing Taipei, or a county listing Los
-    # Angeles, whose metros would otherwise win on feeds.
+    # Angeles as an alias and in Croatian and Nahuatl, whose metros would
+    # otherwise win on feeds.
     from transitio.exceptions import AmbiguousPlaceError
 
     # Kingston: an aliased city abroad would win the narrowed contest on feeds;
@@ -365,7 +366,14 @@ def test_the_feed_margin_does_not_favour_an_alias_over_a_name():
             _place("m-tpe", "metro", "Taipei", "TW"),
             _place("r-ntpe", "region", "New Taipei", "TW", aliases=["Taipei"]),
             _place("tw", "country", "Taiwan", "TW", aliases=["Taipei"]),
-            _place("r-la", "region", "Los Angeles County", "US", ["Los Angeles"]),
+            _place(
+                "r-la",
+                "region",
+                "Los Angeles County",
+                "US",
+                ["Los Angeles"],
+                {"en": "Los Angeles County", "hr": "Los Angeles", "nah": "Los Angeles"},
+            ),
             _place("c-la", "city", "Los Angeles", "US", parent="r-la"),
             _place("m-la", "metro", "Los Angeles", "US"),
         ],
@@ -380,6 +388,78 @@ def test_the_feed_margin_does_not_favour_an_alias_over_a_name():
     assert lookup.resolve("Bogota").id == "c-bog"
     assert lookup.resolve("Taipei").id == "c-tpe"
     assert lookup.resolve("Los Angeles").id == "c-la"
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        # Pinto, Spain, lists the name only in Irish.
+        ("Buenos Aires", "c-ba"),
+        # Munich carries the name in German, a village as its name.
+        ("München", "c-muc"),
+        # Paris, known far more widely, stays a rival through its Finnish label;
+        # so does Mexico through its Polish one against a town of that name in
+        # Mexico, where a country reaching the name by an alias would be the
+        # town's namesake.
+        ("Pariisi", None),
+        ("Meksyk", None),
+    ],
+)
+def test_a_label_in_another_language_does_not_compete_with_an_own_name(name, expected):
+    # Every label counted as a place's own name, so a place abroad carrying a
+    # capital's name in a language not its own kept the capital ambiguous, and
+    # a feed lead on a German label was vetoed in favour of a village's name.
+    from transitio.exceptions import AmbiguousPlaceError
+
+    known = {f"l{n}": f"label {n}" for n in range(150)}
+    lookup = _lookup(
+        [
+            _place("c-ba", "city", "Buenos Aires", "AR"),
+            _place("c-pinto", "city", "Pinto", "ES", names={"ga": "Buenos Aires"}),
+            _place("c-muc", "city", "Munich", "DE", names={"de": "München"}),
+            _place("c-mue", "city", "München", "DE"),
+            _place("c-par", "city", "Paris", "FR", names={**known, "fi": "Pariisi"}),
+            _place("c-pariisi", "city", "Pariisi", "EE"),
+            _place("mx", "country", "Mexico", "MX", names={**known, "pl": "Meksyk"}),
+            _place("c-mek", "city", "Meksyk", "MX"),
+        ],
+        {
+            "c-ba": 30,
+            "c-pinto": 20,
+            "c-muc": 39,
+            "c-mue": 3,
+            "c-par": 55,
+            "c-pariisi": 1,
+            "mx": 2,
+            "c-mek": 2,
+        },
+    )
+    if expected is None:
+        with pytest.raises(AmbiguousPlaceError):
+            lookup.resolve(name)
+    else:
+        assert lookup.resolve(name).id == expected
+
+
+def test_suggestions_rank_a_label_in_another_language_after_aliases():
+    # An American Vienna listing "Wien" in Low German outranked Vienna, whose
+    # German label came after its own Low German one, on feeds alone.
+    lookup = _lookup(
+        [
+            _place(
+                "c-vie", "city", "Vienna", "AT", names={"nds": "Wien", "de": "Wien"}
+            ),
+            _place("c-al", "city", "Neudorf", "AT", aliases=["Wien"]),
+            _place("c-vie-us", "city", "Vienna", "US", names={"nds": "Wien"}),
+        ],
+        {"c-vie": 24, "c-al": 27, "c-vie-us": 30},
+    )
+    hits = lookup.suggest("wien", limit=3)
+    assert [(hit.place.id, hit.source) for hit in hits] == [
+        ("c-vie", "de"),
+        ("c-al", "alias"),
+        ("c-vie-us", "nds"),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -470,6 +550,47 @@ def test_a_feed_lead_does_not_beat_a_far_better_known_place_abroad(
             lookup.resolve(name)
     else:
         assert lookup.resolve(name).id == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "options", "expected"),
+    [
+        ("Stockholm", {"kind": "metro"}, "m-fua"),
+        ("Stockholm", {"definition": "metropolitan region"}, "m-mr"),
+        ("Stockholm", {"definition": "city-region (FAO)"}, "m-fao"),
+        ("Athens", {"kind": "metro"}, None),
+    ],
+)
+def test_kind_metro_picks_one_definition_of_a_metro(name, options, expected):
+    # Each metro definition names its metro after the core city, so Stockholm's
+    # three metros tied under kind="metro". The FAO region shares a member only
+    # with the metropolitan region, and that one with the FUA; Athens, US and
+    # Greece, share none and stay rivals.
+    from transitio.exceptions import AmbiguousPlaceError
+
+    rows = [
+        ("m-fao", "Stockholm", "SE", "city-region (FAO)", ["a", "b"]),
+        ("m-mr", "Stockholm", "SE", "metropolitan region", ["b", "c"]),
+        ("m-fua", "Stockholm", "SE", "functional urban area", ["c", "d"]),
+        ("m-ath-us", "Athens", "US", "city-region (FAO)", ["e"]),
+        ("m-ath-gr", "Athens", "GR", "city-region (FAO)", ["f"]),
+    ]
+    lookup = _lookup(
+        [
+            {
+                **_place(pid, "metro", label, country),
+                "source_subtype": subtype,
+                "member_ids": members,
+            }
+            for pid, label, country, subtype, members in rows
+        ],
+        {row[0]: 3 for row in rows},
+    )
+    if expected is None:
+        with pytest.raises(AmbiguousPlaceError):
+            lookup.resolve(name, **options)
+    else:
+        assert lookup.resolve(name, **options).id == expected
 
 
 def test_padded_header_names_merge_into_one_column(tmp_path):
@@ -1496,3 +1617,57 @@ def test_an_empty_default_view_is_not_fetched_silently(
     assert [(e["feed_id"], e["decision"], e["note"]) for e in result.selection] == [
         (None, None, note)
     ]
+
+
+@pytest.mark.parametrize("osm", [True, False])
+def test_stops_beyond_the_osm_area_are_counted(tmp_path, monkeypatch, osm):
+    # The crop keeps whole trips, so the stops of a kept trip beyond the place
+    # lay outside the OSM area, where cafein gives them no footpaths, and
+    # fetch neither counted nor noted them.
+    import datetime
+    import pathlib
+
+    import shapely
+
+    import transitio.index as transitio_index
+    from index_fixture import covered_feed, edge, place, write_index
+    from transitio.pipeline import fetch
+
+    monkeypatch.setattr(
+        "transitio.pipeline._fetch._today", lambda: datetime.date(2026, 6, 1)
+    )
+    feed = {
+        **covered_feed("f-a"),
+        "atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}},
+    }
+    city = place("c", "city", geometry=shapely.to_wkb(shapely.box(*CITY_BBOX)).hex())
+    index = transitio_index.read_index(
+        write_index(
+            tmp_path / "index",
+            feeds=[feed],
+            places=[city],
+            edges=[edge("c", "f-a", tier="local")],
+        )
+    )
+    # Trip t-in runs on to Espoo, beyond the place grown by 1.6 km.
+    tables = dict(FEED)
+    tables["stop_times.txt"] += "t-in,08:30:00,08:30:00,out1,3\n"
+
+    def download(self, feed, directory=None):
+        return write_zip(pathlib.Path(directory) / "latest.zip", tables)
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas.download", download)
+    monkeypatch.setattr("transitio.osm.fetch_pbf", lambda *a, **k: tmp_path / "a.pbf")
+    result = fetch(place="c", index=index, directory=tmp_path / "out", osm=osm)
+    entry, *notes = result.selection
+    assert entry["decision"] == "delivered"
+    if not osm:
+        assert (entry["stops_outside_osm"], notes) == (None, [])
+        return
+    (last,) = notes
+    assert (entry["stops_outside_osm"], last["feed_id"], last["note"]) == (
+        1,
+        None,
+        "OSM area: 1 of 3 located stops outside it",
+    )

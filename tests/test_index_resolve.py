@@ -1,3 +1,4 @@
+import re
 import sys
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from transitio.index.places import (  # noqa: E402
     _as_dict,
     _as_list,
     _as_str,
+    _own_language,
 )
 
 
@@ -135,6 +137,21 @@ def test_kind_pins_the_scope(idx):
     assert place.id == "Q1109190"
     with pytest.raises(PlaceNotFoundError):
         transitio_index.place("New York metropolitan area", kind="city", index=idx)
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"kind": "city", "definition": "city-region (FAO)"}, "kind='city'"),
+        (
+            {"definition": "urban area"},
+            "'metropolitan statistical area', 'city-region (FAO)'",
+        ),
+    ],
+)
+def test_a_metro_definition_must_be_one_the_index_holds(idx, options, message):
+    with pytest.raises(ValueError, match=re.escape(message)):
+        transitio_index.place("Tri-State Metro", index=idx, **options)
 
 
 def test_a_qid_resolves_directly(idx):
@@ -374,6 +391,21 @@ def test_the_coercion_helpers_handle_parquet_shapes():
     assert _as_dict(None) == {}
     assert _as_str(float("nan")) is None
     assert _as_str("Q1") == "Q1"
+
+
+@pytest.mark.parametrize(
+    ("country", "language", "own"),
+    [
+        ("AT", "de-at", True),
+        ("TW", "zh_Hant", True),
+        ("ES", "ga", False),
+        ("XW", "EN", True),  # a code the table lacks: English and mul only
+        ("XW", "mul", True),
+        (None, "de", False),
+    ],
+)
+def test_a_label_language_is_own_by_its_base_code(country, language, own):
+    assert _own_language(country, language) is own
 
 
 def test_schema_6_places_resolve_by_own_id_and_every_alias():

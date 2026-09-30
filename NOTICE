@@ -10,6 +10,11 @@ Open Database License (ODbL 1.0) and derived from OpenStreetMap
 https://github.com/ringsaturn/tzfpy
 https://github.com/evansiroky/timezone-boundary-builder
 
+The languages of each country, which place lookup reads
+(transitio/index/country_languages.json), come from the Unicode Common Locale
+Data Repository (CLDR) 47, (c) Unicode, Inc., under the Unicode License v3.
+https://www.unicode.org/license.txt
+
 The feed index that transitio installs with transitio.index.refresh() is
 derived data compiled from several open sources; release wheels ship without
 an index. Every built index also carries its own NOTICE file,

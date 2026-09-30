@@ -938,7 +938,7 @@ def _lookup_for(index):
     return lookup
 
 
-def place(query, *, kind=None, index=None):
+def place(query, *, kind=None, definition=None, index=None):
     """Resolve ``query`` to a single :class:`Place`, or raise.
 
     ``query`` is a name, a QID, an own ``tp_`` id, or a :class:`Place`; an id
@@ -955,15 +955,36 @@ def place(query, *, kind=None, index=None):
     other shared names go to the place with more than twice the runner-up's
     feeds, unless a place of the name in another country is far better
     known (by the languages its name is recorded in), since feed counts
-    measure how well each country's feeds are catalogued.
+    measure how well each country's feeds are catalogued. A place's own
+    names are its name and its labels in its country's languages or
+    English; where a place carries the name as its own, one reaching it
+    only through a label in another language does not compete unless it is
+    far better known: "München" is Munich, and "Meksyk", Polish for Mexico,
+    stays ambiguous rather than naming a place in Poland called Meksyk.
     ``kind`` pins the scope. A qualified name, "Name, Qualifier" with one or
     more qualifiers, keeps the places lying within a region or country each
     qualifier names ("London, Ontario", "City of London, UK"); a label that
-    itself holds a comma still matches as written. Raises
+    itself holds a comma still matches as written.
+
+    A metro's definition is its ``subtype``. With ``kind="metro"``, metros
+    of the name sharing a member place are one metro under several
+    definitions, and the first in this order answers:
+    ``"functional urban area"`` (Eurostat Urban Audit),
+    ``"metropolitan statistical area"`` (US Census),
+    ``"metropolitan region"`` (Eurostat's NUTS-3 approximation),
+    ``"city-region (FAO)"``, then any other; "Stockholm" is its functional
+    urban area. ``definition`` names one instead and implies
+    ``kind="metro"``; it raises :class:`ValueError` when ``kind`` names
+    another kind or no metro of the index carries it. US metropolitan
+    statistical areas are named after their principal cities ("Los
+    Angeles–Long Beach–Anaheim metropolitan area"), so a city's name
+    matches one only in part and raises ``PlaceNotFoundError`` listing it;
+    the city's :attr:`Place.metros` holds it. Raises
     :class:`~transitio.exceptions.PlaceNotFoundError` or
     :class:`~transitio.exceptions.AmbiguousPlaceError`.
     """
-    return _lookup_for(_coerce_index(index)).resolve(query, kind=kind)
+    lookup = _lookup_for(_coerce_index(index))
+    return lookup.resolve(query, kind=kind, definition=definition)
 
 
 def places(query, *, index=None):
@@ -979,8 +1000,9 @@ def suggest(prefix, *, limit=10, kinds=None, country=None, lang=None, index=None
     languages and its aliases — normalised as :func:`place` normalises a
     query, so ``hels`` and ``helsingf`` both reach Helsinki. Places rank by
     an exact label first, then kind precedence as :func:`places` ranks it,
-    the label's source (the name, a translation, an alias), more feeds, the
-    label and the id; one :class:`Suggestion` per place, at most ``limit``.
+    the label's source (the name, a name in the place's own languages or
+    English, an alias, a name in another language), more feeds, the label
+    and the id; one :class:`Suggestion` per place, at most ``limit``.
     ``kinds`` keeps only those kinds, ``country`` one ISO code or several,
     and ``lang`` picks the label to show (the place's name in that language
     when it has one, else its name). An empty prefix suggests nothing. The

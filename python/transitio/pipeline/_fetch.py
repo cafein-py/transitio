@@ -56,6 +56,7 @@ _SELECTION_FIELDS = (
     "version_of",
     "fetched_from",
     "download_errors",
+    "stops_outside_osm",
     "path",
 )
 
@@ -80,7 +81,8 @@ class FetchResult:
     # One entry per candidate feed, in candidate order, with its decision;
     # ``skipped`` lists the same skips. Entries with feed_id None note, after
     # the candidates, the feeds an empty default view hides, and last the
-    # place parts the OSM extract leaves out, or why it was not fetched.
+    # place parts the OSM extract leaves out and the delivered stops outside
+    # its area, or why it was not fetched.
     selection: list = dataclasses.field(default_factory=list)
     # The WGS84 area the OSM extract was fetched for; None without one. A
     # failed extract download leaves it and osm_pbf None.
@@ -1101,7 +1103,10 @@ def fetch(
         after the feeds, for the place's parts that hold a stop of a
         delivered feed (the whole place when none does, nothing was
         delivered or a delivered feed's stops.txt cannot be read), each part
-        grown by 1.6 km, cafein's default snap distance. With ``osm=False``
+        grown by 1.6 km, cafein's default snap distance. The crop keeps
+        each trip that serves the area whole, so a delivered feed's stops
+        can lie beyond the OSM area and get no footpaths in cafein;
+        ``stops_outside_osm`` in ``selection`` counts them. With ``osm=False``
         the OSM stage is skipped and the result's ``osm_pbf`` is None, for
         callers who want only the GTFS feeds; ``to_pyrosm`` then raises and
         ``to_cafein`` builds without a walking network. A failed extract
@@ -1157,7 +1162,10 @@ def fetch(
         Transitland Atlas, ``"mdb_latest"`` the Mobility Database hosted
         copy; None when nothing was downloaded), ``download_errors`` (the
         failed download attempts before the one that worked, or all of them
-        when none did, joined with ``"; "``; None when none failed) and
+        when none did, joined with ``"; "``; None when none failed),
+        ``stops_outside_osm`` (the delivered feed's located stops, the
+        stops.txt rows with usable coordinates, outside ``osm_area``; None
+        without an extract or when its stops.txt cannot be read) and
         ``path`` (the delivered feed).
         Windows are ISO dates.
         When ``place`` is fetched without ``tiers`` and its default view
@@ -1167,9 +1175,12 @@ def fetch(
         it, e.g. ``"default view (region: secondary, tertiary) holds none of
         the place's 2 feeds: f-a (primary), f-b (primary); tiers=['local']
         fetches them"``.
-        When the OSM extract leaves out parts of the place, a last entry
-        with ``feed_id`` None notes them, e.g. ``"OSM area: 1 of 47 parts
-        (1783 of 2188 km²)"``; when its download failed, the last entry
+        When the OSM extract leaves out parts of the place, or delivered
+        stops lie outside its area, a last entry with ``feed_id`` None
+        notes them, e.g. ``"OSM area: 1 of 47 parts (1783 of 2188 km²);
+        4970 of 10026 located stops outside it"``, the stops summed over
+        the delivered feeds, with ``"(stops.txt of 1 feed not read)"``
+        added for feeds not counted; when its download failed, the last entry
         notes that instead, e.g. ``"OSM extract not fetched:
         https://download.geofabrik.de/europe-latest.osm.pbf: ReadTimeout:
         timed out (3 requests)"``. ``FetchResult.selection_table()`` returns
@@ -1367,6 +1378,10 @@ def fetch(
             feeds.append(path)
             delivered.add(feed.id, download)
 
+    if osm_pbf is not None:
+        coords = {path: _stop_coords(path) for path in feeds}
+        counts = _count_outside(record, geometry, coords)
+        osm_note = _osm_note(geometry, geometry, *counts)
     if osm_note is not None:
         record.append({**_entry(None, None), "note": osm_note})
     return FetchResult(
@@ -1432,32 +1447,44 @@ def _untrusted_action(policy, exclude, on_unknown):
     return "skip" if on_unknown == "exclude" else "whole"
 
 
-def _osm_parts(geometry, feeds):
-    """The parts of ``geometry`` the OSM extract is fetched for: the union of
-    those holding a stop of a delivered feed in ``feeds``, read from each
-    one's stops.txt, else the whole geometry. A feed whose stops.txt cannot
-    be read could serve any part, so it also yields the whole geometry."""
-    import shapely
+def _stop_coords(path):
+    """The located stops of the feed at ``path``, its stops.txt rows with a
+    stop id and usable coordinates, as an ``(n, 2)`` array of ``(lon,
+    lat)``; None when its stops.txt is absent or cannot be read."""
+    import numpy as np
 
     from transitio.index.fingerprint import _member_coords
 
+    try:
+        with zipfile.ZipFile(path) as archive:
+            coords = _member_coords(archive)
+    except Exception:  # noqa: B902 — unreadable, like an absent stops.txt
+        return None
+    if coords is None:
+        return None
+    return np.array(list(coords.values()), dtype=float).reshape(-1, 2)
+
+
+def _osm_parts(geometry, feeds):
+    """``(parts, coords)``: ``coords`` maps each delivered feed in ``feeds``
+    to its located stops (:func:`_stop_coords`), and ``parts`` is what of
+    ``geometry`` the OSM extract is fetched for, the union of the parts
+    holding such a stop, else the whole geometry. A feed whose stops.txt
+    cannot be read could serve any part, so it also yields the whole
+    geometry."""
+    import numpy as np
+    import shapely
+
+    coords = {path: _stop_coords(path) for path in feeds}
+    located = list(coords.values())
+    if not located or any(points is None for points in located):
+        return geometry, coords
     parts = shapely.get_parts(geometry)
-    tree = shapely.STRtree(parts)
-    held = set()
-    for path in feeds:
-        try:
-            with zipfile.ZipFile(path) as archive:
-                coords = _member_coords(archive)
-        except Exception:  # noqa: B902 — unreadable, like an absent stops.txt
-            coords = None
-        if coords is None:
-            return geometry
-        if coords:
-            points = shapely.points(list(coords.values()))
-            held.update(tree.query(points, predicate="intersects")[1].tolist())
+    points = shapely.points(np.concatenate(located))
+    held = np.unique(shapely.STRtree(parts).query(points, predicate="intersects")[1])
     if len(held) in (0, len(parts)):
-        return geometry
-    return shapely.union_all(parts[sorted(held)])
+        return geometry, coords
+    return shapely.union_all(parts[held]), coords
 
 
 def _hidden_note(place, hidden):
@@ -1484,20 +1511,53 @@ def _hidden_note(place, hidden):
     )
 
 
-def _osm_note(geometry, parts):
-    """The selection-record note on the parts of ``geometry`` that ``parts``
-    leaves out, None when it leaves out none."""
+def _count_outside(record, area, coords):
+    """Set ``stops_outside_osm`` on each delivered entry of ``record``: the
+    located stops of its feed (``coords``, by path) outside ``area``, left
+    None when they are None. Returns ``(outside, total, unread)``, the
+    outside and located stops summed over the counted feeds and the number
+    of delivered feeds not counted."""
+    import shapely
+
+    shapely.prepare(area)
+    outside = total = unread = 0
+    for entry in record:
+        if entry["decision"] != "delivered":
+            continue
+        points = coords.get(entry["path"])
+        if points is None:
+            unread += 1
+            continue
+        count = len(points) - int(shapely.intersects_xy(area, points).sum())
+        entry["stops_outside_osm"] = count
+        outside += count
+        total += len(points)
+    return outside, total, unread
+
+
+def _osm_note(geometry, parts, outside=0, total=0, unread=0):
+    """The selection-record note on the OSM area: the parts of ``geometry``
+    that ``parts`` leaves out, and the ``outside`` of ``total`` located
+    stops outside the area with the ``unread`` feeds whose stops.txt was not
+    read; None when no part is left out and neither count is non-zero."""
     import shapely
 
     from transitio.osm._fetch import _area_km2
 
-    total, kept = shapely.get_num_geometries([geometry, parts])
-    if kept == total:
-        return None
-    return (
-        f"OSM area: {kept} of {total} parts "
-        f"({_area_km2(parts):.0f} of {_area_km2(geometry):.0f} km²)"
-    )
+    clauses = []
+    whole, kept = shapely.get_num_geometries([geometry, parts])
+    if kept != whole:
+        clauses.append(
+            f"{kept} of {whole} parts "
+            f"({_area_km2(parts):.0f} of {_area_km2(geometry):.0f} km²)"
+        )
+    if outside or unread:
+        clause = f"{outside} of {total} located stops outside it"
+        if unread:
+            feeds = "feed" if unread == 1 else "feeds"
+            clause += f" (stops.txt of {unread} {feeds} not read)"
+        clauses.append(clause)
+    return "OSM area: " + "; ".join(clauses) if clauses else None
 
 
 def _osm_extract(area, **options):
@@ -1918,13 +1978,14 @@ def _fetch_place(
 
     osm_pbf = osm_area = None
     if osm:
-        parts = _osm_parts(geometry, feeds)
+        parts, coords = _osm_parts(geometry, feeds)
         osm_pbf, note = _osm_extract(
             parts, buffer_m=_OSM_BUFFER_M, cache_dir=cache_dir, directory=directory
         )
         if osm_pbf is not None:
             osm_area = _buffered(parts, _OSM_BUFFER_M)
-            note = _osm_note(geometry, parts)
+            counts = _count_outside(record, osm_area, coords)
+            note = _osm_note(geometry, parts, *counts)
         if note is not None:
             record.append({**_entry(None, None), "note": note})
 

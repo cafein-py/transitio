@@ -97,6 +97,9 @@ def test_fetch_end_to_end(pipeline_env):
         )
     assert result.osm_pbf == fake_pbf
     assert result.osm_area.bounds == (24.6, 60.1, 25.2, 60.4)
+    # Every stop lies in the area, so no OSM note entry follows the feed's.
+    (entry,) = result.selection
+    assert entry["stops_outside_osm"] == 0
     assert len(result.feeds) == 1
     assert "-cropped-" in result.feeds[0].name
     assert result.feeds[0].suffix == ".zip"
@@ -1471,10 +1474,53 @@ def test_osm_parts_are_those_holding_a_delivered_stop(tmp_path, stops, expected)
             path.write_bytes(_zip({"agency.txt": GTFS["agency.txt"]}))
         else:
             rows = "".join(f"s{i},{y},{x}\n" for i, (y, x) in enumerate(coords))
+            # A row without coordinates is not a located stop.
+            rows += "s-blank,,\n"
             path.write_bytes(_zip({"stops.txt": "stop_id,stop_lat,stop_lon\n" + rows}))
         feeds.append(path)
-    parts = _osm_parts(geometry, feeds)
+    parts, located = _osm_parts(geometry, feeds)
     assert parts.equals(shapely.box(*_SERVED) if expected == "served" else geometry)
+    assert [None if located[p] is None else located[p].tolist() for p in feeds] == [
+        None if coords is None else [[x, y] for y, x in coords] for coords in stops
+    ]
+
+
+_PARTS_NOTE = "OSM area: 1 of 2 parts (247 of 487 km²)"
+
+
+@pytest.mark.parametrize(
+    "served, counts, expected",
+    [
+        pytest.param(True, (0, 2, 0), _PARTS_NOTE, id="parts"),
+        pytest.param(
+            False,
+            (12, 40, 0),
+            "OSM area: 12 of 40 located stops outside it",
+            id="stops",
+        ),
+        pytest.param(
+            True,
+            (1, 3, 0),
+            f"{_PARTS_NOTE}; 1 of 3 located stops outside it",
+            id="parts-and-stops",
+        ),
+        pytest.param(
+            False,
+            (0, 40, 1),
+            "OSM area: 0 of 40 located stops outside it (stops.txt of 1 feed not read)",
+            id="unread",
+        ),
+        pytest.param(False, (0, 40, 0), None, id="neither"),
+    ],
+)
+def test_osm_note_names_the_parts_and_stops_outside_the_area(served, counts, expected):
+    import shapely
+
+    from transitio.pipeline._fetch import _osm_note
+
+    geometry = shapely.union_all([shapely.box(*_SERVED), shapely.box(*_REMOTE)])
+    parts = shapely.box(*_SERVED) if served else geometry
+    assert _osm_note(geometry, parts, *counts) == expected
 
 
 def test_fetch_place_fetches_the_osm_extract_last_for_the_served_parts(
