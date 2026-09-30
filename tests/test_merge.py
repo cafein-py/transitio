@@ -632,6 +632,7 @@ def _repeats(trips, rows=(), continuous=""):
     builder.add_agency("a", "Agency", "https://a.example", HEL)
     builder.add_agency("b", "Other", "https://b.example", HEL)
     stops = {"s1": 60.1, "s2": 60.11, "s3": 60.12, "s4": 60.10001, "s5": 60.100001}
+    stops.update(s6=60.13, s7=60.14, n33=60.1103, n90=60.1108)
     for stop, lat in stops.items():
         builder.add_stop(stop, stop, lat, 24.9)
     builder.add_route("r1", 3, "1", agency_id="a", continuous_pickup=continuous)
@@ -641,7 +642,7 @@ def _repeats(trips, rows=(), continuous=""):
     for service in sorted({trip.get("service", "jan") for trip in trips}):
         builder.add_service(service, "daily", *SERVICES[service])
     for trip in trips:
-        names = ("block_id", "shape_id", "trip_headsign")
+        names = ("block_id", "shape_id", "trip_headsign", "wheelchair_accessible")
         fields = {key: trip[key] for key in names if key in trip}
         if "shape_id" in fields:
             builder.add_shape(fields["shape_id"], [(60.10, 24.9), (60.11, 24.9)])
@@ -738,6 +739,74 @@ def test_agency_keys():
     assert list(agency_keys(pd.Series(names))) == list(expected)
 
 
+# Five stops two minutes apart from 08:00; n33 and n90 lie 33 m and 89 m
+# from s2.
+FIVE = ("s1", "s2", "s3", "s6", "s7")
+MINUTE = {"s1": 0, "s2": 2, "n33": 2, "n90": 2, "s3": 4, "s6": 6, "s7": 8}
+
+
+def _run(stops=FIVE, shifts=(0,), **fields):
+    """A trip over ``stops`` at their minutes past 08:00, each moved by its
+    entry of ``shifts``, repeated, in seconds."""
+    times = [
+        28_800 + 60 * MINUTE[stop] + shifts[k % len(shifts)]
+        for k, stop in enumerate(stops)
+    ]
+    return {"stops": stops, "times": times, **fields}
+
+
+@pytest.mark.parametrize(
+    "variant, unaligned",
+    [
+        (_run(shifts=(45,)), 0),
+        (_run(shifts=(90,)), None),
+        (_run(shifts=(90, -90)), None),
+        (_run(("s1", "n33", "s3", "s6", "s7")), 0),
+        (_run(("s1", "n90", "s3", "s6", "s7")), 1),
+        ((_run(("s1", "s2")), _run(("s1", "n90"))), None),
+        (_run(("s1", "s3", "s6", "s7")), 0),
+        ((_run(("s1", "s2", "s3")), _run()), None),
+        (_run(route="r2"), None),
+        (_run(frequency=HEADWAY), None),
+        (_run(stop_fields={"pickup_type": ("", "", "1")}), None),
+        (_run(stop_fields={"drop_off_type": ("1",)}), 0),
+        ((_run(wheelchair_accessible="1"), _run(wheelchair_accessible="2")), None),
+        (
+            _run(
+                stop_fields={
+                    "arrival_time": ("08:00:00", ""),
+                    "departure_time": ("08:00:00", ""),
+                }
+            ),
+            None,
+        ),
+    ],
+    ids=(
+        "45s-later 90s-later 90s-either-way 33m-away 89m-away 89m-on-two-stops "
+        "skipped-stop two-extra-stops other-route headway-vs-timetabled "
+        "pickup-mid-trip drop-off-at-first other-wheelchair blank-time"
+    ).split(),
+)
+def test_near_matches(variant, unaligned):
+    from transitio.gtfs._near import near_matches
+    from transitio.gtfs._schedule import trip_signatures
+
+    # A pair of specs gives both trips; a single spec the second.
+    pair = variant if isinstance(variant, tuple) else (_run(), variant)
+    _, stops = trip_signatures(_repeats(_trips(*pair)).tables, with_stops=True)
+    earlier, later = (stops[stops["trip_id"] == trip] for trip in ("t1", "t2"))
+    pairs, aligned = near_matches(earlier, later)
+    if unaligned is None:
+        assert pairs.empty and aligned.empty
+        return
+    assert pairs.to_dict("records") == [
+        {"later": "t2", "earlier": "t1", "unaligned": unaligned}
+    ]
+    assert list(aligned["later_stop"]) == list(later["stop_id"])
+    expected = [{"n33": "s2", "n90": ""}.get(s, s) for s in later["stop_id"]]
+    assert list(aligned["earlier_stop"].fillna("")) == expected
+
+
 def _calendar(*rows):
     """calendar.txt from ``(service_id, weekday flags from Monday, start,
     end)`` rows."""
@@ -828,6 +897,10 @@ def _links(*pairs):
 
 
 ONE = _trips({})
+NEAR = _trips(
+    _run(("s1", "n90", "s3", "s6", "s7"), shifts=(45,)),
+    {"stops": ("s1", "n90"), "times": LATER},
+)
 PAIR = _trips({"block_id": "b"}, {"times": LATER, "block_id": "b"})
 LINKED = _trips({}, {"stops": ("s1", "s3"), "times": LATER})
 FREQUENCY = ("frequencies.txt", dict(trip_id="t1", **HEADWAY))
@@ -912,6 +985,13 @@ BLOCKS = _trips(
         ),
         ([_trips({"service": "huge"})] * 2, set(), {"unexpanded": 2}),
         ([ONE, ONE], set(), {"mode": "keep"}),
+        (
+            [_trips(_run()), NEAR],
+            {"f2:t1"},
+            {"transfers": _links(("f2:s1", "f1:s1")), "near": 1, "unaligned": 1},
+        ),
+        ([_trips(_run(("s1", "s2", "s3"))), _trips(_run(shifts=(45,)))], set(), {}),
+        ([_trips(_run()), NEAR], set(), {"mode": "exact"}),
     ],
     ids=(
         "identical one-for-one disjoint-days block-vs-unblocked subset-days "
@@ -919,7 +999,8 @@ BLOCKS = _trips(
         "earlier-frequency trip-transfer half-a-block block-for-block "
         "block-completed-elsewhere candidate-block-order three-inputs "
         "route-continuous-pickup "
-        "stop-link other-pickup other-shape extra-day-past-4000 unexpanded keep"
+        "stop-link other-pickup other-shape extra-day-past-4000 unexpanded keep "
+        "near-times near-subset exact-mode"
     ).split(),
 )
 def test_duplicate_trips(tmp_path, inputs, dropped, expected):
@@ -951,6 +1032,8 @@ def test_duplicate_trips(tmp_path, inputs, dropped, expected):
         "by_feed": dict(by_feed),
         "unexpanded_services": expected.get("unexpanded", 0),
         "stop_links": sum(not row[2] for row in expected.get("transfers", ())) // 2,
+        "near_matches": expected.get("near", 0),
+        "unaligned_stops": expected.get("unaligned", 0),
     }
 
 

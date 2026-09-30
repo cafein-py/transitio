@@ -1001,3 +1001,64 @@ def test_copies_of_a_headway_network_are_merged_once(tmp_path):
     for name in ("trips.txt", "frequencies.txt"):
         assert list(merged[name]["trip_id"]) == ["f1:t1"]
     assert report["duplicate_trips"]["dropped"] == 1
+
+
+def _near_feed(moved, stop_times, extra):
+    """A feed of trip ``g`` on route X36 and headway trip ``h`` on route
+    506 over stops a to e, ``moved`` degrees north, and ``extra`` stops."""
+    lats = dict(zip("abcde", (55.86, 55.862, 55.864, 55.866, 55.868)))
+    stops = "".join(f"{s},{s},{lat + moved:.6f},-4.25\n" for s, lat in lats.items())
+    return {
+        "agency.txt": MIDLAND["agency.txt"],
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\n" + stops + extra,
+        "routes.txt": (
+            "route_id,agency_id,route_short_name,route_type\nx36,1,X36,3\n506,1,506,3\n"
+        ),
+        "trips.txt": "route_id,service_id,trip_id\nx36,wk,g\n506,wk,h\n",
+        "stop_times.txt": (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence,"
+            "pickup_type,drop_off_type\n" + stop_times
+        ),
+        "frequencies.txt": (
+            "trip_id,start_time,end_time,headway_secs\nh,06:00:00,10:00:00,600\n"
+        ),
+        "calendar.txt": FEED["calendar.txt"],
+    }
+
+
+def test_near_repeats_of_a_trip_are_merged_once(tmp_path):
+    # A national feed timing an operator's bus between timing points to the
+    # second, or a headway network's next version moving its last stop
+    # 90 m, did not repeat the trip exactly, so the merge kept both copies.
+    from transitio.edit import FeedEditor
+    from transitio.gtfs import merge_feeds
+
+    headway = "".join(
+        f"h,06:{3 * n:02d}:00,06:{3 * n:02d}:00,{stop},{n},,\n"
+        for n, stop in enumerate("abcd")
+    )
+    national = _near_feed(
+        0,
+        "g,08:00:00,08:00:00,a,1,,1\ng,08:02:30,08:02:30,b,2,,\n"
+        "g,08:05:15,08:05:15,c,3,,\ng,08:07:40,08:07:40,d,4,,\n"
+        "g,08:10:00,08:10:00,e,5,1,\n" + headway + "h,06:12:00,06:12:00,e,4,,\n",
+        "",
+    )
+    operator = _near_feed(
+        0.00002,
+        "g,08:00:00,08:00:00,a,1,,\ng,08:02:00,08:02:00,b,2,,\n"
+        "g,08:04:00,08:04:00,x,3,,\ng,08:05:00,08:05:00,c,4,,\n"
+        "g,08:08:00,08:08:00,d,5,,\ng,08:10:00,08:10:00,e,6,,\n"
+        + headway
+        + "h,06:12:00,06:12:00,f,4,,\n",
+        "x,x,55.863,-4.25\nf,f,55.8688,-4.25\n",
+    )
+    feeds = [
+        write_zip(tmp_path / f"{n}.zip", files)
+        for n, files in enumerate((national, operator))
+    ]
+    report = merge_feeds(feeds, tmp_path / "merged.zip", check=False)
+    merged = FeedEditor(tmp_path / "merged.zip").tables
+    assert sorted(merged["trips.txt"]["trip_id"]) == ["f1:g", "f1:h"]
+    counts = report["duplicate_trips"]
+    assert counts["dropped"] == counts["near_matches"] == counts["unaligned_stops"] == 2

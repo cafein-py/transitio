@@ -268,7 +268,7 @@ def route_keys(tables):
     return _keyed(keys, _column(routes, "route_id"))
 
 
-def trip_signatures(tables):
+def trip_signatures(tables, with_stops=False):
     """The signature of each trip in a feed's tables.
 
     A signature is 128 bits, written as 32 hex digits, over the trip's route
@@ -293,6 +293,19 @@ def trip_signatures(tables):
     leading zeros), and a frequency-based trip whose first departure, or a
     frequency row's ``start_time``, ``end_time`` or ``headway_secs``, cannot
     be read are not signed.
+
+    With ``with_stops``, returns ``(signatures, stops)``, ``stops`` the
+    signed trips' stop times, by trip and in ``stop_sequence`` order, as
+    :func:`~transitio.gtfs._near.near_matches` compares them: ``trip_id``,
+    ``position`` (from 0), ``stop_id``, the stop's ``lon`` and ``lat``,
+    ``seconds`` (the departure time, else the arrival time, a
+    frequency-based trip's counted from its first departure; NaN when
+    neither can be read), ``pickup`` and ``drop_off`` (blank as 0),
+    ``continuous`` (whether an effective ``continuous_pickup`` or
+    ``continuous_drop_off`` is not 1), and per trip ``route`` (a hash of
+    its route's name and type and whether it is frequency-based), ``runs``
+    (a hash of its frequencies.txt rows, 0 for a timetabled trip), and
+    ``wheelchair`` and ``bikes`` (blank as 0).
     """
     from transitio.index.fingerprint import COORDINATE_DECIMALS
 
@@ -307,16 +320,14 @@ def trip_signatures(tables):
     stops = tables.get("stops.txt", pd.DataFrame())
     keys = route_keys(tables)
     trips = trips[_column(trips, "route_id").isin(keys.index)]
-    coordinates = pd.DataFrame(
+    located = pd.DataFrame(
         {
             axis: pd.to_numeric(_stripped(stops, f"stop_{axis}"), errors="coerce")
-            .round(COORDINATE_DECIMALS)
-            .add(0.0)
-            .astype(str)
             for axis in ("lat", "lon")
         }
     )
-    coordinates = _keyed(coordinates, _column(stops, "stop_id"))
+    located = _keyed(located, _column(stops, "stop_id"))
+    coordinates = located.round(COORDINATE_DECIMALS).add(0.0).astype(str)
     stop_rows = coordinates.index.get_indexer(stop_times["stop_id"])
 
     codes, trip_ids = pd.factorize(stop_times["trip_id"])
@@ -421,10 +432,40 @@ def trip_signatures(tables):
             whole.assign(stops=per_trip(sums), runs=per_trip(runs[signed_codes])), key
         )
         halves.append(np.char.mod("%016x", whole_hash))
-    return pd.DataFrame(
+    signatures = pd.DataFrame(
         {
             "trip_id": trips.index.to_numpy(),
             "service_id": _column(trips, "service_id").to_numpy(),
             "signature": np.char.add(*halves) if len(trips) else [],
+        }
+    )
+    if not with_stops:
+        return signatures
+    kept = np.repeat(signed, counts)
+    at, trip = order[kept], ordered[kept]
+    stop = stop_rows[at]
+    placed = trips.index.get_indexer(trip_ids[trip])
+    departure, arrival = (
+        clock_seconds(_column(stop_times, f"{kind}_time").iloc[at])
+        for kind in ("departure", "arrival")
+    )
+    seconds = departure.fillna(arrival).to_numpy()
+    stopping = rows[["continuous_pickup", "continuous_drop_off"]] != "1"
+    return signatures, pd.DataFrame(
+        {
+            "trip_id": trip_ids[trip],
+            "position": positions[kept],
+            "stop_id": located.index[stop],
+            "lon": located["lon"].to_numpy()[stop],
+            "lat": located["lat"].to_numpy()[stop],
+            "seconds": seconds - np.where(headway[trip], first[trip], 0.0),
+            "pickup": rows["pickup"].to_numpy()[at],
+            "drop_off": rows["drop_off"].to_numpy()[at],
+            "continuous": stopping.any(axis=1).to_numpy()[at],
+            # Hashed under the last key, as are the frequency rows.
+            "route": _digest(whole[["name", "type", "headway"]], key)[placed],
+            "runs": runs[trip],
+            "wheelchair": whole["wheelchair"].to_numpy()[placed],
+            "bikes": whole["bikes"].to_numpy()[placed],
         }
     )

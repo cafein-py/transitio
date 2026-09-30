@@ -19,6 +19,7 @@ honest fallthrough beats a guessed geometry.
 
 import math
 
+import numpy as np
 import shapely
 
 #: Endpoints within this distance chain together; anything farther is a
@@ -408,10 +409,11 @@ def _connectable(point, others, tolerance):
 
 
 def _meters(a, b):
-    """Equirectangular metres between two (lon, lat) pairs — exact
-    enough at chaining tolerances."""
-    scale = math.cos(math.radians((a[1] + b[1]) / 2))
-    return math.hypot((a[0] - b[0]) * scale, a[1] - b[1]) * 111_320.0
+    """Equirectangular metres between two (lon, lat) pairs, or pair by
+    pair between two pairs of arrays — exact enough at chaining
+    tolerances."""
+    scale = np.cos(np.radians((a[1] + b[1]) / 2))
+    return np.hypot((a[0] - b[0]) * scale, a[1] - b[1]) * 111_320.0
 
 
 def _merge(parts):
