@@ -26,9 +26,9 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-import httpx
 import platformdirs
 
+from transitio import _http
 from transitio.exceptions import DownloadError, IncompatibleIndexError, TransitioError
 from transitio.index import release as contract
 
@@ -37,7 +37,6 @@ __all__ = ["refresh", "use", "installed", "active_index", "cache_root", "SNAPSHO
 SNAPSHOT_ENV = "TRANSITIO_INDEX_SNAPSHOT"
 KEEP = 3
 TIMEOUT = 60.0
-USER_AGENT = "transitio-index"
 
 # Per-member ceilings for an archive being unpacked, matching the reader's;
 # a member over its ceiling is refused before a byte of it is written.
@@ -384,12 +383,11 @@ def active_index(*, cache_dir=None):
 
 
 def _client(api_url, transport):
-    return httpx.Client(
+    return _http.client(
         base_url=api_url,
         headers={
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": USER_AGENT,
         },
         timeout=TIMEOUT,
         follow_redirects=False,

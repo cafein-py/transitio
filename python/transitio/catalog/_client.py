@@ -12,9 +12,9 @@ import time
 import warnings
 from pathlib import Path
 
-import httpx
 import platformdirs
 
+from transitio import _http
 from transitio.catalog._csv import fetch_catalog_csv, search_csv
 from transitio.catalog._models import Dataset, Feed, as_date
 from transitio.exceptions import DownloadError, MissingTokenError
@@ -139,7 +139,7 @@ class MobilityDatabase:
             if cache_dir
             else Path(platformdirs.user_cache_dir("transitio"))
         )
-        self._http = httpx.Client(
+        self._http = _http.client(
             timeout=timeout, transport=transport, follow_redirects=True
         )
         self._access_token = None

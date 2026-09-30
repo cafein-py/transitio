@@ -9,13 +9,13 @@ import re
 import warnings
 from pathlib import Path
 
-import httpx
 import numpy as np
 import platformdirs
 import shapely
 from shapely.geometry import box
 from shapely.geometry.base import BaseGeometry
 
+from transitio import _http
 from transitio.exceptions import ExtractNotFoundError
 
 
@@ -120,7 +120,7 @@ def _download(url, path, update, transport=None):
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.parent / (path.name + ".part")
-    client = httpx.Client(follow_redirects=True, timeout=60.0, transport=transport)
+    client = _http.client(follow_redirects=True, timeout=60.0, transport=transport)
     with client:
         with client.stream("GET", url) as response:
             response.raise_for_status()

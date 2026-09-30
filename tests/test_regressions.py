@@ -1098,3 +1098,51 @@ def test_a_placeholder_calendar_is_an_older_version_of_the_dated_network(tmp_pat
         "placeholder calendar 2025-12-31 to 2099-01-01",
         {"feed_id": "dated", "route_overlap": 0.0, "stop_overlap": 1.0},
     )
+
+
+@pytest.mark.parametrize("client", ["mdb", "atlas", "osm", "index"])
+def test_http_clients_identify_themselves_as_transitio(client, tmp_path):
+    # Hosts that filter by user agent answered httpx's default
+    # "python-httpx/<version>" with 403 Forbidden, so their feeds never
+    # downloaded.
+    import re
+
+    import httpx
+
+    from transitio import _http
+    from transitio.catalog import AtlasFeed, MobilityDatabase, TransitlandAtlas
+    from transitio.catalog._models import Feed
+    from transitio.index import _refresh
+    from transitio.osm._fetch import _download
+
+    url = "https://feeds.example/gtfs.zip"
+    sent = []
+
+    def handler(request):
+        sent.append(request)
+        return httpx.Response(200, content=b"PK\x03\x04")
+
+    transport = httpx.MockTransport(handler)
+    if client == "mdb":
+        feed = Feed.from_api({"id": "mdb-1", "latest_dataset": {"hosted_url": url}})
+        with MobilityDatabase(None, cache_dir=tmp_path, transport=transport) as db:
+            db.download_latest(feed)
+    elif client == "atlas":
+        feed = AtlasFeed.from_record(
+            {"onestop_id": "f-x", "urls": {"static_current": url}}
+        )
+        with TransitlandAtlas(cache_dir=tmp_path, transport=transport) as atlas:
+            atlas.download(feed)
+    elif client == "osm":
+        _download(url, tmp_path / "extract.osm.pbf", False, transport)
+    else:
+        with _refresh._client("https://api.github.example", transport) as http:
+            http.get("/repos/x/y/releases")
+    (request,) = sent
+    assert request.headers["User-Agent"] == _http.USER_AGENT
+    if client == "index":
+        assert request.headers["Accept"] == "application/vnd.github+json"
+    assert re.fullmatch(
+        r"transitio/\S+ \(\+https://github\.com/cafein-py/transitio\)",
+        _http.USER_AGENT,
+    )

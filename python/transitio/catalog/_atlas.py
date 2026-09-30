@@ -7,9 +7,9 @@ import datetime
 import hashlib
 from pathlib import Path
 
-import httpx
 import platformdirs
 
+from transitio import _http
 from transitio.catalog._client import _stream_download, _write_provenance
 from transitio.exceptions import DownloadError
 
@@ -94,7 +94,7 @@ class TransitlandAtlas:
             if cache_dir
             else Path(platformdirs.user_cache_dir("transitio"))
         )
-        self._http = httpx.Client(
+        self._http = _http.client(
             timeout=timeout, transport=transport, follow_redirects=True
         )
 
