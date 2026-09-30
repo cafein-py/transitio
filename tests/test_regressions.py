@@ -822,3 +822,67 @@ def test_a_capped_calendar_expansion_keeps_the_window_and_target_day(tmp_path):
         reference_date="20280601",
     )
     assert "t-last" in read_entry(output, "trips.txt").decode()
+
+
+def test_a_failed_producer_download_falls_back_to_the_hosted_copy(
+    tmp_path, monkeypatch
+):
+    # A feed whose producer URL timed out or answered 404 was skipped as
+    # "download failed", though its index row names the Mobility Database
+    # hosted copy (urls.latest) the index itself was built from.
+    import json
+
+    import httpx
+
+    import transitio.index as transitio_index
+    from index_fixture import HULL, covered_feed, edge, write_index
+    from transitio.catalog import MobilityDatabase
+    from transitio.pipeline import fetch
+
+    direct = "https://producer.example/gtfs.zip"
+    latest = "https://files.example/mdb-9/latest.zip"
+    feed = {
+        **covered_feed("f-a", coverage_source="crawl"),
+        "coverage": HULL,
+        "mdb": {"urls": {"direct_download": direct, "latest": latest}},
+    }
+    edges = [edge("Q1757", "f-a", tier="local")]
+    index = transitio_index.read_index(
+        write_index(tmp_path / "index", feeds=[feed], edges=edges)
+    )
+    payload = write_zip(tmp_path / "feed.zip", FEED).read_bytes()
+
+    def handler(request):
+        if str(request.url) == latest:
+            return httpx.Response(200, content=payload)
+        return httpx.Response(404)
+
+    class Served(MobilityDatabase):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    monkeypatch.setattr("transitio.catalog.MobilityDatabase", Served)
+    result = fetch(
+        place="Q1757",
+        index=index,
+        directory=tmp_path / "out",
+        crop=False,
+        osm=False,
+        expired="keep",
+    )
+    (entry,) = result.selection
+    assert (entry["decision"], entry["fetched_from"], entry["note"]) == (
+        "delivered",
+        "mdb_latest",
+        "from the Mobility Database hosted copy",
+    )
+    errors = entry["download_errors"]
+    assert errors.startswith("mdb: ") and "404 Not Found" in errors
+    sidecar = result.feeds[0].with_suffix(".provenance.json")
+    provenance = result.reports[0]["summary"]["provenance"]
+    for record in (json.loads(sidecar.read_text()), provenance):
+        assert (record["fetched_from"], record["download_errors"]) == (
+            "mdb_latest",
+            errors,
+        )

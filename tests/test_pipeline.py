@@ -169,6 +169,8 @@ def test_an_area_fetch_delivers_the_same_content_once(pipeline_env, monkeypatch)
     assert first["decision"] == "delivered" and first["path"] == result.feeds[0]
     assert (second["feed_id"], second["same_as"]) == (feed_id, [other])
     assert first["index_window"] is None and first["name"] in {"HSL", "HKL"}
+    # A feed skipped after its download still records where it came from.
+    assert [e["fetched_from"] for e in result.selection] == ["mdb_latest"] * 2
 
 
 OTHER_TRIPS = {**GTFS, "trips.txt": "route_id,service_id,trip_id\nr1,wk,t2\n"}
@@ -449,68 +451,114 @@ def test_fetch_requires_exactly_one_of_aoi_or_place():
         fetch((0, 0, 1, 1), place="X")
 
 
-def test_download_indexed_prefers_mdb_then_atlas(tmp_path):
+DIRECT, STATIC, LATEST = (
+    "https://producer.example/gtfs.zip",
+    "https://atlas.example/gtfs.zip",
+    "https://files.example/mdb-9/latest.zip",
+)
+
+
+@pytest.mark.parametrize(
+    "urls, broken, calls, source, failures",
+    [
+        ((DIRECT, STATIC, LATEST), {}, [DIRECT], "producer", []),
+        (
+            (DIRECT, STATIC, None),
+            {DIRECT: "raise"},
+            [DIRECT, STATIC],
+            "producer",
+            ["mdb: down"],
+        ),
+        (
+            (DIRECT, STATIC, LATEST),
+            {DIRECT: "raise", STATIC: "raise"},
+            [DIRECT, STATIC, LATEST],
+            "mdb_latest",
+            ["mdb: down", "atlas: down"],
+        ),
+        (
+            (DIRECT, None, LATEST),
+            {DIRECT: "html"},
+            [DIRECT, LATEST],
+            "mdb_latest",
+            ["mdb: not a zip archive"],
+        ),
+        (
+            (DIRECT, DIRECT, LATEST),
+            {DIRECT: "raise"},
+            [DIRECT, LATEST],
+            "mdb_latest",
+            ["mdb: down"],
+        ),
+        ((None, STATIC, LATEST), {}, [STATIC], "producer", []),
+        (
+            (DIRECT, STATIC, LATEST),
+            dict.fromkeys((DIRECT, STATIC, LATEST), "raise"),
+            [DIRECT, STATIC, LATEST],
+            None,
+            ["mdb: down", "atlas: down", "mdb_latest: down"],
+        ),
+        ((None, None, None), {}, [], None, []),
+    ],
+    ids=[
+        "direct",
+        "atlas-after-direct",
+        "hosted-copy-last",
+        "html-fails",
+        "each-url-once",
+        "atlas-before-hosted-copy",
+        "all-fail",
+        "no-url",
+    ],
+)
+def test_download_indexed_tries_the_producer_then_the_hosted_copy(
+    tmp_path, urls, broken, calls, source, failures
+):
+    from types import SimpleNamespace
+
     from transitio.exceptions import DownloadError
     from transitio.pipeline._fetch import _download_indexed
 
-    class _FakeFeed:
-        def __init__(self, feed_id, mdb=None, atlas=None):
-            self.feed_id = feed_id
-            self._row = {"mdb": mdb, "atlas": atlas}
-
-    class _RecordingDB:
-        def __init__(self):
-            self.calls = []
-
-        def download_latest(self, feed, directory=None):
-            self.calls.append(feed.latest_dataset_url)
-            return tmp_path / "mdb.zip"
-
-    class _RecordingAtlas:
-        def __init__(self):
-            self.calls = []
-
-        def download(self, feed, directory=None):
-            self.calls.append(feed.static_url)
-            return tmp_path / "atlas.zip"
-
-    db, atlas = _RecordingDB(), _RecordingAtlas()
-    both = _FakeFeed(
-        "f-a",
-        mdb={"urls": {"direct_download": "https://m/a.zip"}},
-        atlas={"urls": {"static_current": "https://a/a.zip"}},
+    direct, static, latest = urls
+    feed = SimpleNamespace(
+        feed_id="f-a",
+        _row={
+            "mdb": {"urls": {"direct_download": direct, "latest": latest}},
+            "atlas": {"urls": {"static_current": static}},
+        },
     )
-    assert _download_indexed(both, db, atlas, tmp_path).name == "mdb.zip"
-    assert db.calls == ["https://m/a.zip"] and atlas.calls == []
-    only = _FakeFeed("f-b", atlas={"urls": {"static_current": "https://a/b.zip"}})
-    assert _download_indexed(only, db, atlas, tmp_path).name == "atlas.zip"
-    assert atlas.calls == ["https://a/b.zip"]
-    with pytest.raises(DownloadError, match="no downloadable url"):
-        _download_indexed(_FakeFeed("f-c"), db, atlas, tmp_path)
+    called = []
 
-    class _FailingDB:
-        def download_latest(self, feed, directory=None):
-            raise RuntimeError("boom")
+    def serve(url, directory):
+        called.append(url)
+        if broken.get(url) == "raise":
+            raise RuntimeError("down")
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "latest.zip"
+        path.write_bytes(b"<html></html>" if broken.get(url) else _zip(GTFS))
+        return path
 
-    class _FailingAtlas:
-        def download(self, feed, directory=None):
-            raise RuntimeError("nope")
-
-    # MDB present but failing falls back to Atlas.
-    both_urls = _FakeFeed(
-        "f-d",
-        mdb={"urls": {"direct_download": "https://m/d.zip"}},
-        atlas={"urls": {"static_current": "https://a/d.zip"}},
+    db = SimpleNamespace(
+        download_latest=lambda proxy, directory: serve(
+            proxy.latest_dataset_url, directory
+        )
     )
-    fallback_atlas = _RecordingAtlas()
-    assert (
-        _download_indexed(both_urls, _FailingDB(), fallback_atlas, tmp_path).name
-        == "atlas.zip"
+    atlas = SimpleNamespace(
+        download=lambda record, directory: serve(record.static_url, directory)
     )
-    assert fallback_atlas.calls == ["https://a/d.zip"]
-    # Both sources failing reports both.
-    with pytest.raises(DownloadError, match="mdb.*atlas"):
-        _download_indexed(both_urls, _FailingDB(), _FailingAtlas(), tmp_path)
+    if source is None:
+        with pytest.raises(DownloadError) as caught:
+            _download_indexed(feed, db, atlas, tmp_path)
+        expected = "; ".join(failures) or "feed f-a has no downloadable url"
+        assert str(caught.value) == expected
+    else:
+        path, fetched_from, seen = _download_indexed(feed, db, atlas, tmp_path)
+        assert (zipfile.is_zipfile(path), fetched_from, seen) == (
+            True,
+            source,
+            failures,
+        )
+    assert called == calls
 
 
 def test_fetch_place_selects_downloads_and_processes(tmp_path, monkeypatch):
@@ -1187,6 +1235,28 @@ def test_fetch_place_falls_back_to_atlas_when_the_dataset_download_fails(
     # The dataset download failed, so the Atlas fallback delivered latest.zip.
     assert [p.name for p in result.feeds] == ["latest.zip"]
     assert result.skipped == []
+    (entry,) = result.selection
+    assert (entry["fetched_from"], entry["download_errors"]) == (
+        "producer",
+        "mdb dataset: dataset download boom",
+    )
+
+
+def test_fetch_place_skips_a_feed_whose_provenance_sidecar_is_unreadable(
+    tmp_path, monkeypatch
+):
+    index = _place_index(
+        tmp_path, {"atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}}}
+    )
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, _gtfs_payload())
+    out = tmp_path / "out"
+    out.mkdir()
+    # The stub writes no sidecar, so this truncated one stays beside the zip.
+    (out / "latest.provenance.json").write_text("{")
+    result = fetch(place="Q1757", index=index, directory=out, crop=False, osm=False)
+    ((feed_id, reason),) = result.skipped
+    assert feed_id == "f-a" and reason.startswith("processing failed: ")
+    assert result.feeds == []
 
 
 def test_fetch_place_from_a_bound_index_uses_its_snapshot(tmp_path, monkeypatch):

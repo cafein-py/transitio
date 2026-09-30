@@ -53,6 +53,8 @@ _SELECTION_FIELDS = (
     "same_as",
     "contained_in",
     "version_of",
+    "fetched_from",
+    "download_errors",
     "path",
 )
 
@@ -701,40 +703,71 @@ def _settle_versions(record, services, protected, day):
 
 
 def _download_indexed(feed, db, atlas, base_dir):
-    """Download an indexed feed, preferring its Mobility Database URL over its
-    Transitland Atlas URL (decision I: MDB wins where a feed has both), and
-    falling back to Atlas when the MDB download fails. Each feed lands in its
-    own digest-named directory under ``base_dir``, so several never collide."""
+    """Download an indexed feed from the first of its URLs that serves a zip
+    archive: the Mobility Database direct download, the Transitland Atlas
+    static feed (decision I: MDB wins where a feed has both), then the
+    Mobility Database hosted copy (``urls.latest``). Each URL is tried once;
+    an attempt fails on any error or when the download is not a zip archive.
+    Each feed lands in its own digest-named directory under ``base_dir``, so
+    several never collide.
+
+    Returns ``(path, fetched_from, failures)``: ``fetched_from`` is
+    ``"producer"`` for the first two URLs and ``"mdb_latest"`` for the hosted
+    copy, ``failures`` the ``"<source>: <error>"`` of each failed attempt.
+    Raises :class:`DownloadError` naming the failures when every attempt
+    fails."""
     from transitio.catalog import AtlasFeed, Feed
     from transitio.catalog._atlas import _feed_dir
     from transitio.exceptions import DownloadError
     from transitio.index.feeds import _parse
 
-    mdb = _parse(feed._row.get("mdb")) or {}
-    mdb_urls = mdb.get("urls") or {}
-    mdb_url = mdb_urls.get("direct_download") or mdb_urls.get("latest")
+    mdb_urls = (_parse(feed._row.get("mdb")) or {}).get("urls") or {}
     atlas_feed = AtlasFeed.from_record(
         _parse(feed._row.get("atlas")) or {}, feed_id=feed.feed_id
     )
-    errors = []
-    if mdb_url:
+
+    def from_mdb(url):
+        proxy = Feed.from_api(
+            {"id": feed.feed_id, "latest_dataset": {"hosted_url": url}}
+        )
+        return db.download_latest(proxy, directory=base_dir / _feed_dir(feed.feed_id))
+
+    def from_atlas(url):
+        return atlas.download(atlas_feed, directory=base_dir)
+
+    attempts = (
+        ("mdb", "producer", mdb_urls.get("direct_download"), from_mdb),
+        ("atlas", "producer", atlas_feed.static_url, from_atlas),
+        ("mdb_latest", "mdb_latest", mdb_urls.get("latest"), from_mdb),
+    )
+    tried, failures = set(), []
+    for label, source, url, download in attempts:
+        if not url or url in tried:
+            continue
+        tried.add(url)
         try:
-            proxy = Feed.from_api(
-                {"id": feed.feed_id, "latest_dataset": {"hosted_url": mdb_url}}
-            )
-            return db.download_latest(
-                proxy, directory=base_dir / _feed_dir(feed.feed_id)
-            )
-        except Exception as error:  # noqa: B902 — fall through to the fallback
-            errors.append(f"mdb: {error}")
-    if atlas_feed.static_url:
-        try:
-            return atlas.download(atlas_feed, directory=base_dir)
-        except Exception as error:  # noqa: B902
-            errors.append(f"atlas: {error}")
-    if errors:
-        raise DownloadError("; ".join(errors))
+            path = download(url)
+        except Exception as error:  # noqa: B902 — try the next URL
+            failures.append(f"{label}: {error}")
+            continue
+        if zipfile.is_zipfile(path):
+            return path, source, failures
+        failures.append(f"{label}: not a zip archive")
+    if failures:
+        raise DownloadError("; ".join(failures))
     raise DownloadError(f"feed {feed.feed_id} has no downloadable url")
+
+
+def _record_source(path, fetched_from, errors):
+    """Add where a download came from and the failed attempts before it to
+    its provenance sidecar (created when absent); returns the sidecar."""
+    from transitio.catalog._client import _write_provenance
+
+    sidecar = path.with_suffix(".provenance.json")
+    provenance = json.loads(sidecar.read_text()) if sidecar.exists() else {}
+    provenance.update(fetched_from=fetched_from, download_errors=errors)
+    _write_provenance(sidecar, provenance)
+    return provenance
 
 
 def _unchanged_since_indexed(feed, http):
@@ -825,14 +858,19 @@ def fetch(
     (checksum-verified, with the hosted canonical-validator report);
     without one, the unversioned latest hosted zip is fetched — a moving
     target with no upstream checksum, documented in its provenance
-    sidecar as such. Every overlapping feed is processed, in a
-    deterministic order with official feeds first; one broken feed never
-    aborts the others — it lands in ``skipped`` with its reason. A download
-    whose content equals a feed already delivered in the call is skipped as
-    ``"same content as <feed id>"`` when its routes are within those
-    delivered from that archive (a feed delivered whole carries all);
-    otherwise it is delivered cut to its own routes, ``same_as`` naming the
-    earlier feed.
+    sidecar as such. On the place path, a feed without a catalogued dataset,
+    or whose dataset download fails, is read from the first of its indexed
+    URLs that serves a zip archive: the Mobility Database direct download,
+    the Transitland Atlas static feed, then the Mobility Database hosted
+    copy. The sidecar and the report's provenance carry ``fetched_from`` and
+    ``download_errors`` as ``selection`` does. Every overlapping feed is
+    processed, in a deterministic order with official feeds first; one
+    broken feed never aborts the others — it lands in ``skipped`` with its
+    reason. A download whose content equals a feed already delivered in the
+    call is skipped as ``"same content as <feed id>"`` when its routes are
+    within those delivered from that archive (a feed delivered whole carries
+    all); otherwise it is delivered cut to its own routes, ``same_as``
+    naming the earlier feed.
 
     On the place path, delivered feeds whose route keys (agency name, route
     short else long name, type) and stops (coordinates at 3 decimals) share
@@ -923,10 +961,11 @@ def fetch(
         candidate order: ``feed_id``, ``name``, ``decision``
         (``"delivered"`` or ``"skipped"``), ``reason`` (why it was skipped),
         ``note`` (about a delivered feed: the routes it was cut to, why a
-        contained feed was kept, a similar feed, an ``agency_timezone`` not
-        equivalent to the zone of most of its stops, e.g. ``"agency_timezone
-        America/New_York; stops in Pacific/Honolulu"``; several join with
-        ``"; "``),
+        contained feed was kept, a similar feed, ``"from the Mobility
+        Database hosted copy"`` after a failed download, an
+        ``agency_timezone`` not equivalent to the zone of most of its stops,
+        e.g. ``"agency_timezone America/New_York; stops in
+        Pacific/Honolulu"``; several join with ``"; "``),
         ``index_window`` (the index's ``[start, end]``; None undated or on
         the area path), ``feed_window`` (the computed window of a validated
         download, delivered or not; None otherwise or when unknown),
@@ -934,7 +973,14 @@ def fetch(
         ``contained_in`` (the containers a containment skip names),
         ``version_of`` (for a left-out version, ``{"feed_id", "route_overlap",
         "stop_overlap"}`` against the highest-ranked kept version it pairs
-        with) and ``path`` (the delivered feed). Windows are ISO dates.
+        with), ``fetched_from`` (where the download came from:
+        ``"mdb_dataset"`` a catalogued dataset, ``"producer"`` the feed's own
+        URL from the Mobility Database or Transitland Atlas, ``"mdb_latest"``
+        the Mobility Database hosted copy; None when nothing was
+        downloaded), ``download_errors`` (the failed download attempts before
+        the one that worked, or all of them when none did, joined with
+        ``"; "``; None when none failed) and ``path`` (the delivered feed).
+        Windows are ISO dates.
         When the OSM extract leaves out parts of the place, a last entry
         with ``feed_id`` None notes them, e.g. ``"OSM area: 1 of 47 parts
         (1783 of 2188 km²)"``. ``FetchResult.selection_table()`` returns it
@@ -1079,7 +1125,13 @@ def fetch(
                 else:
                     path = db.download_latest(feed, directory=target)
             except Exception as error:  # noqa: B902
-                _skip(entry, f"download failed: {error}")
+                _skip(entry, f"download failed: {error}", download_errors=str(error))
+                continue
+            entry["fetched_from"] = "mdb_latest" if dataset is None else "mdb_dataset"
+            try:
+                _record_source(path, entry["fetched_from"], None)
+            except Exception as error:  # noqa: B902 — isolate per-feed failures
+                _skip(entry, f"processing failed: {error}")
                 continue
             twins = [twin for twin, _ in delivered.same_as(path)]
             if twins:
@@ -1254,8 +1306,9 @@ def _fetch_place(
     budgets,
 ):
     """The ``fetch(place=...)`` path: the place geometry is the AOI, feeds come
-    from the index by tier, each is downloaded MDB-then-Atlas (decision I), and
-    a bundled feed is cropped to the routes its matched tiers select, the drop
+    from the index by tier, each is downloaded MDB-then-Atlas (decision I) and
+    then from the MDB hosted copy (:func:`_download_indexed`), and a bundled
+    feed is cropped to the routes its matched tiers select, the drop
     recorded in ``selections``. A feed whose index window misses ``day`` is
     skipped before download when a probe proves the archive unchanged since
     indexed; ``window_day`` is what the computed window is tested against.
@@ -1407,14 +1460,13 @@ def _fetch_place(
                     notes.append("kept: containment not proven current")
             # The hosted validation report only describes the dataset's own
             # bytes, so it is attached only when the dataset supplied them.
-            path = None
-            from_dataset = False
+            path = fetched_from = probed = None
             if dataset is not None:
                 try:
                     path = db.download(
                         dataset, directory=base_dir / _feed_dir(feed.feed_id)
                     )
-                    from_dataset = True
+                    fetched_from = "mdb_dataset"
                 except Exception as error:  # noqa: B902 — try the fallback next
                     errors.append(f"mdb dataset: {error}")
                 if path is None and expired_unchanged(feed, entry):
@@ -1423,20 +1475,31 @@ def _fetch_place(
                 probed = contained == "drop" and feed.feed_id in container_ids
                 probed = probed and unchanged(feed)
                 try:
-                    path = _download_indexed(feed, db, atlas, base_dir)
-                    if probed:
-                        # The proof covers only a download from the probed URL.
-                        sidecar = path.with_suffix(".provenance.json").read_text()
-                        source = json.loads(sidecar).get("source_url")
-                        current[feed.feed_id] = source == probed
+                    path, fetched_from, failures = _download_indexed(
+                        feed, db, atlas, base_dir
+                    )
+                    errors.extend(failures)
                 except Exception as error:  # noqa: B902
                     errors.append(str(error))
+            # Set before the later checks, so a feed skipped after its
+            # download still records where it came from.
+            download_errors = "; ".join(e for e in errors if e) or None
+            entry.update(fetched_from=fetched_from, download_errors=download_errors)
             if path is None:
-                joined = "; ".join(e for e in errors if e)
-                _skip(entry, f"download failed: {joined}")
+                _skip(entry, f"download failed: {download_errors}")
                 continue
+            try:
+                sidecar = _record_source(path, fetched_from, download_errors)
+            except Exception as error:  # noqa: B902 — isolate per-feed failures
+                _skip(entry, f"processing failed: {error}")
+                continue
+            if probed:
+                # The proof covers only a download from the probed URL.
+                current[feed.feed_id] = sidecar.get("source_url") == probed
+            if fetched_from == "mdb_latest" and download_errors:
+                notes.append("from the Mobility Database hosted copy")
             hosted = None
-            if from_dataset:
+            if fetched_from == "mdb_dataset":
                 try:
                     hosted = db.validation_report(dataset)
                 except Exception:  # noqa: B902 — the hosted report is optional
