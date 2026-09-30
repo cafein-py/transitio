@@ -620,6 +620,7 @@ SERVICES = {
     "huge": ("19000101", "20991231"),
 }
 LATER = ("09:00:00", "09:10:00")
+HEADWAY = dict(start_time="08:00:00", end_time="10:00:00", headway_secs="600")
 
 
 def _trips(*specs):
@@ -648,6 +649,9 @@ def _repeats(trips, rows=(), continuous=""):
         stops = list(zip(trip.get("stops", ("s1", "s2")), times, times))
         route, service = trip.get("route", "r1"), trip.get("service", "jan")
         builder.add_trip(route, service, trip["trip_id"], stops, **fields)
+        if "frequency" in trip:
+            row = {"trip_id": trip["trip_id"], **trip["frequency"]}
+            builder.insert_rows("frequencies.txt", [row])
         first = len(builder.tables["stop_times.txt"]) - len(stops)
         for column, values in trip.get("stop_fields", {}).items():
             for offset, value in enumerate(values):
@@ -675,18 +679,35 @@ def _repeats(trips, rows=(), continuous=""):
         ({"route": "r9"}, "absent"),
         ({"trip_id": "t1"}, "absent"),
         ({"stop_fields": {"stop_sequence": ("0" * 19 + "1", "2")}}, "equal"),
+        (({"frequency": HEADWAY}, {"frequency": HEADWAY, "times": LATER}), "equal"),
+        (
+            ({"frequency": HEADWAY}, {"frequency": {**HEADWAY, "headway_secs": "300"}}),
+            "differs",
+        ),
+        ({"frequency": HEADWAY}, "differs"),
+        ({"frequency": {**HEADWAY, "start_time": "8am"}}, "absent"),
+        (
+            {
+                "frequency": HEADWAY,
+                "stop_fields": {"departure_time": ("8am", "08:10:00")},
+            },
+            "absent",
+        ),
     ],
     ids=(
         "identical other-time other-pickup other-route-key moved-stop "
         "moved-within-rounding route-continuous-pickup other-agency other-shape "
         "other-headsign unknown-stop repeated-sequence unknown-route "
-        "listed-twice padded-sequence"
+        "listed-twice padded-sequence headway-shifted other-headway "
+        "headway-vs-timetabled unreadable-frequency unreadable-first-departure"
     ).split(),
 )
 def test_trip_signatures(variant, expected):
     from transitio.gtfs._schedule import trip_signatures
 
-    signed = trip_signatures(_repeats(_trips({}, variant)).tables)
+    # A pair of specs gives both trips; a single spec the second.
+    pair = variant if isinstance(variant, tuple) else ({}, variant)
+    signed = trip_signatures(_repeats(_trips(*pair)).tables)
     signatures = dict(zip(signed["trip_id"], signed["signature"]))
     if expected == "absent":
         assert "t2" not in signatures
@@ -809,10 +830,7 @@ def _links(*pairs):
 ONE = _trips({})
 PAIR = _trips({"block_id": "b"}, {"times": LATER, "block_id": "b"})
 LINKED = _trips({}, {"stops": ("s1", "s3"), "times": LATER})
-FREQUENCY = (
-    "frequencies.txt",
-    dict(trip_id="t1", start_time="08:00:00", end_time="10:00:00", headway_secs="600"),
-)
+FREQUENCY = ("frequencies.txt", dict(trip_id="t1", **HEADWAY))
 TRANSFER = (
     "transfers.txt",
     dict(from_stop_id="s2", to_stop_id="s2", from_trip_id="t1", to_trip_id="t2"),

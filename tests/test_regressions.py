@@ -983,3 +983,21 @@ def test_copies_of_a_trip_under_differently_named_agencies_are_one_service(tmp_p
     for n, files in enumerate((blank, absent)):
         two = write_zip(tmp_path / f"two{n}.zip", {**files, "routes.txt": routes})
         assert _service(two, datetime.date(2026, 6, 1)) is None
+
+
+def test_copies_of_a_headway_network_are_merged_once(tmp_path):
+    # Frequency-based trips were never compared, so a merge kept every copy
+    # of a headway-only network.
+    from transitio.edit import FeedEditor
+    from transitio.gtfs import merge_feeds
+
+    frequencies = "trip_id,start_time,end_time,headway_secs\nt1,08:00:00,10:00:00,600\n"
+    copies = [
+        write_zip(tmp_path / f"{n}.zip", {**MIDLAND, "frequencies.txt": frequencies})
+        for n in range(2)
+    ]
+    report = merge_feeds(copies, tmp_path / "merged.zip", check=False)
+    merged = FeedEditor(tmp_path / "merged.zip").tables
+    for name in ("trips.txt", "frequencies.txt"):
+        assert list(merged[name]["trip_id"]) == ["f1:t1"]
+    assert report["duplicate_trips"]["dropped"] == 1

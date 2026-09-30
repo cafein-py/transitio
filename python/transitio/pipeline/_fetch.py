@@ -577,11 +577,11 @@ def _read_tables(path, names, max_total_bytes=None):
 def _service(path, day=None, max_total_bytes=None):
     """A delivered feed's route keys, rounded stop coordinates and trip
     count, and whether it is one ``unnamed`` agency; with a ``day``, the
-    signatures of its trips running then that are not frequency-based,
-    whether those are all of them, and whether it has transfers or pathways,
-    from those tables only, read as ``FeedEditor`` does. A feed is one
-    unnamed agency when it has at most one agency row, none named, and its
-    routes name at most one ``agency_id``. None when the tables are over
+    signatures of its trips running then, whether those are all of them,
+    and whether it has transfers or pathways, from those tables only, read
+    as ``FeedEditor`` does. A feed is one unnamed agency when it has at most
+    one agency row, none named, and its routes name at most one
+    ``agency_id``. None when the tables are over
     ``max_total_bytes``, a route key has a blank part (an unnamed agency's
     blank agency aside), a stop or station lacks coordinates, or with a
     ``day`` its calendars cannot be read."""
@@ -633,11 +633,7 @@ def _service(path, day=None, max_total_bytes=None):
         running = dates.loc[dates["date"] == pd.Timestamp(day), "service_id"]
         on_day = trips.loc[trips["service_id"].isin(running), "trip_id"]
         signed = trip_signatures(tables)
-        repeated = tables.get("frequencies.txt", pd.DataFrame(columns=["trip_id"]))
-        signed = signed[
-            signed["trip_id"].isin(on_day)
-            & ~signed["trip_id"].isin(repeated["trip_id"])
-        ]
+        signed = signed[signed["trip_id"].isin(on_day)]
     except Exception:  # noqa: B902 — an unreadable feed is never grouped
         return None
     found.update(
@@ -933,7 +929,8 @@ def fetch(
     compare routes by name and type only. With ``when``, one is left out as
     ``"another version of <id>"`` when a kept version pairs with it and kept
     versions run, by trip signature (which leaves out the agency), every
-    non-frequency trip it runs on the day; the top version and the
+    trip it runs on the day, a headway trip matching one with the same
+    stops, relative times and frequency rows; the top version and the
     containers a left-out feed relied on stay, as does one with transfers or
     pathways. A left-out version's fares are not delivered. Without ``when``
     none is left out; similar feeds are noted. A feed whose routes, stops

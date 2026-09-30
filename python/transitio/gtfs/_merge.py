@@ -251,20 +251,20 @@ def merge_tables(
     duplicate_trips : {"drop", "keep"}, default "drop"
         ``"drop"`` leaves out each input's trips that repeat trips kept
         from the inputs before it: same route name and type, stops, times
-        and pickup and drop-off behaviour (see
-        :func:`~transitio.gtfs._schedule.trip_signatures`). The agency,
-        headsigns, short names, ``shape_id`` and shape geometry,
+        and pickup and drop-off behaviour, a frequency-based trip's times
+        counted from its first departure and with the same frequencies.txt
+        rows (see :func:`~transitio.gtfs._schedule.trip_signatures`). The
+        agency, headsigns, short names, ``shape_id`` and shape geometry,
         ``timepoint`` and ``shape_dist_traveled`` may differ; the earlier
         trip's are kept.
         On each date, one earlier trip covers one later trip, and a later
         trip goes only when covered on every date it runs; a block
         (``block_id``) of several trips goes only when one earlier block
-        covers it trip for trip. Frequency-based trips, trips in a
-        trip-specific transfer and trips of a calendar spanning over
-        40,000 days are never compared. A dropped trip's rows go with it,
-        and each of its stops a kept trip still serves is linked both ways
-        to the earlier trip's stop (``transfer_type`` 2). ``"keep"`` keeps
-        every trip.
+        covers it trip for trip. Trips in a trip-specific transfer and
+        trips of a calendar spanning over 40,000 days are never compared.
+        A dropped trip's rows go with it, and each of its stops a kept trip
+        still serves is linked both ways to the earlier trip's stop
+        (``transfer_type`` 2). ``"keep"`` keeps every trip.
 
     Returns
     -------

@@ -838,7 +838,8 @@ def test_date_rules_decide_before_and_after_download(
 def _network(agency="HSL", start="20260101", stops=None, hours=(8,), **options):
     """GTFS of ``agency`` whose ``routes`` each run a trip from s2 to s3 at
     each of ``hours``, daily from ``start`` through 2026, among stops s<i>
-    (s0 to s9 unless ``stops`` names them)."""
+    (s0 to s9 unless ``stops`` names them); with a ``headway``, each trip
+    repeats that often for an hour."""
     stops = range(10) if stops is None else stops
     trips = [(r, h) for r in options.get("routes", ("r1",)) for h in hours]
     times = (
@@ -858,6 +859,14 @@ def _network(agency="HSL", start="20260101", stops=None, hours=(8,), **options):
     }
     if options.get("transfers"):
         tables["transfers.txt"] = "from_stop_id,to_stop_id,transfer_type\ns2,s3,0\n"
+    if options.get("headway"):
+        tables["frequencies.txt"] = (
+            "trip_id,start_time,end_time,headway_secs\n"
+            + "".join(
+                f"{r}{h},{h:02}:00:00,{h + 1:02}:00:00,{options['headway']}\n"
+                for r, h in trips
+            )
+        )
     return _zip(tables)
 
 
@@ -924,6 +933,16 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
         ({"A": NEW, "B": {**OLD, "hours": (8, 9)}}, DAY, {"A": "+", "B": ADDS}),
         ({"A": NEW, "B": {**OLD, "hours": (9,)}}, DAY, {"A": "+", "B": ADDS}),
         (
+            {"A": {**NEW, "headway": 600}, "B": {**OLD, "headway": 600}},
+            DAY,
+            {"A": "+", "B": "- another version of A [A 1.0 1.0]"},
+        ),
+        (
+            {"A": {**NEW, "headway": 600}, "B": {**OLD, "headway": 300}},
+            DAY,
+            {"A": "+", "B": ADDS},
+        ),
+        (
             {"A": {**NEW, "hours": (8, 9)}, "B": OLD, "C": {**OLDER, "hours": (8, 10)}},
             DAY,
             {"A": "+", "B": "- another version of A [A 1.0 1.0]", "C": ADDS},
@@ -972,7 +991,8 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
         "contained-renewed container-cropped container-expired "
         "partial-copy-first partial-copy-after version-covered "
         "version-legal-form version-unnamed-agency version-extra-trip "
-        "version-other-times versions-three versions-three-reversed "
+        "version-other-times version-headway version-other-headway "
+        "versions-three versions-three-reversed "
         "version-chain version-protected-container "
         "version-same-content-container version-under-stop-threshold "
         "version-transfers versions-no-study-day"
