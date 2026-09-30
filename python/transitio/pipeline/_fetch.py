@@ -9,6 +9,7 @@ import io
 import json
 import os
 import pathlib
+import tempfile
 import warnings
 import zipfile
 
@@ -403,20 +404,15 @@ def _process_feed(
     return path, report, fixes, present_routes, window
 
 
-def _hash_stream(handle):
-    digest = hashlib.sha256()
-    for chunk in iter(lambda: handle.read(1 << 20), b""):
-        digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _snapshot(path):
     """``(archive SHA-256, entries)`` of the zip at ``path``, read through one
     open: the entries as sorted ``(name, CRC-32, size)`` from the central
     directory, nothing decompressed. None when it cannot be read."""
+    from transitio._http import sha256_stream
+
     try:
         with open(path, "rb") as handle:
-            digest = _hash_stream(handle)
+            digest = sha256_stream(handle)
             handle.seek(0)
             with zipfile.ZipFile(handle) as archive:
                 listing = sorted(
@@ -434,9 +430,11 @@ def _entry_digests(path, digest):
     SHA-256)``, one row per entry, read through one open that must still hold
     the archive ``digest`` recorded earlier; None when it does not or the
     archive cannot be read."""
+    from transitio._http import sha256_stream
+
     try:
         with open(path, "rb") as handle:
-            if _hash_stream(handle) != digest:
+            if sha256_stream(handle) != digest:
                 return None
             handle.seek(0)
             rows = []
@@ -445,7 +443,7 @@ def _entry_digests(path, digest):
                     if info.is_dir():
                         continue
                     with archive.open(info) as member:
-                        entry = _hash_stream(member)
+                        entry = sha256_stream(member)
                     rows.append((info.filename, info.CRC, info.file_size, entry))
         return tuple(sorted(rows))
     except Exception:  # noqa: B902 — an unreadable archive matches nothing
@@ -790,14 +788,49 @@ def _settle_versions(record, services, protected, day):
     return removed
 
 
-def _download_indexed(feed, db, atlas, base_dir):
+class _Archives:
+    """The archives a call reads feeds from by URL fragment, each downloaded
+    into ``directory`` once, keyed by its URL without the fragment; a failed
+    download is recorded and never repeated."""
+
+    def __init__(self, directory):
+        self._directory = pathlib.Path(directory)
+        self._found = {}
+
+    def get(self, http, url):
+        """``(path, sha256, retrieved_at)`` of the archive at ``url``,
+        downloaded with the ``http`` client when first asked for. Raises
+        :class:`DownloadError` with the failure's text when that download
+        failed."""
+        from transitio import _http
+        from transitio.exceptions import DownloadError
+
+        if url not in self._found:
+            path = self._directory / f"{len(self._found)}.zip"
+            try:
+                digest = _http.download(http, url, path)
+            except Exception as error:  # noqa: B902 — recorded for later calls
+                self._found[url] = str(error)
+            else:
+                now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                self._found[url] = (path, digest, now)
+        found = self._found[url]
+        if isinstance(found, str):
+            raise DownloadError(found)
+        return found
+
+
+def _download_indexed(feed, db, atlas, base_dir, archives, max_total_bytes=None):
     """Download an indexed feed from the first of its URLs that serves a zip
     archive: the Mobility Database direct download, the Transitland Atlas
     static feed (decision I: MDB wins where a feed has both), then the
     Mobility Database hosted copy (``urls.latest``). Each URL is tried once;
     an attempt fails on any error or when the download is not a zip archive.
     Each feed lands in its own digest-named directory under ``base_dir``, so
-    several never collide.
+    several never collide. A URL whose fragment names a member of the archive
+    (:func:`~transitio.catalog._nested.split_fragment`) takes the archive
+    from ``archives`` and extracts that member within ``max_total_bytes``;
+    its sidecar records the archive's URL and SHA-256 beside the feed's.
 
     Returns ``(path, fetched_from, failures)``: ``fetched_from`` is
     ``"producer"`` for the first two URLs and ``"mdb_latest"`` for the hosted
@@ -806,6 +839,8 @@ def _download_indexed(feed, db, atlas, base_dir):
     fails."""
     from transitio.catalog import AtlasFeed, Feed
     from transitio.catalog._atlas import _feed_dir
+    from transitio.catalog._client import _write_provenance
+    from transitio.catalog._nested import extract_feed, split_fragment
     from transitio.exceptions import DownloadError
     from transitio.index.feeds import _parse
 
@@ -823,18 +858,36 @@ def _download_indexed(feed, db, atlas, base_dir):
     def from_atlas(url):
         return atlas.download(atlas_feed, directory=base_dir)
 
+    def from_archive(client, url, outer, member):
+        archive, archive_sha256, retrieved_at = archives.get(client._http, outer)
+        path = base_dir / _feed_dir(feed.feed_id) / "latest.zip"
+        provenance = {
+            "feed_id": feed.feed_id,
+            "source_url": url,
+            "archive_url": outer,
+            "archive_sha256": archive_sha256,
+            "sha256": extract_feed(archive, member, path, max_total_bytes),
+            "retrieved_at": retrieved_at,
+        }
+        _write_provenance(path.with_suffix(".provenance.json"), provenance)
+        return path
+
     attempts = (
-        ("mdb", "producer", mdb_urls.get("direct_download"), from_mdb),
-        ("atlas", "producer", atlas_feed.static_url, from_atlas),
-        ("mdb_latest", "mdb_latest", mdb_urls.get("latest"), from_mdb),
+        ("mdb", "producer", mdb_urls.get("direct_download"), from_mdb, db),
+        ("atlas", "producer", atlas_feed.static_url, from_atlas, atlas),
+        ("mdb_latest", "mdb_latest", mdb_urls.get("latest"), from_mdb, db),
     )
     tried, failures = set(), []
-    for label, source, url, download in attempts:
+    for label, source, url, download, client in attempts:
         if not url or url in tried:
             continue
         tried.add(url)
+        outer, member = split_fragment(url)
         try:
-            path = download(url)
+            if member is None:
+                path = download(url)
+            else:
+                path = from_archive(client, url, outer, member)
         except Exception as error:  # noqa: B902 — try the next URL
             failures.append(f"{label}: {error}")
             continue
@@ -864,7 +917,8 @@ def _unchanged_since_indexed(feed, http):
     static feed, else the Mobility Database direct download), carrying the
     ETag and Last-Modified it recorded, answers 304 Not Modified. Returns
     that URL, or None: any other answer, a failed probe or no recorded
-    validator is no proof."""
+    validator is no proof. A URL fragment is not sent, so the probe of a
+    feed inside a larger archive reaches that archive."""
     from transitio.catalog._atlas import STATIC_URL
     from transitio.index.feeds import _parse, _scalar
 
@@ -950,12 +1004,16 @@ def fetch(
     or whose dataset download fails, is read from the first of its indexed
     URLs that serves a zip archive: the Mobility Database direct download,
     the Transitland Atlas static feed, then the Mobility Database hosted
-    copy. The sidecar and the report's provenance carry ``fetched_from`` and
-    ``download_errors`` as ``selection`` does. Every overlapping feed is
-    processed, in a deterministic order with official feeds first; one
-    broken feed never aborts the others — it lands in ``skipped`` with its
-    reason. A feed lacking a file GTFS requires is skipped, with or without
-    ``when`` and ``repair``: ``"missing required file agency.txt"`` (several
+    copy. A URL fragment names the member of the archive the feed is read
+    from, a nested zip (``.../gtfs.zip#1/google_transit.zip``) or a folder;
+    each such archive is downloaded once per call, and the feed's sidecar
+    records its ``archive_url`` and ``archive_sha256``. The sidecar and the
+    report's provenance carry ``fetched_from`` and ``download_errors`` as
+    ``selection`` does. Every overlapping feed is processed, in a
+    deterministic order with official feeds first; one broken feed never
+    aborts the others — it lands in ``skipped`` with its reason. A feed
+    lacking a file GTFS requires is skipped, with or without ``when`` and
+    ``repair``: ``"missing required file agency.txt"`` (several
     names sorted, ``"missing required files ..."``) or ``"missing calendar.txt
     and calendar_dates.txt"``, joined with ``"; "`` when both apply; a crop
     that keeps no trip leaves both calendar files out. A download whose
@@ -1051,8 +1109,9 @@ def fetch(
         reason naming the file and the budget to raise. A reached
         ``max_notices_per_file`` does not stop the crop (the feed's report
         then carries ``notice_limit_reached``), but it does stop
-        ``repair=True``. With ``when``, ``reference_date`` is the study day;
-        a different one raises ``ValueError``.
+        ``repair=True``. ``max_total_bytes`` also bounds a feed read from
+        inside a larger archive. With ``when``, ``reference_date`` is the
+        study day; a different one raises ``ValueError``.
 
     Returns
     -------
@@ -1510,10 +1569,14 @@ def _fetch_place(
         else pathlib.Path(cache_dir or platformdirs.user_cache_dir("transitio"))
         / "gtfs"
     )
+    base_dir.mkdir(parents=True, exist_ok=True)
+    # Archives read by URL fragment live only for the call.
     with (
         MobilityDatabase(refresh_token, cache_dir=cache_dir) as db,
         TransitlandAtlas(cache_dir=cache_dir) as atlas,
+        tempfile.TemporaryDirectory(dir=base_dir) as scratch,
     ):
+        archives = _Archives(scratch)
         if when is not None and not db._refresh_token:
             warnings.warn(
                 "no Mobility Database API token: 'when' cannot select "
@@ -1586,7 +1649,7 @@ def _fetch_place(
                 probed = probed and unchanged(feed)
                 try:
                     path, fetched_from, failures = _download_indexed(
-                        feed, db, atlas, base_dir
+                        feed, db, atlas, base_dir, archives, budget
                     )
                     errors.extend(failures)
                 except Exception as error:  # noqa: B902

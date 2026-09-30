@@ -1,8 +1,10 @@
 import datetime
 import gzip
 import hashlib
+import io
 import json
 import time
+import zipfile
 
 import httpx
 import pytest
@@ -17,6 +19,7 @@ from transitio.catalog import (
 )
 from transitio.catalog._client import _bounds
 from transitio.catalog._models import Dataset, Feed
+from transitio.catalog._nested import extract_feed, split_fragment
 from transitio.exceptions import DownloadError, MissingTokenError
 
 FEED_RECORD = {
@@ -721,3 +724,106 @@ def test_download_retries_and_resumes(
             assert str(caught.value) == f"{URL}: {expected}"
             assert not list(tmp_path.iterdir())
     assert (requests, slept) == (sent, waits)
+
+
+@pytest.mark.parametrize(
+    "fragment, member",
+    [
+        pytest.param(
+            "#3/google_transit.zip", ("archive", "3/google_transit.zip"), id="archive"
+        ),
+        pytest.param("#feed%20dir/", ("folder", "feed dir"), id="folder"),
+        pytest.param("#/abs.zip", None, id="absolute"),
+        pytest.param("#a/../b.zip", None, id="parent"),
+        pytest.param("", None, id="no-fragment"),
+    ],
+)
+def test_split_fragment_names_the_member(fragment, member):
+    url = "https://data.example/gtfs.zip"
+    assert split_fragment(url + fragment) == (url, member)
+
+
+def _zip_bytes(files):
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, content in files.items():
+            archive.writestr(name, content)
+    return buffer.getvalue()
+
+
+NESTED = {"agency.txt": b"agency_id\na\n", "stops.txt": b"stop_id\ns1\n"}
+INNER = _zip_bytes(NESTED)
+OVER = (
+    "declares {} uncompressed bytes, over the 10 budget "
+    "(raise max_total_bytes to read it)"
+)
+
+
+@pytest.mark.parametrize(
+    "member, budget, expected",
+    [
+        pytest.param(
+            ("archive", "1/google_transit.zip"), None, INNER, id="nested-as-is"
+        ),
+        pytest.param(
+            ("archive", "2/google_transit.zip"), None, NESTED, id="nested-dir"
+        ),
+        pytest.param(("folder", "data"), None, NESTED, id="folder"),
+        pytest.param(
+            ("archive", "9/google_transit.zip"),
+            None,
+            "inner archive '9/google_transit.zip' not in the archive",
+            id="missing-archive",
+        ),
+        pytest.param(
+            ("folder", "nothere"), None, "no GTFS files under 'nothere'", id="none"
+        ),
+        pytest.param(
+            ("archive", "1/google_transit.zip"),
+            10,
+            "inner archive '1/google_transit.zip' " + OVER.format(len(INNER)),
+            id="nested-over-budget",
+        ),
+        pytest.param(
+            ("folder", "data"),
+            10,
+            "the feed under 'data' " + OVER.format(sum(map(len, NESTED.values()))),
+            id="folder-over-budget",
+        ),
+    ],
+)
+def test_extract_feed_writes_the_named_member(tmp_path, member, budget, expected):
+    in_folder = {f"v2/{name}": content for name, content in NESTED.items()}
+    outer = tmp_path / "outer.zip"
+    outer.write_bytes(
+        _zip_bytes(
+            {
+                "1/google_transit.zip": INNER,
+                "2/google_transit.zip": _zip_bytes(
+                    {
+                        **in_folder,
+                        "v2/old/stops.txt": b"stop_id\n",
+                        "__MACOSX/v2/._stops.txt": b"",
+                        "readme.txt": b"PTV",
+                    }
+                ),
+                **{f"data/{name}": content for name, content in NESTED.items()},
+                "readme.txt": b"PTV",
+            }
+        )
+    )
+    target = tmp_path / "feed" / "latest.zip"
+    if isinstance(expected, str):
+        with pytest.raises(DownloadError) as caught:
+            extract_feed(outer, member, target, budget)
+        assert str(caught.value) == expected
+        assert not list(target.parent.iterdir())
+        return
+    digest = extract_feed(outer, member, target, budget)
+    assert digest == hashlib.sha256(target.read_bytes()).hexdigest()
+    if isinstance(expected, bytes):
+        assert target.read_bytes() == expected
+    else:
+        with zipfile.ZipFile(target) as feed:
+            assert {name: feed.read(name) for name in feed.namelist()} == expected
+    assert [path.name for path in target.parent.iterdir()] == ["latest.zip"]

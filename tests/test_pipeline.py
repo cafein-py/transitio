@@ -548,11 +548,11 @@ def test_download_indexed_tries_the_producer_then_the_hosted_copy(
     )
     if source is None:
         with pytest.raises(DownloadError) as caught:
-            _download_indexed(feed, db, atlas, tmp_path)
+            _download_indexed(feed, db, atlas, tmp_path, None)
         expected = "; ".join(failures) or "feed f-a has no downloadable url"
         assert str(caught.value) == expected
     else:
-        path, fetched_from, seen = _download_indexed(feed, db, atlas, tmp_path)
+        path, fetched_from, seen = _download_indexed(feed, db, atlas, tmp_path, None)
         assert (zipfile.is_zipfile(path), fetched_from, seen) == (
             True,
             source,

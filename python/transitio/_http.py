@@ -1,5 +1,6 @@
 """HTTP client settings and the file download shared by transitio's fetchers."""
 
+import contextlib
 import hashlib
 import os
 import re
@@ -47,10 +48,16 @@ def client(*, headers=None, **options):
 
 def sha256_file(path):
     """The SHA-256 hex digest of a file, read in bounded chunks."""
-    digest = hashlib.sha256()
     with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(chunk)
+        return sha256_stream(handle)
+
+
+def sha256_stream(handle):
+    """The SHA-256 hex digest of the rest of a binary stream, read in bounded
+    chunks."""
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: handle.read(1 << 20), b""):
+        digest.update(chunk)
     return digest.hexdigest()
 
 
@@ -72,20 +79,27 @@ def download(client, url, path):
     the last failure.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    with replacing(path) as handle:
+        return _fetch(client, url, _Partial(handle))
+
+
+@contextlib.contextmanager
+def replacing(path):
+    """Write ``path`` through a unique partial file beside it, opened for
+    binary writing and reading: the partial replaces ``path`` when the block
+    completes and is closed and removed when it fails."""
     fd, partial = tempfile.mkstemp(
         dir=path.parent, prefix=path.name + ".", suffix=".part"
     )
     try:
-        # The descriptor is wrapped before the request, so a connection or
-        # HTTP failure closes it rather than leaking it (and lets Windows
-        # unlink the temp).
-        with os.fdopen(fd, "wb") as handle:
-            digest = _fetch(client, url, _Partial(handle))
+        # The descriptor is wrapped at once, so a failure closes it rather
+        # than leaking it (and lets Windows unlink the partial).
+        with os.fdopen(fd, "w+b") as handle:
+            yield handle
         os.replace(partial, path)
     except BaseException:
         _discard(partial)
         raise
-    return digest
 
 
 def _discard(path):

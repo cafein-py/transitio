@@ -1173,3 +1173,77 @@ def test_a_stalled_extract_download_is_retried(tmp_path, monkeypatch):
     digest = _download(url, path, False, httpx.MockTransport(handler))
     assert (path.read_bytes(), digest) == (payload, hashlib.sha256(payload).hexdigest())
     assert (len(requests), list(tmp_path.glob("*.part"))) == (2, [])
+
+
+@pytest.mark.parametrize("status", [200, 404])
+def test_feeds_nested_in_one_archive_are_read_from_it_once(
+    tmp_path, monkeypatch, status
+):
+    # Feeds whose URL fragment names a zip inside a larger archive were each
+    # delivered as the whole archive, downloaded once per feed, and skipped as
+    # "feed has no usable trips.txt".
+    import json
+
+    import httpx
+
+    import transitio.index as transitio_index
+    from index_fixture import HULL, covered_feed, edge, write_index
+    from transitio.catalog import TransitlandAtlas
+    from transitio.pipeline import fetch
+
+    outer = "https://data.example/outer.zip"
+    urls = {f"f-{n}": f"{outer}#{n}/google_transit.zip" for n in (1, 2)}
+    feeds = [
+        {
+            **covered_feed(feed_id, coverage_source="crawl"),
+            "coverage": HULL,
+            "atlas": {"urls": {"static_current": url}},
+        }
+        for feed_id, url in urls.items()
+    ]
+    edges = [edge("Q1757", feed_id, tier="local") for feed_id in urls]
+    index = transitio_index.read_index(
+        write_index(tmp_path / "index", feeds=feeds, edges=edges)
+    )
+    stops = {"f-1": FEED["stops.txt"], "f-2": FEED["stops.txt"].replace("60.", "61.")}
+    inner = {
+        f"{n}/google_transit.zip": write_zip(
+            tmp_path / f"{n}.zip", {**FEED, "stops.txt": stops[f"f-{n}"]}
+        ).read_bytes()
+        for n in (1, 2)
+    }
+    payload = write_zip(tmp_path / "outer.zip", inner).read_bytes()
+    requests = []
+
+    def handler(request):
+        requests.append((request.method, request.url.path))
+        return httpx.Response(status, content=payload if status == 200 else b"")
+
+    class Served(TransitlandAtlas):
+        def __init__(self, **kwargs):
+            super().__init__(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas", Served)
+    out = tmp_path / "out"
+    result = fetch(
+        place="Q1757", index=index, directory=out, crop=False, osm=False, expired="keep"
+    )
+    assert requests == [("GET", "/outer.zip")]
+    assert all(path.name.startswith("id-") for path in out.iterdir())
+    if status == 404:
+        reason = f"download failed: atlas: {outer}: HTTP 404 Not Found"
+        assert sorted(result.skipped) == [("f-1", reason), ("f-2", reason)]
+        return
+    assert {entry["feed_id"]: entry["decision"] for entry in result.selection} == {
+        "f-1": "delivered",
+        "f-2": "delivered",
+    }
+    for entry in result.selection:
+        path = entry["path"]
+        assert read_entry(path, "stops.txt").decode() == stops[entry["feed_id"]]
+        sidecar = json.loads(path.with_suffix(".provenance.json").read_text())
+        assert (sidecar["source_url"], sidecar["archive_url"]) == (
+            urls[entry["feed_id"]],
+            outer,
+        )

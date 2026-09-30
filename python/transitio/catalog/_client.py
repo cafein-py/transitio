@@ -6,7 +6,6 @@ import datetime
 import json
 import os
 import re
-import tempfile
 import time
 import warnings
 from pathlib import Path
@@ -59,16 +58,8 @@ def _write_provenance(path, data):
     Portable -- the fresh unique temp name needs no ``O_NOFOLLOW``, and
     ``os.replace`` swaps it in without following a symlink at the target."""
     body = json.dumps(data, indent=2).encode("utf-8")
-    fd, partial = tempfile.mkstemp(
-        dir=path.parent, prefix=path.name + ".", suffix=".part"
-    )
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(body)
-        os.replace(partial, path)
-    except BaseException:
-        _http._discard(partial)
-        raise
+    with _http.replacing(path) as handle:
+        handle.write(body)
 
 
 class MobilityDatabase:
