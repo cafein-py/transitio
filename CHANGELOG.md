@@ -86,6 +86,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer compete with a city that carries it as its name. Istanbul,
   Kuala Lumpur, Dubai, Hong Kong and Cape Town resolved as ambiguous,
   and Taipei resolved to its metro.
+- `place()` counts as a place's own names its name and its labels in its
+  country's languages (from Unicode CLDR 47) or English. A place that
+  reaches a name only through a label in another language no longer
+  competes with one carrying the name as its own, unless it is far better
+  known, and the feed-lead veto compares own names. `suggest()` ranks a
+  label in another language after aliases. "München" was ambiguous
+  between Munich and a village of that name, and "Buenos Aires" matched
+  127 places, Pinto in Spain among them through its Irish label.
+- `place(kind="metro")` answers with one metro when several definitions
+  delineate it (their metros share a member place), the first of
+  functional urban area, metropolitan statistical area, metropolitan
+  region and city-region (FAO). The new `definition=` argument picks a
+  definition and implies `kind="metro"`; one no metro carries raises
+  `ValueError` listing the definitions the index holds. Stockholm, Basel,
+  Strasbourg, Helsinki and Paris tied among their definitions.
+- `fetch` counts each delivered feed's located stops (those with usable
+  coordinates) outside `osm_area` in a new `selection` field,
+  `stops_outside_osm`, and the last selection entry notes the total, e.g.
+  `"OSM area: 4970 of 10026 located stops outside it"`. The crop keeps
+  each trip that serves the area whole, so such stops can get no
+  footpaths in cafein. cafein gave 3,418 of Glasgow's 10,026 stops no
+  footpaths, and fetch did not say why.
 
 ### Fixed
 

@@ -1617,3 +1617,57 @@ def test_an_empty_default_view_is_not_fetched_silently(
     assert [(e["feed_id"], e["decision"], e["note"]) for e in result.selection] == [
         (None, None, note)
     ]
+
+
+@pytest.mark.parametrize("osm", [True, False])
+def test_stops_beyond_the_osm_area_are_counted(tmp_path, monkeypatch, osm):
+    # The crop keeps whole trips, so the stops of a kept trip beyond the place
+    # lay outside the OSM area, where cafein gives them no footpaths, and
+    # fetch neither counted nor noted them.
+    import datetime
+    import pathlib
+
+    import shapely
+
+    import transitio.index as transitio_index
+    from index_fixture import covered_feed, edge, place, write_index
+    from transitio.pipeline import fetch
+
+    monkeypatch.setattr(
+        "transitio.pipeline._fetch._today", lambda: datetime.date(2026, 6, 1)
+    )
+    feed = {
+        **covered_feed("f-a"),
+        "atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}},
+    }
+    city = place("c", "city", geometry=shapely.to_wkb(shapely.box(*CITY_BBOX)).hex())
+    index = transitio_index.read_index(
+        write_index(
+            tmp_path / "index",
+            feeds=[feed],
+            places=[city],
+            edges=[edge("c", "f-a", tier="local")],
+        )
+    )
+    # Trip t-in runs on to Espoo, beyond the place grown by 1.6 km.
+    tables = dict(FEED)
+    tables["stop_times.txt"] += "t-in,08:30:00,08:30:00,out1,3\n"
+
+    def download(self, feed, directory=None):
+        return write_zip(pathlib.Path(directory) / "latest.zip", tables)
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas.download", download)
+    monkeypatch.setattr("transitio.osm.fetch_pbf", lambda *a, **k: tmp_path / "a.pbf")
+    result = fetch(place="c", index=index, directory=tmp_path / "out", osm=osm)
+    entry, *notes = result.selection
+    assert entry["decision"] == "delivered"
+    if not osm:
+        assert (entry["stops_outside_osm"], notes) == (None, [])
+        return
+    (last,) = notes
+    assert (entry["stops_outside_osm"], last["feed_id"], last["note"]) == (
+        1,
+        None,
+        "OSM area: 1 of 3 located stops outside it",
+    )
