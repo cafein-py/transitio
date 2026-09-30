@@ -552,7 +552,10 @@ def merge_feeds(
         ``"header_fixes"`` key listing the header names normalised when
         an input was read (see :class:`~transitio.edit.FeedEditor`), one
         ``{"feed": <input position>, "file": ..., "columns": [{"from":
-        [<original names>], "to": <name>}, ...]}`` per input and file.
+        [<original names>], "to": <name>}, ...]}`` per input and file, and
+        a ``"trimmed_values"`` key counting the values stripped of
+        surrounding whitespace, one ``{"feed": <input position>, "file":
+        ..., "count": <n>}`` per input and file.
         ``"timezone_interval"`` gives the UTC instants ``[start, end]``
         (ISO 8601) over which time zone names are compared, and
         ``"timezone_aliases"`` maps each ``agency_timezone`` name replaced
@@ -572,6 +575,7 @@ def merge_feeds(
     table_sets = []
     extra_entries = []
     header_fixes = []
+    trimmed_values = []
     sources = []
     for position, feed in enumerate(feeds):
         if getattr(feed, "tables", None) is None:
@@ -580,6 +584,11 @@ def merge_feeds(
         header_fixes.extend(
             {"feed": position, "file": name, "columns": fixes[name]}
             for name in sorted(fixes)
+        )
+        counts = getattr(feed, "_value_fixes", {})
+        trimmed_values.extend(
+            {"feed": position, "file": name, "count": counts[name]}
+            for name in sorted(counts)
         )
         table_sets.append(feed.tables)
         extra_entries.append(list(getattr(feed, "_extra_entries", {})))
@@ -629,6 +638,7 @@ def merge_feeds(
         "dropped_files": dropped,
         "skipped_feeds": skipped,
         "header_fixes": header_fixes,
+        "trimmed_values": trimmed_values,
         **details,
     }
     builder = FeedBuilder()

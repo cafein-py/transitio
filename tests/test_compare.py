@@ -154,8 +154,8 @@ def test_sampling_suppression_ranks_after_complete_counts(tmp_path):
             **{
                 "stops.txt": (
                     "stop_id,stop_name,stop_lat,stop_lon\n"
-                    "s1, Kamppi,60.169,24.931\n"
-                    "s2, Steissi,60.171,24.941\n"
+                    's1,"Kam\nppi",60.169,24.931\n'
+                    's2,"Stei\nssi",60.171,24.941\n'
                 )
             },
         ),

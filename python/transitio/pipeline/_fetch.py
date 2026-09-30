@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import csv
 import dataclasses
 import datetime
 import hashlib
@@ -131,25 +130,39 @@ class FetchResult:
 
 
 def _feed_modes(path):
-    """Coarse modes served by a feed, from its routes.txt.
+    """Coarse modes served by a feed, from its routes.txt with values and
+    header names stripped as ``FeedEditor`` strips them; rows with extra
+    fields are skipped.
 
     Returns ``None`` when routes.txt cannot be read (missing, over the
     byte budget, or malformed) so the caller can report the feed as
     undeterminable rather than silently unfiltered.
     """
+    import pandas as pd
+
+    from transitio.edit._editor import _normalise_table
+
     try:
         with zipfile.ZipFile(path) as archive:
             with archive.open("routes.txt") as handle:
                 data = handle.read(_MODES_BYTE_CAP + 1)
         if len(data) > _MODES_BYTE_CAP:
             return None
-        text = data.decode("utf-8-sig", errors="replace")
-        types = set()
-        for row in csv.DictReader(io.StringIO(text)):
-            value = (row.get("route_type") or "").strip()
-            if value.lstrip("-").isdigit():
-                types.add(int(value))
-    except (OSError, KeyError, ValueError, zipfile.BadZipFile, csv.Error):
+        # Read headerless, so the header row sets the width: a row with
+        # extra fields is skipped wherever it is, never read as an index.
+        rows = pd.read_csv(
+            io.BytesIO(data),
+            header=None,
+            dtype=str,
+            keep_default_na=False,
+            encoding="utf-8-sig",
+            encoding_errors="replace",
+            on_bad_lines="skip",
+        )
+        routes = _normalise_table(rows.iloc[1:].set_axis(list(rows.iloc[0]), axis=1))[0]
+        values = routes.loc[:, routes.columns == "route_type"].to_numpy().ravel()
+        types = {int(value) for value in set(values) if value.lstrip("-").isdigit()}
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
         return None
     return {mode for mode, accepted in _MODE_TYPES.items() if types & accepted}
 
@@ -313,6 +326,7 @@ def _process_feed(
     if sidecar.exists():
         provenance = json.loads(sidecar.read_text())
     present_routes = None
+    source_notices = []
     if crop or routes is not None:
         cropped = path.with_name(f"{path.stem}-cropped-{tag}.zip")
         report = crop_feed(
@@ -324,6 +338,9 @@ def _process_feed(
             # (routes.txt or its column absent) stays undetermined, not empty.
             source = report.get("source_routes")
             present_routes = None if source is None else set(source)
+        # The crop writes trimmed tables; the source's whitespace is
+        # reported with the feed.
+        source_notices = report["source_notices"]
         path = cropped
     # The crop comes first, so the repair works on the area's feed rather
     # than on the whole source.
@@ -352,6 +369,7 @@ def _process_feed(
             reason = f"no service on {day.isoformat()}"
         if reason is not None:
             raise _SkipFeed(reason, window)
+    validation["notices"].extend(source_notices)
     report = build_report(validation, hosted=hosted, provenance=provenance)
     return path, report, fixes, present_routes, window
 
@@ -517,7 +535,7 @@ def _service(path, day=None, max_total_bytes=None):
     calendars cannot be read."""
     import pandas as pd
 
-    from transitio.edit._editor import _MAX_TOTAL_BYTES, _normalise_headers
+    from transitio.edit._editor import _MAX_TOTAL_BYTES, _normalise_table
     from transitio.gtfs._schedule import route_keys, service_dates, trip_signatures
 
     names = {"agency.txt", "routes.txt", "stops.txt", "trips.txt"}
@@ -532,7 +550,7 @@ def _service(path, day=None, max_total_bytes=None):
             if sum(m.file_size for m in members) > limit:
                 return None
             tables = {
-                m.filename: _normalise_headers(pd.read_csv(archive.open(m), **csv))[0]
+                m.filename: _normalise_table(pd.read_csv(archive.open(m), **csv))[0]
                 for m in members
             }
         keys = route_keys(tables)[["agency", "name", "type"]]

@@ -16,7 +16,9 @@ def repair_feed(path, output, **options):
     feed referentially consistent. The repaired feed serves the same trips
     with the same attributes from the passenger's perspective; semantically
     ambiguous data is dropped, never reconstructed. Calling this function
-    is the opt-in — ``validate_feed`` never modifies anything.
+    is the opt-in — ``validate_feed`` never modifies anything. Header names
+    and values are written without surrounding whitespace, as
+    ``validate_feed`` reads them.
 
     Parameters
     ----------
@@ -33,8 +35,9 @@ def repair_feed(path, output, **options):
     dict
         ``{"fixes": [...], "remaining_notices": [...],
         "service_window": ...}`` — every fix record names its action
-        (``default_value``, ``clear_reference``, ``drop_entity``), location
-        and the notice code that triggered it; ``remaining_notices`` come
+        (``trim_whitespace``, one per trimmed file at its first trimmed name
+        or value; ``default_value``, ``clear_reference``, ``drop_entity``),
+        location and the notice code that triggered it; ``remaining_notices`` come
         from revalidating the repaired feed, so callers see exactly what
         was repaired, what was dropped around, and what remains.
 

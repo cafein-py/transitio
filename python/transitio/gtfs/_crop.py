@@ -76,8 +76,9 @@ def crop_feed(
     whose service can be active inside the window are retained. Everything
     else — stops, routes, shapes, calendars, frequencies, transfers,
     pathways, fares, agencies — cascades away to a referentially
-    consistent feed. Retained trips keep their times and attributes
-    untouched.
+    consistent feed. Header names and values are written without
+    surrounding whitespace, as ``validate_feed`` reads them; retained
+    trips otherwise keep their times and attributes untouched.
 
     Parameters
     ----------
@@ -115,10 +116,14 @@ def crop_feed(
     -------
     dict
         ``{"row_counts": ..., "source_routes": [...] or None,
-        "remaining_notices": [...], "service_window": ...}`` for the cropped
-        feed. ``source_routes`` is the distinct ``route_id`` values in the
-        source routes.txt (before the crop), or ``None`` when it has no
-        route_id column, so a caller can tell what a ``routes`` filter dropped.
+        "source_notices": [...], "remaining_notices": [...],
+        "service_window": ...}`` for the cropped feed. ``source_routes`` is
+        the distinct ``route_id`` values in the source routes.txt (before the
+        crop), or ``None`` when it has no route_id column, so a caller can
+        tell what a ``routes`` filter dropped. ``source_notices`` holds one
+        ``leading_or_trailing_whitespaces`` notice per source file the crop
+        read and trimmed, its row numbered as in the source; shapes.txt is
+        read only when a kept trip has a shape.
     """
     if aoi is None and start_date is None and end_date is None and routes is None:
         raise ValueError("nothing to crop: pass aoi, a date window and/or routes")

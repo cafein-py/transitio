@@ -44,6 +44,7 @@ import pandas as pd
 import pyproj
 import shapely
 
+from transitio.edit._editor import _GTFS_TABLES, _normalise_table
 from transitio.exceptions import ShapeInferenceError
 from transitio.shapes import _graph, _levels, _match, _relations, _stitch
 from transitio.shapes._geometry import locate_on_shape, measures
@@ -168,7 +169,7 @@ def _infer_into(
     snapshot, staged, pbf, level, wanted, inference, check, source_path, extract_digest
 ):
     """Infer into ``staged`` from the pinned ``snapshot``."""
-    tables = _read_tables(snapshot)
+    tables, stripped = _read_tables(snapshot)
     patterns, unusable = _patterns(tables, wanted)
     inherited, inherited_shapes = _inherited_provenance(source_path, snapshot)
     reserved = _reserved_shape_ids(tables)
@@ -245,7 +246,7 @@ def _infer_into(
                 "trips": len(pattern.unshaped_trips),
             }
         )
-    _write_feed(snapshot, staged, tables, shape_rows, assignments, patterns)
+    _write_feed(snapshot, staged, tables, stripped, shape_rows, assignments, patterns)
     report["by_mode"] = dict(report["by_mode"])
     report["osm_pbf"] = os.fspath(pbf)
     report["osm_pbf_sha256"] = extract_digest
@@ -929,9 +930,12 @@ def _check_budgets(
 def _read_tables(
     path, max_entry_bytes=MAX_ENTRY_BYTES, max_total_bytes=MAX_TOTAL_BYTES
 ):
-    """The feed's tables as DataFrames, keyed by member name."""
+    """The feed's tables as DataFrames, keyed by member name, values and
+    header names stripped as ``FeedEditor`` strips them, and the names of
+    the GTFS tables that stripping changed."""
     _check_budgets(path, max_entry_bytes, max_total_bytes)
     tables = {}
+    stripped = set()
     with zipfile.ZipFile(path) as archive:
         for info in archive.infolist():
             if not info.filename.endswith(".txt"):
@@ -941,14 +945,19 @@ def _read_tables(
                     # keep_default_na=False: "NA", "NULL", "N/A" are
                     # legal GTFS ids and text, not missing values. Only
                     # a truly empty field is blank.
-                    tables[info.filename] = pd.read_csv(
-                        member, dtype=str, keep_default_na=False, na_values=[]
+                    table, fixes, trimmed = _normalise_table(
+                        pd.read_csv(
+                            member, dtype=str, keep_default_na=False, na_values=[]
+                        )
                     )
                 except pd.errors.EmptyDataError:
                     # A zero-byte member is an empty table, not a
                     # malformed feed.
-                    tables[info.filename] = pd.DataFrame()
-    return tables
+                    table, fixes, trimmed = pd.DataFrame(), [], 0
+            tables[info.filename] = table
+            if (fixes or trimmed) and info.filename in _GTFS_TABLES:
+                stripped.add(info.filename)
+    return tables, stripped
 
 
 def _patterns(tables, wanted):
@@ -1097,13 +1106,14 @@ def _text(value):
     return None
 
 
-def _write_feed(path, output, tables, shape_rows, assignments, patterns):
+def _write_feed(path, output, tables, stripped, shape_rows, assignments, patterns):
     """The source feed with the inferred shapes written in.
 
     Existing shape rows are carried through with their own schema —
     extension columns kept, blank optional fields left blank — because
     a run that infers nothing must leave the table byte-for-byte
-    valid.
+    valid. The ``stripped`` tables are written as read, so their ids
+    match the rewritten trips and stop times; other members are copied.
     """
     trips = tables["trips.txt"].copy()
     stop_times = tables["stop_times.txt"].copy()
@@ -1144,6 +1154,8 @@ def _write_feed(path, output, tables, shape_rows, assignments, patterns):
             elif name == "shapes.txt":
                 out.writestr(name, _to_csv(shapes))
                 wrote_shapes = True
+            elif name in stripped:
+                out.writestr(name, _to_csv(tables[name]))
             else:
                 # Copied members are budgeted and streamed: an
                 # oversized ancillary file must not be expanded whole.

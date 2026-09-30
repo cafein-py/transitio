@@ -292,6 +292,17 @@ def test_feed_modes_undeterminable(tmp_path):
     assert _feed_modes(no_routes) is None
 
 
+def test_feed_modes_read_stripped_values_and_uneven_rows(tmp_path):
+    from transitio.pipeline._fetch import _feed_modes
+
+    feed = tmp_path / "feed.zip"
+    with zipfile.ZipFile(feed, "w") as archive:
+        # A tram if the long row were truncated or shifted into an index;
+        # the short row has a blank route_type.
+        archive.writestr("routes.txt", "route_id, route_type \nr1,0,0\nr0\nr2, 3 \n")
+    assert _feed_modes(feed) == {"bus"}
+
+
 def test_mode_type_extended_blocks():
     from transitio.pipeline._fetch import _MODE_TYPES
 

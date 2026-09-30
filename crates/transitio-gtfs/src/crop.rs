@@ -1,11 +1,13 @@
 //! Spatial and temporal feed cropping: retain the service relevant to an
 //! area and date window and cascade everything else away, keeping the
 //! result referentially consistent. Times and attributes of retained
-//! trips are never altered.
+//! trips are never altered beyond the surrounding whitespace the reader
+//! trims.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
+use crate::notice::Notice;
 use crate::output::ZipOutput;
 use crate::scan::{DelimiterGuard, NoTable, Row, ScanOptions, ScanResult, Table, TableReader};
 use crate::{rules, scan, schema, semantics};
@@ -50,6 +52,10 @@ pub struct CropResult {
     /// ``None`` when routes.txt or its ``route_id`` column is absent (the drop
     /// is then undetermined), never an empty vector standing in for it.
     pub source_routes: Option<Vec<String>>,
+    /// The whitespace the reader trimmed from the source, one notice per
+    /// file read, with rows numbered as in the source. shapes.txt is read
+    /// only when a kept trip has a shape.
+    pub source_notices: Vec<Notice>,
 }
 
 pub fn crop(
@@ -106,6 +112,7 @@ pub fn crop(
                 .collect()
         })
     });
+    let mut source_notices: Vec<Notice> = whitespace(&result.notices).collect();
     let inside = inside_stops(&result, crop_options, area.as_deref());
     let active = active_services(&result, &options, crop_options)?;
     let touched = match &inside {
@@ -123,6 +130,7 @@ pub fn crop(
         crop_options,
         touched.as_ref(),
         active.as_ref(),
+        &mut source_notices,
     )?;
     result.tables.insert("trips.txt".to_string(), trips);
 
@@ -147,6 +155,7 @@ pub fn crop(
         &mut result,
         &kept_trips,
         crop_options,
+        &mut source_notices,
     ) {
         Ok(counts) => counts,
         Err(error) => {
@@ -185,6 +194,7 @@ pub fn crop(
         row_counts,
         validation,
         source_routes,
+        source_notices,
     })
 }
 
@@ -383,6 +393,14 @@ fn unreadable(name: &str, notices: &[crate::notice::Notice], options: &ScanOptio
         .unwrap_or_else(|| format!("{name} cannot be read whole; cannot crop this feed"))
 }
 
+/// The notices of what the reader trimmed, among a pass's notices.
+fn whitespace(notices: &[Notice]) -> impl Iterator<Item = Notice> + '_ {
+    notices
+        .iter()
+        .filter(|n| n.code == "leading_or_trailing_whitespaces")
+        .cloned()
+}
+
 /// The stops inside the crop area, or None without a spatial crop.
 fn inside_stops(
     result: &ScanResult,
@@ -513,6 +531,7 @@ fn select_trips(
     crop_options: &CropOptions,
     touched: Option<&HashSet<String>>,
     active: Option<&HashSet<String>>,
+    source_notices: &mut Vec<Notice>,
 ) -> Result<(HashSet<String>, Table), String> {
     let mut archive = open_archive(source)?;
     let Some(mut reader) = stream_table(&mut archive, "trips.txt", options)? else {
@@ -557,6 +576,7 @@ fn select_trips(
         });
     }
     whole(&reader, "trips.txt", &notices, options)?;
+    source_notices.extend(whitespace(&notices));
     Ok((kept, Table { headers, rows }))
 }
 
@@ -571,6 +591,7 @@ fn write_cropped(
     result: &mut ScanResult,
     kept_trips: &HashSet<String>,
     crop_options: &CropOptions,
+    source_notices: &mut Vec<Notice>,
 ) -> Result<BTreeMap<String, usize>, String> {
     let mut zip = ZipOutput::create(staging)?;
     let mut counts = BTreeMap::new();
@@ -593,6 +614,7 @@ fn write_cropped(
                 .map(|row| row.fields);
             let count = zip.rows("stop_times.txt", &headers, rows)?;
             whole(&reader, "stop_times.txt", &notices, options)?;
+            source_notices.extend(whitespace(&notices));
             counts.insert("stop_times.txt".to_string(), count);
         }
     }
@@ -623,6 +645,7 @@ fn write_cropped(
                 .map(|row| row.fields);
             let count = zip.rows("shapes.txt", &headers, rows)?;
             whole(&reader, "shapes.txt", &notices, options)?;
+            source_notices.extend(whitespace(&notices));
             counts.insert("shapes.txt".to_string(), count);
         }
     }
@@ -944,11 +967,11 @@ mod tests {
         let mut files = crate::scan::tests::minimal();
         files.retain(|(name, _)| *name != "stops.txt");
         // two warnings in the source (empty rows) and two in the cropped
-        // feed (padded names)
+        // feed (names with a line break)
         files.push((
             "stops.txt",
             "stop_id,stop_name,stop_lat,stop_lon\n\
-             s1,Kamppi ,60.169,24.931\n,,,\ns2,Steissi ,60.171,24.941\n,,,\n",
+             s1,\"Ka\npi\",60.169,24.931\n,,,\ns2,\"Ste\nsi\",60.171,24.941\n,,,\n",
         ));
         let flooded = format!(
             "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n{}\n",

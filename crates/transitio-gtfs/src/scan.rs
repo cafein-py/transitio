@@ -5,6 +5,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::notice::{Notice, Severity};
+use crate::rules::clip;
 use crate::schema;
 
 /// Default guards against hostile archives (zip bombs, amplification). Byte
@@ -83,9 +84,9 @@ pub struct Row {
     pub fields: Vec<String>,
 }
 
-/// One parsed file: raw (untrimmed) headers plus the rows that survived the
-/// structural checks; malformed, empty and undecodable rows are noticed and
-/// skipped.
+/// One parsed file: headers plus the rows that survived the structural
+/// checks, names and values trimmed of surrounding whitespace; malformed,
+/// empty and undecodable rows are noticed and skipped.
 pub struct Table {
     pub headers: Vec<String>,
     pub rows: Vec<Row>,
@@ -674,7 +675,8 @@ pub enum NoTable {
 /// checks of the scan, so a pass over a file far larger than memory keeps
 /// only what it takes from each row. `read_table` collects it into a
 /// `Table`; header checks, row checks and the sampled row-level notices
-/// are the same either way.
+/// are the same either way. Header names and values are trimmed of
+/// surrounding whitespace, and one notice per file says so.
 pub struct TableReader<R: Read> {
     spec: &'static schema::FileSpec,
     records: csv::ByteRecordsIntoIter<std::io::Chain<std::io::Cursor<Vec<u8>>, R>>,
@@ -684,8 +686,32 @@ pub struct TableReader<R: Read> {
     max_notices: u64,
     error_notices: u64,
     warning_notices: u64,
+    trimmed: Trimmed,
     truncated: bool,
     finished: bool,
+}
+
+/// What a reader trimmed: how many header names and values, and the
+/// first as (csv row, field name, text as written), clipped.
+#[derive(Default)]
+struct Trimmed {
+    count: u64,
+    first: Option<(u64, String, String)>,
+}
+
+impl Trimmed {
+    fn note(&mut self, count: u64, csv_row: u64, field: &str, written: &str) {
+        self.count += count;
+        if self.first.is_none() {
+            self.first = Some((csv_row, clip(field), clip(written)));
+        }
+    }
+}
+
+/// Python's `str.isspace`: Unicode whitespace plus the separators
+/// U+001C to U+001F, so a value trims here as `str.strip()` trims it.
+fn is_space(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 
 impl<R: Read> TableReader<R> {
@@ -724,9 +750,7 @@ impl<R: Read> TableReader<R> {
             .from_reader(std::io::Cursor::new(prefix).chain(reader))
             .into_byte_records();
 
-        // Headers are kept verbatim: normalising them here would be silent
-        // repair, and a feed other readers reject must not validate clean.
-        let headers: Vec<String> = match records.next() {
+        let written: Vec<String> = match records.next() {
             None => {
                 notices.push(empty_file(spec.name));
                 return Err(NoTable::Empty);
@@ -744,13 +768,13 @@ impl<R: Read> TableReader<R> {
                 .map(|field| String::from_utf8_lossy(field).into_owned())
                 .collect(),
         };
-        if headers.len() > options.max_columns {
+        if written.len() > options.max_columns {
             notices.push(
                 unreadable_file(
                     spec.name,
                     &format!(
                         "{} columns exceed the {}-column limit",
-                        headers.len(),
+                        written.len(),
                         options.max_columns
                     ),
                 )
@@ -758,6 +782,17 @@ impl<R: Read> TableReader<R> {
             );
             return Err(NoTable::Unreadable);
         }
+        let mut trimmed = Trimmed::default();
+        let headers: Vec<String> = written
+            .iter()
+            .map(|raw| {
+                let name = raw.trim_matches(is_space);
+                if name.len() != raw.len() {
+                    trimmed.note(1, 1, name, raw);
+                }
+                name.to_string()
+            })
+            .collect();
         if headers.iter().any(|h| h.contains('\u{FFFD}')) {
             notices.push(invalid_character(spec.name, 1));
         }
@@ -769,14 +804,6 @@ impl<R: Read> TableReader<R> {
                     Notice::new("empty_column_name", Severity::Warning).with("filename", spec.name),
                 );
                 continue;
-            }
-            if header.trim() != header {
-                notices.push(
-                    Notice::new("leading_or_trailing_whitespaces", Severity::Warning)
-                        .with("filename", spec.name)
-                        .with("csvRowNumber", 1)
-                        .with("fieldValue", header.as_str()),
-                );
             }
             if !seen_headers.insert(header.clone()) {
                 notices.push(
@@ -804,6 +831,7 @@ impl<R: Read> TableReader<R> {
             max_notices: options.max_notices_per_file,
             error_notices: 0,
             warning_notices: 0,
+            trimmed,
             truncated: false,
             finished: false,
         })
@@ -890,11 +918,27 @@ impl<R: Read> TableReader<R> {
                 push_sampled(notices, &mut self.error_notices, notice);
                 continue;
             }
+            let mut trimmed = 0;
+            let mut first = None;
             let fields: Vec<String> = record
                 .iter()
-                .map(|field| String::from_utf8_lossy(field).into_owned())
+                .enumerate()
+                .map(|(index, field)| {
+                    let written = String::from_utf8_lossy(field);
+                    let value = written.trim_matches(is_space);
+                    if value.len() != written.len() {
+                        trimmed += 1;
+                        first.get_or_insert(index);
+                    }
+                    value.to_string()
+                })
                 .collect();
-            if fields.iter().all(|field| field.trim().is_empty()) {
+            if let Some(index) = first {
+                let written = String::from_utf8_lossy(&record[index]);
+                self.trimmed
+                    .note(trimmed, self.csv_row, &self.headers[index], &written);
+            }
+            if fields.iter().all(|field| field.is_empty()) {
                 let notice = Notice::new("empty_row", Severity::Warning)
                     .with("filename", self.spec.name)
                     .with("csvRowNumber", self.csv_row);
@@ -915,6 +959,16 @@ impl<R: Read> TableReader<R> {
 
     fn finish(&mut self, notices: &mut Vec<Notice>) {
         self.finished = true;
+        if let Some((csv_row, field, written)) = self.trimmed.first.take() {
+            notices.push(
+                Notice::new("leading_or_trailing_whitespaces", Severity::Warning)
+                    .with("filename", self.spec.name)
+                    .with("csvRowNumber", csv_row)
+                    .with("fieldName", field)
+                    .with("fieldValue", written)
+                    .with("trimmedCount", self.trimmed.count),
+            );
+        }
         let suppressed_errors = self.error_notices.saturating_sub(self.max_notices);
         let suppressed_warnings = self.warning_notices.saturating_sub(self.max_notices);
         if suppressed_errors + suppressed_warnings > 0 {
@@ -1496,17 +1550,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn padded_headers_are_not_silently_repaired() {
-        let mut files = minimal();
-        files.retain(|(name, _)| *name != "trips.txt");
-        files.push(("trips.txt", " route_id,service_id,trip_id\nr1,wk,t1\n"));
-        let result = scan_reader(build_zip(&files)).unwrap();
-        let codes = codes(&result);
-        assert!(codes.contains(&"leading_or_trailing_whitespaces"));
-        assert!(codes.contains(&"missing_required_column")); // exact "route_id" absent
-    }
-
-    #[test]
     fn header_only_file_is_empty() {
         let mut files = minimal();
         files.retain(|(name, _)| *name != "stops.txt");
@@ -1705,6 +1748,78 @@ pub(crate) mod tests {
 
     fn notice_codes(notices: &[Notice]) -> Vec<&'static str> {
         notices.iter().map(|n| n.code).collect()
+    }
+
+    #[test]
+    fn whitespace_is_trimmed_with_one_notice_per_file() {
+        // the file, the first row's fields, the notice codes, and the
+        // whitespace notice's row, field, value as written and count
+        let header = "stop_id,stop_name,stop_lat,stop_lon\n";
+        let cases = [
+            (
+                " stop_id ,stop_name,stop_lat,stop_lon \n s1,Kamppi ,60.1,24.9\ns2,K,60.2,24.8 \n"
+                    .to_string(),
+                ["s1", "Kamppi", "60.1", "24.9"],
+                vec!["leading_or_trailing_whitespaces"],
+                Some((1, "stop_id", " stop_id ", 5)),
+            ),
+            (
+                format!("{header}\" s1 \",Kamppi,60.1,24.9\n"),
+                ["s1", "Kamppi", "60.1", "24.9"],
+                vec!["leading_or_trailing_whitespaces"],
+                Some((2, "stop_id", " s1 ", 1)),
+            ),
+            (
+                format!("{header}s1, ,60.1,24.9\n"),
+                ["s1", "", "60.1", "24.9"],
+                vec!["leading_or_trailing_whitespaces"],
+                Some((2, "stop_name", " ", 1)),
+            ),
+            (
+                format!("{header}s1,\u{a0}Kamppi\u{b}\u{1f},60.1,24.9\n"),
+                ["s1", "Kamppi", "60.1", "24.9"],
+                vec!["leading_or_trailing_whitespaces"],
+                Some((2, "stop_name", "\u{a0}Kamppi\u{b}\u{1f}", 1)),
+            ),
+            (
+                format!("{header} , ,,\t\ns1,Kamppi,60.1,24.9\n"),
+                ["s1", "Kamppi", "60.1", "24.9"],
+                vec!["empty_row", "leading_or_trailing_whitespaces"],
+                Some((2, "stop_id", " ", 3)),
+            ),
+            (
+                format!("{header}s1,Kamppi,60.1,24.9\n"),
+                ["s1", "Kamppi", "60.1", "24.9"],
+                vec![],
+                None,
+            ),
+            (
+                "stop_id,stop_name, stop_id,stop_lat,stop_lon\ns1,Kamppi,s1,60.1,24.9\n"
+                    .to_string(),
+                ["s1", "Kamppi", "s1", "60.1"],
+                vec!["duplicated_column", "leading_or_trailing_whitespaces"],
+                Some((1, "stop_id", " stop_id", 1)),
+            ),
+        ];
+        for (bytes, fields, codes, expected) in cases {
+            let options = ScanOptions::default();
+            let streamed = stream(bytes.as_bytes(), &options, options.max_rows);
+            assert_eq!(streamed.rows[0].fields[..4], fields, "{bytes:?}");
+            assert_eq!(notice_codes(&streamed.notices), codes, "{bytes:?}");
+            let found = streamed
+                .notices
+                .iter()
+                .find(|n| n.code == "leading_or_trailing_whitespaces")
+                .map(|n| {
+                    (
+                        n.context["csvRowNumber"].as_u64().unwrap(),
+                        n.context["fieldName"].as_str().unwrap(),
+                        n.context["fieldValue"].as_str().unwrap(),
+                        n.context["trimmedCount"].as_u64().unwrap(),
+                    )
+                });
+            assert_eq!(found, expected, "{bytes:?}");
+        }
     }
 
     #[test]

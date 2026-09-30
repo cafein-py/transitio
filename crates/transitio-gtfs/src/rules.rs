@@ -148,7 +148,7 @@ fn field_rules(name: &str, table: &Table, samplers: &mut Samplers, notices: &mut
     let sampler = samplers.file(spec.file);
     if spec.complete {
         for (header, column) in table.headers.iter().zip(&columns) {
-            if column.is_none() && !header.is_empty() && header.trim() == header {
+            if column.is_none() && !header.is_empty() {
                 sampler.push(
                     notices,
                     Notice::new("unknown_column", Severity::Info)
@@ -179,19 +179,6 @@ fn field_rules(name: &str, table: &Table, samplers: &mut Samplers, notices: &mut
                 }
                 continue;
             }
-            if value.trim() != value {
-                sampler.push(
-                    notices,
-                    field_notice(
-                        "leading_or_trailing_whitespaces",
-                        Severity::Warning,
-                        spec.file,
-                        row.csv_row,
-                        column.name,
-                        value,
-                    ),
-                );
-            }
             if value.contains('\n') || value.contains('\r') {
                 sampler.push(
                     notices,
@@ -205,8 +192,7 @@ fn field_rules(name: &str, table: &Table, samplers: &mut Samplers, notices: &mut
                     ),
                 );
             }
-            let trimmed = value.trim();
-            check_kind(sampler, notices, spec.file, row.csv_row, column, trimmed);
+            check_kind(sampler, notices, spec.file, row.csv_row, column, value);
         }
     }
 }

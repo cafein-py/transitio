@@ -6,7 +6,7 @@ pytest.importorskip("transitio._core")
 
 from transitio.edit import FeedBuilder, FeedEditor  # noqa: E402
 from transitio.edit._editor import (  # noqa: E402
-    _normalise_headers,
+    _normalise_table,
     format_gtfs_time,
     parse_gtfs_time,
 )
@@ -189,37 +189,40 @@ def test_gtfs_time_helpers():
 
 
 @pytest.mark.parametrize(
-    "columns, expected, fixes",
+    "columns, expected, fixes, trimmed",
     [
         (
             {"agency_id": ["a"], " agency_name": ["A"]},
             {"agency_id": ["a"], "agency_name": ["A"]},
             [{"from": [" agency_name"], "to": "agency_name"}],
+            0,
         ),
         (
             {
                 "agency_name": ["A", "", " "],
                 "agency_url": ["u", "v", "w"],
-                " agency_name": ["X", "B", ""],
+                " agency_name": ["X", " B", ""],
             },
-            {"agency_name": ["A", "B", " "], "agency_url": ["u", "v", "w"]},
+            {"agency_name": ["A", "B", ""], "agency_url": ["u", "v", "w"]},
             [{"from": ["agency_name", " agency_name"], "to": "agency_name"}],
+            2,
         ),
-        ({"stop_id": ["1"]}, {"stop_id": ["1"]}, []),
+        ({"stop_id": ["1"]}, {"stop_id": ["1"]}, [], 0),
         (
-            {" stop_id ": ["1"], "stop_name": ["K"]},
-            {"stop_id": ["1"], "stop_name": ["K"]},
+            {" stop_id ": ["\u00a01", "2"], "stop_name": ["K\u001f", "L"]},
+            {"stop_id": ["1", "2"], "stop_name": ["K", "L"]},
             [{"from": [" stop_id "], "to": "stop_id"}],
+            2,
         ),
     ],
-    ids=["padded", "padded-duplicate", "clean", "padded-id"],
+    ids=["padded", "padded-duplicate", "clean", "padded-values"],
 )
-def test_normalise_headers(columns, expected, fixes):
+def test_normalise_table(columns, expected, fixes, trimmed):
     import pandas as pd
 
-    table, changed = _normalise_headers(pd.DataFrame(columns, dtype=str))
+    table, changed, count = _normalise_table(pd.DataFrame(columns, dtype=str))
     pd.testing.assert_frame_equal(table, pd.DataFrame(expected, dtype=str))
-    assert changed == fixes
+    assert (changed, count) == (fixes, trimmed)
 
 
 def test_save_refuses_symlink_staging(tmp_path):

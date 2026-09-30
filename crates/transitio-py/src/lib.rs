@@ -256,6 +256,7 @@ fn crop_feed(
         let report = serde_json::json!({
             "row_counts": result.row_counts,
             "source_routes": result.source_routes,
+            "source_notices": result.source_notices,
             "remaining_notices": result.validation.notices,
             "service_window": result.validation.service_window,
         });

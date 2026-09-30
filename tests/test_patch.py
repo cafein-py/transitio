@@ -103,10 +103,12 @@ def test_replaces_broken_trip_with_donor(tmp_path):
     assert read_member(base, "trips.txt") == BASE["trips.txt"]
 
 
-def test_padded_base_header_is_logged(tmp_path):
+def test_padded_base_header_and_values_are_logged(tmp_path):
     padded = dict(BASE)
-    padded["agency.txt"] = BASE["agency.txt"].replace(
-        "agency_id,agency_name", " agency_id , agency_name", 1
+    padded["agency.txt"] = (
+        BASE["agency.txt"]
+        .replace("agency_id,agency_name", " agency_id , agency_name", 1)
+        .replace("b1,City Transit", "b1 , City Transit", 1)
     )
     base = write_zip(tmp_path / "base.zip", padded)
     donor = write_zip(tmp_path / "donor.zip", DONOR)
@@ -120,9 +122,15 @@ def test_padded_base_header_is_logged(tmp_path):
             {"from": [" agency_name"], "to": "agency_name"},
         ],
     }
-    assert [p["action"] for p in report["patches"][1:]] == ["replace_trip"]
-    header = read_member(output, "agency.txt").splitlines()[0]
+    assert report["patches"][1] == {
+        "action": "trim_values",
+        "file": "agency.txt",
+        "count": 2,
+    }
+    assert [p["action"] for p in report["patches"][2:]] == ["replace_trip"]
+    header, row = read_member(output, "agency.txt").splitlines()[:2]
     assert header == "agency_id,agency_name,agency_url,agency_timezone"
+    assert row.startswith("b1,City Transit,")
 
 
 def test_no_match_raises_with_report_and_written_output(tmp_path):
@@ -303,8 +311,8 @@ def test_reliability_refusal_beats_check_false(tmp_path):
         **{
             "stops.txt": (
                 "stop_id,stop_name,stop_lat,stop_lon\n"
-                "bs1, Kamppi,60.169,24.931\n"
-                "bs2, Steissi,60.171,24.941\n"
+                'bs1,"Kam\nppi",60.169,24.931\n'
+                'bs2,"Stei\nssi",60.171,24.941\n'
             )
         },
     )
@@ -477,17 +485,17 @@ def test_blank_agency_ids_backfilled_on_both_sides(tmp_path):
 
 def test_reliability_refusal_covers_donor_and_final_stages(tmp_path):
     base = write_zip(tmp_path / "base.zip", BASE)
-    padded = dict(
+    sampled = dict(
         DONOR,
         **{
             "stops.txt": (
                 "stop_id,stop_name,stop_lat,stop_lon\n"
-                "ds1, Kamppi,60.169,24.931\n"
-                "ds2, Steissi,60.171,24.941\n"
+                'ds1,"Kam\nppi",60.169,24.931\n'
+                'ds2,"Stei\nssi",60.171,24.941\n'
             )
         },
     )
-    donor = write_zip(tmp_path / "donor.zip", padded)
+    donor = write_zip(tmp_path / "donor.zip", sampled)
     with pytest.raises(PatchError, match="donor validation"):
         patch_feed(
             base, donor, tmp_path / "out.zip", check=False, max_notices_per_file=1
@@ -783,7 +791,7 @@ def test_stop_match_distance_thresholds():
     assert _stops_match((named, here), ("", shifted(30))) is False
 
 
-def test_whitespace_bearing_donor_ids_survive_the_closure(tmp_path):
+def test_padded_donor_ids_are_trimmed_through_the_closure(tmp_path):
     spaced = dict(
         DONOR,
         **{
@@ -803,13 +811,12 @@ def test_whitespace_bearing_donor_ids_survive_the_closure(tmp_path):
     base = write_zip(tmp_path / "base.zip", BASE)
     donor = write_zip(tmp_path / "donor.zip", spaced)
     output = tmp_path / "out.zip"
-    # Ids are opaque: internally consistent whitespace must neither
-    # break the closure nor the revalidation of the patched output.
+    # Padded ids are read trimmed in every table, so the closure and the
+    # associative rows keep referring to the same id.
     report = patch_feed(base, donor, output)
     assert any(p["action"] == "replace_trip" for p in report["patches"])
-    assert "donor:dr1 " in read_member(output, "routes.txt")
-    # The associative row references the same whitespace-bearing id.
-    assert "donor:dr1 " in read_member(output, "route_networks.txt")
+    assert "donor:dr1,donor:d9," in read_member(output, "routes.txt")
+    assert read_member(output, "route_networks.txt").endswith(",donor:dr1\n")
 
 
 def test_malformed_base_departure_is_never_normalised(tmp_path):

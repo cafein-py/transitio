@@ -32,6 +32,12 @@ def validate_feed(
     provided by the upcoming report module, not by this function's flat
     notice list.
 
+    Header names and values are read without surrounding whitespace (the
+    characters ``str.strip()`` removes), so the rules see them trimmed. A
+    file that had any carries one ``leading_or_trailing_whitespaces``
+    warning naming the first occurrence, with ``trimmedCount`` the number
+    of header names and values trimmed.
+
     Parameters
     ----------
     path : str or pathlib.Path

@@ -460,3 +460,73 @@ def test_padded_header_names_keep_the_selector_trusted(tmp_path, form):
     path = write_zip(tmp_path / "feed.zip", members)
     trusted = _selector_trusted(path, feed, SimpleNamespace(state="complete"))
     assert trusted == (True, None, {"r1", "r2"})
+
+
+def test_padded_values_are_read_trimmed(tmp_path):
+    # Values were read as written: a feed padding every line, as Renfe pads
+    # its lines with about 150 spaces, had no calendar end_date, so fetch
+    # skipped it as idle, and a parent_station of one space, as York Region
+    # writes it, was a dangling reference.
+    import datetime
+
+    from transitio.gtfs import merge_feeds
+    from transitio.pipeline._fetch import _process_feed, _service
+
+    files = dict(
+        FEED,
+        **{
+            "stops.txt": (
+                "stop_id,stop_name,parent_station,stop_lat,stop_lon\n"
+                "in1,Kamppi, ,60.169,24.931\n"
+                "in2,Steissi,,60.171,24.941\n"
+                "out1,Espoo,,60.205,24.655\n"
+            )
+        },
+    )
+    padded = {
+        name: "".join(f"{line}{' ' * 150}\n" for line in text.splitlines())
+        for name, text in files.items()
+    }
+    source = write_zip(tmp_path / "padded.zip", padded)
+
+    def trimmed(notices):
+        return sorted(
+            n["context"]["filename"]
+            for n in notices
+            if n["code"] == "leading_or_trailing_whitespaces"
+        )
+
+    report = validate_feed(source, reference_date="20260601")
+    assert report["service_window"] == ["20260101", "20261231"]
+    assert report["moment"]["activeTrips"] == 2
+    assert "foreign_key_violation" not in {n["code"] for n in report["notices"]}
+    assert trimmed(report["notices"]) == sorted(padded)
+
+    cropped = crop_feed(
+        source, tmp_path / "cropped.zip", aoi=CITY_BBOX, reference_date="20260601"
+    )
+    assert trimmed(cropped["source_notices"]) == sorted(padded)
+
+    day = datetime.date(2026, 6, 1)
+    kept = _process_feed(
+        source,
+        geometry=CITY_BBOX,
+        tag="study",
+        repair=False,
+        crop=True,
+        modes={"bus"},
+        day=day,
+        study=True,
+        hosted=None,
+        budgets={"reference_date": "20260601"},
+    )
+    groups = {group["code"]: group for group in kept[1]["notices"]}
+    assert groups["leading_or_trailing_whitespaces"]["totalNotices"] == len(padded)
+    assert _service(source, day) is not None
+
+    clean = write_zip(tmp_path / "clean.zip", FEED)
+    merged = merge_feeds([source, clean], tmp_path / "merged.zip")
+    assert not any(n["severity"] == "ERROR" for n in merged["notices"])
+    assert [(entry["feed"], entry["file"]) for entry in merged["trimmed_values"]] == [
+        (0, name) for name in sorted(padded)
+    ]

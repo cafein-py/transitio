@@ -449,6 +449,26 @@ def test_legal_na_strings_survive(transit_pbf, tmp_path):
     assert set(stop_times["stop_id"]) == {"NA", "NULL"}
 
 
+def test_padded_tables_are_written_stripped(transit_pbf, tmp_path):
+    # Values are read stripped, so a padded table is written stripped too
+    # and its ids still match the rewritten trips; clean tables are copied.
+    feed = tmp_path / "padded.zip"
+    agency = b"agency_id,agency_name\nA,Ag\n"
+    with zipfile.ZipFile(feed, "w") as out:
+        out.writestr("agency.txt", agency)
+        out.writestr("routes.txt", "route_id,agency_id,route_type\nR ,A,3\n")
+        out.writestr("trips.txt", "route_id,service_id,trip_id\nR ,S,T\n")
+        out.writestr("stop_times.txt", "trip_id,stop_id,stop_sequence\nT,X,1\nT,Y,2\n")
+        # A stop without coordinates: nothing is inferred, the feed is written.
+        out.writestr("stops.txt", "stop_id,stop_lat,stop_lon\nX,,\nY,60.18,24.95\n")
+    output = tmp_path / "out.zip"
+    infer_shapes(feed, output, transit_pbf, modes=["bus"], check=False)
+    assert list(read_table(output, "routes.txt")["route_id"]) == ["R"]
+    assert list(read_table(output, "trips.txt")["route_id"]) == ["R"]
+    with zipfile.ZipFile(output) as archive:
+        assert archive.read("agency.txt") == agency
+
+
 def test_certification_refuses_a_sampled_validation(monkeypatch):
     # A truncated validation cannot prove the output is sound, so it
     # must refuse rather than certify on partial evidence.
