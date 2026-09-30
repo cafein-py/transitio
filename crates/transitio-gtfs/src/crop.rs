@@ -813,19 +813,99 @@ fn retain(
             }
         }
     }
-    if let Some(fare_rules) = result.tables.get_mut("fare_rules.txt") {
-        if let Some(route) = column(fare_rules, "route_id") {
-            fare_rules.rows.retain(|row| {
-                let id = row.fields[route].as_str();
-                id.is_empty() || kept_routes.contains(id)
-            });
+    retain_fares(result, &kept_routes, &kept_agencies);
+}
+
+/// A fare rule naming a removed route or zone goes. Its fare goes whole,
+/// rules included, when that leaves the fare without the route rules or
+/// origin-destination rules it had, or without a contains zone it named,
+/// so no fare applies more widely than in the source; so does a fare of a
+/// pruned agency. A fare without rules applies everywhere and stays.
+fn retain_fares(
+    result: &mut ScanResult,
+    kept_routes: &HashSet<String>,
+    kept_agencies: &HashSet<String>,
+) {
+    fn value(row: &Row, index: Option<usize>) -> Option<&str> {
+        index
+            .map(|i| row.fields[i].as_str())
+            .filter(|id| !id.is_empty())
+    }
+    let kept_zones = referenced(result, "stops.txt", "zone_id");
+    let mut dropped: HashSet<String> = HashSet::new();
+    if !kept_agencies.is_empty() {
+        if let Some(fares) = result.tables.get("fare_attributes.txt") {
+            if let Some(id) = column(fares, "fare_id") {
+                let agency = column(fares, "agency_id");
+                dropped.extend(
+                    fares
+                        .rows
+                        .iter()
+                        .filter(|row| {
+                            value(row, agency).is_some_and(|a| !kept_agencies.contains(a))
+                        })
+                        .map(|row| row.fields[id].clone()),
+                );
+            }
         }
     }
-    // Fares referenced by surviving rules; feeds without fare_rules keep
-    // their fare_attributes untouched.
-    if result.tables.contains_key("fare_rules.txt") {
-        let kept_fares = referenced(result, "fare_rules.txt", "fare_id");
-        keep_rows(result, "fare_attributes.txt", "fare_id", &kept_fares);
+    if let Some(rules) = result.tables.get_mut("fare_rules.txt") {
+        let fare = column(rules, "fare_id");
+        let route = column(rules, "route_id");
+        let ends = [column(rules, "origin_id"), column(rules, "destination_id")];
+        let contains = column(rules, "contains_id");
+        let dead = |row: &Row| {
+            value(row, route).is_some_and(|id| !kept_routes.contains(id))
+                || [ends[0], ends[1], contains]
+                    .into_iter()
+                    .any(|zone| value(row, zone).is_some_and(|id| !kept_zones.contains(id)))
+        };
+        // Per fare: whether it had route rules and whether one survives, the
+        // same for origin-destination rules, and the contains zones of all
+        // its rules and of the surviving ones.
+        #[derive(Default)]
+        struct Selectors<'r> {
+            routes: [bool; 2],
+            pairs: [bool; 2],
+            zones: [HashSet<&'r str>; 2],
+        }
+        let mut selectors: BTreeMap<&str, Selectors> = BTreeMap::new();
+        for row in &rules.rows {
+            let live = !dead(row);
+            let entry = selectors.entry(value(row, fare).unwrap_or("")).or_default();
+            if value(row, route).is_some() {
+                entry.routes = [true, entry.routes[1] || live];
+            }
+            if ends.iter().any(|&end| value(row, end).is_some()) {
+                entry.pairs = [true, entry.pairs[1] || live];
+            }
+            if let Some(zone) = value(row, contains) {
+                entry.zones[0].insert(zone);
+                if live {
+                    entry.zones[1].insert(zone);
+                }
+            }
+        }
+        dropped.extend(
+            selectors
+                .into_iter()
+                .filter(|(_, s)| {
+                    s.routes == [true, false]
+                        || s.pairs == [true, false]
+                        || s.zones[0].len() > s.zones[1].len()
+                })
+                .map(|(id, _)| id.to_string()),
+        );
+        rules
+            .rows
+            .retain(|row| !dead(row) && !dropped.contains(value(row, fare).unwrap_or("")));
+    }
+    if !dropped.is_empty() {
+        if let Some(fares) = result.tables.get_mut("fare_attributes.txt") {
+            if let Some(id) = column(fares, "fare_id") {
+                fares.rows.retain(|row| !dropped.contains(&row.fields[id]));
+            }
+        }
     }
 }
 

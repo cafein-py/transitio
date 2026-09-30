@@ -76,7 +76,11 @@ def crop_feed(
     whose service can be active inside the window are retained. Everything
     else — stops, routes, shapes, calendars, frequencies, transfers,
     pathways, fares, agencies — cascades away to a referentially
-    consistent feed. Header names and values are written without
+    consistent feed. A fare rule naming a removed route or zone goes, and
+    its fare goes whole when that leaves the fare without its route rules,
+    its origin-destination rules or one of its contains zones, or when its
+    agency goes, so no fare applies more widely than in the source. A fare
+    without rules applies everywhere and stays. Header names and values are written without
     surrounding whitespace, as ``validate_feed`` reads them; retained
     trips otherwise keep their times and attributes untouched.
 

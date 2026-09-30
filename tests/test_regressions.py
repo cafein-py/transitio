@@ -530,3 +530,48 @@ def test_padded_values_are_read_trimmed(tmp_path):
     assert [(entry["feed"], entry["file"]) for entry in merged["trimmed_values"]] == [
         (0, name) for name in sorted(padded)
     ]
+
+
+def test_cropped_fares_never_apply_more_widely(tmp_path):
+    # The crop kept fare_rules rows naming zones only removed stops carried,
+    # kept fares of a pruned agency, and dropped fares that had no rules.
+    files = dict(FEED)
+    files["stops.txt"] = (
+        "stop_id,stop_name,stop_lat,stop_lon,zone_id\n"
+        "in1,Kamppi,60.169,24.931,A\n"
+        "in2,Steissi,60.171,24.941,B\n"
+        "out1,Espoo,60.205,24.655,C\n"
+    )
+    files["fare_attributes.txt"] = (
+        "fare_id,price,currency_type,payment_method,transfers,agency_id\n"
+        + "".join(f"f{n},3.10,EUR,0,,hsl\n" for n in range(1, 9))
+        + "f9,2.00,EUR,0,,espoo\n"
+    )
+    files["fare_rules.txt"] = (
+        "fare_id,route_id,origin_id,destination_id,contains_id\n"
+        "f1,,A,B,\n"
+        "f2,,A,C,\n"
+        "f3,,,,A\nf3,,,,B\n"
+        "f4,,,,A\nf4,,,,C\nf4,r-in,,,\n"
+        "f5,r-in,,,\nf5,r-out,,,\n"
+        "f6,r-out,,,\nf6,,A,B,\n"
+        "f7,,Z,,\n"
+    )
+    source = write_zip(tmp_path / "feed.zip", files)
+    output = tmp_path / "cropped.zip"
+    result = crop_feed(source, output, aoi=CITY_BBOX, reference_date="20260601")
+
+    def rows(name):
+        return list(csv.DictReader(io.StringIO(read_entry(output, name).decode())))
+
+    assert [tuple(row.values()) for row in rows("fare_rules.txt")] == [
+        ("f1", "", "A", "B", ""),
+        ("f3", "", "", "", "A"),
+        ("f3", "", "", "", "B"),
+        ("f5", "r-in", "", "", ""),
+    ]
+    fares = [row["fare_id"] for row in rows("fare_attributes.txt")]
+    assert fares == ["f1", "f3", "f5", "f8"]
+    assert not any(
+        n["code"] == "foreign_key_violation" for n in result["remaining_notices"]
+    )
