@@ -8,7 +8,7 @@ pytest.importorskip("transitio._core")
 
 import transitio.catalog  # noqa: E402
 import transitio.osm  # noqa: E402
-from transitio.exceptions import StaleSelectorError  # noqa: E402
+from transitio.exceptions import DownloadError, StaleSelectorError  # noqa: E402
 from transitio.pipeline import fetch  # noqa: E402
 
 GTFS = {
@@ -1895,23 +1895,40 @@ def test_fetch_place_excludes_an_unknown_only_feed(tmp_path, monkeypatch):
     assert result.skipped == [("f-a", "only unknown-tier edges")]
 
 
-def test_fetch_aoi_without_osm_skips_the_extract(pipeline_env, monkeypatch):
+_EXTRACT_FAILURE = "https://download.example/extract.osm.pbf: HTTP 404 Not Found"
+
+
+@pytest.mark.parametrize(
+    "osm, notes",
+    [(False, []), (True, [f"OSM extract not fetched: {_EXTRACT_FAILURE}"])],
+    ids=["osm-off", "download-failed"],
+)
+def test_fetch_aoi_without_an_extract_keeps_the_feeds(
+    pipeline_env, monkeypatch, osm, notes
+):
     tmp_path, _ = pipeline_env
 
-    def forbidden(*a, **k):  # osm=False must not reach the OSM stage
-        raise AssertionError("fetch_pbf called despite osm=False")
+    def unavailable(*a, **k):  # osm=False must not reach the OSM stage
+        assert osm, "fetch_pbf called despite osm=False"
+        raise DownloadError(_EXTRACT_FAILURE)
 
-    monkeypatch.setattr("transitio.osm._fetch.fetch_pbf", forbidden)
-    monkeypatch.setattr("transitio.osm.fetch_pbf", forbidden)
-    with pytest.warns(UserWarning):
+    monkeypatch.setattr("transitio.osm._fetch.fetch_pbf", unavailable)
+    monkeypatch.setattr("transitio.osm.fetch_pbf", unavailable)
+    with pytest.warns(UserWarning) as caught:
         result = fetch(
             (24.6, 60.1, 25.2, 60.4),
             directory=tmp_path,
-            osm=False,
+            osm=osm,
             reference_date="20260601",
         )
-    assert result.osm_pbf is None
+    assert (result.osm_pbf, result.osm_area) == (None, None)
     assert len(result.feeds) == 1  # the GTFS side is unaffected
+    # The note entry comes after the feed's.
+    assert [(e["feed_id"], e["note"]) for e in result.selection[1:]] == [
+        (None, note) for note in notes
+    ]
+    warned = [str(w.message) for w in caught if "OSM" in str(w.message)]
+    assert warned == [f"{note}; osm_pbf is None" for note in notes]
 
 
 def test_fetch_place_without_osm_skips_the_extract(tmp_path, monkeypatch):

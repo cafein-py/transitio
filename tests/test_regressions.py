@@ -8,6 +8,7 @@ import pytest
 
 pytest.importorskip("transitio._core")
 
+from transitio.exceptions import DownloadError, ExtractNotFoundError  # noqa: E402
 from transitio.gtfs import crop_feed  # noqa: E402
 from transitio.repair import repair_feed  # noqa: E402
 from transitio.validate import validate_feed  # noqa: E402
@@ -1247,3 +1248,74 @@ def test_feeds_nested_in_one_archive_are_read_from_it_once(
             urls[entry["feed_id"]],
             outer,
         )
+
+
+_EXTRACT_TIMEOUT = (
+    "https://download.geofabrik.de/europe-latest.osm.pbf: ReadTimeout: timed out"
+    " (3 requests)"
+)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(DownloadError(_EXTRACT_TIMEOUT), id="download"),
+        pytest.param(
+            ExtractNotFoundError("no extract covers the area"), id="no-extract"
+        ),
+        pytest.param(ValueError("invalid area"), id="value"),
+    ],
+)
+def test_a_failed_extract_download_keeps_the_fetched_feeds(
+    tmp_path, monkeypatch, error
+):
+    # A read timeout on the OSM extract, fetched after the place's feeds,
+    # raised from fetch and lost the feeds already downloaded and processed.
+    import pathlib
+
+    import transitio.index as transitio_index
+    from index_fixture import HULL, covered_feed, edge, write_index
+    from transitio.pipeline import fetch
+
+    feed = {
+        **covered_feed("f-a", coverage_source="crawl"),
+        "coverage": HULL,
+        "atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}},
+    }
+    edges = [edge("Q1757", "f-a", tier="local")]
+    index = transitio_index.read_index(
+        write_index(tmp_path / "index", feeds=[feed], edges=edges)
+    )
+
+    def download(self, feed, directory=None):
+        return write_zip(pathlib.Path(directory) / "latest.zip", FEED)
+
+    def fetch_pbf(*args, **kwargs):
+        raise error
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas.download", download)
+    monkeypatch.setattr("transitio.osm.fetch_pbf", fetch_pbf)
+    options = dict(
+        place="Q1757",
+        index=index,
+        directory=tmp_path / "out",
+        crop=False,
+        expired="keep",
+    )
+    if not isinstance(error, DownloadError):
+        with pytest.raises(type(error)) as caught:
+            fetch(**options)
+        assert caught.value is error
+        return
+    with pytest.warns(UserWarning, match="OSM extract not fetched"):
+        result = fetch(**options)
+    delivered, last = result.selection
+    assert delivered["decision"] == "delivered"
+    assert result.feeds == [delivered["path"]]
+    assert (result.osm_pbf, result.osm_area) == (None, None)
+    assert (last["feed_id"], last["decision"], last["note"]) == (
+        None,
+        None,
+        f"OSM extract not fetched: {_EXTRACT_TIMEOUT}",
+    )

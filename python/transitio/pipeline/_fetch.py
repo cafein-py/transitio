@@ -79,9 +79,10 @@ class FetchResult:
     contained: dict = dataclasses.field(default_factory=dict)
     # One entry per candidate feed, in candidate order, with its decision;
     # ``skipped`` lists the same skips. A last entry with feed_id None notes
-    # the place parts the OSM extract leaves out.
+    # the place parts the OSM extract leaves out, or why it was not fetched.
     selection: list = dataclasses.field(default_factory=list)
-    # The WGS84 area the OSM extract was fetched for; None without one.
+    # The WGS84 area the OSM extract was fetched for; None without one. A
+    # failed extract download leaves it and osm_pbf None.
     osm_area: object = None
 
     def __iter__(self):  # convenient (pbf, feeds) unpacking
@@ -89,7 +90,7 @@ class FetchResult:
 
     def selection_table(self):
         """The selection record as a ``pandas.DataFrame``, one row per
-        candidate feed, then the OSM-area note row when there is one."""
+        candidate feed, then the OSM note row when there is one."""
         import pandas as pd
 
         return pd.DataFrame(self.selection, columns=list(_SELECTION_FIELDS))
@@ -125,7 +126,8 @@ class FetchResult:
         """
         if self.osm_pbf is None:
             raise ValueError(
-                "this result has no OSM extract; it was fetched with osm=False"
+                "this result has no OSM extract: it was fetched with osm=False "
+                "or the extract download failed"
             )
         from pyrosm import OSM
 
@@ -1100,7 +1102,13 @@ def fetch(
         grown by 1.6 km, cafein's default snap distance. With ``osm=False``
         the OSM stage is skipped and the result's ``osm_pbf`` is None, for
         callers who want only the GTFS feeds; ``to_pyrosm`` then raises and
-        ``to_cafein`` builds without a walking network.
+        ``to_cafein`` builds without a walking network. A failed extract
+        download does not abort the call: the feeds are still delivered,
+        ``osm_pbf`` and ``osm_area`` are None, a ``UserWarning`` says so and
+        the last selection entry notes ``"OSM extract not fetched:
+        <error>"``; ``to_cafein`` then builds without a walking network, as
+        with ``osm=False``. Other errors, such as ``ExtractNotFoundError``
+        when no extract covers the area, still raise.
     refresh_token, cache_dir, directory, country_code
         Passed to the catalog and OSM layers.
     **budgets
@@ -1152,13 +1160,16 @@ def fetch(
         Windows are ISO dates.
         When the OSM extract leaves out parts of the place, a last entry
         with ``feed_id`` None notes them, e.g. ``"OSM area: 1 of 47 parts
-        (1783 of 2188 km²)"``. ``FetchResult.selection_table()`` returns it
-        as a DataFrame. ``osm_area`` is the WGS84 geometry the OSM extract
-        was fetched for (None with ``osm=False``).
+        (1783 of 2188 km²)"``; when its download failed, the last entry
+        notes that instead, e.g. ``"OSM extract not fetched:
+        https://download.geofabrik.de/europe-latest.osm.pbf: ReadTimeout:
+        timed out (3 requests)"``. ``FetchResult.selection_table()`` returns
+        the record as a DataFrame. ``osm_area`` is the WGS84 geometry the OSM
+        extract was fetched for (None with ``osm=False`` or a failed
+        download).
     """
     from transitio.catalog import MobilityDatabase
     from transitio.catalog._models import as_date
-    from transitio.osm import fetch_pbf
     from transitio.osm._fetch import _as_geometry
 
     if (aoi is None) == (place is None):
@@ -1247,9 +1258,11 @@ def fetch(
         ).encode()
     ).hexdigest()[:16]
 
-    osm_pbf = (
-        fetch_pbf(geometry, cache_dir=cache_dir, directory=directory) if osm else None
-    )
+    osm_pbf = osm_note = None
+    if osm:
+        osm_pbf, osm_note = _osm_extract(
+            geometry, cache_dir=cache_dir, directory=directory
+        )
 
     from transitio.catalog._atlas import _feed_dir
 
@@ -1345,6 +1358,8 @@ def fetch(
             feeds.append(path)
             delivered.add(feed.id, download)
 
+    if osm_note is not None:
+        record.append({**_entry(None, None), "note": osm_note})
     return FetchResult(
         osm_pbf=osm_pbf,
         feeds=feeds,
@@ -1352,7 +1367,7 @@ def fetch(
         repairs=repairs,
         skipped=_skipped(record),
         selection=record,
-        osm_area=geometry if osm else None,
+        osm_area=None if osm_pbf is None else geometry,
     )
 
 
@@ -1452,6 +1467,21 @@ def _osm_note(geometry, parts):
     )
 
 
+def _osm_extract(area, **options):
+    """``(path, None)`` for the OSM extract :func:`~transitio.osm.fetch_pbf`
+    fetches for ``area``, or ``(None, note)`` with a ``UserWarning`` when its
+    download fails; any other error raises."""
+    from transitio.exceptions import DownloadError
+    from transitio.osm import fetch_pbf
+
+    try:
+        return fetch_pbf(area, **options), None
+    except DownloadError as error:
+        note = f"OSM extract not fetched: {error}"
+        warnings.warn(f"{note}; osm_pbf is None", UserWarning, stacklevel=3)
+        return None, note
+
+
 def _fetch_place(
     place,
     *,
@@ -1496,7 +1526,6 @@ def _fetch_place(
         place as resolve_place,
     )
     from transitio.index.feeds import _parse
-    from transitio.osm import fetch_pbf
     from transitio.osm._fetch import _buffered
 
     if isinstance(place, Place):
@@ -1848,11 +1877,12 @@ def _fetch_place(
     osm_pbf = osm_area = None
     if osm:
         parts = _osm_parts(geometry, feeds)
-        osm_pbf = fetch_pbf(
+        osm_pbf, note = _osm_extract(
             parts, buffer_m=_OSM_BUFFER_M, cache_dir=cache_dir, directory=directory
         )
-        osm_area = _buffered(parts, _OSM_BUFFER_M)
-        note = _osm_note(geometry, parts)
+        if osm_pbf is not None:
+            osm_area = _buffered(parts, _OSM_BUFFER_M)
+            note = _osm_note(geometry, parts)
         if note is not None:
             record.append({**_entry(None, None), "note": note})
 
