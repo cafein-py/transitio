@@ -886,3 +886,55 @@ def test_a_failed_producer_download_falls_back_to_the_hosted_copy(
             "mdb_latest",
             errors,
         )
+
+
+_YEAR = ["2026-01-01", "2026-12-31"]
+
+
+@pytest.mark.parametrize(
+    "dropped, reason, window",
+    [
+        pytest.param(
+            ["agency.txt"], "missing required file agency.txt", _YEAR, id="agency"
+        ),
+        pytest.param(
+            ["stops.txt", "agency.txt"],
+            "missing required files agency.txt, stops.txt",
+            _YEAR,
+            id="two-files",
+        ),
+        pytest.param(
+            ["calendar.txt", "calendar_dates.txt"],
+            "missing calendar.txt and calendar_dates.txt",
+            None,
+            id="calendars",
+        ),
+        pytest.param([], None, _YEAR, id="complete"),
+    ],
+)
+def test_a_feed_missing_a_required_file_is_skipped(tmp_path, dropped, reason, window):
+    # A feed without agency.txt was delivered, its report counting the
+    # error, and cafein then refused every delivered feed.
+    from transitio.pipeline._fetch import _process_feed, _SkipFeed
+
+    files = {name: text for name, text in FEED.items() if name not in dropped}
+    source = write_zip(tmp_path / "feed.zip", files)
+    options = dict(
+        geometry=None,
+        tag="t",
+        repair=False,
+        crop=False,
+        modes=None,
+        day=None,
+        study=False,
+        hosted=None,
+        # Feed-level notices bypass the per-file notice cap.
+        budgets={"max_notices_per_file": 0},
+    )
+    if reason is None:
+        path, report, *_, kept_window = _process_feed(source, **options)
+        assert (path, kept_window) == (source, window) and report["summary"]
+        return
+    with pytest.raises(_SkipFeed) as caught:
+        _process_feed(source, **options)
+    assert (caught.value.reason, caught.value.window) == (reason, window)

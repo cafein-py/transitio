@@ -5,6 +5,86 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+
+- `merge_feeds(check=True)` refuses only the error-severity notices the
+  merge introduced, those its inputs do not carry; `check="strict"`
+  refuses any, as `True` did. The inputs are validated only when the
+  merged feed has an error, and the report gains `"inherited_errors"`
+  (per input, by code) and `"introduced_errors"`. Toronto's merge was
+  refused over errors its inputs already carried.
+- `merge_feeds` defaults to `timezones="skip"`, and the common time zone
+  is the one most feeds' stops confirm: a feed vouches for its
+  `agency_timezone` when most of its stops lie in an equivalent zone, as
+  located by `tzfpy`, a new required dependency. Leaving a feed out warns
+  with a `UserWarning`, its `"skipped_feeds"` entry gains
+  `"stop_timezone"`, and one feed left is merged alone. `fetch` notes a
+  delivered feed whose `agency_timezone` its stops contradict. Honolulu's
+  merge stopped on an airport shuttle feed declaring `America/New_York`.
+- `fetch(place=...)` tries the Mobility Database direct download, the
+  Transitland Atlas static feed, then the Mobility Database hosted copy,
+  moving on after any failure, an answer that is not a zip archive
+  included. `selection`, the provenance sidecar and the report's
+  provenance record `fetched_from` and `download_errors`. Feeds of Mexico
+  City, Moscow and Montréal were skipped as `"download failed"` though
+  the index was built from their hosted copies.
+- `fetch` skips a feed lacking a file GTFS requires, as `"missing required
+  file agency.txt"` (`"missing required files ..."` for several), and one
+  with neither calendar file as `"missing calendar.txt and
+  calendar_dates.txt"`, which includes a crop that keeps no trip; it does
+  not repair them. Toronto's TTC surface feed has no `agency.txt`, and
+  cafein refused every feed delivered with it.
+
+### Fixed
+
+- `transitio.index.fingerprint.from_feed` reads header names without
+  surrounding whitespace, as the index build does (of two names that trim
+  alike, the first column is read), so a feed with a padded header, such
+  as Metra's, keeps a trusted route selector in `fetch`.
+- The validator no longer checks `routes.network_id` against
+  `networks.txt`, since GTFS makes it an id of its own: a feed without
+  that file had every value reported as a `foreign_key_violation` error,
+  and `repair_feed` cleared them all. A `network_id` column in
+  `routes.txt` next to `route_networks.txt` or `networks.txt` is the
+  canonical `route_networks_specified_in_more_than_one_file` error.
+  Strasbourg's CTS feed carried 38 such errors and MBTA's 249.
+- Validation, cropping and repair read header names and values without
+  surrounding whitespace and write them trimmed; a file that had any
+  carries one `leading_or_trailing_whitespaces` warning, with
+  `trimmedCount`, instead of one per value, so a padded column no longer
+  fills the notice cap. `repair_feed` logs a `trim_whitespace` fix per
+  file, `crop_feed`'s report gains `"source_notices"`, and `FeedEditor`,
+  `merge_feeds` (`"trimmed_values"`), `patch_feed` (`trim_values`) and
+  `fetch`'s mode filter strip values too. Renfe pads every line with
+  about 150 spaces, which left its feed without a service window.
+- `crop_feed` drops the `fare_rules.txt` rows naming a route or zone it
+  removed, and a fare whole when that leaves it without its route rules,
+  its origin-destination rules or one of its `contains_id` zones, or when
+  its agency goes, so no fare applies more widely than in the source. A
+  fare without rules applies everywhere and stays. GO Transit's cropped
+  feed carried 3,458 fare-rule `foreign_key_violation` errors.
+- `merge_feeds` and `merge_tables` keep every input's default rider
+  category instead of raising `ValueError` when several inputs declare
+  one, as GTFS sets the default per fare product. `merge_feeds`' report
+  lists them under `"rider_defaults"`, with the fare products a blank
+  `rider_category_id` opens to every input's categories. Los Angeles's
+  merge was refused.
+- The scanner's delimiter guard counts only delimiters outside quotes, in
+  every table, so Brockton Area Transit's two-column `areas.txt`, whose
+  quoted polygons hold thousands of commas, no longer stops its crop as
+  exceeding `max_columns`. A file that trips the guard keeps the rows
+  before that line, and the refusal names the line and the guard:
+  "areas.txt line 7 has more than 4096 delimiters outside quotes, the
+  guard set by max_columns (1000)".
+- A feed past the 2,000,000-day calendar expansion cap keeps its service
+  window, its `moment` for the target day and its `expired_calendar`
+  check, and carries a `service_expansion_truncated` warning; only
+  `baselineTrips` is `None`, and the notices comparing against it are not
+  raised. A temporal crop keeps every service that runs in its window.
+  Basel's crop of the Swiss national feed had no service window.
+
 ## 0.17.0 — 2026-09-28
 
 ### Added

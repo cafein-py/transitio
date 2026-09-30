@@ -1353,7 +1353,8 @@ def test_fetch_place_output_names_differ_by_geometry(tmp_path, monkeypatch):
     out = tmp_path / "out"
     place_obj = transitio.place("Q1757", index=index)
     first = fetch(place=place_obj, directory=out)
-    place_obj._record["geometry"] = shapely.box(10.0, 50.0, 10.2, 50.2)
+    # Still around the fixture's stops, so the crop keeps its trip.
+    place_obj._record["geometry"] = shapely.box(24.92, 60.16, 24.95, 60.18)
     second = fetch(place=place_obj, directory=out)
     assert first.feeds[0].name != second.feeds[0].name
 

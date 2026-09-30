@@ -246,6 +246,29 @@ def _idle(validation, day):
     )
 
 
+def _missing_files(validation):
+    """Why a validation report makes a feed unreadable, or None: the required
+    files it lacks, and both calendar files when neither is present."""
+    notices = validation["notices"]
+    names = sorted(
+        {
+            notice["context"]["filename"]
+            for notice in notices
+            if notice.get("code") == "missing_required_file"
+        }
+    )
+    parts = []
+    if names:
+        noun = "file" if len(names) == 1 else "files"
+        parts.append(f"missing required {noun} {', '.join(names)}")
+    if any(
+        notice.get("code") == "missing_calendar_and_calendar_date_files"
+        for notice in notices
+    ):
+        parts.append("missing calendar.txt and calendar_dates.txt")
+    return "; ".join(parts) or None
+
+
 def _entry(feed_id, name, index_window=None):
     """An undecided selection-record entry for one candidate feed."""
     entry = dict.fromkeys(_SELECTION_FIELDS)
@@ -306,7 +329,8 @@ def _process_feed(
 ):
     """Crop, repair, mode-filter, validate and report one downloaded feed.
 
-    The computed service window is tested against ``day`` (None tests
+    A feed whose validation finds a required file missing drops out on any
+    day. The computed service window is tested against ``day`` (None tests
     nothing): with a ``study`` day it must cover the day and the validation
     report must not prove the day idle; otherwise it must not end before it.
 
@@ -365,6 +389,9 @@ def _process_feed(
             for value in validation["service_window"]
         )
     window = _window(start, end)
+    missing = _missing_files(validation)
+    if missing is not None:
+        raise _SkipFeed(missing, window)
     if day is not None:
         reason = _misses(start, end, day, study)
         if reason is None and study and _idle(validation, day):
@@ -866,11 +893,16 @@ def fetch(
     ``download_errors`` as ``selection`` does. Every overlapping feed is
     processed, in a deterministic order with official feeds first; one
     broken feed never aborts the others — it lands in ``skipped`` with its
-    reason. A download whose content equals a feed already delivered in the
-    call is skipped as ``"same content as <feed id>"`` when its routes are
-    within those delivered from that archive (a feed delivered whole carries
-    all); otherwise it is delivered cut to its own routes, ``same_as``
-    naming the earlier feed.
+    reason. A feed lacking a file GTFS requires is skipped, with or without
+    ``when`` and ``repair``: ``"missing required file agency.txt"`` (several
+    names sorted, ``"missing required files ..."``) or ``"missing calendar.txt
+    and calendar_dates.txt"``, joined with ``"; "`` when both apply; a crop
+    that keeps no trip leaves both calendar files out. A download whose
+    content equals a feed already delivered in the call is skipped as
+    ``"same content as <feed id>"`` when its routes are within those
+    delivered from that archive (a feed delivered whole carries all);
+    otherwise it is delivered cut to its own routes, ``same_as`` naming the
+    earlier feed.
 
     On the place path, delivered feeds whose route keys (agency name, route
     short else long name, type) and stops (coordinates at 3 decimals) share
