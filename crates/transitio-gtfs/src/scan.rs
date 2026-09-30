@@ -324,7 +324,8 @@ pub fn scan_reader_streaming<R: Read + Seek>(
 /// Why a feed cannot be taken whole to `verb` it, or None when it can,
 /// from the notices of its scan and the files it left incomplete: each
 /// file cut short, with every budget it exceeded and that budget's value
-/// ("stops.txt exceeds max_rows (5)"), and with `notice_caps` each file
+/// ("stops.txt exceeds max_rows (5)", or for the delimiter guard the line
+/// and the guard `max_columns` sets), and with `notice_caps` each file
 /// whose notices were sampled.
 pub fn refusal<'a>(
     notices: &[Notice],
@@ -370,7 +371,15 @@ pub fn refusal<'a>(
                 "max_notices_per_file" => options.max_notices_per_file,
                 _ => continue,
             };
-            reasons.insert(format!("{file} exceeds {budget} ({value})"));
+            let guard = notice.context.get("delimiterGuard");
+            let line = notice.context.get("lineNumber");
+            reasons.insert(match (budget, guard, line) {
+                ("max_columns", Some(guard), Some(line)) => format!(
+                    "{file} line {line} has more than {guard} delimiters outside quotes, \
+                     the guard set by {budget} ({value})"
+                ),
+                _ => format!("{file} exceeds {budget} ({value})"),
+            });
             budgets.insert(budget);
             if notice.code != "notice_limit_reached" {
                 explained.insert(file);
@@ -613,32 +622,10 @@ fn read_table(
         notices.push(empty_file(spec.name));
         return (None, false);
     }
-    // Crude quote-agnostic guard against naive delimiter floods: the CSV
-    // reader allocates per-field offsets for a whole record before any
-    // post-parse check can run. The threshold is deliberately slack so
-    // legitimate quoted commas never trip it. This is defense-in-depth, not
-    // a complete control — a record spread across quoted newlines evades
-    // the per-line count and is bounded by the byte and row budgets
-    // instead; the compact columnar representation planned for the rule
-    // engine removes the amplification surface entirely.
-    let delimiter_guard = options.max_columns.saturating_mul(4).max(4096);
-    for (line_index, line) in bytes.split(|b| *b == b'\n').enumerate() {
-        let delimiters = line.iter().filter(|b| **b == b',').count();
-        if delimiters > delimiter_guard {
-            notices.push(
-                unreadable_file(
-                    spec.name,
-                    &format!(
-                        "line {} has {delimiters} delimiters, over the {delimiter_guard} guard",
-                        line_index + 1
-                    ),
-                )
-                .with("budgets", vec!["max_columns"]),
-            );
-            return (None, true);
-        }
-    }
-    let mut reader = match TableReader::open(spec, bytes, options, options.max_rows, notices) {
+    // The entry budget bounds a record held in memory, so only the
+    // delimiter count is guarded.
+    let guarded = DelimiterGuard::new(bytes, options, u64::MAX);
+    let mut reader = match TableReader::open(spec, guarded, options, options.max_rows, notices) {
         Ok(reader) => reader,
         Err(NoTable::Empty) => return (None, false),
         Err(NoTable::Unreadable) => return (None, true),
@@ -651,8 +638,10 @@ fn read_table(
     if rows.is_empty() {
         // Header-only files (or files whose every row was dropped) carry no
         // entities; a required file passing clean in that state would be a
-        // false negative.
-        notices.push(empty_file(spec.name));
+        // false negative. A file cut short is noticed as such instead.
+        if !truncated {
+            notices.push(empty_file(spec.name));
+        }
         return (None, truncated);
     }
     (
@@ -992,15 +981,16 @@ impl<R: Read> TableReader<R> {
 pub const MAX_RECORD_BYTES: u64 = 16 * 1024 * 1024;
 
 /// A reader that fails once a logical CSV record carries more delimiters
-/// than the guard allows, or more bytes than `MAX_RECORD_BYTES`: the
-/// defence `read_table` applies before parsing, for input that is streamed
-/// rather than held in memory and so has no entry budget bounding it.
+/// outside quotes than the guard allows (4 × `max_columns`, at least
+/// 4096), or more bytes than its record limit: the csv reader allocates
+/// per-field offsets for a whole record before any row check can run.
 /// Quoting is tracked the way the csv reader reads it, so a record that
 /// spans quoted newlines counts as one record. The bytes before the flood
 /// are still delivered, so the rows read so far stay usable.
 pub struct DelimiterGuard<R: Read> {
     inner: R,
     guard: usize,
+    max_record_bytes: u64,
     delimiters: usize,
     record_bytes: u64,
     field: FieldState,
@@ -1008,15 +998,21 @@ pub struct DelimiterGuard<R: Read> {
     /// removes (`TableReader::open` skips one, the csv reader a second);
     /// `LEADING_MARK_BYTES` once they are complete or ruled out.
     leading: usize,
+    /// The 1-based line of the next byte, and the line the current record
+    /// starts on; `\n`, `\r` and `\r\n` each end one line, quoted or not.
+    line: u64,
+    record_line: u64,
+    after_return: bool,
     tripped: Option<Tripped>,
 }
 
-/// Why a `DelimiterGuard` stopped, and the `ScanOptions` field that
-/// raises its limit, if any.
+/// Why a `DelimiterGuard` stopped: the line the record starts on, and the
+/// guard when the delimiter count tripped it.
 #[derive(Clone, Debug)]
 struct Tripped {
     reason: String,
-    budget: Option<&'static str>,
+    line: u64,
+    delimiter_guard: Option<usize>,
 }
 
 impl std::fmt::Display for Tripped {
@@ -1042,14 +1038,19 @@ enum FieldState {
 }
 
 impl<R: Read> DelimiterGuard<R> {
-    pub fn new(inner: R, options: &ScanOptions) -> Self {
+    /// `max_record_bytes` caps a record (`u64::MAX` for no cap).
+    pub fn new(inner: R, options: &ScanOptions, max_record_bytes: u64) -> Self {
         DelimiterGuard {
             inner,
             guard: options.max_columns.saturating_mul(4).max(4096),
+            max_record_bytes,
             delimiters: 0,
             record_bytes: 0,
             field: FieldState::Start,
             leading: 0,
+            line: 1,
+            record_line: 1,
+            after_return: false,
             tripped: None,
         }
     }
@@ -1077,6 +1078,10 @@ impl<R: Read> Read for DelimiterGuard<R> {
                 self.leading = LEADING_MARK_BYTES;
             }
             self.record_bytes += 1;
+            if byte == b'\r' || (byte == b'\n' && !self.after_return) {
+                self.line += 1;
+            }
+            self.after_return = byte == b'\r';
             let mut delimiter = false;
             let mut record_end = false;
             self.field = match (self.field, byte) {
@@ -1098,20 +1103,31 @@ impl<R: Read> Read for DelimiterGuard<R> {
             if record_end {
                 self.delimiters = 0;
                 self.record_bytes = 0;
+                self.record_line = self.line;
                 continue;
             }
             if delimiter {
                 self.delimiters += 1;
             }
+            let line = self.record_line;
             let tripped = if self.delimiters > self.guard {
                 Tripped {
-                    reason: format!("a record has more than {} delimiters", self.guard),
-                    budget: Some("max_columns"),
+                    reason: format!(
+                        "line {line} has more than {} delimiters outside quotes \
+                         (the delimiter guard: 4 × max_columns, at least 4096)",
+                        self.guard
+                    ),
+                    line,
+                    delimiter_guard: Some(self.guard),
                 }
-            } else if self.record_bytes > MAX_RECORD_BYTES {
+            } else if self.record_bytes > self.max_record_bytes {
                 Tripped {
-                    reason: format!("a record is longer than {MAX_RECORD_BYTES} bytes"),
-                    budget: None,
+                    reason: format!(
+                        "line {line} starts a record longer than {} bytes",
+                        self.max_record_bytes
+                    ),
+                    line,
+                    delimiter_guard: None,
                 }
             } else {
                 continue;
@@ -1142,19 +1158,25 @@ fn unreadable_file(filename: &'static str, message: &str) -> Notice {
         .with("message", message)
 }
 
-/// `unreadable_file` for a read that failed, naming the budget when a
-/// `DelimiterGuard` stopped it.
+/// `unreadable_file` for a read that failed. When a `DelimiterGuard`
+/// stopped it, the notice names the line, and for too many delimiters the
+/// guard and its budget.
 fn read_failure(filename: &'static str, error: &csv::Error) -> Notice {
     let notice = unreadable_file(filename, &error.to_string());
-    let budget = match error.kind() {
+    let tripped = match error.kind() {
         csv::ErrorKind::Io(io) => io
             .get_ref()
-            .and_then(|inner| inner.downcast_ref::<Tripped>())
-            .and_then(|tripped| tripped.budget),
+            .and_then(|inner| inner.downcast_ref::<Tripped>()),
         _ => None,
     };
-    match budget {
-        Some(budget) => notice.with("budgets", vec![budget]),
+    let Some(tripped) = tripped else {
+        return notice;
+    };
+    let notice = notice.with("lineNumber", tripped.line);
+    match tripped.delimiter_guard {
+        Some(guard) => notice
+            .with("budgets", vec!["max_columns"])
+            .with("delimiterGuard", guard),
         None => notice,
     }
 }
@@ -1495,18 +1517,81 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn delimiter_heavy_rows_are_refused() {
-        let hostile = format!("stop_id,stop_name\ns1,Kamppi\n{}\n", ",".repeat(5000));
-        let mut files = minimal();
-        files.retain(|(name, _)| *name != "stops.txt");
-        let hostile_files: Vec<(&str, &[u8])> = files
-            .iter()
-            .map(|(name, content)| (*name, content.as_bytes()))
-            .chain(std::iter::once(("stops.txt", hostile.as_bytes())))
-            .collect();
-        let result = scan_reader(zip_with(&hostile_files)).unwrap();
-        assert!(codes(&result).contains(&"unreadable_file"));
-        assert!(!result.tables.contains_key("stops.txt"));
+    fn delimiter_heavy_rows_are_refused_from_their_line() {
+        let commas = ",".repeat(5000);
+        let polygon = format!("area_id,wkt\na1,\"POLYGON(({commas}))\"\n");
+        let header = "stop_id,stop_name,stop_lat,stop_lon\n";
+        let (s1, s2) = ("s1,Kamppi,60.169,24.931\n", "s2,Steissi,60.171,24.941\n");
+        let flooded = format!("{header}{s1}{commas}\n{s2}");
+        let flooded_first = format!("{header}{commas}\n{s1}");
+        // the file, its content, max_columns, the IDs kept, the file's
+        // notices, and the line the guard trips on
+        let cases = [
+            ("areas.txt", polygon, 1000, vec!["a1"], vec![], None),
+            (
+                "stops.txt",
+                flooded.clone(),
+                1000,
+                vec!["s1"],
+                vec!["unreadable_file"],
+                Some(3),
+            ),
+            (
+                "stops.txt",
+                flooded_first,
+                1000,
+                vec![],
+                vec!["unreadable_file"],
+                Some(2),
+            ),
+            (
+                "stops.txt",
+                flooded,
+                2000,
+                vec!["s1", "s2"],
+                vec!["invalid_row_length"],
+                None,
+            ),
+        ];
+        for (file, content, max_columns, kept, expected, line) in cases {
+            let mut files = minimal();
+            files.retain(|(name, _)| *name != file);
+            files.push((file, &content));
+            let options = ScanOptions {
+                max_columns,
+                ..ScanOptions::default()
+            };
+            let result = scan_reader_with(build_zip(&files), options).unwrap();
+            let notices: Vec<&Notice> = result
+                .notices
+                .iter()
+                .filter(|n| n.context.get("filename").and_then(|v| v.as_str()) == Some(file))
+                .collect();
+            let found: Vec<&str> = notices.iter().map(|n| n.code).collect();
+            assert_eq!(found, expected, "{file} under {max_columns}");
+            let rows = result.tables.get(file).map_or(&[][..], |table| &table.rows);
+            let ids: Vec<&str> = rows.iter().map(|row| row.fields[0].as_str()).collect();
+            assert_eq!(ids, kept, "{file} under {max_columns}");
+            if file == "areas.txt" {
+                assert_eq!(rows[0].fields[1], format!("POLYGON(({commas}))"));
+            }
+            assert_eq!(result.incomplete.contains(file), line.is_some());
+            let incomplete = result.incomplete.iter().map(String::as_str);
+            let reason = refusal(&result.notices, incomplete, &options, false, "crop");
+            let Some(line) = line else {
+                assert_eq!(reason, None);
+                continue;
+            };
+            let context = &notices[0].context;
+            assert_eq!(context["lineNumber"], line);
+            assert_eq!(context["delimiterGuard"], 4096);
+            assert_eq!(context["budgets"], serde_json::json!(["max_columns"]));
+            let expected = format!(
+                "{file} line {line} has more than 4096 delimiters outside quotes, the guard \
+                 set by max_columns (1000); raise it to crop this feed"
+            );
+            assert_eq!(reason.as_deref(), Some(expected.as_str()));
+        }
     }
 
     #[test]
@@ -1722,7 +1807,7 @@ pub(crate) mod tests {
     fn stream(bytes: &[u8], options: &ScanOptions, max_rows: u64) -> Streamed {
         let spec = schema::spec_for("stops.txt").unwrap();
         let mut notices = Vec::new();
-        let reader = DelimiterGuard::new(bytes, options);
+        let reader = DelimiterGuard::new(bytes, options, MAX_RECORD_BYTES);
         let mut reader = match TableReader::open(spec, reader, options, max_rows, &mut notices) {
             Ok(reader) => reader,
             Err(outcome) => {
@@ -2002,24 +2087,33 @@ pub(crate) mod tests {
         marked_header.extend(b"_id\",stop_name,stop_lat,stop_lon\n");
         marked_header.extend(row);
         let twice_marked_header: Vec<u8> = [&BYTE_ORDER_MARK[..], &marked_header[..]].concat();
+        // \r\n, a quoted \n and \r each end one line before the flood
+        let line_ends: Vec<u8> = [
+            &b"stop_id,stop_name,stop_lat,stop_lon\r\nb,\"Br\navo\",60.2,24.8\r"[..],
+            &commas[..],
+        ]
+        .concat();
         // the flooded row arriving right after the last allowed row is a
         // read failure, not the row cap; only the delimiter guard follows a
-        // budget
+        // budget; the line is the one the record starts on
         let columns = Some(serde_json::json!(["max_columns"]));
-        for (bytes, max_rows, rows_before, budgets) in [
-            (flooded_row, 1, 1, columns.clone()),
-            (flooded_header, u64::MAX, 0, columns),
-            (quoted, u64::MAX, 1, None),
-            (oversized, u64::MAX, 1, None),
-            (marked_header, u64::MAX, 0, None),
-            (twice_marked_header, u64::MAX, 0, None),
+        for (bytes, max_rows, rows_before, budgets, line) in [
+            (flooded_row, 1, 1, columns.clone(), 3),
+            (flooded_header, u64::MAX, 0, columns.clone(), 1),
+            (quoted, u64::MAX, 1, None, 3),
+            (oversized, u64::MAX, 1, None, 3),
+            (marked_header, u64::MAX, 0, None, 1),
+            (twice_marked_header, u64::MAX, 0, None, 1),
+            (line_ends, u64::MAX, 1, columns, 4),
         ] {
             let streamed = stream(&bytes, &ScanOptions::default(), max_rows);
             // the rows before the flood are usable; nothing after it is read
             assert_eq!(streamed.rows.len(), rows_before);
             assert!(streamed.truncated);
             assert_eq!(notice_codes(&streamed.notices), ["unreadable_file"]);
-            assert_eq!(streamed.notices[0].context.get("budgets"), budgets.as_ref());
+            let context = &streamed.notices[0].context;
+            assert_eq!(context.get("budgets"), budgets.as_ref());
+            assert_eq!(context["lineNumber"], line);
         }
     }
 

@@ -58,7 +58,10 @@ def validate_feed(
         Rows retained per file (default 20 million); reading past the cap
         raises a ``too_many_rows`` notice and stops for that file.
     max_columns : int, optional
-        Column-count guard per file (default 1000).
+        Column-count guard per file (default 1000). It also sets the
+        delimiter guard: a record with more than 4 × ``max_columns`` (at
+        least 4096) delimiters outside quotes is ``unreadable_file``, and
+        the file keeps only the rows before it.
     max_notices_per_file : int, optional
         Row-level notices retained per file (default 10000); further
         occurrences are counted in a ``notice_limit_reached`` notice.

@@ -9,7 +9,9 @@ use std::path::Path;
 
 use crate::notice::Notice;
 use crate::output::ZipOutput;
-use crate::scan::{DelimiterGuard, NoTable, Row, ScanOptions, ScanResult, Table, TableReader};
+use crate::scan::{
+    DelimiterGuard, NoTable, Row, ScanOptions, ScanResult, Table, TableReader, MAX_RECORD_BYTES,
+};
 use crate::{rules, scan, schema, semantics};
 
 /// Tables read from the archive row by row rather than parsed whole: the
@@ -341,8 +343,9 @@ pub fn validate_polygon(parts: &[PolygonRings]) -> Result<(), String> {
     Ok(())
 }
 
-/// The named table streamed from the archive under the stream guard, or
-/// None when the archive has no such entry or it is empty.
+/// The named table streamed from the archive under the delimiter guard,
+/// with records capped at `MAX_RECORD_BYTES` as no entry budget bounds
+/// them, or None when the archive has no such entry or it is empty.
 fn stream_table<'a>(
     archive: &'a mut zip::ZipArchive<std::fs::File>,
     name: &'static str,
@@ -355,7 +358,7 @@ fn stream_table<'a>(
     };
     let spec = schema::spec_for(name).expect("a streamed table is a known GTFS file");
     let mut notices = Vec::new();
-    let guarded = DelimiterGuard::new(entry, options);
+    let guarded = DelimiterGuard::new(entry, options, MAX_RECORD_BYTES);
     match TableReader::open(spec, guarded, options, u64::MAX, &mut notices) {
         Ok(reader) => Ok(Some(reader)),
         Err(NoTable::Empty) => Ok(None),
@@ -1109,7 +1112,10 @@ mod tests {
             (
                 defaults,
                 Some(flooded.as_str()),
-                Some("stop_times.txt exceeds max_columns (1000); raise it to crop this feed"),
+                Some(
+                    "stop_times.txt line 2 has more than 4096 delimiters outside quotes, \
+                     the guard set by max_columns (1000); raise it to crop this feed",
+                ),
             ),
         ];
         for (options, stop_times, expected) in cases {

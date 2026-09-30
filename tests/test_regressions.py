@@ -770,3 +770,18 @@ def test_merge_leaves_out_the_feed_whose_stops_lie_in_another_time_zone(tmp_path
     agency = FeedEditor(output).tables["agency.txt"]
     assert list(agency["agency_id"]) == ["f2:hsl", "f2:espoo"]
     assert set(agency["agency_timezone"]) == {"Pacific/Honolulu"}
+
+
+def test_quoted_commas_do_not_trip_the_delimiter_guard(tmp_path):
+    # The delimiter guard counted every comma on a line, so a two-column
+    # areas.txt whose quoted WKT polygon held over 4096 commas was refused as
+    # exceeding max_columns and the feed could not be cropped.
+    ring = ", ".join(f"24.{i:04d} 60.1" for i in range(4200))
+    areas = f'area_id,wkt\na1,"POLYGON(({ring}))"\na2,"POINT (24.9 60.1)"\n'
+    source = write_zip(tmp_path / "feed.zip", {**FEED, "areas.txt": areas})
+    output = tmp_path / "cropped.zip"
+    crop_feed(source, output, aoi=CITY_BBOX, reference_date="20260601")
+    cropped = read_entry(output, "areas.txt").decode()
+    assert list(csv.reader(io.StringIO(cropped))) == list(
+        csv.reader(io.StringIO(areas))
+    )
