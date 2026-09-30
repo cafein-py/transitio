@@ -837,16 +837,16 @@ def test_date_rules_decide_before_and_after_download(
 
 def _network(agency="HSL", start="20260101", stops=None, hours=(8,), **options):
     """GTFS of ``agency`` whose ``routes`` each run a trip from s2 to s3 at
-    each of ``hours``, daily from ``start`` through 2026, among stops s<i>
-    (s0 to s9 unless ``stops`` names them); with a ``headway``, each trip
-    repeats that often for an hour."""
+    each of ``hours``, daily from ``start`` to ``end`` (through 2026 unless
+    given), among stops s<i> (s0 to s9 unless ``stops`` names them); with a
+    ``headway``, each trip repeats that often for an hour."""
     stops = range(10) if stops is None else stops
     trips = [(r, h) for r in options.get("routes", ("r1",)) for h in hours]
     times = (
         "{0}{1},{1:02}:00:00,{1:02}:00:00,s2,1\n{0}{1},{1:02}:10:00,{1:02}:10:00,s3,2"
     )
     tables = {
-        **_calendar(start, "20261231"),
+        **_calendar(start, options.get("end", "20261231")),
         "agency.txt": GTFS["agency.txt"].replace("HSL", agency),
         "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\n"
         + "".join(f"s{i},S{i},{60 + i / 100:.2f},24.9\n" for i in stops),
@@ -877,6 +877,9 @@ NEW, OLD, OLDER = ({"start": f"2026{month}01"} for month in ("06", "05", "04"))
 C, F = {"agency": "C"}, {"agency": "F"}
 AB, ABC = {**C, "routes": ("a", "b")}, {**C, "routes": ("a", "b", "c")}
 IN_C, ADDS = {**F, "in": "C"}, f"+ similar to A but adds service on {DAY}"
+# A network on a placeholder calendar, and the note it gets.
+HELD = {"start": "20000101", "end": "20990101"}
+HELD_NOTE = "placeholder calendar 2000-01-01 to 2099-01-01"
 KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
 
 
@@ -985,6 +988,24 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
                 "B": "+ similar to A; kept, no study day",
             },
         ),
+        (
+            {"A": {**NEW, "end": "20991231"}, "B": OLD},
+            DAY,
+            {
+                "A": "+ placeholder calendar 2026-06-01 to 2099-12-31",
+                "B": "- another version of A [A 1.0 1.0]",
+            },
+        ),
+        (
+            {"A": {**NEW, "stops": range(8)}, "B": {**HELD, "stops": range(1, 9)}},
+            DAY,
+            {"A": "+", "B": f"+ {HELD_NOTE}"},
+        ),
+        (
+            {"A": HELD, "B": {**HELD, "routes": ("x",)}},
+            DAY,
+            {"A": f"+ {HELD_NOTE}", "B": f"+ {HELD_NOTE}"},
+        ),
     ],
     ids=(
         "identical identical-overlapping-routes container-renewed "
@@ -995,7 +1016,8 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
         "versions-three versions-three-reversed "
         "version-chain version-protected-container "
         "version-same-content-container version-under-stop-threshold "
-        "version-transfers versions-no-study-day"
+        "version-transfers versions-no-study-day placeholder-starting-later "
+        "placeholder-under-stop-threshold placeholders-other-routes"
     ).split(),
 )
 def test_fetch_delivers_one_copy_per_service(

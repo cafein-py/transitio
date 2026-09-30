@@ -27,6 +27,10 @@ MAX_SERVICE_DAYS = 40_000
 #: Days expanded from one calendar.txt at most; the longest rows past it are
 #: not expanded.
 MAX_EXPANDED_DAYS = 50_000_000
+#: A calendar row whose end is this many days or more after its start is a
+#: placeholder rather than a timetable period, as the validator's
+#: ``calendar_span_truncated`` notice counts it.
+PLACEHOLDER_DAYS = 4000
 # A trip signature joins two 64-bit hashes taken under these keys.
 _HASH_KEYS = ("transitio-trip-1", "transitio-trip-2")
 # Legal-form words an agency key drops from the end of a name.
@@ -87,6 +91,17 @@ def service_span(tables, within):
         return None
     days = dates["date"].to_numpy().astype("datetime64[D]")
     return days.min().item(), days.max().item()
+
+
+def placeholder_rows(tables):
+    """The calendar.txt rows whose end is :data:`PLACEHOLDER_DAYS` days or
+    more after their start, as ``service_id``, ``start`` and ``end``; rows
+    with an unreadable date are left out."""
+    calendar = tables.get("calendar.txt", pd.DataFrame())
+    start, end = (parse_dates(_column(calendar, f"{e}_date")) for e in ("start", "end"))
+    services = _column(calendar, "service_id").to_numpy()
+    rows = pd.DataFrame({"service_id": services, "start": start, "end": end})
+    return rows[end - start >= np.timedelta64(PLACEHOLDER_DAYS, "D")]
 
 
 def service_dates(tables):

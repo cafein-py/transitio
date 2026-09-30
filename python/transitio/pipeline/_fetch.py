@@ -578,10 +578,15 @@ def _service(path, day=None, max_total_bytes=None):
     """A delivered feed's route keys, rounded stop coordinates and trip
     count, and whether it is one ``unnamed`` agency; with a ``day``, the
     signatures of its trips running then, whether those are all of them,
-    and whether it has transfers or pathways, from those tables only, read
-    as ``FeedEditor`` does. A feed is one unnamed agency when it has at most
-    one agency row, none named, and its routes name at most one
-    ``agency_id``. None when the tables are over
+    whether it has transfers or pathways, and its ``placeholder`` calendar,
+    from those tables only, read as ``FeedEditor`` does. A feed is one
+    unnamed agency when it has at most one agency row, none named, and its
+    routes name at most one ``agency_id``. When trips run on the day and
+    each of their services has a calendar.txt row spanning
+    :data:`~transitio.gtfs._schedule.PLACEHOLDER_DAYS` days or more, its
+    placeholder calendar is the earliest start and latest end of those
+    rows, a ``(start, end)`` pair of dates, and None otherwise. The result
+    is None when the tables are over
     ``max_total_bytes``, a route key has a blank part (an unnamed agency's
     blank agency aside), a stop or station lacks coordinates, or with a
     ``day`` its calendars cannot be read."""
@@ -589,6 +594,7 @@ def _service(path, day=None, max_total_bytes=None):
 
     from transitio.gtfs._schedule import (
         _column,
+        placeholder_rows,
         route_keys,
         service_dates,
         trip_signatures,
@@ -631,15 +637,22 @@ def _service(path, day=None, max_total_bytes=None):
         if unexpanded or dates.empty:
             return None
         running = dates.loc[dates["date"] == pd.Timestamp(day), "service_id"]
-        on_day = trips.loc[trips["service_id"].isin(running), "trip_id"]
+        today = trips[trips["service_id"].isin(running)]
+        on_day, used = today["trip_id"], today["service_id"]
         signed = trip_signatures(tables)
         signed = signed[signed["trip_id"].isin(on_day)]
+        rows = placeholder_rows(tables)
+        rows = rows[rows["service_id"].isin(used)]
+        placeholder = None
+        if len(used) and used.isin(rows["service_id"]).all():
+            placeholder = (rows["start"].min().date(), rows["end"].max().date())
     except Exception:  # noqa: B902 — an unreadable feed is never grouped
         return None
     found.update(
         day=set(signed["signature"]),
         complete=len(signed) == len(on_day),
         linked=any(len(tables.get(n, ())) for n in ("transfers.txt", "pathways.txt")),
+        placeholder=placeholder,
     )
     return found
 
@@ -680,12 +693,36 @@ def _settle_versions(record, services, protected, day):
     entries = {entry["feed_id"]: entry for entry in record}
     order = {feed_id: position for position, feed_id in enumerate(entries)}
 
+    def start(feed_id):
+        # An undated feed starts when its placeholder calendar does.
+        span = services[feed_id].get("placeholder")
+        if span is not None:
+            return span[0]
+        value = (entries[feed_id]["feed_window"] or [None])[0]
+        return None if value is None else datetime.date.fromisoformat(value)
+
     def rank(feed_id):
-        start = (entries[feed_id]["feed_window"] or [None])[0]
-        later = -datetime.date.fromisoformat(start).toordinal() if start else 0
-        return (start is None, later, -services[feed_id]["trips"], order[feed_id])
+        first = start(feed_id)
+        later = -first.toordinal() if first else 0
+        return (first is None, later, -services[feed_id]["trips"], order[feed_id])
+
+    def supersedes(feed_id, other):
+        # A dated feed starting after an undated one's placeholder calendar.
+        first = start(feed_id)
+        return (
+            services[feed_id].get("placeholder") is None
+            and services[other].get("placeholder") is not None
+            and first is not None
+            and first > start(other)
+        )
+
+    def undated(feed_id):
+        span = services[feed_id].get("placeholder")
+        return span and "placeholder calendar {} to {}".format(*span)
 
     ids = sorted(services, key=rank)
+    for feed_id in filter(undated, ids):
+        _note(entries[feed_id], undated(feed_id))
     # A pair with an unnamed agency compares routes by name and type only.
     lines = {
         feed_id: {key[1:] for key in services[feed_id]["routes"]} for feed_id in ids
@@ -699,7 +736,10 @@ def _settle_versions(record, services, protected, day):
                 for f in (one, other)
             ]
             overlaps = tuple(len(a & b) / len(a | b) for a, b in zip(*sides))
-            if overlaps[0] >= _ROUTE_OVERLAP and overlaps[1] >= _STOP_OVERLAP:
+            # An undated feed and a dated one starting later pair on stops alone.
+            routed = supersedes(one, other) or supersedes(other, one)
+            routed = routed or overlaps[0] >= _ROUTE_OVERLAP
+            if routed and overlaps[1] >= _STOP_OVERLAP:
                 pairs[one][other] = pairs[other][one] = overlaps
     removed, grouped = set(), set()
     for top in ids:
@@ -725,6 +765,9 @@ def _settle_versions(record, services, protected, day):
                 continue
             service = services[member]
             partners = [other for other in kept if other in pairs[member]]
+            if any(supersedes(other, member) for other in partners):
+                removed.add(member)
+                continue
             adds = not (service["complete"] and service["day"] <= covered)
             if partners and not adds and not service["linked"]:
                 removed.add(member)
@@ -736,11 +779,14 @@ def _settle_versions(record, services, protected, day):
             kept = sorted([*kept, member], key=ids.index)
             covered |= service["day"]
         for member in [m for m in members if m in removed]:
-            partner = next(other for other in kept if other in pairs[member])
+            partners = [other for other in kept if other in pairs[member]]
+            later = [other for other in partners if supersedes(other, member)]
+            partner = (later or partners)[0]
             route, stop = (round(share, 3) for share in pairs[member][partner])
             version = {"feed_id": partner, "route_overlap": route, "stop_overlap": stop}
             reason = f"another version of {partner}"
-            _skip(entries[member], reason, note=None, path=None, version_of=version)
+            note = undated(member)
+            _skip(entries[member], reason, note=note, path=None, version_of=version)
     return removed
 
 
@@ -932,10 +978,18 @@ def fetch(
     trip it runs on the day, a headway trip matching one with the same
     stops, relative times and frequency rows; the top version and the
     containers a left-out feed relied on stay, as does one with transfers or
-    pathways. A left-out version's fares are not delivered. Without ``when``
-    none is left out; similar feeds are noted. A feed whose routes, stops
-    or, with ``when``, calendars cannot be read, or with a blank agency name
-    that is not unnamed, is never a version.
+    pathways. With ``when``, a feed whose trips running on the day all
+    belong to services with a calendar.txt row spanning 4,000 days or more
+    is undated, noted ``"placeholder calendar <start> to <end>"``, the
+    widest dates of those rows, and ranks by its placeholder start. An
+    undated feed also pairs on stops alone with a dated one starting after
+    its placeholder start, so its ``version_of`` route overlap may be under
+    0.9, and a kept such version leaves it out whatever it runs on the day
+    and its transfers or pathways; the top version and the containers
+    relied on still stay. A left-out version's fares are not delivered.
+    Without ``when`` none is left out; similar feeds are noted. A feed
+    whose routes, stops or, with ``when``, calendars cannot be read, or with
+    a blank agency name that is not unnamed, is never a version.
 
     Parameters
     ----------
@@ -1018,7 +1072,8 @@ def fetch(
         Database hosted copy"`` after a failed download, an
         ``agency_timezone`` not equivalent to the zone of most of its stops,
         e.g. ``"agency_timezone America/New_York; stops in
-        Pacific/Honolulu"``; several join with ``"; "``),
+        Pacific/Honolulu"``, a placeholder calendar, which a left-out
+        version keeps; several join with ``"; "``),
         ``index_window`` (the index's ``[start, end]``; None undated or on
         the area path), ``feed_window`` (the computed window of a validated
         download, delivered or not; None otherwise or when unknown),
@@ -1026,13 +1081,15 @@ def fetch(
         ``contained_in`` (the containers a containment skip names),
         ``version_of`` (for a left-out version, ``{"feed_id", "route_overlap",
         "stop_overlap"}`` against the highest-ranked kept version it pairs
-        with), ``fetched_from`` (where the download came from:
-        ``"mdb_dataset"`` a catalogued dataset, ``"producer"`` the feed's own
-        URL from the Mobility Database or Transitland Atlas, ``"mdb_latest"``
-        the Mobility Database hosted copy; None when nothing was
-        downloaded), ``download_errors`` (the failed download attempts before
-        the one that worked, or all of them when none did, joined with
-        ``"; "``; None when none failed) and ``path`` (the delivered feed).
+        with, for an undated feed the highest-ranked dated one starting after
+        its placeholder start when one does), ``fetched_from`` (where the
+        download came from: ``"mdb_dataset"`` a catalogued dataset,
+        ``"producer"`` the feed's own URL from the Mobility Database or
+        Transitland Atlas, ``"mdb_latest"`` the Mobility Database hosted
+        copy; None when nothing was downloaded), ``download_errors`` (the
+        failed download attempts before the one that worked, or all of them
+        when none did, joined with ``"; "``; None when none failed) and
+        ``path`` (the delivered feed).
         Windows are ISO dates.
         When the OSM extract leaves out parts of the place, a last entry
         with ``feed_id`` None notes them, e.g. ``"OSM area: 1 of 47 parts

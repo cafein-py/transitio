@@ -1062,3 +1062,39 @@ def test_near_repeats_of_a_trip_are_merged_once(tmp_path):
     assert sorted(merged["trips.txt"]["trip_id"]) == ["f1:g", "f1:h"]
     counts = report["duplicate_trips"]
     assert counts["dropped"] == counts["near_matches"] == counts["unaligned_stops"] == 2
+
+
+def test_a_placeholder_calendar_is_an_older_version_of_the_dated_network(tmp_path):
+    # A snapshot on a 2025 to 2099 calendar passed every date check, and as
+    # its route names had drifted it never paired with the dated network
+    # serving the same stops, so both were delivered. Its first running day
+    # comes after the dated network's start.
+    import datetime
+
+    from transitio.pipeline._fetch import _entry, _service, _settle_versions
+
+    dated = write_zip(tmp_path / "dated.zip", FEED)
+    snapshot = {
+        **FEED,
+        "routes.txt": FEED["routes.txt"].replace(",1,", ",x,").replace(",2,", ",y,"),
+        "calendar.txt": FEED["calendar.txt"].replace(
+            "20260101,20261231", "20251231,20990101"
+        ),
+        "calendar_dates.txt": FEED["calendar_dates.txt"]
+        + "wk,20251231,2\nwk,20260101,2\n",
+        "transfers.txt": "from_stop_id,to_stop_id,transfer_type\nin1,in2,0\n",
+    }
+    snapshot = write_zip(tmp_path / "snapshot.zip", snapshot)
+    day = datetime.date(2026, 6, 1)
+    record = [_entry("snapshot", None), _entry("dated", None)]
+    windows = (["2026-01-05", "2099-01-01"], ["2026-01-01", "2026-12-31"])
+    for entry, window in zip(record, windows):
+        entry.update(decision="delivered", feed_window=window)
+    services = {"dated": _service(dated, day), "snapshot": _service(snapshot, day)}
+    assert _settle_versions(record, services, set(), day) == {"snapshot"}
+    assert record[1]["note"] is None
+    assert (record[0]["reason"], record[0]["note"], record[0]["version_of"]) == (
+        "another version of dated",
+        "placeholder calendar 2025-12-31 to 2099-01-01",
+        {"feed_id": "dated", "route_overlap": 0.0, "stop_overlap": 1.0},
+    )
