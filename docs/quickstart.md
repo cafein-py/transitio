@@ -239,10 +239,15 @@ for feed in augsburg.feeds(tiers=["local", "regional"]):
 
 `feeds()` without tiers returns the place kind's default view: a city's or a
 metro's primary and secondary feeds (its local and regional service), a
-region's secondary and tertiary ones, a country's tertiary ones. `exclude`
-drops named tiers and `requires=["shapes.txt"]` keeps only feeds carrying
-those files. `feed.realtime` lists the GTFS-realtime companions tied to a
-static feed; the companions the index could not tie to one are in
+region's secondary and tertiary ones, a country's tertiary ones. A region or
+country of at most 1,000 km², such as Monaco or San Juan, is town-sized and
+keeps its primary, secondary and tertiary feeds. When `fetch(place=...)`
+without tiers finds the default view empty while the place has feeds, an
+entry of the selection record names them and the `tiers` that fetch them,
+and a warning repeats it. `exclude` drops named tiers and
+`requires=["shapes.txt"]` keeps only feeds carrying those files.
+`feed.realtime` lists the GTFS-realtime companions tied to a static feed;
+the companions the index could not tie to one are in
 `Index.realtime_unlinked()`.
 
 ## Reading the validation report

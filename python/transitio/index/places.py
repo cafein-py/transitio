@@ -293,9 +293,10 @@ class Place:
         to narrow), ``on_unknown`` governs unknown-tier edges and ``requires``
         keeps only feeds whose manifest carries the named GTFS files (for
         example ``"shapes.txt"``). On a schema-7 index ``categories`` picks
-        the relevance categories (the place kind's default view unless named;
-        ``None`` for all) and ``international=True`` adds the cross-border
-        feeds. See :func:`transitio.index.feeds.feeds_for_place`.
+        the relevance categories (the place kind's default view unless named,
+        in which a region or country of at most 1,000 km² keeps its primary
+        feeds too; ``None`` for all) and ``international=True`` adds the
+        cross-border feeds. See :func:`transitio.index.feeds.feeds_for_place`.
         """
         return self._lookup.feeds(
             self,

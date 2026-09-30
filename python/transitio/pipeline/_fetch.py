@@ -78,8 +78,9 @@ class FetchResult:
     # feeds, from the index's contained_in (schema 10); empty otherwise.
     contained: dict = dataclasses.field(default_factory=dict)
     # One entry per candidate feed, in candidate order, with its decision;
-    # ``skipped`` lists the same skips. A last entry with feed_id None notes
-    # the place parts the OSM extract leaves out, or why it was not fetched.
+    # ``skipped`` lists the same skips. Entries with feed_id None note, after
+    # the candidates, the feeds an empty default view hides, and last the
+    # place parts the OSM extract leaves out, or why it was not fetched.
     selection: list = dataclasses.field(default_factory=list)
     # The WGS84 area the OSM extract was fetched for; None without one. A
     # failed extract download leaves it and osm_pbf None.
@@ -90,7 +91,8 @@ class FetchResult:
 
     def selection_table(self):
         """The selection record as a ``pandas.DataFrame``, one row per
-        candidate feed, then the OSM note row when there is one."""
+        candidate feed, then the default-view and OSM note rows when there
+        are any."""
         import pandas as pd
 
         return pd.DataFrame(self.selection, columns=list(_SELECTION_FIELDS))
@@ -1158,6 +1160,13 @@ def fetch(
         when none did, joined with ``"; "``; None when none failed) and
         ``path`` (the delivered feed).
         Windows are ISO dates.
+        When ``place`` is fetched without ``tiers`` and its default view
+        (:meth:`~transitio.index.Place.feeds`) holds none of the place's
+        feeds, an entry with ``feed_id`` None after the candidates names
+        them and the tiers that fetch them, and a ``UserWarning`` repeats
+        it, e.g. ``"default view (region: secondary, tertiary) holds none of
+        the place's 2 feeds: f-a (primary), f-b (primary); tiers=['local']
+        fetches them"``.
         When the OSM extract leaves out parts of the place, a last entry
         with ``feed_id`` None notes them, e.g. ``"OSM area: 1 of 47 parts
         (1783 of 2188 km²)"``; when its download failed, the last entry
@@ -1451,6 +1460,30 @@ def _osm_parts(geometry, feeds):
     return shapely.union_all(parts[sorted(held)])
 
 
+def _hidden_note(place, hidden):
+    """The selection-record note on a place whose default view holds none of
+    its ``hidden`` feeds: the view's categories, the feeds (at most five
+    named) and the tiers that fetch them, local, regional and national when
+    only unknown edges remain."""
+    from transitio.index.feeds import CATEGORY_ORDER, _default_categories
+
+    shown = _default_categories(place, None, "default", False) or ()
+    categories = ", ".join(c for c in CATEGORY_ORDER if c in shown)
+    named = ", ".join(
+        f"{feed.feed_id} ({feed.relevance_category})" for feed in hidden[:5]
+    )
+    if len(hidden) > 5:
+        named += f" and {len(hidden) - 5} more"
+    order = ("local", "regional", "national", "international")
+    found = set().union(*(feed.tiers for feed in hidden))
+    tiers = [tier for tier in order if tier in found] or list(order[:3])
+    feeds, them = ("feed", "it") if len(hidden) == 1 else ("feeds", "them")
+    return (
+        f"default view ({place.kind}: {categories}) holds none of the place's "
+        f"{len(hidden)} {feeds}: {named}; tiers={tiers} fetches {them}"
+    )
+
+
 def _osm_note(geometry, parts):
     """The selection-record note on the parts of ``geometry`` that ``parts``
     leaves out, None when it leaves out none."""
@@ -1589,6 +1622,15 @@ def _fetch_place(
                 _skip(entry, "only unknown-tier edges")
     for feed in offered:
         entry_for(feed)
+    if tiers is None and not offered:
+        # An empty default view may hide feeds a tier query would fetch.
+        hidden = place_obj.feeds(
+            exclude=exclude, on_unknown=on_unknown, categories=None
+        )
+        if hidden:
+            note = _hidden_note(place_obj, hidden)
+            record.append({**_entry(None, None), "note": note})
+            warnings.warn(note, UserWarning, stacklevel=3)
 
     import platformdirs
 

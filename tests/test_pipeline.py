@@ -1226,6 +1226,36 @@ def test_timezone_note(tmp_path, zone, stops, budget, expected):
     assert _timezone_note(path, budget) == expected
 
 
+@pytest.mark.parametrize(
+    "hidden, expected",
+    [
+        pytest.param(
+            [("f-u", "unknown", {"unknown"})],
+            "1 feed: f-u (unknown); tiers=['local', 'regional', 'national'] fetches it",
+            id="unknown-only",
+        ),
+        pytest.param(
+            [(f"f-{n}", "tertiary", {"national", "regional"}) for n in range(7)],
+            "7 feeds: f-0 (tertiary), f-1 (tertiary), f-2 (tertiary), f-3 (tertiary),"
+            " f-4 (tertiary) and 2 more; tiers=['regional', 'national'] fetches them",
+            id="seven",
+        ),
+    ],
+)
+def test_hidden_view_note(hidden, expected):
+    from types import SimpleNamespace
+
+    from transitio.pipeline._fetch import _hidden_note
+
+    feeds = [
+        SimpleNamespace(feed_id=feed_id, relevance_category=category, tiers=tiers)
+        for feed_id, category, tiers in hidden
+    ]
+    note = _hidden_note(SimpleNamespace(kind="city"), feeds)
+    prefix = "default view (city: primary, secondary) holds none of the place's "
+    assert note == prefix + expected
+
+
 @pytest.mark.parametrize("path", ["area", "place"])
 def test_a_delivered_feed_notes_an_agency_timezone_its_stops_disagree_with(
     pipeline_env, monkeypatch, path

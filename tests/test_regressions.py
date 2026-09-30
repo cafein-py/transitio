@@ -1319,3 +1319,78 @@ def test_a_failed_extract_download_keeps_the_fetched_feeds(
         None,
         f"OSM extract not fetched: {_EXTRACT_TIMEOUT}",
     )
+
+
+_HIDDEN_NOTE = (
+    "default view (region: secondary, tertiary) holds none of the place's 1 feed:"
+    " f-bus (primary); tiers=['local'] fetches it"
+)
+
+
+@pytest.mark.parametrize(
+    "bbox, note",
+    [
+        pytest.param(CITY_BBOX, None, id="town-sized"),
+        pytest.param(WIDE_BBOX, _HIDDEN_NOTE, id="wide"),
+    ],
+)
+def test_an_empty_default_view_is_not_fetched_silently(
+    tmp_path, monkeypatch, bbox, note
+):
+    # A town-sized region or country (Monaco, San Juan) left its local-only
+    # feeds out of the default view, and fetch(place=...) returned no feeds,
+    # an empty selection record and no warning.
+    import datetime
+    import pathlib
+    import warnings
+
+    import shapely
+
+    import transitio
+    import transitio.index as transitio_index
+    from index_fixture import covered_feed, edge, place, write_partitioned_index
+    from transitio.pipeline import fetch
+
+    monkeypatch.setattr(
+        transitio, "__version__", transitio_index.MIN_READER_VERSIONS[7], raising=False
+    )
+    monkeypatch.setattr(
+        "transitio.pipeline._fetch._today", lambda: datetime.date(2026, 6, 1)
+    )
+    feed = {
+        **covered_feed("f-bus"),
+        "atlas": {"urls": {"static_current": "https://feeds.example/bus.zip"}},
+        "home_country": "FI",
+        "scope": "domestic",
+    }
+    region = place("r", "region", geometry=shapely.to_wkb(shapely.box(*bbox)).hex())
+    local = edge(
+        "r", "f-bus", tier="local", relevance_category="primary", relevance=0.9
+    )
+    index = transitio_index.read_index(
+        write_partitioned_index(
+            tmp_path / "index", feeds=[feed], places=[region], edges=[local]
+        )
+    )
+    calls = []
+
+    def download(self, feed, directory=None):
+        calls.append(feed.feed_id)
+        return write_zip(pathlib.Path(directory) / "latest.zip", FEED)
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas.download", download)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = fetch(
+            place="r", index=index, directory=tmp_path / "out", crop=False, osm=False
+        )
+    warned = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
+    if note is None:
+        (entry,) = result.selection
+        assert (warned, calls, entry["decision"]) == ([], ["f-bus"], "delivered")
+        return
+    assert (warned, calls, result.feeds) == ([note], [], [])
+    assert [(e["feed_id"], e["decision"], e["note"]) for e in result.selection] == [
+        (None, None, note)
+    ]
