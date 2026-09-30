@@ -75,7 +75,7 @@ MIN_READER_VERSIONS = {
 # Bumped whenever name resolution, ranking or filtering changes: the snapshot
 # pins the data, this pins how the reader interprets it, and a result that
 # records both (with the transitio version) is reproducible.
-DISCOVERY_SEMANTICS_VERSION = 2
+DISCOVERY_SEMANTICS_VERSION = 3
 
 FEEDS_FILE = "feeds.parquet"
 REALTIME_FILE = "realtime.parquet"
@@ -942,9 +942,20 @@ def place(query, *, kind=None, index=None):
     """Resolve ``query`` to a single :class:`Place`, or raise.
 
     ``query`` is a name, a QID, an own ``tp_`` id, or a :class:`Place`; an id
-    resolves through the place's former ids and the QIDs it carries. A name
-    shared by a city and the metros named after it in its country, or an
-    area containing it with much the same service, resolves to the city;
+    resolves through the place's former ids and the QIDs it carries. Only a
+    name matching a label in full resolves: a partial name ("Helsi") raises
+    :class:`~transitio.exceptions.PlaceNotFoundError` with the places it
+    partly matches as ``candidates``, and :func:`suggest` completes names. A
+    name shared by a city and the metros named after it in its country, an
+    area containing it with much the same service, or places inside it or
+    areas in its country listing its name only as an alias, resolves to the
+    city ("Taipei" is the city, not New Taipei or Taiwan); where no city
+    matches, a region or country of the name stands as the city ("Istanbul"
+    is the province, not its metro);
+    other shared names go to the place with more than twice the runner-up's
+    feeds, unless a place of the name in another country is far better
+    known (by the languages its name is recorded in), since feed counts
+    measure how well each country's feeds are catalogued.
     ``kind`` pins the scope. A qualified name, "Name, Qualifier" with one or
     more qualifiers, keeps the places lying within a region or country each
     qualifier names ("London, Ontario", "City of London, UK"); a label that

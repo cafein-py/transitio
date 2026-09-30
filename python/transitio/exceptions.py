@@ -14,7 +14,15 @@ class IncompatibleIndexError(TransitioError):
 
 
 class PlaceNotFoundError(TransitioError):
-    """No place in the index matches the query."""
+    """No place in the index matches the query.
+
+    When the query only partly matches place names (a prefix of a name, or
+    some of its words), those places are available as :attr:`candidates`,
+    ranked as :func:`transitio.index.places` lists them; otherwise it is
+    empty.
+    """
+
+    candidates = ()
 
 
 class AmbiguousPlaceError(TransitioError):

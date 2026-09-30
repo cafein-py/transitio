@@ -70,7 +70,8 @@ leads, as for London in the UK and in Canada, `place` raises
 `AmbiguousPlaceError`; a qualifier names the region or country that holds
 the place, as in `"London, Ontario"` or `"City of London, UK"`, `kind="city"`
 (or `"metro"`, `"region"`, `"country"`) restricts the scope, and a Wikidata
-id picks one place.
+id picks one place. A partial name raises `PlaceNotFoundError`, which lists
+the places it partly matches; `transitio.suggest` completes names.
 
 ### Inferring missing route shapes
 

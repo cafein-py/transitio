@@ -183,10 +183,20 @@ transitio.suggest("augs")         # type-ahead over names, translations, aliases
 A name can match several places. A city wins over the metros in its country
 that carry its name, and over a same-named area containing it that runs much
 the same service: "Augsburg" is the city, not its three metros, and
-"Helsinki" the city, not the Helsinki sub-region. Other places sharing a name
-are decided as before, by the sole exact match or a clear lead in feeds; where
-neither holds, as for London in the UK and in Canada, or New York City and
-New York State, `place` raises `AmbiguousPlaceError`. A qualifier after a
+"Helsinki" the city, not the Helsinki sub-region. It also wins over the areas
+in its country that list its name only as an alias: "Taipei" is the city, not
+New Taipei or Taiwan. Where no city carries a name, a region or country of
+that name takes the city's place: "Istanbul" is the province, not its metro.
+Other places sharing a name
+are decided by the sole exact match or a clear lead in feeds. Feed counts
+reflect how well each country's feeds are catalogued, so a lead in feeds does
+not decide against a place of that name abroad whose name is recorded in far
+more languages: "Moscow" is not Moscow, Idaho, however many more feeds it
+has than Moscow, Russia. Where nothing decides, as for London in the UK and in
+Canada, or New York City and New York State, `place` raises
+`AmbiguousPlaceError`. Only a full name resolves: a partial one such as
+`"Augs"` raises `PlaceNotFoundError`, whose `candidates` hold the places it
+partly matches, and `suggest` completes it. A qualifier after a
 comma names the region or country that holds the place — `"London, Ontario"`,
 `"London, Canada"`, `"City of London, UK"` — and is matched against the names,
 translations and aliases of the place's region and country, so codes such as
@@ -239,10 +249,15 @@ for feed in augsburg.feeds(tiers=["local", "regional"]):
 
 `feeds()` without tiers returns the place kind's default view: a city's or a
 metro's primary and secondary feeds (its local and regional service), a
-region's secondary and tertiary ones, a country's tertiary ones. `exclude`
-drops named tiers and `requires=["shapes.txt"]` keeps only feeds carrying
-those files. `feed.realtime` lists the GTFS-realtime companions tied to a
-static feed; the companions the index could not tie to one are in
+region's secondary and tertiary ones, a country's tertiary ones. A region or
+country of at most 1,000 km², such as Monaco or San Juan, is town-sized and
+keeps its primary, secondary and tertiary feeds. When `fetch(place=...)`
+without tiers finds the default view empty while the place has feeds, an
+entry of the selection record names them and the `tiers` that fetch them,
+and a warning repeats it. `exclude` drops named tiers and
+`requires=["shapes.txt"]` keeps only feeds carrying those files.
+`feed.realtime` lists the GTFS-realtime companions tied to a static feed;
+the companions the index could not tie to one are in
 `Index.realtime_unlinked()`.
 
 ## Reading the validation report

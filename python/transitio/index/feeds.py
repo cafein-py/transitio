@@ -129,6 +129,8 @@ class PlaceService(ServiceLevel):
 # The relevance categories in the order a place's view lists them, and the
 # categories each place kind shows by default: a city its primary and
 # secondary feeds, a region its secondary and tertiary, a country its tertiary.
+# A region or country of at most 1,000 km² is town-sized and keeps its
+# primary, secondary and tertiary feeds.
 CATEGORY_ORDER = ("primary", "secondary", "tertiary", "international", "unknown")
 DEFAULT_CATEGORIES = {
     "city": ("primary", "secondary"),
@@ -136,6 +138,7 @@ DEFAULT_CATEGORIES = {
     "region": ("secondary", "tertiary"),
     "country": ("tertiary",),
 }
+TOWN_MAX_KM2 = 1000.0
 
 
 def _relevance(value):
@@ -511,9 +514,10 @@ def _matched(edges, tiers, exclude, on_unknown, categories=None):
 
 def _default_categories(place, tiers, categories, international):
     """The relevance categories a query keeps: the ones asked for, else the
-    place kind's default view — with ``international`` added when the
-    cross-border feeds were asked for — unless tiers were named (a tier
-    query is answered in tiers)."""
+    place kind's default view (with ``primary`` for a town-sized region or
+    country) — with ``international`` added when the cross-border feeds
+    were asked for — unless tiers were named (a tier query is answered in
+    tiers)."""
     if categories != "default":
         return None if categories is None else frozenset(categories)
     if tiers is not None:
@@ -521,7 +525,23 @@ def _default_categories(place, tiers, categories, international):
     default = DEFAULT_CATEGORIES.get(place.kind)
     if default is None:
         return None
+    if place.kind in ("region", "country") and _town_sized(place):
+        default = ("primary", "secondary", "tertiary")
     return frozenset(default) | ({"international"} if international else set())
+
+
+def _town_sized(place):
+    """Whether ``place`` has a boundary of at most :data:`TOWN_MAX_KM2`."""
+    import shapely
+
+    from transitio.osm._fetch import _area_km2
+
+    geometry = place.geometry
+    if isinstance(geometry, (bytes, bytearray)):
+        geometry = shapely.from_wkb(bytes(geometry))
+    if geometry is None or geometry.is_empty:
+        return False
+    return _area_km2(geometry) <= TOWN_MAX_KM2
 
 
 def _companions(index, feed_id, partition=None):
@@ -588,9 +608,11 @@ def feeds_for_place(
 
     On a schema-7 index the place's default view applies: a city keeps its
     ``primary`` and ``secondary`` feeds, a region ``secondary`` and
-    ``tertiary``, a country ``tertiary`` (``categories`` names other
-    categories, ``None`` keeps every category; a ``tiers`` query is answered
-    in tiers instead), cross-border edges are left out unless
+    ``tertiary``, a country ``tertiary``, and a region or country whose
+    boundary covers at most :data:`TOWN_MAX_KM2` (1,000 km²) is town-sized
+    and keeps ``primary``, ``secondary`` and ``tertiary`` (``categories``
+    names other categories, ``None`` keeps every category; a ``tiers`` query
+    is answered in tiers instead), cross-border edges are left out unless
     ``international=True`` adds them — for a country load, from the links
     table and the partitions holding their feeds — and the feeds come back
     by category, then relevance high to low, then id. An older index has no

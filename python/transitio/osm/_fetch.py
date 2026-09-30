@@ -9,13 +9,13 @@ import re
 import warnings
 from pathlib import Path
 
-import httpx
 import numpy as np
 import platformdirs
 import shapely
 from shapely.geometry import box
 from shapely.geometry.base import BaseGeometry
 
+from transitio import _http
 from transitio.exceptions import ExtractNotFoundError
 
 
@@ -107,27 +107,16 @@ def _resolve_url(geometry, update):
         raise ExtractNotFoundError(str(error)) from error
 
 
-def _sha256(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _download(url, path, update, transport=None):
+    """Download ``url`` to ``path``; return its SHA-256 hex, or None when a
+    cached file is kept."""
     if path.exists() and not update:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    partial = path.parent / (path.name + ".part")
-    client = httpx.Client(follow_redirects=True, timeout=60.0, transport=transport)
+        return None
+    client = _http.client(
+        timeout=_http.TIMEOUT, follow_redirects=True, transport=transport
+    )
     with client:
-        with client.stream("GET", url) as response:
-            response.raise_for_status()
-            with open(partial, "wb") as handle:
-                for chunk in response.iter_bytes():
-                    handle.write(chunk)
-    partial.replace(path)
+        return _http.download(client, url, path)
 
 
 def _fmt_coord(value):
@@ -154,7 +143,7 @@ def _write_provenance(path, *, geometry, url, extract_sha256, cropped):
     record = {
         "source_url": url,
         "extract_sha256": extract_sha256,
-        "file_sha256": _sha256(path) if cropped else extract_sha256,
+        "file_sha256": _http.sha256_file(path) if cropped else extract_sha256,
         "cropped": cropped,
         "aoi_bounds": list(geometry.bounds),
         "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -214,6 +203,14 @@ def fetch_pbf(
     -------
     pathlib.Path
         Path of the ``.osm.pbf`` file.
+
+    Raises
+    ------
+    ExtractNotFoundError
+        When no Geofabrik extract covers the grown AOI.
+    DownloadError
+        When the extract download fails (dropped connections and transient
+        HTTP errors are retried first).
     """
     geometry = _buffered(_as_geometry(aoi), buffer_m)
     cache = (
@@ -235,8 +232,9 @@ def fetch_pbf(
     if target.exists() and not update:
         return target
 
-    _download(url, extract_path, update, transport)
-    extract_sha256 = _sha256(extract_path)
+    extract_sha256 = _download(url, extract_path, update, transport)
+    if extract_sha256 is None:
+        extract_sha256 = _http.sha256_file(extract_path)
 
     if crop:
         from pyrosm import OSM

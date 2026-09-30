@@ -3,18 +3,16 @@
 from __future__ import annotations
 
 import datetime
-import hashlib
 import json
 import os
 import re
-import tempfile
 import time
 import warnings
 from pathlib import Path
 
-import httpx
 import platformdirs
 
+from transitio import _http
 from transitio.catalog._csv import fetch_catalog_csv, search_csv
 from transitio.catalog._models import Dataset, Feed, as_date
 from transitio.exceptions import DownloadError, MissingTokenError
@@ -22,7 +20,6 @@ from transitio.exceptions import DownloadError, MissingTokenError
 API_URL = "https://api.mobilitydatabase.org/v1"
 TOKEN_ENV_VAR = "MOBILITY_API_REFRESH_TOKEN"
 
-_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 _PAGE_SIZE = 100
 _EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -54,46 +51,6 @@ def _bounds(aoi):
     return values
 
 
-def _sha256(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _stream_download(client, url, path):
-    """Stream a URL to ``path`` via a partial file; return the SHA-256 hex."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    digest = hashlib.sha256()
-    fd, partial = tempfile.mkstemp(
-        dir=path.parent, prefix=path.name + ".", suffix=".part"
-    )
-    try:
-        # The descriptor is wrapped before the request, so a connection or
-        # HTTP failure closes it rather than leaking it (and lets Windows
-        # unlink the temp).
-        with os.fdopen(fd, "wb") as handle:
-            with client.stream("GET", url) as response:
-                response.raise_for_status()
-                for chunk in response.iter_bytes():
-                    digest.update(chunk)
-                    handle.write(chunk)
-        os.replace(partial, path)
-    except BaseException:
-        _discard(partial)
-        raise
-    return digest.hexdigest()
-
-
-def _discard(path):
-    """Remove a temporary file, tolerant of its already being gone."""
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
-
-
 def _write_provenance(path, data):
     """Write a provenance sidecar atomically and without following a symlink
     at the target: a partial write cannot leave truncated JSON beside the
@@ -101,16 +58,8 @@ def _write_provenance(path, data):
     Portable -- the fresh unique temp name needs no ``O_NOFOLLOW``, and
     ``os.replace`` swaps it in without following a symlink at the target."""
     body = json.dumps(data, indent=2).encode("utf-8")
-    fd, partial = tempfile.mkstemp(
-        dir=path.parent, prefix=path.name + ".", suffix=".part"
-    )
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(body)
-        os.replace(partial, path)
-    except BaseException:
-        _discard(partial)
-        raise
+    with _http.replacing(path) as handle:
+        handle.write(body)
 
 
 class MobilityDatabase:
@@ -124,14 +73,19 @@ class MobilityDatabase:
     cache_dir : str or pathlib.Path, optional
         Directory for downloaded datasets. Defaults to the platform user
         cache directory for transitio.
-    timeout : float, default 30.0
-        Per-request timeout in seconds.
+    timeout : float or httpx.Timeout, default 60 s, 15 s to connect
+        Per-request timeout, in seconds when a float.
     transport : httpx.BaseTransport, optional
         Custom transport, mainly for testing.
     """
 
     def __init__(
-        self, refresh_token=None, *, cache_dir=None, timeout=30.0, transport=None
+        self,
+        refresh_token=None,
+        *,
+        cache_dir=None,
+        timeout=_http.TIMEOUT,
+        transport=None,
     ):
         self._refresh_token = refresh_token or os.environ.get(TOKEN_ENV_VAR)
         self._cache_dir = (
@@ -139,7 +93,7 @@ class MobilityDatabase:
             if cache_dir
             else Path(platformdirs.user_cache_dir("transitio"))
         )
-        self._http = httpx.Client(
+        self._http = _http.client(
             timeout=timeout, transport=transport, follow_redirects=True
         )
         self._access_token = None
@@ -184,7 +138,7 @@ class MobilityDatabase:
                 self._access_token = None
                 refreshed = True
                 continue
-            if response.status_code in _RETRY_STATUSES and attempt < 3:
+            if response.status_code in _http.RETRY_STATUSES and attempt < 3:
                 time.sleep(self._retry_wait * 2**attempt)
                 attempt += 1
                 continue
@@ -407,6 +361,13 @@ class MobilityDatabase:
         -------
         pathlib.Path
             Path of the downloaded zip.
+
+        Raises
+        ------
+        DownloadError
+            When the dataset has no hosted URL, its download fails (dropped
+            connections and transient HTTP errors are retried first), or its
+            checksum does not match.
         """
         if not dataset.hosted_url:
             raise DownloadError(f"dataset {dataset.id} has no hosted download url")
@@ -417,10 +378,10 @@ class MobilityDatabase:
         )
         target_dir.mkdir(parents=True, exist_ok=True)
         path = target_dir / f"{_safe_id(dataset.id)}.zip"
-        if path.exists() and dataset.hash and _sha256(path) == dataset.hash:
+        if path.exists() and dataset.hash and _http.sha256_file(path) == dataset.hash:
             return path
         # The catalog token is never sent to download hosts.
-        digest = _stream_download(self._http, dataset.hosted_url, path)
+        digest = _http.download(self._http, dataset.hosted_url, path)
         if dataset.hash and digest != dataset.hash:
             path.unlink()
             raise DownloadError(
@@ -461,6 +422,12 @@ class MobilityDatabase:
         -------
         pathlib.Path
             Path of the downloaded zip.
+
+        Raises
+        ------
+        DownloadError
+            When the feed has no hosted URL or its download fails (dropped
+            connections and transient HTTP errors are retried first).
         """
         if not feed.latest_dataset_url:
             raise DownloadError(f"feed {feed.id} has no hosted latest-dataset url")
@@ -470,7 +437,7 @@ class MobilityDatabase:
             else self._cache_dir / "gtfs" / _safe_id(feed.id)
         )
         path = target_dir / "latest.zip"
-        digest = _stream_download(self._http, feed.latest_dataset_url, path)
+        digest = _http.download(self._http, feed.latest_dataset_url, path)
         provenance = {
             "feed_id": feed.id,
             "source_url": feed.latest_dataset_url,

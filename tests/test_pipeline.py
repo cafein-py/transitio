@@ -8,7 +8,7 @@ pytest.importorskip("transitio._core")
 
 import transitio.catalog  # noqa: E402
 import transitio.osm  # noqa: E402
-from transitio.exceptions import StaleSelectorError  # noqa: E402
+from transitio.exceptions import DownloadError, StaleSelectorError  # noqa: E402
 from transitio.pipeline import fetch  # noqa: E402
 
 GTFS = {
@@ -548,11 +548,11 @@ def test_download_indexed_tries_the_producer_then_the_hosted_copy(
     )
     if source is None:
         with pytest.raises(DownloadError) as caught:
-            _download_indexed(feed, db, atlas, tmp_path)
+            _download_indexed(feed, db, atlas, tmp_path, None)
         expected = "; ".join(failures) or "feed f-a has no downloadable url"
         assert str(caught.value) == expected
     else:
-        path, fetched_from, seen = _download_indexed(feed, db, atlas, tmp_path)
+        path, fetched_from, seen = _download_indexed(feed, db, atlas, tmp_path, None)
         assert (zipfile.is_zipfile(path), fetched_from, seen) == (
             True,
             source,
@@ -837,15 +837,16 @@ def test_date_rules_decide_before_and_after_download(
 
 def _network(agency="HSL", start="20260101", stops=None, hours=(8,), **options):
     """GTFS of ``agency`` whose ``routes`` each run a trip from s2 to s3 at
-    each of ``hours``, daily from ``start`` through 2026, among stops s<i>
-    (s0 to s9 unless ``stops`` names them)."""
+    each of ``hours``, daily from ``start`` to ``end`` (through 2026 unless
+    given), among stops s<i> (s0 to s9 unless ``stops`` names them); with a
+    ``headway``, each trip repeats that often for an hour."""
     stops = range(10) if stops is None else stops
     trips = [(r, h) for r in options.get("routes", ("r1",)) for h in hours]
     times = (
         "{0}{1},{1:02}:00:00,{1:02}:00:00,s2,1\n{0}{1},{1:02}:10:00,{1:02}:10:00,s3,2"
     )
     tables = {
-        **_calendar(start, "20261231"),
+        **_calendar(start, options.get("end", "20261231")),
         "agency.txt": GTFS["agency.txt"].replace("HSL", agency),
         "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\n"
         + "".join(f"s{i},S{i},{60 + i / 100:.2f},24.9\n" for i in stops),
@@ -858,6 +859,14 @@ def _network(agency="HSL", start="20260101", stops=None, hours=(8,), **options):
     }
     if options.get("transfers"):
         tables["transfers.txt"] = "from_stop_id,to_stop_id,transfer_type\ns2,s3,0\n"
+    if options.get("headway"):
+        tables["frequencies.txt"] = (
+            "trip_id,start_time,end_time,headway_secs\n"
+            + "".join(
+                f"{r}{h},{h:02}:00:00,{h + 1:02}:00:00,{options['headway']}\n"
+                for r, h in trips
+            )
+        )
     return _zip(tables)
 
 
@@ -868,6 +877,9 @@ NEW, OLD, OLDER = ({"start": f"2026{month}01"} for month in ("06", "05", "04"))
 C, F = {"agency": "C"}, {"agency": "F"}
 AB, ABC = {**C, "routes": ("a", "b")}, {**C, "routes": ("a", "b", "c")}
 IN_C, ADDS = {**F, "in": "C"}, f"+ similar to A but adds service on {DAY}"
+# A network on a placeholder calendar, and the note it gets.
+HELD = {"start": "20000101", "end": "20990101"}
+HELD_NOTE = "placeholder calendar 2000-01-01 to 2099-01-01"
 KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
 
 
@@ -911,8 +923,28 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
             DAY,
             {"A": "+", "B": "- another version of A [A 1.0 1.0]"},
         ),
+        (
+            {"A": NEW, "B": {**OLD, "agency": "HSL Oy."}},
+            DAY,
+            {"A": "+", "B": "- another version of A [A 1.0 1.0]"},
+        ),
+        (
+            {"A": NEW, "B": {**OLD, "agency": ""}},
+            DAY,
+            {"A": "+", "B": "- another version of A [A 1.0 1.0]"},
+        ),
         ({"A": NEW, "B": {**OLD, "hours": (8, 9)}}, DAY, {"A": "+", "B": ADDS}),
         ({"A": NEW, "B": {**OLD, "hours": (9,)}}, DAY, {"A": "+", "B": ADDS}),
+        (
+            {"A": {**NEW, "headway": 600}, "B": {**OLD, "headway": 600}},
+            DAY,
+            {"A": "+", "B": "- another version of A [A 1.0 1.0]"},
+        ),
+        (
+            {"A": {**NEW, "headway": 600}, "B": {**OLD, "headway": 300}},
+            DAY,
+            {"A": "+", "B": ADDS},
+        ),
         (
             {"A": {**NEW, "hours": (8, 9)}, "B": OLD, "C": {**OLDER, "hours": (8, 10)}},
             DAY,
@@ -956,15 +988,36 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
                 "B": "+ similar to A; kept, no study day",
             },
         ),
+        (
+            {"A": {**NEW, "end": "20991231"}, "B": OLD},
+            DAY,
+            {
+                "A": "+ placeholder calendar 2026-06-01 to 2099-12-31",
+                "B": "- another version of A [A 1.0 1.0]",
+            },
+        ),
+        (
+            {"A": {**NEW, "stops": range(8)}, "B": {**HELD, "stops": range(1, 9)}},
+            DAY,
+            {"A": "+", "B": f"+ {HELD_NOTE}"},
+        ),
+        (
+            {"A": HELD, "B": {**HELD, "routes": ("x",)}},
+            DAY,
+            {"A": f"+ {HELD_NOTE}", "B": f"+ {HELD_NOTE}"},
+        ),
     ],
     ids=(
         "identical identical-overlapping-routes container-renewed "
         "contained-renewed container-cropped container-expired "
         "partial-copy-first partial-copy-after version-covered "
-        "version-extra-trip version-other-times versions-three "
-        "versions-three-reversed version-chain version-protected-container "
+        "version-legal-form version-unnamed-agency version-extra-trip "
+        "version-other-times version-headway version-other-headway "
+        "versions-three versions-three-reversed "
+        "version-chain version-protected-container "
         "version-same-content-container version-under-stop-threshold "
-        "version-transfers versions-no-study-day"
+        "version-transfers versions-no-study-day placeholder-starting-later "
+        "placeholder-under-stop-threshold placeholders-other-routes"
     ).split(),
 )
 def test_fetch_delivers_one_copy_per_service(
@@ -1171,6 +1224,36 @@ def test_timezone_note(tmp_path, zone, stops, budget, expected):
     path = tmp_path / "feed.zip"
     path.write_bytes(_zip(files))
     assert _timezone_note(path, budget) == expected
+
+
+@pytest.mark.parametrize(
+    "hidden, expected",
+    [
+        pytest.param(
+            [("f-u", "unknown", {"unknown"})],
+            "1 feed: f-u (unknown); tiers=['local', 'regional', 'national'] fetches it",
+            id="unknown-only",
+        ),
+        pytest.param(
+            [(f"f-{n}", "tertiary", {"national", "regional"}) for n in range(7)],
+            "7 feeds: f-0 (tertiary), f-1 (tertiary), f-2 (tertiary), f-3 (tertiary),"
+            " f-4 (tertiary) and 2 more; tiers=['regional', 'national'] fetches them",
+            id="seven",
+        ),
+    ],
+)
+def test_hidden_view_note(hidden, expected):
+    from types import SimpleNamespace
+
+    from transitio.pipeline._fetch import _hidden_note
+
+    feeds = [
+        SimpleNamespace(feed_id=feed_id, relevance_category=category, tiers=tiers)
+        for feed_id, category, tiers in hidden
+    ]
+    note = _hidden_note(SimpleNamespace(kind="city"), feeds)
+    prefix = "default view (city: primary, secondary) holds none of the place's "
+    assert note == prefix + expected
 
 
 @pytest.mark.parametrize("path", ["area", "place"])
@@ -1842,23 +1925,40 @@ def test_fetch_place_excludes_an_unknown_only_feed(tmp_path, monkeypatch):
     assert result.skipped == [("f-a", "only unknown-tier edges")]
 
 
-def test_fetch_aoi_without_osm_skips_the_extract(pipeline_env, monkeypatch):
+_EXTRACT_FAILURE = "https://download.example/extract.osm.pbf: HTTP 404 Not Found"
+
+
+@pytest.mark.parametrize(
+    "osm, notes",
+    [(False, []), (True, [f"OSM extract not fetched: {_EXTRACT_FAILURE}"])],
+    ids=["osm-off", "download-failed"],
+)
+def test_fetch_aoi_without_an_extract_keeps_the_feeds(
+    pipeline_env, monkeypatch, osm, notes
+):
     tmp_path, _ = pipeline_env
 
-    def forbidden(*a, **k):  # osm=False must not reach the OSM stage
-        raise AssertionError("fetch_pbf called despite osm=False")
+    def unavailable(*a, **k):  # osm=False must not reach the OSM stage
+        assert osm, "fetch_pbf called despite osm=False"
+        raise DownloadError(_EXTRACT_FAILURE)
 
-    monkeypatch.setattr("transitio.osm._fetch.fetch_pbf", forbidden)
-    monkeypatch.setattr("transitio.osm.fetch_pbf", forbidden)
-    with pytest.warns(UserWarning):
+    monkeypatch.setattr("transitio.osm._fetch.fetch_pbf", unavailable)
+    monkeypatch.setattr("transitio.osm.fetch_pbf", unavailable)
+    with pytest.warns(UserWarning) as caught:
         result = fetch(
             (24.6, 60.1, 25.2, 60.4),
             directory=tmp_path,
-            osm=False,
+            osm=osm,
             reference_date="20260601",
         )
-    assert result.osm_pbf is None
+    assert (result.osm_pbf, result.osm_area) == (None, None)
     assert len(result.feeds) == 1  # the GTFS side is unaffected
+    # The note entry comes after the feed's.
+    assert [(e["feed_id"], e["note"]) for e in result.selection[1:]] == [
+        (None, note) for note in notes
+    ]
+    warned = [str(w.message) for w in caught if "OSM" in str(w.message)]
+    assert warned == [f"{note}; osm_pbf is None" for note in notes]
 
 
 def test_fetch_place_without_osm_skips_the_extract(tmp_path, monkeypatch):

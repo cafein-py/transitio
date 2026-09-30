@@ -770,13 +770,11 @@ class FeedBuilder:
         if change_log and applied:
             # stage the sidecar BEFORE publishing anything: a failure here
             # leaves the previous zip and its sidecar untouched
-            import hashlib
             import tempfile
 
-            digest = hashlib.sha256()
-            with open(staging, "rb") as source_handle:
-                for chunk in iter(lambda: source_handle.read(1 << 20), b""):
-                    digest.update(chunk)
+            from transitio._http import sha256_file
+
+            result_sha256 = sha256_file(staging)
             try:
                 fd, temp_name = tempfile.mkstemp(
                     dir=path.parent, prefix=".changes-", suffix=".part"
@@ -787,7 +785,7 @@ class FeedBuilder:
                         handle,
                         applied,
                         self._source_sha256,
-                        digest.hexdigest(),
+                        result_sha256,
                     )
             except OSError:
                 staging.unlink(missing_ok=True)
@@ -855,13 +853,9 @@ class FeedEditor(FeedBuilder):
         self.source = Path(path)
         self._header_fixes = {}  # filename -> changed header names
         self._value_fixes = {}  # filename -> count of trimmed values
-        import hashlib
+        from transitio._http import sha256_file
 
-        digest = hashlib.sha256()
-        with open(self.source, "rb") as handle:
-            for chunk in iter(lambda: handle.read(1 << 20), b""):
-                digest.update(chunk)
-        self._source_sha256 = digest.hexdigest()
+        self._source_sha256 = sha256_file(self.source)
         with zipfile.ZipFile(self.source) as archive:
             declared = sum(
                 info.file_size for info in archive.infolist() if not info.is_dir()

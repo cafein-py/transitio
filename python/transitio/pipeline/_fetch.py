@@ -9,6 +9,7 @@ import io
 import json
 import os
 import pathlib
+import tempfile
 import warnings
 import zipfile
 
@@ -77,10 +78,12 @@ class FetchResult:
     # feeds, from the index's contained_in (schema 10); empty otherwise.
     contained: dict = dataclasses.field(default_factory=dict)
     # One entry per candidate feed, in candidate order, with its decision;
-    # ``skipped`` lists the same skips. A last entry with feed_id None notes
-    # the place parts the OSM extract leaves out.
+    # ``skipped`` lists the same skips. Entries with feed_id None note, after
+    # the candidates, the feeds an empty default view hides, and last the
+    # place parts the OSM extract leaves out, or why it was not fetched.
     selection: list = dataclasses.field(default_factory=list)
-    # The WGS84 area the OSM extract was fetched for; None without one.
+    # The WGS84 area the OSM extract was fetched for; None without one. A
+    # failed extract download leaves it and osm_pbf None.
     osm_area: object = None
 
     def __iter__(self):  # convenient (pbf, feeds) unpacking
@@ -88,7 +91,8 @@ class FetchResult:
 
     def selection_table(self):
         """The selection record as a ``pandas.DataFrame``, one row per
-        candidate feed, then the OSM-area note row when there is one."""
+        candidate feed, then the default-view and OSM note rows when there
+        are any."""
         import pandas as pd
 
         return pd.DataFrame(self.selection, columns=list(_SELECTION_FIELDS))
@@ -124,7 +128,8 @@ class FetchResult:
         """
         if self.osm_pbf is None:
             raise ValueError(
-                "this result has no OSM extract; it was fetched with osm=False"
+                "this result has no OSM extract: it was fetched with osm=False "
+                "or the extract download failed"
             )
         from pyrosm import OSM
 
@@ -403,20 +408,15 @@ def _process_feed(
     return path, report, fixes, present_routes, window
 
 
-def _hash_stream(handle):
-    digest = hashlib.sha256()
-    for chunk in iter(lambda: handle.read(1 << 20), b""):
-        digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _snapshot(path):
     """``(archive SHA-256, entries)`` of the zip at ``path``, read through one
     open: the entries as sorted ``(name, CRC-32, size)`` from the central
     directory, nothing decompressed. None when it cannot be read."""
+    from transitio._http import sha256_stream
+
     try:
         with open(path, "rb") as handle:
-            digest = _hash_stream(handle)
+            digest = sha256_stream(handle)
             handle.seek(0)
             with zipfile.ZipFile(handle) as archive:
                 listing = sorted(
@@ -434,9 +434,11 @@ def _entry_digests(path, digest):
     SHA-256)``, one row per entry, read through one open that must still hold
     the archive ``digest`` recorded earlier; None when it does not or the
     archive cannot be read."""
+    from transitio._http import sha256_stream
+
     try:
         with open(path, "rb") as handle:
-            if _hash_stream(handle) != digest:
+            if sha256_stream(handle) != digest:
                 return None
             handle.seek(0)
             rows = []
@@ -445,7 +447,7 @@ def _entry_digests(path, digest):
                     if info.is_dir():
                         continue
                     with archive.open(info) as member:
-                        entry = _hash_stream(member)
+                        entry = sha256_stream(member)
                     rows.append((info.filename, info.CRC, info.file_size, entry))
         return tuple(sorted(rows))
     except Exception:  # noqa: B902 — an unreadable archive matches nothing
@@ -576,15 +578,29 @@ def _read_tables(path, names, max_total_bytes=None):
 
 def _service(path, day=None, max_total_bytes=None):
     """A delivered feed's route keys, rounded stop coordinates and trip
-    count; with a ``day``, the signatures of its trips running then that are
-    not frequency-based, whether those are all of them, and whether it has
-    transfers or pathways, from those tables only, read as ``FeedEditor``
-    does. None when they are over ``max_total_bytes``, a route key has a
-    blank part, a stop or station lacks coordinates, or with a ``day`` its
-    calendars cannot be read."""
+    count, and whether it is one ``unnamed`` agency; with a ``day``, the
+    signatures of its trips running then, whether those are all of them,
+    whether it has transfers or pathways, and its ``placeholder`` calendar,
+    from those tables only, read as ``FeedEditor`` does. A feed is one
+    unnamed agency when it has at most one agency row, none named, and its
+    routes name at most one ``agency_id``. When trips run on the day and
+    each of their services has a calendar.txt row spanning
+    :data:`~transitio.gtfs._schedule.PLACEHOLDER_DAYS` days or more, its
+    placeholder calendar is the earliest start and latest end of those
+    rows, a ``(start, end)`` pair of dates, and None otherwise. The result
+    is None when the tables are over
+    ``max_total_bytes``, a route key has a blank part (an unnamed agency's
+    blank agency aside), a stop or station lacks coordinates, or with a
+    ``day`` its calendars cannot be read."""
     import pandas as pd
 
-    from transitio.gtfs._schedule import route_keys, service_dates, trip_signatures
+    from transitio.gtfs._schedule import (
+        _column,
+        placeholder_rows,
+        route_keys,
+        service_dates,
+        trip_signatures,
+    )
 
     names = {"agency.txt", "routes.txt", "stops.txt", "trips.txt"}
     if day is not None:
@@ -595,12 +611,17 @@ def _service(path, day=None, max_total_bytes=None):
         if tables is None:
             return None
         keys = route_keys(tables)[["agency", "name", "type"]]
+        agency = tables.get("agency.txt", pd.DataFrame())
+        named = (_column(agency, "agency_name").str.strip() != "").any()
+        ids = _column(tables.get("routes.txt", pd.DataFrame()), "agency_id").str.strip()
+        unnamed = len(agency) <= 1 and not named and ids[ids != ""].nunique() <= 1
         stops = tables["stops.txt"]
         points = stops[["stop_lat", "stop_lon"]].apply(pd.to_numeric, errors="coerce")
         # Stops and stations need coordinates; other location types may lack them.
         kind = stops.get("location_type", pd.Series("", index=stops.index))
         located = points[kind.str.strip().isin(("", "0", "1"))]
-        if (keys == "").any(axis=None) or located.isna().any(axis=None):
+        parts = keys[["name", "type"]] if unnamed else keys
+        if (parts == "").any(axis=None) or located.isna().any(axis=None):
             return None
         points = points.round(_STOP_DECIMALS).add(0.0).dropna()
         trips = tables.get("trips.txt", pd.DataFrame(columns=["trip_id", "service_id"]))
@@ -608,6 +629,7 @@ def _service(path, day=None, max_total_bytes=None):
             "routes": set(keys.itertuples(index=False, name=None)),
             "stops": set(points.itertuples(index=False, name=None)),
             "trips": len(trips),
+            "unnamed": unnamed,
         }
         if not (found["routes"] and found["stops"]):
             return None
@@ -617,19 +639,22 @@ def _service(path, day=None, max_total_bytes=None):
         if unexpanded or dates.empty:
             return None
         running = dates.loc[dates["date"] == pd.Timestamp(day), "service_id"]
-        on_day = trips.loc[trips["service_id"].isin(running), "trip_id"]
+        today = trips[trips["service_id"].isin(running)]
+        on_day, used = today["trip_id"], today["service_id"]
         signed = trip_signatures(tables)
-        repeated = tables.get("frequencies.txt", pd.DataFrame(columns=["trip_id"]))
-        signed = signed[
-            signed["trip_id"].isin(on_day)
-            & ~signed["trip_id"].isin(repeated["trip_id"])
-        ]
+        signed = signed[signed["trip_id"].isin(on_day)]
+        rows = placeholder_rows(tables)
+        rows = rows[rows["service_id"].isin(used)]
+        placeholder = None
+        if len(used) and used.isin(rows["service_id"]).all():
+            placeholder = (rows["start"].min().date(), rows["end"].max().date())
     except Exception:  # noqa: B902 — an unreadable feed is never grouped
         return None
     found.update(
         day=set(signed["signature"]),
         complete=len(signed) == len(on_day),
         linked=any(len(tables.get(n, ())) for n in ("transfers.txt", "pathways.txt")),
+        placeholder=placeholder,
     )
     return found
 
@@ -670,21 +695,53 @@ def _settle_versions(record, services, protected, day):
     entries = {entry["feed_id"]: entry for entry in record}
     order = {feed_id: position for position, feed_id in enumerate(entries)}
 
+    def start(feed_id):
+        # An undated feed starts when its placeholder calendar does.
+        span = services[feed_id].get("placeholder")
+        if span is not None:
+            return span[0]
+        value = (entries[feed_id]["feed_window"] or [None])[0]
+        return None if value is None else datetime.date.fromisoformat(value)
+
     def rank(feed_id):
-        start = (entries[feed_id]["feed_window"] or [None])[0]
-        later = -datetime.date.fromisoformat(start).toordinal() if start else 0
-        return (start is None, later, -services[feed_id]["trips"], order[feed_id])
+        first = start(feed_id)
+        later = -first.toordinal() if first else 0
+        return (first is None, later, -services[feed_id]["trips"], order[feed_id])
+
+    def supersedes(feed_id, other):
+        # A dated feed starting after an undated one's placeholder calendar.
+        first = start(feed_id)
+        return (
+            services[feed_id].get("placeholder") is None
+            and services[other].get("placeholder") is not None
+            and first is not None
+            and first > start(other)
+        )
+
+    def undated(feed_id):
+        span = services[feed_id].get("placeholder")
+        return span and "placeholder calendar {} to {}".format(*span)
 
     ids = sorted(services, key=rank)
+    for feed_id in filter(undated, ids):
+        _note(entries[feed_id], undated(feed_id))
+    # A pair with an unnamed agency compares routes by name and type only.
+    lines = {
+        feed_id: {key[1:] for key in services[feed_id]["routes"]} for feed_id in ids
+    }
     pairs = {feed_id: {} for feed_id in ids}
     for position, one in enumerate(ids):
         for other in ids[position + 1 :]:
-            overlaps = tuple(
-                len(services[one][key] & services[other][key])
-                / len(services[one][key] | services[other][key])
-                for key in ("routes", "stops")
-            )
-            if overlaps[0] >= _ROUTE_OVERLAP and overlaps[1] >= _STOP_OVERLAP:
+            unnamed = services[one]["unnamed"] or services[other]["unnamed"]
+            sides = [
+                (lines[f] if unnamed else services[f]["routes"], services[f]["stops"])
+                for f in (one, other)
+            ]
+            overlaps = tuple(len(a & b) / len(a | b) for a, b in zip(*sides))
+            # An undated feed and a dated one starting later pair on stops alone.
+            routed = supersedes(one, other) or supersedes(other, one)
+            routed = routed or overlaps[0] >= _ROUTE_OVERLAP
+            if routed and overlaps[1] >= _STOP_OVERLAP:
                 pairs[one][other] = pairs[other][one] = overlaps
     removed, grouped = set(), set()
     for top in ids:
@@ -710,6 +767,9 @@ def _settle_versions(record, services, protected, day):
                 continue
             service = services[member]
             partners = [other for other in kept if other in pairs[member]]
+            if any(supersedes(other, member) for other in partners):
+                removed.add(member)
+                continue
             adds = not (service["complete"] and service["day"] <= covered)
             if partners and not adds and not service["linked"]:
                 removed.add(member)
@@ -721,22 +781,60 @@ def _settle_versions(record, services, protected, day):
             kept = sorted([*kept, member], key=ids.index)
             covered |= service["day"]
         for member in [m for m in members if m in removed]:
-            partner = next(other for other in kept if other in pairs[member])
+            partners = [other for other in kept if other in pairs[member]]
+            later = [other for other in partners if supersedes(other, member)]
+            partner = (later or partners)[0]
             route, stop = (round(share, 3) for share in pairs[member][partner])
             version = {"feed_id": partner, "route_overlap": route, "stop_overlap": stop}
             reason = f"another version of {partner}"
-            _skip(entries[member], reason, note=None, path=None, version_of=version)
+            note = undated(member)
+            _skip(entries[member], reason, note=note, path=None, version_of=version)
     return removed
 
 
-def _download_indexed(feed, db, atlas, base_dir):
+class _Archives:
+    """The archives a call reads feeds from by URL fragment, each downloaded
+    into ``directory`` once, keyed by its URL without the fragment; a failed
+    download is recorded and never repeated."""
+
+    def __init__(self, directory):
+        self._directory = pathlib.Path(directory)
+        self._found = {}
+
+    def get(self, http, url):
+        """``(path, sha256, retrieved_at)`` of the archive at ``url``,
+        downloaded with the ``http`` client when first asked for. Raises
+        :class:`DownloadError` with the failure's text when that download
+        failed."""
+        from transitio import _http
+        from transitio.exceptions import DownloadError
+
+        if url not in self._found:
+            path = self._directory / f"{len(self._found)}.zip"
+            try:
+                digest = _http.download(http, url, path)
+            except Exception as error:  # noqa: B902 — recorded for later calls
+                self._found[url] = str(error)
+            else:
+                now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                self._found[url] = (path, digest, now)
+        found = self._found[url]
+        if isinstance(found, str):
+            raise DownloadError(found)
+        return found
+
+
+def _download_indexed(feed, db, atlas, base_dir, archives, max_total_bytes=None):
     """Download an indexed feed from the first of its URLs that serves a zip
     archive: the Mobility Database direct download, the Transitland Atlas
     static feed (decision I: MDB wins where a feed has both), then the
     Mobility Database hosted copy (``urls.latest``). Each URL is tried once;
     an attempt fails on any error or when the download is not a zip archive.
     Each feed lands in its own digest-named directory under ``base_dir``, so
-    several never collide.
+    several never collide. A URL whose fragment names a member of the archive
+    (:func:`~transitio.catalog._nested.split_fragment`) takes the archive
+    from ``archives`` and extracts that member within ``max_total_bytes``;
+    its sidecar records the archive's URL and SHA-256 beside the feed's.
 
     Returns ``(path, fetched_from, failures)``: ``fetched_from`` is
     ``"producer"`` for the first two URLs and ``"mdb_latest"`` for the hosted
@@ -745,6 +843,8 @@ def _download_indexed(feed, db, atlas, base_dir):
     fails."""
     from transitio.catalog import AtlasFeed, Feed
     from transitio.catalog._atlas import _feed_dir
+    from transitio.catalog._client import _write_provenance
+    from transitio.catalog._nested import extract_feed, split_fragment
     from transitio.exceptions import DownloadError
     from transitio.index.feeds import _parse
 
@@ -762,18 +862,36 @@ def _download_indexed(feed, db, atlas, base_dir):
     def from_atlas(url):
         return atlas.download(atlas_feed, directory=base_dir)
 
+    def from_archive(client, url, outer, member):
+        archive, archive_sha256, retrieved_at = archives.get(client._http, outer)
+        path = base_dir / _feed_dir(feed.feed_id) / "latest.zip"
+        provenance = {
+            "feed_id": feed.feed_id,
+            "source_url": url,
+            "archive_url": outer,
+            "archive_sha256": archive_sha256,
+            "sha256": extract_feed(archive, member, path, max_total_bytes),
+            "retrieved_at": retrieved_at,
+        }
+        _write_provenance(path.with_suffix(".provenance.json"), provenance)
+        return path
+
     attempts = (
-        ("mdb", "producer", mdb_urls.get("direct_download"), from_mdb),
-        ("atlas", "producer", atlas_feed.static_url, from_atlas),
-        ("mdb_latest", "mdb_latest", mdb_urls.get("latest"), from_mdb),
+        ("mdb", "producer", mdb_urls.get("direct_download"), from_mdb, db),
+        ("atlas", "producer", atlas_feed.static_url, from_atlas, atlas),
+        ("mdb_latest", "mdb_latest", mdb_urls.get("latest"), from_mdb, db),
     )
     tried, failures = set(), []
-    for label, source, url, download in attempts:
+    for label, source, url, download, client in attempts:
         if not url or url in tried:
             continue
         tried.add(url)
+        outer, member = split_fragment(url)
         try:
-            path = download(url)
+            if member is None:
+                path = download(url)
+            else:
+                path = from_archive(client, url, outer, member)
         except Exception as error:  # noqa: B902 — try the next URL
             failures.append(f"{label}: {error}")
             continue
@@ -803,7 +921,8 @@ def _unchanged_since_indexed(feed, http):
     static feed, else the Mobility Database direct download), carrying the
     ETag and Last-Modified it recorded, answers 304 Not Modified. Returns
     that URL, or None: any other answer, a failed probe or no recorded
-    validator is no proof."""
+    validator is no proof. A URL fragment is not sent, so the probe of a
+    feed inside a larger archive reaches that archive."""
     from transitio.catalog._atlas import STATIC_URL
     from transitio.index.feeds import _parse, _scalar
 
@@ -889,12 +1008,16 @@ def fetch(
     or whose dataset download fails, is read from the first of its indexed
     URLs that serves a zip archive: the Mobility Database direct download,
     the Transitland Atlas static feed, then the Mobility Database hosted
-    copy. The sidecar and the report's provenance carry ``fetched_from`` and
-    ``download_errors`` as ``selection`` does. Every overlapping feed is
-    processed, in a deterministic order with official feeds first; one
-    broken feed never aborts the others — it lands in ``skipped`` with its
-    reason. A feed lacking a file GTFS requires is skipped, with or without
-    ``when`` and ``repair``: ``"missing required file agency.txt"`` (several
+    copy. A URL fragment names the member of the archive the feed is read
+    from, a nested zip (``.../gtfs.zip#1/google_transit.zip``) or a folder;
+    each such archive is downloaded once per call, and the feed's sidecar
+    records its ``archive_url`` and ``archive_sha256``. The sidecar and the
+    report's provenance carry ``fetched_from`` and ``download_errors`` as
+    ``selection`` does. Every overlapping feed is processed, in a
+    deterministic order with official feeds first; one broken feed never
+    aborts the others — it lands in ``skipped`` with its reason. A feed
+    lacking a file GTFS requires is skipped, with or without ``when`` and
+    ``repair``: ``"missing required file agency.txt"`` (several
     names sorted, ``"missing required files ..."``) or ``"missing calendar.txt
     and calendar_dates.txt"``, joined with ``"; "`` when both apply; a crop
     that keeps no trip leaves both calendar files out. A download whose
@@ -907,14 +1030,28 @@ def fetch(
     On the place path, delivered feeds whose route keys (agency name, route
     short else long name, type) and stops (coordinates at 3 decimals) share
     0.9 and 0.8 or more are versions, ranked by later start, more trips,
-    then candidate order. With ``when``, one is left out as ``"another
-    version of <id>"`` when a kept version pairs with it and kept versions
-    run, by trip signature, every non-frequency trip it runs on the day;
-    the top version and the containers a left-out feed relied on stay, as
-    does one with transfers or pathways. A left-out version's fares are not
-    delivered. Without ``when`` none is left out; similar feeds are noted.
-    A feed whose routes, stops or, with ``when``, calendars cannot be read
-    is never a version.
+    then candidate order. Agency names compare casefolded, without
+    diacritics, punctuation or a trailing legal form (``Ltd``, ``Oy``,
+    ``S.A.`` and the like). A feed with at most one agency row, none named,
+    whose routes name at most one ``agency_id`` is unnamed, and its pairs
+    compare routes by name and type only. With ``when``, one is left out as
+    ``"another version of <id>"`` when a kept version pairs with it and kept
+    versions run, by trip signature (which leaves out the agency), every
+    trip it runs on the day, a headway trip matching one with the same
+    stops, relative times and frequency rows; the top version and the
+    containers a left-out feed relied on stay, as does one with transfers or
+    pathways. With ``when``, a feed whose trips running on the day all
+    belong to services with a calendar.txt row spanning 4,000 days or more
+    is undated, noted ``"placeholder calendar <start> to <end>"``, the
+    widest dates of those rows, and ranks by its placeholder start. An
+    undated feed also pairs on stops alone with a dated one starting after
+    its placeholder start, so its ``version_of`` route overlap may be under
+    0.9, and a kept such version leaves it out whatever it runs on the day
+    and its transfers or pathways; the top version and the containers
+    relied on still stay. A left-out version's fares are not delivered.
+    Without ``when`` none is left out; similar feeds are noted. A feed
+    whose routes, stops or, with ``when``, calendars cannot be read, or with
+    a blank agency name that is not unnamed, is never a version.
 
     Parameters
     ----------
@@ -967,7 +1104,13 @@ def fetch(
         grown by 1.6 km, cafein's default snap distance. With ``osm=False``
         the OSM stage is skipped and the result's ``osm_pbf`` is None, for
         callers who want only the GTFS feeds; ``to_pyrosm`` then raises and
-        ``to_cafein`` builds without a walking network.
+        ``to_cafein`` builds without a walking network. A failed extract
+        download does not abort the call: the feeds are still delivered,
+        ``osm_pbf`` and ``osm_area`` are None, a ``UserWarning`` says so and
+        the last selection entry notes ``"OSM extract not fetched:
+        <error>"``; ``to_cafein`` then builds without a walking network, as
+        with ``osm=False``. Other errors, such as ``ExtractNotFoundError``
+        when no extract covers the area, still raise.
     refresh_token, cache_dir, directory, country_code
         Passed to the catalog and OSM layers.
     **budgets
@@ -976,8 +1119,9 @@ def fetch(
         reason naming the file and the budget to raise. A reached
         ``max_notices_per_file`` does not stop the crop (the feed's report
         then carries ``notice_limit_reached``), but it does stop
-        ``repair=True``. With ``when``, ``reference_date`` is the study day;
-        a different one raises ``ValueError``.
+        ``repair=True``. ``max_total_bytes`` also bounds a feed read from
+        inside a larger archive. With ``when``, ``reference_date`` is the
+        study day; a different one raises ``ValueError``.
 
     Returns
     -------
@@ -997,7 +1141,8 @@ def fetch(
         Database hosted copy"`` after a failed download, an
         ``agency_timezone`` not equivalent to the zone of most of its stops,
         e.g. ``"agency_timezone America/New_York; stops in
-        Pacific/Honolulu"``; several join with ``"; "``),
+        Pacific/Honolulu"``, a placeholder calendar, which a left-out
+        version keeps; several join with ``"; "``),
         ``index_window`` (the index's ``[start, end]``; None undated or on
         the area path), ``feed_window`` (the computed window of a validated
         download, delivered or not; None otherwise or when unknown),
@@ -1005,23 +1150,35 @@ def fetch(
         ``contained_in`` (the containers a containment skip names),
         ``version_of`` (for a left-out version, ``{"feed_id", "route_overlap",
         "stop_overlap"}`` against the highest-ranked kept version it pairs
-        with), ``fetched_from`` (where the download came from:
-        ``"mdb_dataset"`` a catalogued dataset, ``"producer"`` the feed's own
-        URL from the Mobility Database or Transitland Atlas, ``"mdb_latest"``
-        the Mobility Database hosted copy; None when nothing was
-        downloaded), ``download_errors`` (the failed download attempts before
-        the one that worked, or all of them when none did, joined with
-        ``"; "``; None when none failed) and ``path`` (the delivered feed).
+        with, for an undated feed the highest-ranked dated one starting after
+        its placeholder start when one does), ``fetched_from`` (where the
+        download came from: ``"mdb_dataset"`` a catalogued dataset,
+        ``"producer"`` the feed's own URL from the Mobility Database or
+        Transitland Atlas, ``"mdb_latest"`` the Mobility Database hosted
+        copy; None when nothing was downloaded), ``download_errors`` (the
+        failed download attempts before the one that worked, or all of them
+        when none did, joined with ``"; "``; None when none failed) and
+        ``path`` (the delivered feed).
         Windows are ISO dates.
+        When ``place`` is fetched without ``tiers`` and its default view
+        (:meth:`~transitio.index.Place.feeds`) holds none of the place's
+        feeds, an entry with ``feed_id`` None after the candidates names
+        them and the tiers that fetch them, and a ``UserWarning`` repeats
+        it, e.g. ``"default view (region: secondary, tertiary) holds none of
+        the place's 2 feeds: f-a (primary), f-b (primary); tiers=['local']
+        fetches them"``.
         When the OSM extract leaves out parts of the place, a last entry
         with ``feed_id`` None notes them, e.g. ``"OSM area: 1 of 47 parts
-        (1783 of 2188 km²)"``. ``FetchResult.selection_table()`` returns it
-        as a DataFrame. ``osm_area`` is the WGS84 geometry the OSM extract
-        was fetched for (None with ``osm=False``).
+        (1783 of 2188 km²)"``; when its download failed, the last entry
+        notes that instead, e.g. ``"OSM extract not fetched:
+        https://download.geofabrik.de/europe-latest.osm.pbf: ReadTimeout:
+        timed out (3 requests)"``. ``FetchResult.selection_table()`` returns
+        the record as a DataFrame. ``osm_area`` is the WGS84 geometry the OSM
+        extract was fetched for (None with ``osm=False`` or a failed
+        download).
     """
     from transitio.catalog import MobilityDatabase
     from transitio.catalog._models import as_date
-    from transitio.osm import fetch_pbf
     from transitio.osm._fetch import _as_geometry
 
     if (aoi is None) == (place is None):
@@ -1110,9 +1267,11 @@ def fetch(
         ).encode()
     ).hexdigest()[:16]
 
-    osm_pbf = (
-        fetch_pbf(geometry, cache_dir=cache_dir, directory=directory) if osm else None
-    )
+    osm_pbf = osm_note = None
+    if osm:
+        osm_pbf, osm_note = _osm_extract(
+            geometry, cache_dir=cache_dir, directory=directory
+        )
 
     from transitio.catalog._atlas import _feed_dir
 
@@ -1208,6 +1367,8 @@ def fetch(
             feeds.append(path)
             delivered.add(feed.id, download)
 
+    if osm_note is not None:
+        record.append({**_entry(None, None), "note": osm_note})
     return FetchResult(
         osm_pbf=osm_pbf,
         feeds=feeds,
@@ -1215,7 +1376,7 @@ def fetch(
         repairs=repairs,
         skipped=_skipped(record),
         selection=record,
-        osm_area=geometry if osm else None,
+        osm_area=None if osm_pbf is None else geometry,
     )
 
 
@@ -1299,6 +1460,30 @@ def _osm_parts(geometry, feeds):
     return shapely.union_all(parts[sorted(held)])
 
 
+def _hidden_note(place, hidden):
+    """The selection-record note on a place whose default view holds none of
+    its ``hidden`` feeds: the view's categories, the feeds (at most five
+    named) and the tiers that fetch them, local, regional and national when
+    only unknown edges remain."""
+    from transitio.index.feeds import CATEGORY_ORDER, _default_categories
+
+    shown = _default_categories(place, None, "default", False) or ()
+    categories = ", ".join(c for c in CATEGORY_ORDER if c in shown)
+    named = ", ".join(
+        f"{feed.feed_id} ({feed.relevance_category})" for feed in hidden[:5]
+    )
+    if len(hidden) > 5:
+        named += f" and {len(hidden) - 5} more"
+    order = ("local", "regional", "national", "international")
+    found = set().union(*(feed.tiers for feed in hidden))
+    tiers = [tier for tier in order if tier in found] or list(order[:3])
+    feeds, them = ("feed", "it") if len(hidden) == 1 else ("feeds", "them")
+    return (
+        f"default view ({place.kind}: {categories}) holds none of the place's "
+        f"{len(hidden)} {feeds}: {named}; tiers={tiers} fetches {them}"
+    )
+
+
 def _osm_note(geometry, parts):
     """The selection-record note on the parts of ``geometry`` that ``parts``
     leaves out, None when it leaves out none."""
@@ -1313,6 +1498,21 @@ def _osm_note(geometry, parts):
         f"OSM area: {kept} of {total} parts "
         f"({_area_km2(parts):.0f} of {_area_km2(geometry):.0f} km²)"
     )
+
+
+def _osm_extract(area, **options):
+    """``(path, None)`` for the OSM extract :func:`~transitio.osm.fetch_pbf`
+    fetches for ``area``, or ``(None, note)`` with a ``UserWarning`` when its
+    download fails; any other error raises."""
+    from transitio.exceptions import DownloadError
+    from transitio.osm import fetch_pbf
+
+    try:
+        return fetch_pbf(area, **options), None
+    except DownloadError as error:
+        note = f"OSM extract not fetched: {error}"
+        warnings.warn(f"{note}; osm_pbf is None", UserWarning, stacklevel=3)
+        return None, note
 
 
 def _fetch_place(
@@ -1359,7 +1559,6 @@ def _fetch_place(
         place as resolve_place,
     )
     from transitio.index.feeds import _parse
-    from transitio.osm import fetch_pbf
     from transitio.osm._fetch import _buffered
 
     if isinstance(place, Place):
@@ -1423,6 +1622,15 @@ def _fetch_place(
                 _skip(entry, "only unknown-tier edges")
     for feed in offered:
         entry_for(feed)
+    if tiers is None and not offered:
+        # An empty default view may hide feeds a tier query would fetch.
+        hidden = place_obj.feeds(
+            exclude=exclude, on_unknown=on_unknown, categories=None
+        )
+        if hidden:
+            note = _hidden_note(place_obj, hidden)
+            record.append({**_entry(None, None), "note": note})
+            warnings.warn(note, UserWarning, stacklevel=3)
 
     import platformdirs
 
@@ -1432,10 +1640,14 @@ def _fetch_place(
         else pathlib.Path(cache_dir or platformdirs.user_cache_dir("transitio"))
         / "gtfs"
     )
+    base_dir.mkdir(parents=True, exist_ok=True)
+    # Archives read by URL fragment live only for the call.
     with (
         MobilityDatabase(refresh_token, cache_dir=cache_dir) as db,
         TransitlandAtlas(cache_dir=cache_dir) as atlas,
+        tempfile.TemporaryDirectory(dir=base_dir) as scratch,
     ):
+        archives = _Archives(scratch)
         if when is not None and not db._refresh_token:
             warnings.warn(
                 "no Mobility Database API token: 'when' cannot select "
@@ -1508,7 +1720,7 @@ def _fetch_place(
                 probed = probed and unchanged(feed)
                 try:
                     path, fetched_from, failures = _download_indexed(
-                        feed, db, atlas, base_dir
+                        feed, db, atlas, base_dir, archives, budget
                     )
                     errors.extend(failures)
                 except Exception as error:  # noqa: B902
@@ -1707,11 +1919,12 @@ def _fetch_place(
     osm_pbf = osm_area = None
     if osm:
         parts = _osm_parts(geometry, feeds)
-        osm_pbf = fetch_pbf(
+        osm_pbf, note = _osm_extract(
             parts, buffer_m=_OSM_BUFFER_M, cache_dir=cache_dir, directory=directory
         )
-        osm_area = _buffered(parts, _OSM_BUFFER_M)
-        note = _osm_note(geometry, parts)
+        if osm_pbf is not None:
+            osm_area = _buffered(parts, _OSM_BUFFER_M)
+            note = _osm_note(geometry, parts)
         if note is not None:
             record.append({**_entry(None, None), "note": note})
 

@@ -36,6 +36,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calendar_dates.txt"`, which includes a crop that keeps no trip; it does
   not repair them. Toronto's TTC surface feed has no `agency.txt`, and
   cafein refused every feed delivered with it.
+- `fetch`'s version pass and the merge's duplicate drop compare agency
+  names with case, diacritics, punctuation and trailing legal forms
+  (Ltd, GmbH, Oy, S.A. …) set aside, and a feed with one unnamed agency
+  can pair as a version. Trip signatures leave the agency out, so copies
+  of one network published under different agency names are dropped as
+  duplicates. Glasgow's "Midland Bluebird Ltd" and the national feed's
+  "Midland Bluebird" did not match.
+- Headway-based trips count in `fetch`'s version pass and the merge's
+  duplicate drop: a trip with `frequencies.txt` rows signs over its
+  stops, its times relative to the first departure and its frequency
+  rows, and matches only a trip with the same rows. Santiago's DTPM
+  network came three times.
+- `merge_feeds` and `merge_tables` also drop a later input's trip that
+  nearly repeats an earlier input's: same route name and type, stops
+  aligned in order within 50 m and 180 s, a mean time difference of at
+  most 60 s, and agreeing pickup, drop-off and accessibility values.
+  `duplicate_trips="exact"` keeps equal-signature matching only, and the
+  report gains `"near_matches"` and `"unaligned_stops"`. Santiago's
+  merged day fell from 16,890 trips to about 11,040.
+- `fetch` treats a feed whose trips run under calendar rows spanning
+  4,000 days or more as undated: it pairs with a dated feed on shared
+  stops alone and is left out when a kept dated version starts later,
+  and every such feed notes `placeholder calendar <start> to <end>`.
+  Bogotá got TransMilenio's 2024 snapshot (2000 to 2099) beside the
+  2026 feed.
+- transitio's HTTP clients send `User-Agent: transitio/<version>
+  (+https://github.com/cafein-py/transitio)` instead of httpx's default,
+  which Metrolink's and Riverside Transit's hosts answered with 403.
+- Feed and OSM extract downloads retry dropped connections, read
+  timeouts, short bodies and retryable statuses (three failed attempts,
+  ten requests at most) and resume with `Range` when the server pins the
+  file with a strong ETag or a Last-Modified date; the read timeout is
+  60 s and the connect timeout 15 s.
+- A region or country of at most 1,000 km² lists its primary feeds too
+  by default, as a city does, so a town-sized municipality or small state
+  offers its local feeds; `DISCOVERY_SEMANTICS_VERSION` is 3. When the
+  default view of a place is empty although it has feeds, `fetch` warns
+  and notes which tiers would fetch them. Monaco's default fetch returned
+  no feeds and no warning.
+- `place()` resolves exact names only: a name with only partial matches
+  raises `PlaceNotFoundError`, whose `.candidates` lists them, and the
+  feed margin does not decide when a better-known exact namesake (100 or
+  more language labels, more than twice the leader's) lies in another
+  country. "Nuuk" had resolved to Nuuksio, "Moscow" to Moscow, Idaho.
+- `place()`'s city-first rule counts a city-level region or dependency
+  when no exact match is a city, and places reaching the name only
+  through an alias (a county, a neighbouring region, the country) no
+  longer compete with a city that carries it as its name. Istanbul,
+  Kuala Lumpur, Dubai, Hong Kong and Cape Town resolved as ambiguous,
+  and Taipei resolved to its metro.
 
 ### Fixed
 
@@ -84,6 +134,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `baselineTrips` is `None`, and the notices comparing against it are not
   raised. A temporal crop keeps every service that runs in its window.
   Basel's crop of the Swiss national feed had no service window.
+- `fetch` reads a feed named by a URL fragment inside the downloaded
+  archive (`…/gtfs.zip#1/google_transit.zip`, or a folder), downloading
+  the outer archive once per place; members declaring more uncompressed
+  bytes than `max_total_bytes` are refused. Melbourne's seven PTV feeds
+  were skipped as having no usable `trips.txt`.
+- A failed OSM extract download no longer loses the feeds `fetch` already
+  fetched: they are delivered without an extract, with a `UserWarning`
+  and a selection note. Baarle-Hertog's extract download timed out.
 
 ## 0.17.0 — 2026-09-28
 

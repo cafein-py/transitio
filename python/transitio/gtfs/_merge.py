@@ -248,22 +248,31 @@ def merge_tables(
     extra_entries : sequence of sequence of str, optional
         Per feed, the archive entries that are not GTFS tables; they
         are reported as dropped (``locations.geojson`` is refused).
-    duplicate_trips : {"drop", "keep"}, default "drop"
-        ``"drop"`` leaves out each input's trips that repeat trips kept
-        from the inputs before it: same route key, stops, times and pickup
-        and drop-off behaviour (see
-        :func:`~transitio.gtfs._schedule.trip_signatures`). Headsigns,
-        short names, ``shape_id`` and shape geometry, ``timepoint`` and
-        ``shape_dist_traveled`` may differ; the earlier trip's are kept.
+    duplicate_trips : {"drop", "exact", "keep"}, default "drop"
+        ``"exact"`` leaves out each input's trips that repeat trips kept
+        from the inputs before it: same route name and type, stops, times
+        and pickup and drop-off behaviour, a frequency-based trip's times
+        counted from its first departure and with the same frequencies.txt
+        rows (see :func:`~transitio.gtfs._schedule.trip_signatures`). The
+        agency, headsigns, short names, ``shape_id`` and shape geometry,
+        ``timepoint`` and ``shape_dist_traveled`` may differ; the earlier
+        trip's are kept. ``"drop"`` also leaves out a trip with no such
+        repeat that nearly repeats kept trips: same route name and type and
+        frequencies.txt rows, its stops within 50 m and 3 minutes of theirs
+        in order, a minute apart on average, at most two stops and a fifth
+        of them unmatched, the same pickup and drop-off behaviour but for
+        drop-off at the first matched stop and pickup at the last, and no
+        contrary ``wheelchair_accessible`` or ``bikes_allowed`` (see
+        :func:`~transitio.gtfs._near.near_matches`).
         On each date, one earlier trip covers one later trip, and a later
         trip goes only when covered on every date it runs; a block
         (``block_id``) of several trips goes only when one earlier block
-        covers it trip for trip. Frequency-based trips, trips in a
-        trip-specific transfer and trips of a calendar spanning over
-        40,000 days are never compared. A dropped trip's rows go with it,
-        and each of its stops a kept trip still serves is linked both ways
-        to the earlier trip's stop (``transfer_type`` 2). ``"keep"`` keeps
-        every trip.
+        covers it trip for trip. Trips in a trip-specific transfer and
+        trips of a calendar spanning over 40,000 days are never compared.
+        A dropped trip's rows go with it, and each of its stops a kept trip
+        still serves is linked both ways to the earlier trip's stop it
+        repeats (``transfer_type`` 2); a near repeat's unmatched stops are
+        not linked. ``"keep"`` keeps every trip.
 
     Returns
     -------
@@ -297,9 +306,10 @@ def _merge_tables(
     zones already, ``labels`` name the inputs in a refusal, ``positions``
     are their positions in the report, and ``allow_single`` lets one input
     through, prefixed as any other."""
-    if duplicate_trips not in ("drop", "keep"):
+    if duplicate_trips not in ("drop", "exact", "keep"):
         raise ValueError(
-            f"duplicate_trips must be 'drop' or 'keep', not {duplicate_trips!r}"
+            "duplicate_trips must be 'drop', 'exact' or 'keep', "
+            f"not {duplicate_trips!r}"
         )
     table_sets = list(table_sets)
     if len(table_sets) < (1 if allow_single else 2):
@@ -354,10 +364,11 @@ def _merge_tables(
         filled = agency["agency_timezone"].str.strip() != ""
         agency.loc[filled, "agency_timezone"] = used
     duplicates = {"dropped": 0, "by_feed": {}, "unexpanded_services": 0}
-    duplicates["stop_links"] = 0
+    duplicates.update(stop_links=0, near_matches=0, unaligned_stops=0)
     at = range(len(prefixed)) if positions is None else positions
-    if duplicate_trips == "drop":
-        duplicates = drop_duplicate_trips(merged, prefixed, at)
+    if duplicate_trips != "keep":
+        near = duplicate_trips == "drop"
+        duplicates = drop_duplicate_trips(merged, prefixed, at, near)
     details = {
         "timezone_interval": (
             None if interval is None else [instant.isoformat() for instant in interval]
@@ -792,9 +803,9 @@ def merge_feeds(
         ``"refuse"`` raises :class:`~transitio.exceptions.InvalidFeedError`
         (also a ``ValueError``) naming each input with its zones, by
         position, prefix and path.
-    duplicate_trips : {"drop", "keep"}, default "drop"
-        Whether to leave out the trips an input repeats from the inputs
-        before it (see :func:`merge_tables`).
+    duplicate_trips : {"drop", "exact", "keep"}, default "drop"
+        Whether to leave out the trips an input repeats, or nearly repeats
+        (``"drop"``), from the inputs before it (see :func:`merge_tables`).
     **budgets
         ``validate_feed`` keyword arguments.
 
@@ -818,9 +829,11 @@ def merge_feeds(
         ``"timezone_aliases"`` maps each ``agency_timezone`` name replaced
         to the name used. ``"duplicate_trips"`` counts the trips dropped
         as repeats, ``{"dropped": <n>, "by_feed": {<input position>: <n>},
-        "unexpanded_services": <n>, "stop_links": <n>}``: the services not
-        expanded, whose trips were never compared, and the stop pairs
-        linked. ``"rider_defaults"`` is ``[]`` unless two or more inputs
+        "unexpanded_services": <n>, "stop_links": <n>, "near_matches": <n>,
+        "unaligned_stops": <n>}``: the services not expanded, whose trips
+        were never compared, the stop pairs linked, the trips dropped as
+        near repeats and those trips' stop times left unmatched.
+        ``"rider_defaults"`` is ``[]`` unless two or more inputs
         declare a default rider category; it then lists one ``{"feed":
         <input position>, "defaults": [<rider_category_id>, ...],
         "wildcard_products": [<fare_product_id>, ...]}`` per input with a

@@ -5,20 +5,32 @@ import pytest
 
 pytest.importorskip("geopandas")
 
+import shapely  # noqa: E402
+
 import transitio  # noqa: E402
 from transitio import index as reader  # noqa: E402
 from index_fixture import (  # noqa: E402
+    GEOM_HEX,
     covered_feed,
     edge,
     place,
     write_partitioned_index,
 )
 
+
+def _box(*bounds):
+    return shapely.to_wkb(shapely.box(*bounds)).hex()
+
+
 PLACES = [
     place("fi", "country", country_code="FI", name="Finland"),
     place("uus", "region", country_code="FI", name="Uusimaa", parent_id="fi"),
     place("hel", "city", country_code="FI", name="Helsinki", parent_id="uus"),
     place("tll", "city", country_code="EE", name="Tallinn"),
+    # About 10 km², 250 km² and 12,000 km².
+    place("mc", "country", country_code="MC", geometry=_box(7.40, 43.72, 7.44, 43.75)),
+    place("town", "region", country_code="FI", parent_id="fi", geometry=GEOM_HEX),
+    place("wide", "region", country_code="FI", geometry=_box(24.0, 60.0, 26.0, 61.0)),
 ]
 FEEDS = [
     {**covered_feed("f-hsl"), "home_country": "FI", "scope": "domestic"},
@@ -27,6 +39,9 @@ FEEDS = [
     {**covered_feed("f-tlt"), "home_country": "EE", "scope": "domestic"},
     {**covered_feed("f-ferry"), "home_country": None, "scope": "international"},
     {**covered_feed("f-old"), "home_country": None, "scope": "declared"},
+    {**covered_feed("f-cam"), "home_country": "MC", "scope": "domestic"},
+    {**covered_feed("f-zou"), "home_country": "MC", "scope": "domestic"},
+    {**covered_feed("f-ter"), "home_country": "MC", "scope": "domestic"},
 ]
 
 
@@ -61,6 +76,18 @@ EDGES = [
     _edge("fi", "f-coach", "national", "tertiary", 0.3),
     _edge("fi", "f-hsl", "local", "primary", 0.1),
     _edge("tll", "f-tlt", "local", "primary", 0.8),
+] + [
+    # The sized places: a local-only, a regional and a national feed each.
+    _edge(place_id, feed_id, tier, category, 0.5)
+    for place_id, feed_ids in (
+        ("mc", ("f-cam", "f-zou", "f-ter")),
+        ("town", ("f-hsl", "f-coach", "f-vr")),
+        ("wide", ("f-hsl", "f-coach", "f-vr")),
+    )
+    for feed_id, (tier, category) in zip(
+        feed_ids,
+        (("local", "primary"), ("regional", "secondary"), ("national", "tertiary")),
+    )
 ]
 
 
@@ -106,6 +133,21 @@ def test_the_default_view_follows_the_place_kind_and_ranks_by_relevance(index):
         "f-vr",
         "f-old",
     ]
+
+
+@pytest.mark.parametrize(
+    "place_id, expected",
+    [
+        pytest.param("mc", ["f-cam", "f-zou", "f-ter"], id="country-10km2"),
+        pytest.param("town", ["f-hsl", "f-coach", "f-vr"], id="region-250km2"),
+        pytest.param("wide", ["f-coach", "f-vr"], id="region-12000km2"),
+    ],
+)
+def test_a_town_sized_region_or_country_lists_its_local_feeds(
+    index, place_id, expected
+):
+    # At most 1,000 km²: primary, secondary and tertiary; larger: by kind.
+    assert _ids(reader.place(place_id, index=index).feeds()) == expected
 
 
 def test_international_adds_the_cross_border_feeds(index, tmp_path):

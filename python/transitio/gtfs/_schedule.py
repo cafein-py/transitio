@@ -27,8 +27,16 @@ MAX_SERVICE_DAYS = 40_000
 #: Days expanded from one calendar.txt at most; the longest rows past it are
 #: not expanded.
 MAX_EXPANDED_DAYS = 50_000_000
+#: A calendar row whose end is this many days or more after its start is a
+#: placeholder rather than a timetable period, as the validator's
+#: ``calendar_span_truncated`` notice counts it.
+PLACEHOLDER_DAYS = 4000
 # A trip signature joins two 64-bit hashes taken under these keys.
 _HASH_KEYS = ("transitio-trip-1", "transitio-trip-2")
+# Legal-form words an agency key drops from the end of a name.
+_LEGAL_FORMS = frozenset(
+    "ltd limited inc llc plc corp gmbh ag kg sa sas srl spa oy oyj ab as asa bv nv".split()
+)
 
 
 def _matching(text, pattern):
@@ -83,6 +91,17 @@ def service_span(tables, within):
         return None
     days = dates["date"].to_numpy().astype("datetime64[D]")
     return days.min().item(), days.max().item()
+
+
+def placeholder_rows(tables):
+    """The calendar.txt rows whose end is :data:`PLACEHOLDER_DAYS` days or
+    more after their start, as ``service_id``, ``start`` and ``end``; rows
+    with an unreadable date are left out."""
+    calendar = tables.get("calendar.txt", pd.DataFrame())
+    start, end = (parse_dates(_column(calendar, f"{e}_date")) for e in ("start", "end"))
+    services = _column(calendar, "service_id").to_numpy()
+    rows = pd.DataFrame({"service_id": services, "start": start, "end": end})
+    return rows[end - start >= np.timedelta64(PLACEHOLDER_DAYS, "D")]
 
 
 def service_dates(tables):
@@ -218,15 +237,33 @@ def _digest(frame, key):
     return pd.util.hash_pandas_object(frame, index=False, hash_key=key).to_numpy()
 
 
+def agency_keys(names):
+    """Each agency name of the series ``names`` as compared across feeds:
+    casefolded, diacritics and punctuation dropped, whitespace collapsed
+    (:func:`transitio.index.places._normalize`), then its trailing
+    legal-form words (``Ltd``, ``GmbH``, ``Oy``, ``S.A.`` and the like)
+    dropped, its first word always kept."""
+    from transitio.index.places import _normalize
+
+    def key(name):
+        words = _normalize(name).split()
+        while len(words) > 1 and words[-1] in _LEGAL_FORMS:
+            words.pop()
+        return " ".join(words)
+
+    return names.map(key)
+
+
 def route_keys(tables):
     """Each route's key, indexed by ``route_id`` (the first row of each id
-    kept): ``agency``, its agency name, and ``name``, its short name, else
-    long name, both casefolded; ``type``, its route type; and its
-    ``continuous_pickup`` and ``continuous_drop_off``, blank when unset."""
+    kept): ``agency``, its agency name as :func:`agency_keys` compares it;
+    ``name``, its short name, else long name, casefolded; ``type``, its
+    route type; and its ``continuous_pickup`` and ``continuous_drop_off``,
+    blank when unset."""
     agency, routes = (
         tables.get(name, pd.DataFrame()) for name in ("agency.txt", "routes.txt")
     )
-    names = _stripped(agency, "agency_name").str.casefold()
+    names = agency_keys(_stripped(agency, "agency_name"))
     route_agency = _column(routes, "agency_id")
     agency_names = route_agency.map(_keyed(names, _column(agency, "agency_id")))
     if len(agency) == 1:
@@ -246,25 +283,44 @@ def route_keys(tables):
     return _keyed(keys, _column(routes, "route_id"))
 
 
-def trip_signatures(tables):
+def trip_signatures(tables, with_stops=False):
     """The signature of each trip in a feed's tables.
 
     A signature is 128 bits, written as 32 hex digits, over the trip's route
-    key (agency name and route short name, else long name, both casefolded,
-    and route type), its ``wheelchair_accessible`` and ``bikes_allowed``
-    (blank as 0), and per stop, in ``stop_sequence`` order: the stop's
-    coordinates rounded to 5 decimals, arrival and departure times with
-    single-digit hours padded, ``pickup_type`` and ``drop_off_type`` (blank
-    as 0), and the effective ``continuous_pickup`` and ``continuous_drop_off``
-    (the stop time's value, else the route's, else 1). Headsigns, short
-    names, ``shape_id`` and shape geometry, ``timepoint`` and
-    ``shape_dist_traveled`` are not part of it.
+    short name, else long name, casefolded, and route type, its
+    ``wheelchair_accessible`` and ``bikes_allowed`` (blank as 0), and per
+    stop, in ``stop_sequence`` order: the stop's coordinates rounded to 5
+    decimals, arrival and departure times with single-digit hours padded,
+    ``pickup_type`` and ``drop_off_type`` (blank as 0), and the effective
+    ``continuous_pickup`` and ``continuous_drop_off`` (the stop time's value,
+    else the route's, else 1). The agency, headsigns, short names,
+    ``shape_id`` and shape geometry, ``timepoint`` and
+    ``shape_dist_traveled`` are not part of it. A frequency-based trip, one
+    named in frequencies.txt, has its times as seconds after its first
+    departure, and is also signed over its frequencies.txt rows in any
+    order: ``start_time`` and ``end_time`` in seconds, ``headway_secs`` and
+    ``exact_times`` (blank as 0); it never signs equal to a timetabled trip.
 
     Returns one ``trip_id``, ``service_id``, ``signature`` row per signed
     trip. A trip listed twice in trips.txt, one naming a stop or route the
-    feed lacks, and one whose stop times cannot be ordered (a blank,
+    feed lacks, one whose stop times cannot be ordered (a blank,
     non-numeric or repeated ``stop_sequence``, or one over 18 digits past
-    leading zeros) are not signed.
+    leading zeros), and a frequency-based trip whose first departure, or a
+    frequency row's ``start_time``, ``end_time`` or ``headway_secs``, cannot
+    be read are not signed.
+
+    With ``with_stops``, returns ``(signatures, stops)``, ``stops`` the
+    signed trips' stop times, by trip and in ``stop_sequence`` order, as
+    :func:`~transitio.gtfs._near.near_matches` compares them: ``trip_id``,
+    ``position`` (from 0), ``stop_id``, the stop's ``lon`` and ``lat``,
+    ``seconds`` (the departure time, else the arrival time, a
+    frequency-based trip's counted from its first departure; NaN when
+    neither can be read), ``pickup`` and ``drop_off`` (blank as 0),
+    ``continuous`` (whether an effective ``continuous_pickup`` or
+    ``continuous_drop_off`` is not 1), and per trip ``route`` (a hash of
+    its route's name and type and whether it is frequency-based), ``runs``
+    (a hash of its frequencies.txt rows, 0 for a timetabled trip), and
+    ``wheelchair`` and ``bikes`` (blank as 0).
     """
     from transitio.index.fingerprint import COORDINATE_DECIMALS
 
@@ -279,16 +335,14 @@ def trip_signatures(tables):
     stops = tables.get("stops.txt", pd.DataFrame())
     keys = route_keys(tables)
     trips = trips[_column(trips, "route_id").isin(keys.index)]
-    coordinates = pd.DataFrame(
+    located = pd.DataFrame(
         {
             axis: pd.to_numeric(_stripped(stops, f"stop_{axis}"), errors="coerce")
-            .round(COORDINATE_DECIMALS)
-            .add(0.0)
-            .astype(str)
             for axis in ("lat", "lon")
         }
     )
-    coordinates = _keyed(coordinates, _column(stops, "stop_id"))
+    located = _keyed(located, _column(stops, "stop_id"))
+    coordinates = located.round(COORDINATE_DECIMALS).add(0.0).astype(str)
     stop_rows = coordinates.index.get_indexer(stop_times["stop_id"])
 
     codes, trip_ids = pd.factorize(stop_times["trip_id"])
@@ -302,6 +356,7 @@ def trip_signatures(tables):
     ordered, ranked = codes[order], sequence[order]
     repeated = (ordered[1:] == ordered[:-1]) & (ranked[1:] == ranked[:-1])
     unsigned = np.r_[codes[~orderable | (stop_rows < 0)], ordered[1:][repeated]]
+    starts = np.flatnonzero(np.r_[True, ordered[1:] != ordered[:-1]])[: len(order)]
     row_keys = keys.reindex(
         stop_times["trip_id"].map(_column(trips, "route_id")).to_numpy()
     )
@@ -311,10 +366,41 @@ def trip_signatures(tables):
         value = np.where(value != "", value, row_keys[name].fillna("").to_numpy())
         return np.where(value != "", value, "1")
 
-    arrival, departure = (
-        padded_clocks(_column(stop_times, f"{kind}_time")).to_numpy()
-        for kind in ("arrival", "departure")
+    frequencies = tables.get("frequencies.txt", pd.DataFrame())
+    listed = trip_ids.get_indexer(_column(frequencies, "trip_id"))
+    headway = trip_ids.isin(_column(frequencies, "trip_id"))
+    first = np.full(len(trip_ids), np.nan)
+    departures = _column(stop_times, "departure_time").iloc[order[starts]]
+    first[ordered[starts]] = clock_seconds(departures).to_numpy()
+    timed = np.flatnonzero(headway[codes])
+
+    def clock(kind):
+        # A frequency-based trip's times count from its first departure.
+        column = _column(stop_times, f"{kind}_time")
+        text = np.array(padded_clocks(column), dtype=object)
+        after = clock_seconds(column.iloc[timed]).to_numpy() - first[codes[timed]]
+        known = ~np.isnan(after)
+        text[timed[known]] = after[known].astype("int64").astype(str)
+        return text
+
+    start, end = (
+        clock_seconds(_column(frequencies, f"{edge}_time")).to_numpy()
+        for edge in ("start", "end")
     )
+    spacing = _stripped(frequencies, "headway_secs")
+    readable = _matching(spacing, r"\d+") & ~np.isnan(start + end)
+    periods = pd.DataFrame(
+        {
+            "start": start,
+            "end": end,
+            "headway": spacing.str.lstrip("0").to_numpy(),
+            "exact_times": _stripped(frequencies, "exact_times", "0").to_numpy(),
+        }
+    )
+    named = listed >= 0
+    unreadable = np.flatnonzero(headway & np.isnan(first))
+    unsigned = np.r_[unsigned, listed[named & ~readable], unreadable]
+    arrival, departure = (clock(kind) for kind in ("arrival", "departure"))
     rows = pd.DataFrame(
         {
             "arrival": arrival,
@@ -325,23 +411,24 @@ def trip_signatures(tables):
             "continuous_drop_off": effective("continuous_drop_off"),
         }
     )
-    starts = np.flatnonzero(np.r_[True, ordered[1:] != ordered[:-1]])[: len(order)]
     counts = np.diff(np.r_[starts, len(order)])
     positions = np.arange(len(order)) - np.repeat(starts, counts)
     signed = ~np.isin(ordered[starts], unsigned)
     signed &= trip_ids[ordered[starts]].isin(trips.index)
-    signed_ids = trip_ids[ordered[starts][signed]]
+    signed_codes = ordered[starts][signed]
+    signed_ids = trip_ids[signed_codes]
     trips = trips[trips.index.isin(signed_ids)]
 
     def per_trip(values):
         return pd.Series(values, index=signed_ids).reindex(trips.index).to_numpy()
 
     route = keys.reindex(_column(trips, "route_id").to_numpy())
-    whole = route[["agency", "name", "type"]].set_axis(trips.index)
+    whole = route[["name", "type"]].set_axis(trips.index)
     whole = whole.assign(
         wheelchair=_stripped(trips, "wheelchair_accessible", "0"),
         bikes=_stripped(trips, "bikes_allowed", "0"),
         count=per_trip(counts[signed]),
+        headway=per_trip(headway[signed_codes]),
     )
     halves = []
     for key in _HASH_KEYS:
@@ -350,15 +437,50 @@ def trip_signatures(tables):
             {"row": _digest(rows.assign(stop=stop), key)[order], "position": positions}
         )
         # Each row's hash is taken with its position in the trip, and the
-        # sum over the trip wraps around at 64 bits.
+        # sum over the trip wraps around at 64 bits; frequency rows are
+        # summed without a position.
         placed = _digest(placed, key)
         sums = np.add.reduceat(placed, starts)[signed] if len(order) else placed
-        whole_hash = _digest(whole.assign(stops=per_trip(sums)), key)
+        runs = np.zeros(len(trip_ids), dtype="uint64")
+        np.add.at(runs, listed[named], _digest(periods, key)[named])
+        whole_hash = _digest(
+            whole.assign(stops=per_trip(sums), runs=per_trip(runs[signed_codes])), key
+        )
         halves.append(np.char.mod("%016x", whole_hash))
-    return pd.DataFrame(
+    signatures = pd.DataFrame(
         {
             "trip_id": trips.index.to_numpy(),
             "service_id": _column(trips, "service_id").to_numpy(),
             "signature": np.char.add(*halves) if len(trips) else [],
+        }
+    )
+    if not with_stops:
+        return signatures
+    kept = np.repeat(signed, counts)
+    at, trip = order[kept], ordered[kept]
+    stop = stop_rows[at]
+    placed = trips.index.get_indexer(trip_ids[trip])
+    departure, arrival = (
+        clock_seconds(_column(stop_times, f"{kind}_time").iloc[at])
+        for kind in ("departure", "arrival")
+    )
+    seconds = departure.fillna(arrival).to_numpy()
+    stopping = rows[["continuous_pickup", "continuous_drop_off"]] != "1"
+    return signatures, pd.DataFrame(
+        {
+            "trip_id": trip_ids[trip],
+            "position": positions[kept],
+            "stop_id": located.index[stop],
+            "lon": located["lon"].to_numpy()[stop],
+            "lat": located["lat"].to_numpy()[stop],
+            "seconds": seconds - np.where(headway[trip], first[trip], 0.0),
+            "pickup": rows["pickup"].to_numpy()[at],
+            "drop_off": rows["drop_off"].to_numpy()[at],
+            "continuous": stopping.any(axis=1).to_numpy()[at],
+            # Hashed under the last key, as are the frequency rows.
+            "route": _digest(whole[["name", "type", "headway"]], key)[placed],
+            "runs": runs[trip],
+            "wheelchair": whole["wheelchair"].to_numpy()[placed],
+            "bikes": whole["bikes"].to_numpy()[placed],
         }
     )

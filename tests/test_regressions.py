@@ -8,6 +8,7 @@ import pytest
 
 pytest.importorskip("transitio._core")
 
+from transitio.exceptions import DownloadError, ExtractNotFoundError  # noqa: E402
 from transitio.gtfs import crop_feed  # noqa: E402
 from transitio.repair import repair_feed  # noqa: E402
 from transitio.validate import validate_feed  # noqa: E402
@@ -250,31 +251,42 @@ def test_area_search_ranks_local_feed_over_continental_aggregate(tmp_path):
     assert [feed.id for feed in search_csv(path, bounds=helsinki, limit=1)] == ["mdb-2"]
 
 
+def _place(place_id, kind, name, country, aliases=(), names=None, parent=None):
+    return {
+        "place_id": place_id,
+        "kind": kind,
+        "name": name,
+        "names": names or {"en": name},
+        "aliases": list(aliases),
+        "parent_id": parent,
+        "default_metro_id": None,
+        "metro_ids": [],
+        "member_ids": [],
+        "country_code": country,
+        "source_subtype": None,
+    }
+
+
+def _lookup(rows, feeds):
+    """A resolver over the place ``rows``, with the feed counts ``feeds``."""
+    pandas = pytest.importorskip("pandas")
+    from transitio.index.places import _PlaceLookup
+
+    return _PlaceLookup(
+        pandas.DataFrame(rows), feed_count=lambda place_id: feeds.get(place_id, 0)
+    )
+
+
 def test_a_city_is_not_outranked_by_the_places_named_after_it():
     # Augsburg's name is shared by three metros in its country, one per metro
     # definition, and by a containing region with about the same service;
     # London's only exact-match city is in Canada, the metros sharing its name
     # in the UK; New York State carries far more service than the city; and
     # Hamilton's busier British metro must not win once the Canadian one, the
-    # city's namesake, is set aside.
-    pandas = pytest.importorskip("pandas")
+    # city's namesake, is set aside. Where no city matches, Istanbul's province
+    # stands as the city against its metro; Lagos's Portuguese town keeps the
+    # Nigerian state from standing as one, so the Nigerian metro stays a rival.
     from transitio.exceptions import AmbiguousPlaceError
-    from transitio.index.places import _PlaceLookup
-
-    def place(place_id, kind, name, country, parent=None):
-        return {
-            "place_id": place_id,
-            "kind": kind,
-            "name": name,
-            "names": {"en": name},
-            "aliases": [],
-            "parent_id": parent,
-            "default_metro_id": None,
-            "metro_ids": [],
-            "member_ids": [],
-            "country_code": country,
-            "source_subtype": None,
-        }
 
     feeds = {
         "c-aug": 30,
@@ -284,29 +296,38 @@ def test_a_city_is_not_outranked_by_the_places_named_after_it():
         "c-ham": 5,
         "m-ham-ca": 40,
         "m-ham-gb": 60,
+        "r-ist": 6,
+        "m-ist": 4,
+        "m-lag": 1,
+        "r-lag": 1,
+        "c-lag": 5,
     }
-    lookup = _PlaceLookup(
-        pandas.DataFrame(
-            [
-                place("r-aug", "region", "Augsburg", "DE"),
-                place("c-aug", "city", "Augsburg", "DE", parent="r-aug"),
-                place("m-aug-1", "metro", "Augsburg", "DE"),
-                place("m-aug-2", "metro", "Augsburg", "DE"),
-                place("m-aug-3", "metro", "Augsburg", "DE"),
-                place("c-lon", "city", "London", "CA"),
-                place("m-lon-1", "metro", "London", "GB"),
-                place("m-lon-2", "metro", "London", "GB"),
-                place("r-ny", "region", "New York", "US"),
-                place("c-ny", "city", "New York", "US", parent="r-ny"),
-                place("c-ham", "city", "Hamilton", "CA"),
-                place("m-ham-ca", "metro", "Hamilton", "CA"),
-                place("m-ham-gb", "metro", "Hamilton", "GB"),
-            ]
-        ),
-        feed_count=lambda place_id: feeds.get(place_id, 0),
+    lookup = _lookup(
+        [
+            _place("r-aug", "region", "Augsburg", "DE"),
+            _place("c-aug", "city", "Augsburg", "DE", parent="r-aug"),
+            _place("m-aug-1", "metro", "Augsburg", "DE"),
+            _place("m-aug-2", "metro", "Augsburg", "DE"),
+            _place("m-aug-3", "metro", "Augsburg", "DE"),
+            _place("c-lon", "city", "London", "CA"),
+            _place("m-lon-1", "metro", "London", "GB"),
+            _place("m-lon-2", "metro", "London", "GB"),
+            _place("r-ny", "region", "New York", "US"),
+            _place("c-ny", "city", "New York", "US", parent="r-ny"),
+            _place("c-ham", "city", "Hamilton", "CA"),
+            _place("m-ham-ca", "metro", "Hamilton", "CA"),
+            _place("m-ham-gb", "metro", "Hamilton", "GB"),
+            _place("r-ist", "region", "Istanbul", "TR"),
+            _place("m-ist", "metro", "Istanbul", "TR"),
+            _place("m-lag", "metro", "Lagos", "NG"),
+            _place("r-lag", "region", "Lagos", "NG"),
+            _place("c-lag", "city", "Lagos", "PT"),
+        ],
+        feeds,
     )
     assert lookup.resolve("Augsburg").id == "c-aug"
-    for name in ("London", "New York", "Hamilton"):
+    assert lookup.resolve("Istanbul").id == "r-ist"
+    for name in ("London", "New York", "Hamilton", "Lagos"):
         with pytest.raises(AmbiguousPlaceError):
             lookup.resolve(name)
 
@@ -315,50 +336,40 @@ def test_the_feed_margin_does_not_favour_an_alias_over_a_name():
     # Saint Paul, Minnesota carries "São Paulo" as an alias and more feeds than
     # São Paulo itself: the name stays ambiguous rather than naming Saint Paul,
     # and a qualifier picks São Paulo; a translation still reaches Vienna; and
-    # a district listing its city's name as an alias is no rival to the city.
-    pandas = pytest.importorskip("pandas")
+    # a district listing its city's name as an alias is no rival to the city,
+    # nor are a region and a country listing Taipei, or a county listing Los
+    # Angeles, whose metros would otherwise win on feeds.
     from transitio.exceptions import AmbiguousPlaceError
-    from transitio.index.places import _PlaceLookup
-
-    def place(place_id, kind, name, country, aliases=(), names=None, parent=None):
-        return {
-            "place_id": place_id,
-            "kind": kind,
-            "name": name,
-            "names": names or {"en": name},
-            "aliases": list(aliases),
-            "parent_id": parent,
-            "default_metro_id": None,
-            "metro_ids": [],
-            "member_ids": [],
-            "country_code": country,
-            "source_subtype": None,
-        }
 
     # Kingston: an aliased city abroad would win the narrowed contest on feeds;
     # the veto must not hand the name to the busy metro set aside as a namesake.
     feeds = {"c-stp": 7, "c-sp": 2, "c-vie": 27, "m-wien": 30}
     feeds.update({"c-kin": 5, "c-kin-us": 30, "m-kin": 100})
     feeds.update({"c-bog": 6, "c-pa": 5, "m-bog": 6})
-    lookup = _PlaceLookup(
-        pandas.DataFrame(
-            [
-                place("br", "country", "Brazil", "BR"),
-                place("c-sp", "city", "São Paulo", "BR"),
-                place("c-stp", "city", "Saint Paul", "US", aliases=["São Paulo"]),
-                place("c-vie", "city", "Vienna", "AT", names={"de": "Wien"}),
-                place("m-wien", "metro", "Wien", "AT"),
-                place("c-kin", "city", "Kingston", "JM"),
-                place("m-kin", "metro", "Kingston", "JM"),
-                place("c-kin-us", "city", "Port Kingston", "US", aliases=["Kingston"]),
-                place("c-bog", "city", "Bogotá", "CO"),
-                place("m-bog", "metro", "Bogotá", "CO"),
-                place(
-                    "c-pa", "city", "Puente Aranda", "CO", ["Bogotá"], parent="c-bog"
-                ),
-            ]
-        ),
-        feed_count=lambda place_id: feeds.get(place_id, 0),
+    feeds.update({"c-tpe": 1, "m-tpe": 4, "r-ntpe": 2, "tw": 9})
+    feeds.update({"c-la": 54, "r-la": 120, "m-la": 142})
+    lookup = _lookup(
+        [
+            _place("br", "country", "Brazil", "BR"),
+            _place("c-sp", "city", "São Paulo", "BR"),
+            _place("c-stp", "city", "Saint Paul", "US", aliases=["São Paulo"]),
+            _place("c-vie", "city", "Vienna", "AT", names={"de": "Wien"}),
+            _place("m-wien", "metro", "Wien", "AT"),
+            _place("c-kin", "city", "Kingston", "JM"),
+            _place("m-kin", "metro", "Kingston", "JM"),
+            _place("c-kin-us", "city", "Port Kingston", "US", aliases=["Kingston"]),
+            _place("c-bog", "city", "Bogotá", "CO"),
+            _place("m-bog", "metro", "Bogotá", "CO"),
+            _place("c-pa", "city", "Puente Aranda", "CO", ["Bogotá"], parent="c-bog"),
+            _place("c-tpe", "city", "Taipei", "TW"),
+            _place("m-tpe", "metro", "Taipei", "TW"),
+            _place("r-ntpe", "region", "New Taipei", "TW", aliases=["Taipei"]),
+            _place("tw", "country", "Taiwan", "TW", aliases=["Taipei"]),
+            _place("r-la", "region", "Los Angeles County", "US", ["Los Angeles"]),
+            _place("c-la", "city", "Los Angeles", "US", parent="r-la"),
+            _place("m-la", "metro", "Los Angeles", "US"),
+        ],
+        feeds,
     )
     with pytest.raises(AmbiguousPlaceError):
         lookup.resolve("Sao Paulo")
@@ -367,6 +378,98 @@ def test_the_feed_margin_does_not_favour_an_alias_over_a_name():
     with pytest.raises(AmbiguousPlaceError):
         lookup.resolve("Kingston")
     assert lookup.resolve("Bogota").id == "c-bog"
+    assert lookup.resolve("Taipei").id == "c-tpe"
+    assert lookup.resolve("Los Angeles").id == "c-la"
+
+
+@pytest.mark.parametrize(
+    ("name", "rows", "expected"),
+    [
+        # Each row: the place id, its kind, country, feeds and language labels.
+        pytest.param(
+            "Moscow",
+            [("us", "city", "US", 3, 77), ("ru", "city", "RU", 0, 336)],
+            None,
+            id="moscow",
+        ),
+        # Delhi, India, a region, ranks below two American townships.
+        pytest.param(
+            "Delhi",
+            [
+                ("us", "city", "US", 5, 31),
+                ("us-1", "city", "US", 1, 1),
+                ("us-2", "city", "US", 1, 1),
+                ("in", "region", "IN", 2, 101),
+            ],
+            None,
+            id="delhi",
+        ),
+        # An American metro leads and counts the labels of its country's city,
+        # too few against Russia's, and enough in the next case.
+        pytest.param(
+            "Saint Petersburg",
+            [
+                ("us-m", "metro", "US", 12, 1),
+                ("us", "city", "US", 0, 117),
+                ("ru", "region", "RU", 0, 264),
+            ],
+            None,
+            id="metro-leader",
+        ),
+        pytest.param(
+            "Saint Petersburg",
+            [
+                ("us-m", "metro", "US", 12, 1),
+                ("us", "city", "US", 0, 150),
+                ("ru", "region", "RU", 0, 264),
+            ],
+            "us-m",
+            id="metro-leader-known",
+        ),
+        pytest.param(
+            "Paris",
+            [("fr", "city", "FR", 55, 344), ("us", "city", "US", 1, 60)],
+            "fr",
+            id="paris",
+        ),
+        # Abroad below the floor; a better-known place at home is no rival.
+        pytest.param(
+            "Springfield",
+            [
+                ("us", "city", "US", 5, 30),
+                ("gb", "city", "GB", 0, 90),
+                ("us-2", "city", "US", 0, 336),
+            ],
+            "us",
+            id="floor",
+        ),
+        # Twice the leader's labels is not more than twice.
+        pytest.param(
+            "Springfield",
+            [("us", "city", "US", 5, 80), ("gb", "city", "GB", 0, 160)],
+            "us",
+            id="twice",
+        ),
+    ],
+)
+def test_a_feed_lead_does_not_beat_a_far_better_known_place_abroad(
+    name, rows, expected
+):
+    # Feed counts measure how well each country's feeds are catalogued: Moscow,
+    # Idaho, with three feeds, won over Moscow, Russia, with none. The labels a
+    # place carries in many languages mark it as known far beyond its country.
+    from transitio.exceptions import AmbiguousPlaceError
+
+    places = [
+        _place(pid, kind, name, country, names={f"l{n}": name for n in range(labels)})
+        for pid, kind, country, _, labels in rows
+    ]
+    lookup = _lookup(places, {row[0]: row[3] for row in rows})
+    if expected is None:
+        with pytest.raises(AmbiguousPlaceError):
+            lookup.resolve(name)
+    else:
+        assert lookup.resolve(name).id == expected
 
 
 def test_padded_header_names_merge_into_one_column(tmp_path):
@@ -938,3 +1041,458 @@ def test_a_feed_missing_a_required_file_is_skipped(tmp_path, dropped, reason, wi
     with pytest.raises(_SkipFeed) as caught:
         _process_feed(source, **options)
     assert (caught.value.reason, caught.value.window) == (reason, window)
+
+
+MIDLAND = {
+    "agency.txt": (
+        "agency_id,agency_name,agency_url,agency_timezone\n"
+        "1,Midland Bluebird,https://m.example,Europe/London\n"
+    ),
+    "stops.txt": (
+        "stop_id,stop_name,stop_lat,stop_lon\na,A,55.86,-4.25\nb,B,55.87,-4.26\n"
+    ),
+    "routes.txt": "route_id,agency_id,route_short_name,route_type\nx36,1,X36,3\n",
+    "trips.txt": "route_id,service_id,trip_id\nx36,wk,t1\n",
+    "stop_times.txt": (
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "t1,08:00:00,08:00:00,a,1\nt1,08:10:00,08:10:00,b,2\n"
+    ),
+    "calendar.txt": FEED["calendar.txt"],
+}
+
+
+def test_copies_of_a_trip_under_differently_named_agencies_are_one_service(tmp_path):
+    # Copies of one network under "Midland Bluebird" and "Midland Bluebird
+    # Ltd" were neither duplicates in the merge nor versions in fetch.
+    import datetime
+
+    from transitio.edit import FeedEditor
+    from transitio.gtfs import merge_tables
+    from transitio.pipeline._fetch import _service
+
+    agency = MIDLAND["agency.txt"]
+    renamed = {**MIDLAND, "agency.txt": agency.replace("Bluebird,", "Bluebird Ltd,")}
+    tables = [
+        FeedEditor(write_zip(tmp_path / f"{n}.zip", files)).tables
+        for n, files in enumerate((MIDLAND, renamed))
+    ]
+    merged, _ = merge_tables(tables)
+    assert list(merged["trips.txt"]["trip_id"]) == ["f1:t1"]
+    # Routes naming two agency ids under one blank-named agency, or without
+    # agency.txt, are not one unnamed agency.
+    routes = MIDLAND["routes.txt"] + "x37,2,X37,3\n"
+    blank = {**MIDLAND, "agency.txt": agency.replace("Midland Bluebird", "")}
+    absent = {name: text for name, text in MIDLAND.items() if name != "agency.txt"}
+    for n, files in enumerate((blank, absent)):
+        two = write_zip(tmp_path / f"two{n}.zip", {**files, "routes.txt": routes})
+        assert _service(two, datetime.date(2026, 6, 1)) is None
+
+
+def test_copies_of_a_headway_network_are_merged_once(tmp_path):
+    # Frequency-based trips were never compared, so a merge kept every copy
+    # of a headway-only network.
+    from transitio.edit import FeedEditor
+    from transitio.gtfs import merge_feeds
+
+    frequencies = "trip_id,start_time,end_time,headway_secs\nt1,08:00:00,10:00:00,600\n"
+    copies = [
+        write_zip(tmp_path / f"{n}.zip", {**MIDLAND, "frequencies.txt": frequencies})
+        for n in range(2)
+    ]
+    report = merge_feeds(copies, tmp_path / "merged.zip", check=False)
+    merged = FeedEditor(tmp_path / "merged.zip").tables
+    for name in ("trips.txt", "frequencies.txt"):
+        assert list(merged[name]["trip_id"]) == ["f1:t1"]
+    assert report["duplicate_trips"]["dropped"] == 1
+
+
+def _near_feed(moved, stop_times, extra):
+    """A feed of trip ``g`` on route X36 and headway trip ``h`` on route
+    506 over stops a to e, ``moved`` degrees north, and ``extra`` stops."""
+    lats = dict(zip("abcde", (55.86, 55.862, 55.864, 55.866, 55.868)))
+    stops = "".join(f"{s},{s},{lat + moved:.6f},-4.25\n" for s, lat in lats.items())
+    return {
+        "agency.txt": MIDLAND["agency.txt"],
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\n" + stops + extra,
+        "routes.txt": (
+            "route_id,agency_id,route_short_name,route_type\nx36,1,X36,3\n506,1,506,3\n"
+        ),
+        "trips.txt": "route_id,service_id,trip_id\nx36,wk,g\n506,wk,h\n",
+        "stop_times.txt": (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence,"
+            "pickup_type,drop_off_type\n" + stop_times
+        ),
+        "frequencies.txt": (
+            "trip_id,start_time,end_time,headway_secs\nh,06:00:00,10:00:00,600\n"
+        ),
+        "calendar.txt": FEED["calendar.txt"],
+    }
+
+
+def test_near_repeats_of_a_trip_are_merged_once(tmp_path):
+    # A national feed timing an operator's bus between timing points to the
+    # second, or a headway network's next version moving its last stop
+    # 90 m, did not repeat the trip exactly, so the merge kept both copies.
+    from transitio.edit import FeedEditor
+    from transitio.gtfs import merge_feeds
+
+    headway = "".join(
+        f"h,06:{3 * n:02d}:00,06:{3 * n:02d}:00,{stop},{n},,\n"
+        for n, stop in enumerate("abcd")
+    )
+    national = _near_feed(
+        0,
+        "g,08:00:00,08:00:00,a,1,,1\ng,08:02:30,08:02:30,b,2,,\n"
+        "g,08:05:15,08:05:15,c,3,,\ng,08:07:40,08:07:40,d,4,,\n"
+        "g,08:10:00,08:10:00,e,5,1,\n" + headway + "h,06:12:00,06:12:00,e,4,,\n",
+        "",
+    )
+    operator = _near_feed(
+        0.00002,
+        "g,08:00:00,08:00:00,a,1,,\ng,08:02:00,08:02:00,b,2,,\n"
+        "g,08:04:00,08:04:00,x,3,,\ng,08:05:00,08:05:00,c,4,,\n"
+        "g,08:08:00,08:08:00,d,5,,\ng,08:10:00,08:10:00,e,6,,\n"
+        + headway
+        + "h,06:12:00,06:12:00,f,4,,\n",
+        "x,x,55.863,-4.25\nf,f,55.8688,-4.25\n",
+    )
+    feeds = [
+        write_zip(tmp_path / f"{n}.zip", files)
+        for n, files in enumerate((national, operator))
+    ]
+    report = merge_feeds(feeds, tmp_path / "merged.zip", check=False)
+    merged = FeedEditor(tmp_path / "merged.zip").tables
+    assert sorted(merged["trips.txt"]["trip_id"]) == ["f1:g", "f1:h"]
+    counts = report["duplicate_trips"]
+    assert counts["dropped"] == counts["near_matches"] == counts["unaligned_stops"] == 2
+
+
+def test_a_placeholder_calendar_is_an_older_version_of_the_dated_network(tmp_path):
+    # A snapshot on a 2025 to 2099 calendar passed every date check, and as
+    # its route names had drifted it never paired with the dated network
+    # serving the same stops, so both were delivered. Its first running day
+    # comes after the dated network's start.
+    import datetime
+
+    from transitio.pipeline._fetch import _entry, _service, _settle_versions
+
+    dated = write_zip(tmp_path / "dated.zip", FEED)
+    snapshot = {
+        **FEED,
+        "routes.txt": FEED["routes.txt"].replace(",1,", ",x,").replace(",2,", ",y,"),
+        "calendar.txt": FEED["calendar.txt"].replace(
+            "20260101,20261231", "20251231,20990101"
+        ),
+        "calendar_dates.txt": FEED["calendar_dates.txt"]
+        + "wk,20251231,2\nwk,20260101,2\n",
+        "transfers.txt": "from_stop_id,to_stop_id,transfer_type\nin1,in2,0\n",
+    }
+    snapshot = write_zip(tmp_path / "snapshot.zip", snapshot)
+    day = datetime.date(2026, 6, 1)
+    record = [_entry("snapshot", None), _entry("dated", None)]
+    windows = (["2026-01-05", "2099-01-01"], ["2026-01-01", "2026-12-31"])
+    for entry, window in zip(record, windows):
+        entry.update(decision="delivered", feed_window=window)
+    services = {"dated": _service(dated, day), "snapshot": _service(snapshot, day)}
+    assert _settle_versions(record, services, set(), day) == {"snapshot"}
+    assert record[1]["note"] is None
+    assert (record[0]["reason"], record[0]["note"], record[0]["version_of"]) == (
+        "another version of dated",
+        "placeholder calendar 2025-12-31 to 2099-01-01",
+        {"feed_id": "dated", "route_overlap": 0.0, "stop_overlap": 1.0},
+    )
+
+
+@pytest.mark.parametrize("client", ["mdb", "atlas", "osm", "index"])
+def test_http_clients_identify_themselves_as_transitio(client, tmp_path):
+    # Hosts that filter by user agent answered httpx's default
+    # "python-httpx/<version>" with 403 Forbidden, so their feeds never
+    # downloaded.
+    import re
+
+    import httpx
+
+    from transitio import _http
+    from transitio.catalog import AtlasFeed, MobilityDatabase, TransitlandAtlas
+    from transitio.catalog._models import Feed
+    from transitio.index import _refresh
+    from transitio.osm._fetch import _download
+
+    url = "https://feeds.example/gtfs.zip"
+    sent = []
+
+    def handler(request):
+        sent.append(request)
+        return httpx.Response(200, content=b"PK\x03\x04")
+
+    transport = httpx.MockTransport(handler)
+    if client == "mdb":
+        feed = Feed.from_api({"id": "mdb-1", "latest_dataset": {"hosted_url": url}})
+        with MobilityDatabase(None, cache_dir=tmp_path, transport=transport) as db:
+            db.download_latest(feed)
+    elif client == "atlas":
+        feed = AtlasFeed.from_record(
+            {"onestop_id": "f-x", "urls": {"static_current": url}}
+        )
+        with TransitlandAtlas(cache_dir=tmp_path, transport=transport) as atlas:
+            atlas.download(feed)
+    elif client == "osm":
+        _download(url, tmp_path / "extract.osm.pbf", False, transport)
+    else:
+        with _refresh._client("https://api.github.example", transport) as http:
+            http.get("/repos/x/y/releases")
+    (request,) = sent
+    assert request.headers["User-Agent"] == _http.USER_AGENT
+    if client == "index":
+        assert request.headers["Accept"] == "application/vnd.github+json"
+    assert re.fullmatch(
+        r"transitio/\S+ \(\+https://github\.com/cafein-py/transitio\)",
+        _http.USER_AGENT,
+    )
+
+
+def test_a_stalled_extract_download_is_retried(tmp_path, monkeypatch):
+    # The OSM extract download made one attempt, so a read timeout on a slow
+    # host failed the fetch, and its fixed-name .part file was left behind.
+    import hashlib
+    import time
+
+    import httpx
+
+    from transitio.osm._fetch import _download
+
+    payload = b"\x00pbf"
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if len(requests) == 1:
+            raise httpx.ReadTimeout("timed out", request=request)
+        return httpx.Response(200, content=payload)
+
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    path = tmp_path / "extract.osm.pbf"
+    url = "https://download.example/extract.osm.pbf"
+    digest = _download(url, path, False, httpx.MockTransport(handler))
+    assert (path.read_bytes(), digest) == (payload, hashlib.sha256(payload).hexdigest())
+    assert (len(requests), list(tmp_path.glob("*.part"))) == (2, [])
+
+
+@pytest.mark.parametrize("status", [200, 404])
+def test_feeds_nested_in_one_archive_are_read_from_it_once(
+    tmp_path, monkeypatch, status
+):
+    # Feeds whose URL fragment names a zip inside a larger archive were each
+    # delivered as the whole archive, downloaded once per feed, and skipped as
+    # "feed has no usable trips.txt".
+    import json
+
+    import httpx
+
+    import transitio.index as transitio_index
+    from index_fixture import HULL, covered_feed, edge, write_index
+    from transitio.catalog import TransitlandAtlas
+    from transitio.pipeline import fetch
+
+    outer = "https://data.example/outer.zip"
+    urls = {f"f-{n}": f"{outer}#{n}/google_transit.zip" for n in (1, 2)}
+    feeds = [
+        {
+            **covered_feed(feed_id, coverage_source="crawl"),
+            "coverage": HULL,
+            "atlas": {"urls": {"static_current": url}},
+        }
+        for feed_id, url in urls.items()
+    ]
+    edges = [edge("Q1757", feed_id, tier="local") for feed_id in urls]
+    index = transitio_index.read_index(
+        write_index(tmp_path / "index", feeds=feeds, edges=edges)
+    )
+    stops = {"f-1": FEED["stops.txt"], "f-2": FEED["stops.txt"].replace("60.", "61.")}
+    inner = {
+        f"{n}/google_transit.zip": write_zip(
+            tmp_path / f"{n}.zip", {**FEED, "stops.txt": stops[f"f-{n}"]}
+        ).read_bytes()
+        for n in (1, 2)
+    }
+    payload = write_zip(tmp_path / "outer.zip", inner).read_bytes()
+    requests = []
+
+    def handler(request):
+        requests.append((request.method, request.url.path))
+        return httpx.Response(status, content=payload if status == 200 else b"")
+
+    class Served(TransitlandAtlas):
+        def __init__(self, **kwargs):
+            super().__init__(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas", Served)
+    out = tmp_path / "out"
+    result = fetch(
+        place="Q1757", index=index, directory=out, crop=False, osm=False, expired="keep"
+    )
+    assert requests == [("GET", "/outer.zip")]
+    assert all(path.name.startswith("id-") for path in out.iterdir())
+    if status == 404:
+        reason = f"download failed: atlas: {outer}: HTTP 404 Not Found"
+        assert sorted(result.skipped) == [("f-1", reason), ("f-2", reason)]
+        return
+    assert {entry["feed_id"]: entry["decision"] for entry in result.selection} == {
+        "f-1": "delivered",
+        "f-2": "delivered",
+    }
+    for entry in result.selection:
+        path = entry["path"]
+        assert read_entry(path, "stops.txt").decode() == stops[entry["feed_id"]]
+        sidecar = json.loads(path.with_suffix(".provenance.json").read_text())
+        assert (sidecar["source_url"], sidecar["archive_url"]) == (
+            urls[entry["feed_id"]],
+            outer,
+        )
+
+
+_EXTRACT_TIMEOUT = (
+    "https://download.geofabrik.de/europe-latest.osm.pbf: ReadTimeout: timed out"
+    " (3 requests)"
+)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(DownloadError(_EXTRACT_TIMEOUT), id="download"),
+        pytest.param(
+            ExtractNotFoundError("no extract covers the area"), id="no-extract"
+        ),
+        pytest.param(ValueError("invalid area"), id="value"),
+    ],
+)
+def test_a_failed_extract_download_keeps_the_fetched_feeds(
+    tmp_path, monkeypatch, error
+):
+    # A read timeout on the OSM extract, fetched after the place's feeds,
+    # raised from fetch and lost the feeds already downloaded and processed.
+    import pathlib
+
+    import transitio.index as transitio_index
+    from index_fixture import HULL, covered_feed, edge, write_index
+    from transitio.pipeline import fetch
+
+    feed = {
+        **covered_feed("f-a", coverage_source="crawl"),
+        "coverage": HULL,
+        "atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}},
+    }
+    edges = [edge("Q1757", "f-a", tier="local")]
+    index = transitio_index.read_index(
+        write_index(tmp_path / "index", feeds=[feed], edges=edges)
+    )
+
+    def download(self, feed, directory=None):
+        return write_zip(pathlib.Path(directory) / "latest.zip", FEED)
+
+    def fetch_pbf(*args, **kwargs):
+        raise error
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas.download", download)
+    monkeypatch.setattr("transitio.osm.fetch_pbf", fetch_pbf)
+    options = dict(
+        place="Q1757",
+        index=index,
+        directory=tmp_path / "out",
+        crop=False,
+        expired="keep",
+    )
+    if not isinstance(error, DownloadError):
+        with pytest.raises(type(error)) as caught:
+            fetch(**options)
+        assert caught.value is error
+        return
+    with pytest.warns(UserWarning, match="OSM extract not fetched"):
+        result = fetch(**options)
+    delivered, last = result.selection
+    assert delivered["decision"] == "delivered"
+    assert result.feeds == [delivered["path"]]
+    assert (result.osm_pbf, result.osm_area) == (None, None)
+    assert (last["feed_id"], last["decision"], last["note"]) == (
+        None,
+        None,
+        f"OSM extract not fetched: {_EXTRACT_TIMEOUT}",
+    )
+
+
+_HIDDEN_NOTE = (
+    "default view (region: secondary, tertiary) holds none of the place's 1 feed:"
+    " f-bus (primary); tiers=['local'] fetches it"
+)
+
+
+@pytest.mark.parametrize(
+    "bbox, note",
+    [
+        pytest.param(CITY_BBOX, None, id="town-sized"),
+        pytest.param(WIDE_BBOX, _HIDDEN_NOTE, id="wide"),
+    ],
+)
+def test_an_empty_default_view_is_not_fetched_silently(
+    tmp_path, monkeypatch, bbox, note
+):
+    # A town-sized region or country (Monaco, San Juan) left its local-only
+    # feeds out of the default view, and fetch(place=...) returned no feeds,
+    # an empty selection record and no warning.
+    import datetime
+    import pathlib
+    import warnings
+
+    import shapely
+
+    import transitio
+    import transitio.index as transitio_index
+    from index_fixture import covered_feed, edge, place, write_partitioned_index
+    from transitio.pipeline import fetch
+
+    monkeypatch.setattr(
+        transitio, "__version__", transitio_index.MIN_READER_VERSIONS[7], raising=False
+    )
+    monkeypatch.setattr(
+        "transitio.pipeline._fetch._today", lambda: datetime.date(2026, 6, 1)
+    )
+    feed = {
+        **covered_feed("f-bus"),
+        "atlas": {"urls": {"static_current": "https://feeds.example/bus.zip"}},
+        "home_country": "FI",
+        "scope": "domestic",
+    }
+    region = place("r", "region", geometry=shapely.to_wkb(shapely.box(*bbox)).hex())
+    local = edge(
+        "r", "f-bus", tier="local", relevance_category="primary", relevance=0.9
+    )
+    index = transitio_index.read_index(
+        write_partitioned_index(
+            tmp_path / "index", feeds=[feed], places=[region], edges=[local]
+        )
+    )
+    calls = []
+
+    def download(self, feed, directory=None):
+        calls.append(feed.feed_id)
+        return write_zip(pathlib.Path(directory) / "latest.zip", FEED)
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas.download", download)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = fetch(
+            place="r", index=index, directory=tmp_path / "out", crop=False, osm=False
+        )
+    warned = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
+    if note is None:
+        (entry,) = result.selection
+        assert (warned, calls, entry["decision"]) == ([], ["f-bus"], "delivered")
+        return
+    assert (warned, calls, result.feeds) == ([note], [], [])
+    assert [(e["feed_id"], e["decision"], e["note"]) for e in result.selection] == [
+        (None, None, note)
+    ]

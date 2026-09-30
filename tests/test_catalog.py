@@ -1,11 +1,16 @@
 import datetime
+import gzip
 import hashlib
+import io
 import json
+import time
+import zipfile
 
 import httpx
 import pytest
 from shapely.geometry import box
 
+from transitio import _http
 from transitio.catalog import (
     TOKEN_ENV_VAR,
     AtlasFeed,
@@ -14,6 +19,7 @@ from transitio.catalog import (
 )
 from transitio.catalog._client import _bounds
 from transitio.catalog._models import Dataset, Feed
+from transitio.catalog._nested import extract_feed, split_fragment
 from transitio.exceptions import DownloadError, MissingTokenError
 
 FEED_RECORD = {
@@ -568,3 +574,256 @@ def test_atlas_download_namespaces_feeds_in_a_shared_directory(tmp_path):
     assert path_a != path_b
     assert path_a.read_bytes() == b"AAAA"
     assert path_b.read_bytes() == b"BBBB"
+
+
+URL = "https://feeds.example/gtfs.zip"
+# Incompressible, so its gzip encoding is longer than the decoded bytes.
+BODY = b"".join(hashlib.sha256(bytes([i])).digest() for i in range(64))
+STRONG, WEAK, MODIFIED = '"v1"', 'W/"v1"', "Tue, 01 Jun 2021 00:00:00 GMT"
+FRESH, RESUMED = (None, None), ("bytes=1024-", STRONG)
+
+
+class _Body(httpx.SyncByteStream):
+    """A response body cut by a ``ReadError`` after ``drop`` bytes, if given."""
+
+    def __init__(self, data, drop):
+        self._data, self._drop = data, drop
+
+    def __iter__(self):
+        yield self._data[: self._drop]
+        if self._drop is not None:
+            raise httpx.ReadError("connection reset")
+
+
+def _answer(status=200, body=b"", *, drop=None, size=None, **headers):
+    """A scripted answer; ``Content-Length`` is ``size``, else the body's."""
+    headers = {name.replace("_", "-"): value for name, value in headers.items()}
+    headers["Content-Length"] = str(len(body) if size is None else size)
+    return status, headers, body, drop
+
+
+def _rest(start, **headers):
+    total = len(BODY)
+    range_ = f"bytes {start}-{total - 1}/{total}"
+    return _answer(206, BODY[start:], content_range=range_, **headers)
+
+
+@pytest.mark.parametrize(
+    "script, expected, sent, waits",
+    [
+        pytest.param(
+            [_answer(body=BODY, drop=1024, etag=STRONG), _rest(1024, etag=STRONG)],
+            BODY,
+            [FRESH, RESUMED],
+            [],
+            id="drop-resumed-by-etag",
+        ),
+        pytest.param(
+            [
+                _answer(body=BODY[:1024], size=len(BODY), last_modified=MODIFIED),
+                _rest(1024, last_modified=MODIFIED),
+            ],
+            BODY,
+            [FRESH, ("bytes=1024-", MODIFIED)],
+            [],
+            id="short-body-resumed-by-last-modified",
+        ),
+        pytest.param(
+            [_answer(body=BODY, drop=1024, etag=WEAK), _answer(body=BODY)],
+            BODY,
+            [FRESH, FRESH],
+            [1.0],
+            id="weak-etag-restarts",
+        ),
+        pytest.param(
+            [_answer(body=BODY, drop=1024, etag=STRONG), _answer(body=BODY[::-1])],
+            BODY[::-1],
+            [FRESH, RESUMED],
+            [],
+            id="changed-file-restarts",
+        ),
+        pytest.param(
+            [
+                _answer(body=BODY, drop=1024, etag=STRONG),
+                _rest(512, etag=STRONG),
+                _answer(body=BODY),
+            ],
+            BODY,
+            [FRESH, RESUMED, FRESH],
+            [1.0],
+            id="misaligned-resume-restarts",
+        ),
+        pytest.param(
+            [_answer(body=gzip.compress(BODY, mtime=0), content_encoding="gzip")],
+            BODY,
+            [FRESH],
+            [],
+            id="gzip-encoded",
+        ),
+        pytest.param(
+            [_answer(503), httpx.ReadTimeout, _answer(body=BODY)],
+            BODY,
+            [FRESH] * 3,
+            [1.0, 2.0],
+            id="transient-failures",
+        ),
+        pytest.param(
+            [_answer(503)] * 3,
+            "HTTP 503 Service Unavailable (3 requests)",
+            [FRESH] * 3,
+            [1.0, 2.0],
+            id="retry-status-thrice",
+        ),
+        pytest.param(
+            [_answer(body=BODY[:1024], size=len(BODY))] * 3,
+            "body ended at 1024 of 2048 bytes (3 requests)",
+            [FRESH] * 3,
+            [1.0, 2.0],
+            id="unpinned-short-body-thrice",
+        ),
+        pytest.param(
+            [httpx.ConnectTimeout],
+            "ConnectTimeout: timed out",
+            [FRESH],
+            [],
+            id="connect-timeout",
+        ),
+        pytest.param([_answer(404)], "HTTP 404 Not Found", [FRESH], [], id="not-found"),
+        pytest.param(
+            [_answer(body=BODY, drop=1, etag=STRONG)] * 10,
+            "ReadError: connection reset (10 requests)",
+            [FRESH] + [("bytes=1-", STRONG)] * 9,
+            [],
+            id="request-cap",
+        ),
+    ],
+)
+def test_download_retries_and_resumes(
+    tmp_path, monkeypatch, script, expected, sent, waits
+):
+    requests, slept = [], []
+
+    def handler(request):
+        requests.append((request.headers.get("Range"), request.headers.get("If-Range")))
+        step = script[len(requests) - 1]
+        if isinstance(step, type):
+            raise step("timed out", request=request)
+        status, headers, body, drop = step
+        return httpx.Response(status, headers=headers, stream=_Body(body, drop))
+
+    monkeypatch.setattr(time, "sleep", slept.append)
+    path = tmp_path / "feed.zip"
+    with _http.client(transport=httpx.MockTransport(handler)) as client:
+        if isinstance(expected, bytes):
+            digest = _http.download(client, URL, path)
+            assert path.read_bytes() == expected
+            assert digest == hashlib.sha256(expected).hexdigest()
+        else:
+            with pytest.raises(DownloadError) as caught:
+                _http.download(client, URL, path)
+            assert str(caught.value) == f"{URL}: {expected}"
+            assert not list(tmp_path.iterdir())
+    assert (requests, slept) == (sent, waits)
+
+
+@pytest.mark.parametrize(
+    "fragment, member",
+    [
+        pytest.param(
+            "#3/google_transit.zip", ("archive", "3/google_transit.zip"), id="archive"
+        ),
+        pytest.param("#feed%20dir/", ("folder", "feed dir"), id="folder"),
+        pytest.param("#/abs.zip", None, id="absolute"),
+        pytest.param("#a/../b.zip", None, id="parent"),
+        pytest.param("", None, id="no-fragment"),
+    ],
+)
+def test_split_fragment_names_the_member(fragment, member):
+    url = "https://data.example/gtfs.zip"
+    assert split_fragment(url + fragment) == (url, member)
+
+
+def _zip_bytes(files):
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, content in files.items():
+            archive.writestr(name, content)
+    return buffer.getvalue()
+
+
+NESTED = {"agency.txt": b"agency_id\na\n", "stops.txt": b"stop_id\ns1\n"}
+INNER = _zip_bytes(NESTED)
+OVER = (
+    "declares {} uncompressed bytes, over the 10 budget "
+    "(raise max_total_bytes to read it)"
+)
+
+
+@pytest.mark.parametrize(
+    "member, budget, expected",
+    [
+        pytest.param(
+            ("archive", "1/google_transit.zip"), None, INNER, id="nested-as-is"
+        ),
+        pytest.param(
+            ("archive", "2/google_transit.zip"), None, NESTED, id="nested-dir"
+        ),
+        pytest.param(("folder", "data"), None, NESTED, id="folder"),
+        pytest.param(
+            ("archive", "9/google_transit.zip"),
+            None,
+            "inner archive '9/google_transit.zip' not in the archive",
+            id="missing-archive",
+        ),
+        pytest.param(
+            ("folder", "nothere"), None, "no GTFS files under 'nothere'", id="none"
+        ),
+        pytest.param(
+            ("archive", "1/google_transit.zip"),
+            10,
+            "inner archive '1/google_transit.zip' " + OVER.format(len(INNER)),
+            id="nested-over-budget",
+        ),
+        pytest.param(
+            ("folder", "data"),
+            10,
+            "the feed under 'data' " + OVER.format(sum(map(len, NESTED.values()))),
+            id="folder-over-budget",
+        ),
+    ],
+)
+def test_extract_feed_writes_the_named_member(tmp_path, member, budget, expected):
+    in_folder = {f"v2/{name}": content for name, content in NESTED.items()}
+    outer = tmp_path / "outer.zip"
+    outer.write_bytes(
+        _zip_bytes(
+            {
+                "1/google_transit.zip": INNER,
+                "2/google_transit.zip": _zip_bytes(
+                    {
+                        **in_folder,
+                        "v2/old/stops.txt": b"stop_id\n",
+                        "__MACOSX/v2/._stops.txt": b"",
+                        "readme.txt": b"PTV",
+                    }
+                ),
+                **{f"data/{name}": content for name, content in NESTED.items()},
+                "readme.txt": b"PTV",
+            }
+        )
+    )
+    target = tmp_path / "feed" / "latest.zip"
+    if isinstance(expected, str):
+        with pytest.raises(DownloadError) as caught:
+            extract_feed(outer, member, target, budget)
+        assert str(caught.value) == expected
+        assert not list(target.parent.iterdir())
+        return
+    digest = extract_feed(outer, member, target, budget)
+    assert digest == hashlib.sha256(target.read_bytes()).hexdigest()
+    if isinstance(expected, bytes):
+        assert target.read_bytes() == expected
+    else:
+        with zipfile.ZipFile(target) as feed:
+            assert {name: feed.read(name) for name in feed.namelist()} == expected
+    assert [path.name for path in target.parent.iterdir()] == ["latest.zip"]
