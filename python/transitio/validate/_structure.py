@@ -87,7 +87,8 @@ def validate_feed(
         ``moment`` (present when ``reference_date`` was passed and the
         inputs were reliable, else ``None``) measures the target:
         ``activeTrips``/``activeRoutes``/``stopsServed`` at the date
-        (or clock time), the feed's own ``baselineTrips`` mean and the
+        (or clock time), the feed's own ``baselineTrips`` mean (``None``
+        when a service-day expansion cap was reached) and the
         ``windowDays`` denominator — measurement only, judgement stays
         with the notices. ``incomplete`` lists files whose retained
         content was truncated or unreadable (their row counts are lower

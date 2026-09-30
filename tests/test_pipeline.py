@@ -684,6 +684,8 @@ DAY = "2026-06-07"  # the study day, a Sunday
 ENDED, NOW = ("2021-01-01", "2021-12-31"), ("2026-01-01", "2026-12-31")
 LATER, NEXT = ("2027-01-01", "2027-12-31"), ("2026-07-01", "2026-12-31")
 SPRING = ("2026-01-01", "2026-05-01")
+# Past the validator's calendar expansion cap.
+LONG = ("1900-01-01", "2099-12-31")
 ETAG, MODIFIED = {"etag": '"v1"'}, {"last_modified": "Tue, 01 Jun 2021 00:00:00 GMT"}
 # The skip reasons the cases expect.
 R_ENDED, R_SPRING = "service ended 2021-12-31", "service ended 2026-05-01"
@@ -702,8 +704,7 @@ R_IDLE, SAME = f"no service on {DAY}", "; unchanged since indexed"
         (LATER, MODIFIED, 304, LATER, DAY, "skip", False, R_STARTS + SAME, None),
         (NOW, ETAG, 304, (*NOW, "1111100"), DAY, "skip", True, R_IDLE, NOW),
         (NOW, {}, 200, (*NOW, "0000000"), DAY, "skip", True, R_IDLE, None),
-        # Past the validator's calendar expansion guard: no window, no moment.
-        (NOW, {}, 200, ("1900-01-01", "2099-12-31"), DAY, "skip", True, None, None),
+        (NOW, {}, 200, (*LONG, "1111100"), DAY, "skip", True, R_IDLE, LONG),
         (LATER, ETAG, 200, LATER, DAY, "skip", True, R_STARTS, LATER),
         (NEXT, ETAG, 304, NEXT, None, "skip", True, None, NEXT),
         (NOW, ETAG, 304, SPRING, None, "skip", True, R_SPRING, SPRING),
@@ -718,7 +719,7 @@ R_IDLE, SAME = f"no service on {DAY}", "; unchanged since indexed"
         "starts-after-unchanged",
         "weekdays-on-sunday",
         "unknown-window-idle",
-        "unknown-window-no-moment",
+        "capped-expansion-idle",
         "starts-after-renewed",
         "no-study-day-starts-next-month",
         "no-study-day-served-ended",

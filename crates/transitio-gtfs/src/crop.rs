@@ -456,7 +456,7 @@ fn active_services(
 ) -> Result<Option<HashSet<String>>, String> {
     // Temporal selection over actual service activity: weekday flags and
     // calendar_dates exceptions included, via the semantic tier's
-    // active-date computation.
+    // service calendars.
     match (&crop_options.start_date, &crop_options.end_date) {
         (None, None) => Ok(None),
         (start, end) => {
@@ -466,14 +466,12 @@ fn active_services(
             };
             let window_start = parse(start, "00010101")?;
             let window_end = parse(end, "99991231")?;
-            let dates = semantics::active_service_dates(&result.tables, options);
-            Ok(Some(
-                dates
-                    .into_iter()
-                    .filter(|(_, days)| days.iter().any(|d| *d >= window_start && *d <= window_end))
-                    .map(|(id, _)| id)
-                    .collect(),
-            ))
+            Ok(Some(semantics::active_services_between(
+                &result.tables,
+                options,
+                window_start,
+                window_end,
+            )))
         }
     }
 }

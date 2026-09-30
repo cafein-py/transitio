@@ -785,3 +785,40 @@ def test_quoted_commas_do_not_trip_the_delimiter_guard(tmp_path):
     assert list(csv.reader(io.StringIO(cropped))) == list(
         csv.reader(io.StringIO(areas))
     )
+
+
+def test_a_capped_calendar_expansion_keeps_the_window_and_target_day(tmp_path):
+    # Calendar rows past the 2,000,000-day expansion budget were skipped
+    # without a notice: the report lost its service window and moment, and
+    # a temporal crop dropped the trips of the skipped services.
+    files = dict(FEED)
+    daily, never = "1,1,1,1,1,1,1", "0,0,0,0,0,0,0"
+    files["calendar.txt"] += "".join(
+        f"s{i},{never if i == 0 else daily},20200101,20301212\n" for i in range(502)
+    )
+    files["trips.txt"] += "r-in,s501,t-last\n"
+    files[
+        "stop_times.txt"
+    ] += "t-last,10:00:00,10:00:00,in1,1\nt-last,10:05:00,10:05:00,in2,2\n"
+    source = write_zip(tmp_path / "feed.zip", files)
+    # The row notice of s0, which runs on no weekday, fills the budget of one.
+    report = validate_feed(source, reference_date="20280601", max_notices_per_file=1)
+    capped = [
+        n for n in report["notices"] if n["code"] == "service_expansion_truncated"
+    ]
+    assert [n["context"] for n in capped] == [
+        {"maxServiceDays": 2_000_000, "calendarDays": 365 + 502 * 3999}
+    ]
+    assert report["service_window"] == ["20200101", "20301212"]
+    assert report["moment"]["activeTrips"] == 1
+    assert report["moment"]["baselineTrips"] is None
+
+    output = tmp_path / "cropped.zip"
+    crop_feed(
+        source,
+        output,
+        start_date="20280601",
+        end_date="20280601",
+        reference_date="20280601",
+    )
+    assert "t-last" in read_entry(output, "trips.txt").decode()
