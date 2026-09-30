@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import hashlib
-import json
+import os
 import re
 import warnings
 from pathlib import Path
@@ -16,7 +17,7 @@ from shapely.geometry import box
 from shapely.geometry.base import BaseGeometry
 
 from transitio import _http
-from transitio.exceptions import ExtractNotFoundError
+from transitio.exceptions import DownloadError, ExtractNotFoundError
 
 
 def _as_geometry(aoi):
@@ -97,26 +98,21 @@ def _area_km2(geometry):
     return sum(projected.area.sum() for _, projected in _utm_groups(parts)) / 1e6
 
 
-def _resolve_url(geometry, update):
-    """Return the PBF URL of the smallest covering Geofabrik extract."""
-    from pyrosm import get_data_by_bbox
+def _extract(geometry, update, directory):
+    """The smallest single extract that contains ``geometry``, downloaded by
+    pyrosm into ``directory``."""
+    from pyrosm import get_data_by_area
+    from pyrosm.exceptions import ExtractDownloadError
 
+    directory.mkdir(parents=True, exist_ok=True)
     try:
-        return get_data_by_bbox(geometry, download=False, update=update)
+        return get_data_by_area(
+            geometry, crop=False, update=update, directory=str(directory)
+        )
     except ValueError as error:
         raise ExtractNotFoundError(str(error)) from error
-
-
-def _download(url, path, update, transport=None):
-    """Download ``url`` to ``path``; return its SHA-256 hex, or None when a
-    cached file is kept."""
-    if path.exists() and not update:
-        return None
-    client = _http.client(
-        timeout=_http.TIMEOUT, follow_redirects=True, transport=transport
-    )
-    with client:
-        return _http.download(client, url, path)
+    except ExtractDownloadError as error:
+        raise DownloadError(str(error)) from error
 
 
 def _fmt_coord(value):
@@ -139,16 +135,46 @@ def _crop_filename(aoi, geometry):
     return f"aoi_{coords}_{digest}.osm.pbf"
 
 
-def _write_provenance(path, *, geometry, url, extract_sha256, cropped):
+def _checksum_and_written(path):
+    """The SHA-256 hex of the file at ``path`` and the UTC time it was last
+    written, read from one open file."""
+    with open(path, "rb") as handle:
+        written = os.fstat(handle.fileno()).st_mtime
+        digest = _http.sha256_stream(handle)
+    utc = datetime.datetime.fromtimestamp(written, datetime.timezone.utc)
+    return digest, utc.isoformat()
+
+
+def _write_provenance(
+    path, *, geometry, extract, extract_sha256, retrieved_at, cropped
+):
     record = {
-        "source_url": url,
+        "source_url": extract.url,
+        "provider": extract.provider,
+        "extract": extract.extract,
+        "extract_bytes": extract.bytes,
+        "failed_extracts": [
+            {"url": url, "error": error} for url, error in extract.failed
+        ],
         "extract_sha256": extract_sha256,
         "file_sha256": _http.sha256_file(path) if cropped else extract_sha256,
         "cropped": cropped,
         "aoi_bounds": list(geometry.bounds),
-        "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "retrieved_at": retrieved_at,
     }
-    path.with_suffix(".provenance.json").write_text(json.dumps(record, indent=2))
+    from transitio.catalog._client import _write_provenance as write_sidecar
+
+    write_sidecar(path.with_suffix(".provenance.json"), record)
+
+
+@contextlib.contextmanager
+def _taking_turns(*directories):
+    """Hold the fetch lock of each directory, taken in one order so that
+    calls sharing directories never wait on each other in a cycle."""
+    with contextlib.ExitStack() as stack:
+        for directory in sorted({Path(d).resolve() for d in directories}):
+            stack.enter_context(_http.locked(directory / ".fetch_pbf.lock"))
+        yield
 
 
 def fetch_pbf(
@@ -159,17 +185,28 @@ def fetch_pbf(
     directory=None,
     cache_dir=None,
     update=False,
-    transport=None,
 ):
-    """Download (and by default crop) the OSM extract covering an AOI.
+    """Download (and by default crop) the smallest OSM extract containing an AOI.
 
-    Resolution and cropping build on pyrosm: the AOI is grown by ``buffer_m``,
-    the smallest Geofabrik extract whose extent covers the grown AOI is picked
-    from pyrosm's bundled extract index, its ``.osm.pbf`` is downloaded into
-    the transitio cache, and by default the result is cropped to the envelope
-    of the grown AOI (pyrosm crops a polygon by its bounding box). A
-    ``.provenance.json`` sidecar records the source extract URL, checksums,
-    the grown AOI's bounds and the retrieval timestamp.
+    The AOI is grown by ``buffer_m``, then pyrosm's ``get_data_by_area``
+    picks the smallest single extract that contains it, among Geofabrik and
+    BBBike extracts and Movisda's administrative areas and 1° and 10° grid
+    tiles. pyrosm downloads it, three attempts per extract, falling back to
+    the next smallest. By default the result is cropped to the envelope of
+    the grown AOI. The extract contains the grown AOI, though not always its
+    whole envelope, and Movisda cuts ways at its tile edges; either way only
+    data outside the AOI can be missing from the crop.
+
+    Ranking needs the network. pyrosm fetches Movisda's index (kept for a
+    day) and asks Geofabrik and BBBike for download sizes (kept for a week);
+    what it cannot fetch is skipped or ranked last, with a ``UserWarning``.
+    A ``.provenance.json`` sidecar records the source extract's URL,
+    provider, id and size, the smaller extracts whose download failed, the
+    checksums, the grown AOI's bounds and ``retrieved_at``, the time the
+    extract was downloaded (its file's modification time). A crop is reused
+    while it and its sidecar exist. Calls sharing the cache or
+    ``directory`` take turns (a ``.fetch_pbf.lock`` file there), so a file
+    and its sidecar always describe the same extract.
 
     Parameters
     ----------
@@ -179,7 +216,7 @@ def fetch_pbf(
         geocode via Nominatim.
     crop : bool, default True
         Crop the downloaded extract to the envelope of the grown AOI;
-        ``False`` returns the full covering extract.
+        ``False`` returns the full extract.
     buffer_m : float, default 0
         Metres to grow the AOI by before the extract is picked and cropped.
         Each part of the geometry is buffered in the UTM zone of its centroid
@@ -189,15 +226,15 @@ def fetch_pbf(
         ``UserWarning`` says when a part is clipped there.
     directory : str or pathlib.Path, optional
         Directory for the returned file; defaults to the transitio cache.
-        Full extracts backing a crop always stay in the cache.
+        Full extracts backing a crop always stay in the cache. With
+        ``crop=False`` the extract is downloaded there, and pyrosm keeps its
+        index and size caches beside it.
     cache_dir : str or pathlib.Path, optional
         Cache directory for full extracts. Defaults to the platform user
         cache directory for transitio.
     update : bool, default False
-        Re-download the extract (and refresh the extract index) even when a
-        cached copy exists.
-    transport : httpx.BaseTransport, optional
-        Custom transport, mainly for testing.
+        Re-download the extract and refresh the provider indexes and sizes,
+        even when a cached copy exists.
 
     Returns
     -------
@@ -207,46 +244,58 @@ def fetch_pbf(
     Raises
     ------
     ExtractNotFoundError
-        When no Geofabrik extract covers the grown AOI.
+        When no Geofabrik, BBBike or Movisda extract contains the grown AOI.
     DownloadError
-        When the extract download fails (dropped connections and transient
-        HTTP errors are retried first).
+        When every extract that contains the grown AOI fails to download.
+    ValueError
+        When the grown AOI has no area.
     """
     geometry = _buffered(_as_geometry(aoi), buffer_m)
+    minx, miny, maxx, maxy = geometry.bounds
+    if geometry.is_empty or not (minx < maxx and miny < maxy):
+        raise ValueError("the AOI has no area; grow a point or line with buffer_m")
     cache = (
         Path(cache_dir) if cache_dir else Path(platformdirs.user_cache_dir("transitio"))
     )
     extract_dir = cache / "osm"
     out_dir = Path(directory) if directory else extract_dir
 
-    url = _resolve_url(geometry, update)
-    filename = url.rsplit("/", 1)[-1]
-
+    # A crop's full extract stays in the cache; a full extract goes to out_dir.
+    source_dir = extract_dir if crop else out_dir
     if crop:
         # A grown place name is named by its geometry, not by the name alone.
         target = out_dir / _crop_filename(geometry if buffer_m else aoi, geometry)
-        extract_path = extract_dir / filename
-    else:
-        target = out_dir / filename
-        extract_path = target
-    if target.exists() and not update:
-        return target
+        # The sidecar marks a whole crop: it is removed before the crop is
+        # replaced and written again after.
+        sidecar = target.with_suffix(".provenance.json")
+        if target.exists() and sidecar.exists() and not update:
+            return target
+    with _taking_turns(source_dir, out_dir):
+        # Another call may have made the crop while this one waited.
+        if crop and target.exists() and sidecar.exists() and not update:
+            return target
+        extract = _extract(geometry, update, source_dir)
+        if update or not crop:
+            # pyrosm may have replaced the extract, so its sidecar goes before
+            # anything else can fail; a full extract's is written again below.
+            Path(extract.path).with_suffix(".provenance.json").unlink(missing_ok=True)
+        extract_sha256, retrieved_at = _checksum_and_written(extract.path)
+        if crop:
+            from pyrosm import OSM
 
-    extract_sha256 = _download(url, extract_path, update, transport)
-    if extract_sha256 is None:
-        extract_sha256 = _http.sha256_file(extract_path)
-
-    if crop:
-        from pyrosm import OSM
-
-        out_dir.mkdir(parents=True, exist_ok=True)
-        OSM(str(extract_path), bounding_box=geometry).to_pbf(output_path=str(target))
-
-    _write_provenance(
-        target,
-        geometry=geometry,
-        url=url,
-        extract_sha256=extract_sha256,
-        cropped=crop,
-    )
+            with _http.staged(target) as partial:
+                OSM(extract.path, bounding_box=geometry).to_pbf(
+                    output_path=str(partial)
+                )
+                sidecar.unlink(missing_ok=True)
+        else:
+            target = Path(extract.path)
+        _write_provenance(
+            target,
+            geometry=geometry,
+            extract=extract,
+            extract_sha256=extract_sha256,
+            retrieved_at=retrieved_at,
+            cropped=crop,
+        )
     return target

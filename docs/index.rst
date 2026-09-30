@@ -33,8 +33,9 @@ What can I do with transitio?
   <https://mobilitydatabase.org/>`__ catalog, with or without an API token
 - pick the dataset version whose service range covers a given day, and
   download it with checksum verification and a provenance sidecar
-- resolve and download the smallest OpenStreetMap extract covering the area
-  and crop it to the true AOI geometry (via pyrosm)
+- download the smallest single OpenStreetMap extract that contains the area,
+  from Geofabrik, BBBike or Movisda, and crop it to the area's bounding box
+  (via pyrosm)
 - validate GTFS feeds with a fast Rust core emitting the canonical
   `gtfs-validator <https://github.com/MobilityData/gtfs-validator>`__ notice
   codes, merged with the hosted canonical report where one exists

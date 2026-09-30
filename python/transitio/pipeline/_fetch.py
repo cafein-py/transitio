@@ -1181,9 +1181,10 @@ def fetch(
         4970 of 10026 located stops outside it"``, the stops summed over
         the delivered feeds, with ``"(stops.txt of 1 feed not read)"``
         added for feeds not counted; when its download failed, the last entry
-        notes that instead, e.g. ``"OSM extract not fetched:
-        https://download.geofabrik.de/europe-latest.osm.pbf: ReadTimeout:
-        timed out (3 requests)"``. ``FetchResult.selection_table()`` returns
+        notes that instead, e.g. ``"OSM extract not fetched: Could not
+        download any of the 1 extracts that contain the area:
+        https://download.bbbike.org/osm/bbbike/Basel/Basel.osm.pbf (timed
+        out)"``. ``FetchResult.selection_table()`` returns
         the record as a DataFrame. ``osm_area`` is the WGS84 geometry the OSM
         extract was fetched for (None with ``osm=False`` or a failed
         download).

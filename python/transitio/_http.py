@@ -1,11 +1,14 @@
-"""HTTP client settings and the file download shared by transitio's fetchers."""
+"""HTTP client settings, the file download and the file publication and
+locking helpers shared by transitio's fetchers."""
 
 import contextlib
+import errno
 import hashlib
 import os
 import re
 import tempfile
 import time
+from pathlib import Path
 
 import httpx
 
@@ -100,6 +103,44 @@ def replacing(path):
     except BaseException:
         _discard(partial)
         raise
+
+
+@contextlib.contextmanager
+def staged(path):
+    """Like :func:`replacing`, for a writer that opens the file by name: a
+    path in a private directory beside ``path``, whose file replaces ``path``
+    when the block completes; the directory is removed either way."""
+    with tempfile.TemporaryDirectory(
+        dir=path.parent, prefix=path.name + ".", ignore_cleanup_errors=True
+    ) as directory:
+        partial = Path(directory) / path.name
+        yield partial
+        os.replace(partial, path)
+
+
+@contextlib.contextmanager
+def locked(path):
+    """Hold an exclusive advisory lock on the file ``path``, created if
+    missing, for the block; another process taking it waits meanwhile."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+b") as handle:
+        try:
+            import fcntl
+        except ImportError:  # Windows
+            import msvcrt
+
+            handle.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError as error:
+                    # LK_LOCK gives up after ten one-second tries.
+                    if error.errno != errno.EDEADLK:
+                        raise
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
 
 
 def _discard(path):

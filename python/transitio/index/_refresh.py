@@ -452,22 +452,8 @@ def _unpack(data, staging):
 def _installing(root):
     """One refresh at a time per cache: an advisory lock on the snapshots
     directory, so two processes cannot race the activation."""
-    snapshots = _snapshots(root)
-    snapshots.mkdir(parents=True, exist_ok=True)
-    handle = open(snapshots / ".lock", "a+b")
-    try:
-        try:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        except ImportError:  # Windows
-            import msvcrt
-
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+    with _http.locked(_snapshots(root) / ".lock"):
         yield
-    finally:
-        handle.close()
 
 
 def _install(root, snapshot_id, data):
