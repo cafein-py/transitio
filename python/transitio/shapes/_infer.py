@@ -48,6 +48,7 @@ from transitio.edit._editor import _GTFS_TABLES, _normalise_table
 from transitio.exceptions import ShapeInferenceError
 from transitio.shapes import _graph, _levels, _match, _relations, _stitch
 from transitio.shapes._geometry import locate_on_shape, measures
+from transitio.validate._structure import CERTIFY_NOTICE_BUDGET, _errors, _unreliable
 
 #: Total-length plausibility band against the pattern's crow-fly
 #: length: below the floor the alignment is too short to connect the
@@ -472,27 +473,6 @@ def _certify(path, output, report, check):
         raise error
 
 
-def _unreliable(validation):
-    """Whether a validation saw less than the whole feed."""
-    return bool(validation.get("incomplete")) or any(
-        notice["code"] in ("notice_limit_reached", "too_many_rows")
-        for notice in validation.get("notices", [])
-    )
-
-
-def _errors(validation):
-    """Error-severity notices as a multiset of ``(code, context)``.
-
-    Identity, not just the code: fixing one occurrence while
-    introducing another under the same code must still count.
-    """
-    return collections.Counter(
-        (notice["code"], json.dumps(notice.get("context"), sort_keys=True))
-        for notice in validation.get("notices", [])
-        if notice["severity"] == "ERROR"
-    )
-
-
 def _cut(projected, lons, lats, along):
     """The alignment between the first and last stop, as `_Resolved`.
 
@@ -881,11 +861,6 @@ def _resolve_modes(modes):
 #: corrupt archive must not exhaust memory before certification runs.
 MAX_ENTRY_BYTES = 1 << 30
 MAX_TOTAL_BYTES = 2 << 30
-
-#: Per-file notice budget for the certification validations. High
-#: enough that an ordinary large feed is compared in full; a feed that
-#: still saturates it is refused rather than certified on a sample.
-CERTIFY_NOTICE_BUDGET = 1_000_000
 
 #: Archive-entry count budget: every member is copied to the output.
 MAX_ENTRIES = 10_000

@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import collections
 import datetime
+import json
 import math
+import pathlib
+import tempfile
 
 import pandas as pd
 
 from transitio.exceptions import InvalidFeedError
 from transitio.gtfs._duplicates import drop_duplicate_trips
+from transitio.validate import _structure
 
 # Every standard column holding a feed-scoped identifier or a reference
 # to one; all get the feed prefix so same-valued ids from different
@@ -497,6 +502,158 @@ def _zone_classes(names, interval):
     return {name: tuple(members) for members in classes.values() for name in members}
 
 
+def _identity(notice, lookup):
+    """A notice's identity across feeds, ``(code, context)``, and the sorted
+    positions of the inputs its ids name.
+
+    Row numbers are left out, as concatenation shifts rows. Ids are the
+    values under keys ending in ``Id``, ``IdA`` or ``IdB``, under
+    ``parentStation``, and under ``fieldValue`` when the notice's file and
+    field hold ids; one reading ``"<prefix>:<rest>"``, the prefix a key of
+    ``lookup``, names the input at ``lookup[prefix]`` and compares as
+    ``<rest>``.
+    """
+    context = notice.get("context") or {}
+    if "childFieldName" in context:
+        column = (context.get("childFilename"), context.get("childFieldName"))
+    else:
+        column = (context.get("filename"), context.get("fieldName"))
+    value_is_id = column[1] in _ID_COLUMNS.get(column[0], ())
+    kept, named = {}, set()
+    for key, value in context.items():
+        if "RowNumber" in key or "rowNumber" in key:
+            continue
+        is_id = key.endswith(("Id", "IdA", "IdB")) or key == "parentStation"
+        if isinstance(value, str) and (is_id or key == "fieldValue" and value_is_id):
+            prefix, colon, rest = value.partition(":")
+            if colon and prefix in lookup:
+                named.add(lookup[prefix])
+                value = rest
+        kept[key] = value
+    return (notice["code"], json.dumps(kept, sort_keys=True)), tuple(sorted(named))
+
+
+def _split_errors(merged, inputs, prefixes):
+    """Split the merged feed's error-severity notices into those inherited
+    from each input and those the merge introduced.
+
+    ``inputs`` holds one validation per input, in ``prefixes`` order, and
+    notices compare by :func:`_identity`. A notice naming one input is
+    inherited when that input carries it, one naming several is
+    introduced, and one naming none goes to the earliest input carrying
+    it. Named notices match first, and each input notice matches once.
+    Returns ``(inherited, introduced)``: a ``Counter`` of codes per input,
+    and one of the codes left.
+    """
+    lookup = {prefix: position for position, prefix in enumerate(prefixes)}
+    pools = [
+        _structure._errors(validation, key=lambda notice: _identity(notice, {})[0])
+        for validation in inputs
+    ]
+    holders = {}
+    for position, pool in enumerate(pools):
+        for identity in pool:
+            holders.setdefault(identity, []).append(position)
+    found = _structure._errors(merged, key=lambda notice: _identity(notice, lookup))
+    # Named notices first, so an id-less one cannot take their match.
+    ordered = [item for item in found.items() if item[0][1]]
+    ordered += [item for item in found.items() if not item[0][1]]
+    inherited = [collections.Counter() for _ in pools]
+    introduced = collections.Counter()
+    for (identity, named), count in ordered:
+        if not named:
+            candidates = holders.get(identity, ())
+        else:
+            candidates = named if len(named) == 1 else ()
+        for position in candidates:
+            matched = min(count, pools[position][identity])
+            if matched:
+                pools[position][identity] -= matched
+                inherited[position][identity[0]] += matched
+                count -= matched
+        if count:
+            introduced[identity[0]] += count
+    return inherited, introduced
+
+
+def _gate(report, check, tables, table_sets, prefixes, positions, budgets):
+    """Record the merged feed's inherited and introduced error-severity
+    notices on ``report`` and refuse the feed as ``check`` says; ``tables``
+    are the merged tables, ``table_sets`` the inputs'."""
+    from transitio.edit import FeedBuilder
+
+    report["inherited_errors"] = []
+    report["introduced_errors"] = {"errors": 0, "codes": {}}
+    if not any(notice["severity"] == "ERROR" for notice in report["notices"]):
+        return
+    budgets = dict(budgets)
+    budgets["max_notices_per_file"] = max(
+        budgets.get("max_notices_per_file") or 0, _structure.CERTIFY_NOTICE_BUDGET
+    )
+    validations, sources = [report], list(enumerate(table_sets))
+    if _structure._unreliable(report):
+        validations, sources = [], [("merged", tables), *sources]
+    with tempfile.TemporaryDirectory(prefix="transitio-merge-") as workdir:
+        for name, source in sources:
+            if validations and _structure._unreliable(validations[-1]):
+                break
+            builder = FeedBuilder()
+            builder.tables = source
+            path = pathlib.Path(workdir, f"{name}.zip")
+            validations.append(
+                builder.save(path, check=False, change_log=False, **budgets)
+            )
+            path.unlink()
+    if any(_structure._unreliable(validation) for validation in validations):
+        report["inherited_errors"] = report["introduced_errors"] = None
+        message = (
+            "cannot tell inherited errors from introduced ones: validation was "
+            "sampled or truncated; raise the budgets or pass check=False"
+        )
+    else:
+        inherited, introduced = _split_errors(validations[0], validations[1:], prefixes)
+        report["inherited_errors"] = [
+            {
+                "feed": position,
+                "errors": sum(codes.values()),
+                "codes": dict(sorted(codes.items())),
+            }
+            for position, codes in zip(positions, inherited)
+            if codes
+        ]
+        new = sum(introduced.values())
+        report["introduced_errors"] = {
+            "errors": new,
+            "codes": dict(sorted(introduced.items())),
+        }
+        carried = sum(entry["errors"] for entry in report["inherited_errors"])
+        if check == "strict":
+            if not carried + new:
+                return
+            message = (
+                f"merged feed has {carried + new} error-severity notices, {carried} "
+                "of them inherited from the inputs (check=True refuses only those "
+                "the merge introduced)"
+            )
+        elif new:
+            listed = ", ".join(
+                f"{code} {count}"
+                for code, count in sorted(
+                    introduced.items(), key=lambda item: (-item[1], item[0])
+                )
+            )
+            message = (
+                f"the merge introduced {new} error-severity notices ({listed}); "
+                f"{carried} more are inherited from the inputs, see "
+                "report['inherited_errors'] (check=False skips this gate)"
+            )
+        else:
+            return
+    error = InvalidFeedError(message)
+    error.report = report
+    raise error
+
+
 def merge_feeds(
     feeds,
     output,
@@ -522,10 +679,23 @@ def merge_feeds(
         Destination path for the merged ``.zip``.
     prefixes : sequence of str, optional
         One id prefix per feed (see :func:`merge_tables`).
-    check : bool, default True
-        Raise :class:`~transitio.exceptions.InvalidFeedError` when the
-        validator reports ERROR-severity notices (the report is on the
-        exception and the file is still written).
+    check : {True, "strict", False}, default True
+        ``True`` raises :class:`~transitio.exceptions.InvalidFeedError`
+        when the merge introduced ERROR-severity notices, those of the
+        written feed that its inputs do not carry; ``"strict"`` raises on
+        any ERROR-severity notice and ``False`` never raises. The report is
+        on the exception and the file is still written. The inputs are
+        validated only when the written feed has an ERROR-severity notice:
+        each as the merge read it, with ``budgets`` and at least 1,000,000
+        notices per file, and the merged tables again with those budgets
+        when the written feed's validation was sampled or truncated. Notices
+        compare by code and context, without row numbers and with ids
+        read without their prefix; a notice naming no input's ids counts
+        against the earliest input carrying it. When a validation is still
+        sampled or truncated, inherited notices cannot be told from
+        introduced ones, and ``True`` and ``"strict"`` both raise. Unless
+        ``check`` is ``False``, the tables of in-memory inputs are copied
+        first, so the merge holds them twice.
     timezones : {"refuse", "skip"}, default "refuse"
         Feeds declaring ``agency_timezone`` names that are not equivalent
         (see :func:`merge_tables`) cannot share one dataset. ``"refuse"``
@@ -563,12 +733,20 @@ def merge_feeds(
         as repeats, ``{"dropped": <n>, "by_feed": {<input position>: <n>},
         "unexpanded_services": <n>, "stop_links": <n>}``: the services not
         expanded, whose trips were never compared, and the stop pairs
-        linked.
+        linked. ``"inherited_errors"`` lists the ERROR-severity notices
+        the written feed carries from its inputs, one ``{"feed": <input
+        position>, "errors": <n>, "codes": {<code>: <n>}}`` per input with
+        any, and ``"introduced_errors"`` counts the others, ``{"errors":
+        <n>, "codes": {<code>: <n>}}``; both are ``None`` with
+        ``check=False`` and when the validations were sampled or
+        truncated.
     """
     from transitio.edit import FeedBuilder, FeedEditor
 
     if timezones not in ("refuse", "skip"):
         raise ValueError(f"timezones must be 'refuse' or 'skip', not {timezones!r}")
+    if not (isinstance(check, bool) or check == "strict"):
+        raise ValueError(f"check must be True, False or 'strict', not {check!r}")
     feeds = list(feeds)
     if len(feeds) < 2:
         raise ValueError("need at least two feeds to merge")
@@ -578,8 +756,13 @@ def merge_feeds(
     trimmed_values = []
     sources = []
     for position, feed in enumerate(feeds):
-        if getattr(feed, "tables", None) is None:
+        tables = getattr(feed, "tables", None)
+        if tables is None:
             feed = FeedEditor(feed)
+            tables = feed.tables
+        elif check:
+            # The caller's tables may change before the gate validates them.
+            tables = {name: table.copy() for name, table in tables.items()}
         fixes = getattr(feed, "_header_fixes", {})
         header_fixes.extend(
             {"feed": position, "file": name, "columns": fixes[name]}
@@ -590,7 +773,7 @@ def merge_feeds(
             {"feed": position, "file": name, "count": counts[name]}
             for name in sorted(counts)
         )
-        table_sets.append(feed.tables)
+        table_sets.append(tables)
         extra_entries.append(list(getattr(feed, "_extra_entries", {})))
         sources.append(getattr(feed, "source", None))
     names = _clean_prefixes(prefixes, len(table_sets))
@@ -643,10 +826,10 @@ def merge_feeds(
     }
     builder = FeedBuilder()
     builder.tables = tables
-    try:
-        report = builder.save(output, check=check, **budgets)
-    except InvalidFeedError as error:
-        error.report.update(extra)
-        raise
+    report = builder.save(output, check=False, **budgets)
     report.update(extra)
+    if check:
+        _gate(report, check, tables, table_sets, names, positions, budgets)
+    else:
+        report["inherited_errors"] = report["introduced_errors"] = None
     return report

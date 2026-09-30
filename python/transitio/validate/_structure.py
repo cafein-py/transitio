@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import collections
 import json
 import os
+
+#: Per-file notice budget for validations whose notice sets are compared.
+#: High enough that an ordinary large feed is compared in full; a feed that
+#: still saturates it is refused rather than compared on a sample.
+CERTIFY_NOTICE_BUDGET = 1_000_000
 
 
 def validate_feed(
@@ -125,4 +131,30 @@ def validate_feed(
             reference_date=reference_date,
             reference_time=reference_time,
         )
+    )
+
+
+def _unreliable(validation):
+    """Whether a validation saw less than the whole feed."""
+    return bool(validation.get("incomplete")) or any(
+        notice["code"] in ("notice_limit_reached", "too_many_rows")
+        for notice in validation.get("notices", [])
+    )
+
+
+def _errors(validation, key=None):
+    """Error-severity notices as a multiset of ``key(notice)``.
+
+    The default key is ``(code, context)``: identity, not just the code,
+    so fixing one occurrence while introducing another under the same code
+    must still count.
+    """
+    return collections.Counter(
+        (
+            (notice["code"], json.dumps(notice.get("context"), sort_keys=True))
+            if key is None
+            else key(notice)
+        )
+        for notice in validation.get("notices", [])
+        if notice["severity"] == "ERROR"
     )

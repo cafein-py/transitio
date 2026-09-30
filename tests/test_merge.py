@@ -510,6 +510,82 @@ def test_argument_errors():
         merge_tables([feed, feed], prefixes=["x"])
     with pytest.raises(ValueError, match="duplicate_trips"):
         merge_tables([feed, feed], duplicate_trips="maybe")
+    for check in ("maybe", 1):
+        with pytest.raises(ValueError, match="check"):
+            merge_feeds([feed, feed], "out.zip", check=check)
+
+
+def _error(code, **context):
+    return {"code": code, "severity": "ERROR", "context": context}
+
+
+STOP_REF = {"childFilename": "stop_times.txt", "childFieldName": "stop_id"}
+STOP_KEY = {"filename": "stops.txt", "fieldNames": "stop_id"}
+ARRIVAL = {"filename": "stop_times.txt", "fieldName": "arrival_time"}
+
+
+@pytest.mark.parametrize(
+    "merged, first, second, inherited, introduced",
+    [
+        pytest.param(
+            [
+                _error(
+                    "foreign_key_violation",
+                    **STOP_REF,
+                    fieldValue="f1:s9",
+                    csvRowNumber=7,
+                )
+            ],
+            [
+                _error(
+                    "foreign_key_violation", **STOP_REF, fieldValue="s9", csvRowNumber=3
+                )
+            ],
+            [],
+            [{"foreign_key_violation": 1}, {}],
+            {},
+            id="prefixed-id",
+        ),
+        pytest.param(
+            [
+                _error(
+                    "block_trips_with_overlapping_stop_times",
+                    blockId="f1:b",
+                    tripIdA="f1:t1",
+                    tripIdB="f2:t1",
+                ),
+                _error("duplicate_key", **STOP_KEY, oldCsvRowNumber=2, csvRowNumber=5),
+                _error("duplicate_key", **STOP_KEY, oldCsvRowNumber=3, csvRowNumber=9),
+            ],
+            [
+                _error(
+                    "block_trips_with_overlapping_stop_times",
+                    blockId="b",
+                    tripIdA="t1",
+                    tripIdB="t1",
+                )
+            ],
+            [_error("duplicate_key", **STOP_KEY, oldCsvRowNumber=2, csvRowNumber=3)],
+            [{}, {"duplicate_key": 1}],
+            {"block_trips_with_overlapping_stop_times": 1, "duplicate_key": 1},
+            id="several-or-no-inputs",
+        ),
+        pytest.param(
+            [_error("invalid_time", **ARRIVAL, fieldValue="f1:30", csvRowNumber=2)],
+            [_error("invalid_time", **ARRIVAL, fieldValue="f1:30", csvRowNumber=2)],
+            [_error("invalid_time", **ARRIVAL, fieldValue="f1:30", csvRowNumber=2)],
+            [{"invalid_time": 1}, {}],
+            {},
+            id="not-an-id",
+        ),
+    ],
+)
+def test_split_errors(merged, first, second, inherited, introduced):
+    from transitio.gtfs._merge import _split_errors
+
+    validations = [{"notices": notices} for notices in (merged, first, second)]
+    found = _split_errors(validations[0], validations[1:], ["f1", "f2"])
+    assert found == (inherited, introduced)
 
 
 SERVICES = {

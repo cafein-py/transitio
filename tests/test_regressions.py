@@ -575,3 +575,96 @@ def test_cropped_fares_never_apply_more_widely(tmp_path):
     assert not any(
         n["code"] == "foreign_key_violation" for n in result["remaining_notices"]
     )
+
+
+INHERITED = [{"feed": 0, "errors": 1, "codes": {"foreign_key_violation": 1}}]
+
+
+@pytest.mark.parametrize(
+    "check, variant, refusal, inherited, introduced",
+    [
+        (True, None, None, INHERITED, {"errors": 0, "codes": {}}),
+        ("strict", None, "1 of them inherited", INHERITED, {"errors": 0, "codes": {}}),
+        (False, None, None, None, None),
+        (
+            True,
+            "dangling-stop",
+            r"introduced 1 .*\(foreign_key_violation 1\)",
+            INHERITED,
+            {"errors": 1, "codes": {"foreign_key_violation": 1}},
+        ),
+        (
+            True,
+            "input-changed-after-read",
+            r"introduced 1 .*\(foreign_key_violation 1\)",
+            INHERITED,
+            {"errors": 1, "codes": {"foreign_key_violation": 1}},
+        ),
+        (True, "capped", None, INHERITED, {"errors": 0, "codes": {}}),
+        (True, "sampled", "cannot tell", None, None),
+    ],
+    ids=[
+        "inherited",
+        "strict",
+        "unchecked",
+        "introduced",
+        "input-changed-after-read",
+        "capped",
+        "sampled",
+    ],
+)
+def test_merge_refuses_only_errors_it_introduced(
+    tmp_path, monkeypatch, check, variant, refusal, inherited, introduced
+):
+    # A merge refused every error-severity notice of the merged feed, those
+    # its inputs already carried included, so feeds merged clean only when
+    # every input was clean.
+    from transitio.edit import FeedBuilder
+    from transitio.exceptions import InvalidFeedError
+    from transitio.gtfs import _merge, merge_feeds
+
+    def feed(start, end):
+        builder = FeedBuilder()
+        builder.add_agency("a", "Agency", "https://a.example", "Europe/Helsinki")
+        builder.add_stop("s1", "First", 60.169, 24.931)
+        builder.add_stop("s2", "Second", 60.171, 24.941)
+        builder.add_route("r1", 3, "1", agency_id="a")
+        builder.add_service("wk", "weekdays", "20260101", "20261231")
+        builder.add_trip("r1", "wk", "t1", [("s1", start, start), ("s2", end, end)])
+        return builder
+
+    first = feed("08:00:00", "08:05:00")
+    first.insert_rows(
+        "attributions.txt",
+        [{"route_id": "gone", "organization_name": "Org", "is_operator": "1"}],
+    )
+    second = feed("09:00:00", "09:05:00")
+    if variant in ("dangling-stop", "input-changed-after-read"):
+        merge_tables = _merge._merge_tables
+
+        def dangling(*args, **kwargs):
+            tables, dropped, details = merge_tables(*args, **kwargs)
+            stops = tables["stops.txt"]
+            tables["stops.txt"] = stops[stops["stop_id"] != "f2:s2"]
+            if variant == "input-changed-after-read":
+                # The caller's feed now carries the error the merge introduced.
+                second.delete_rows("stops.txt", [1])
+            return tables, dropped, details
+
+        monkeypatch.setattr(_merge, "_merge_tables", dangling)
+    if variant == "sampled":
+        monkeypatch.setattr("transitio.validate._structure.CERTIFY_NOTICE_BUDGET", 0)
+    feeds = [first, second]
+    output = tmp_path / "merged.zip"
+    budgets = {"reference_date": "20260601"}
+    if variant == "capped":
+        budgets["max_notices_per_file"] = 0
+    if refusal is None:
+        report = merge_feeds(feeds, output, check=check, **budgets)
+    else:
+        with pytest.raises(InvalidFeedError, match=refusal) as refused:
+            merge_feeds(feeds, output, check=check, **budgets)
+        report = refused.value.report
+    assert output.exists()
+    assert report["inherited_errors"] == inherited
+    assert report["introduced_errors"] == introduced
