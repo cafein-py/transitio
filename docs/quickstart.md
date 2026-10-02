@@ -227,12 +227,15 @@ when the qualified name names no single place, so `"Halifax, Canada"` is the
 city, not the region labelled "Halifax (Canadà)" in Piedmontese. `kind` (`"city"`,
 `"metro"`, `"region"`, `"country"`) restricts the scope, and a Wikidata id or
 the index's own id picks one place. The metro definitions below each name a
-metro after its core city; with `kind="metro"`, one metro under several
-definitions (they share member places) answers with the first of
-`functional urban area`, `metropolitan statistical area`,
-`metropolitan region` and `city-region (FAO)`, so
-`transitio.place("Stockholm", kind="metro")` is its functional urban area,
-and `definition="metropolitan region"` picks another definition. A US
+metro after its core city; one metro under several definitions (they share
+member places) answers with the first of `functional urban area`,
+`metropolitan statistical area`, `metropolitan region` and
+`city-region (FAO)`, so `transitio.place("Stockholm", kind="metro")` is its
+functional urban area, and `definition="metropolitan region"` picks another
+definition. A city's own metros, those in its country, keep every
+definition, so that dropping the others cannot hand the city's name to one
+of them; `"Cambridge, United Kingdom"`, with no city of the name in the UK,
+is its metropolitan region. A US
 metropolitan statistical area is named after its principal cities, so a
 city's name matches it only in part; the city's `metros` lists it.
 

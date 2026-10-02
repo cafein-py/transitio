@@ -560,33 +560,58 @@ def test_a_feed_lead_does_not_beat_a_far_better_known_place_abroad(
         ("Stockholm", {"definition": "metropolitan region"}, "m-mr"),
         ("Stockholm", {"definition": "city-region (FAO)"}, "m-fao"),
         ("Athens", {"kind": "metro"}, None),
+        # The definition that answers carries the name only in another language.
+        ("Kansas City", {"kind": "metro"}, "m-kc-msa"),
+        ("Stockholm", {}, "m-fua"),
+        # A city of the name abroad leaves the British metros one metro.
+        ("Ipswich", {}, "m-ips-mr"),
+        # The city's own metros keep both definitions, so neither outruns it.
+        ("Firenze", {}, None),
     ],
 )
-def test_kind_metro_picks_one_definition_of_a_metro(name, options, expected):
+def test_one_definition_of_a_metro_answers(name, options, expected):
     # Each metro definition names its metro after the core city, so Stockholm's
-    # three metros tied under kind="metro". The FAO region shares a member only
-    # with the metropolitan region, and that one with the FUA; Athens, US and
-    # Greece, share none and stay rivals.
+    # three metros tied, and without kind="metro" so did Cambridge's two in the
+    # UK. The FAO region shares a member only with the metropolitan region, and
+    # that one with the FUA; Athens, US and Greece, share none and stay rivals.
+    # Florence's metros are the city's namesakes: with one definition dropped,
+    # its FUA would beat the city by the margin.
     from transitio.exceptions import AmbiguousPlaceError
 
-    rows = [
-        ("m-fao", "Stockholm", "SE", "city-region (FAO)", ["a", "b"]),
-        ("m-mr", "Stockholm", "SE", "metropolitan region", ["b", "c"]),
-        ("m-fua", "Stockholm", "SE", "functional urban area", ["c", "d"]),
-        ("m-ath-us", "Athens", "US", "city-region (FAO)", ["e"]),
-        ("m-ath-gr", "Athens", "GR", "city-region (FAO)", ["f"]),
+    metros = [
+        # Each row: the id, name, country, definition, members and feeds.
+        ("m-fao", "Stockholm", "SE", "city-region (FAO)", ["a", "b"], 3),
+        ("m-mr", "Stockholm", "SE", "metropolitan region", ["b", "c"], 3),
+        ("m-fua", "Stockholm", "SE", "functional urban area", ["c", "d"], 3),
+        ("m-ath-us", "Athens", "US", "city-region (FAO)", ["e"], 3),
+        ("m-ath-gr", "Athens", "GR", "city-region (FAO)", ["f"], 3),
+        ("m-kc-fao", "Kansas City", "US", "city-region (FAO)", ["j"], 14),
+        ("m-ips-mr", "Ipswich", "GB", "metropolitan region", ["g"], 6),
+        ("m-ips-fao", "Ipswich", "GB", "city-region (FAO)", ["g", "h"], 6),
+        ("m-flr-fua", "Firenze", "IT", "functional urban area", ["i"], 26),
+        ("m-flr-mr", "Firenze", "IT", "metropolitan region", ["i"], 25),
     ]
-    lookup = _lookup(
-        [
-            {
-                **_place(pid, "metro", label, country),
-                "source_subtype": subtype,
-                "member_ids": members,
-            }
-            for pid, label, country, subtype, members in rows
-        ],
-        {row[0]: 3 for row in rows},
-    )
+    florence = {"en": "Florence", "it": "Firenze"}
+    places = [
+        {
+            **_place(pid, "metro", label, country),
+            "source_subtype": subtype,
+            "member_ids": members,
+        }
+        for pid, label, country, subtype, members, _ in metros
+    ] + [
+        _place("c-ips", "city", "Ipswich", "AU"),
+        _place("r-flr", "region", "Florence", "IT", names=florence),
+        _place("c-flr", "city", "Florence", "IT", names=florence, parent="r-flr"),
+        {
+            **_place("m-kc-msa", "metro", "KC area", "US", names={"da": "Kansas City"}),
+            "source_subtype": "metropolitan statistical area",
+            "member_ids": ["j"],
+        },
+    ]
+    feeds = {row[0]: row[-1] for row in metros}
+    feeds.update({"c-ips": 1, "r-flr": 26, "c-flr": 11, "m-kc-msa": 7})
+    lookup = _lookup(places, feeds)
     if expected is None:
         with pytest.raises(AmbiguousPlaceError):
             lookup.resolve(name, **options)

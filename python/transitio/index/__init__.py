@@ -971,14 +971,18 @@ def place(query, *, kind=None, definition=None, index=None):
     only when the qualified name names no single place (no exact match, or
     several that nothing decides between).
 
-    A metro's definition is its ``subtype``. With ``kind="metro"``, metros
-    of the name sharing a member place are one metro under several
-    definitions, and the first in this order answers:
+    A metro's definition is its ``subtype``. Metros of the name sharing a
+    member place are one metro under several definitions, and the first in
+    this order answers:
     ``"functional urban area"`` (Eurostat Urban Audit),
     ``"metropolitan statistical area"`` (US Census),
     ``"metropolitan region"`` (Eurostat's NUTS-3 approximation),
-    ``"city-region (FAO)"``, then any other; "Stockholm" is its functional
-    urban area. ``definition`` names one instead and implies
+    ``"city-region (FAO)"``, then any other; "Stockholm" with
+    ``kind="metro"`` is its functional urban area. A city's own metros,
+    those in its country, keep every definition, so that dropping the
+    others cannot hand the city's name to one of them; "Cambridge, United
+    Kingdom", with no city of the name in the UK, is its metropolitan
+    region. ``definition`` names one instead and implies
     ``kind="metro"``; it raises :class:`ValueError` when ``kind`` names
     another kind or no metro of the index carries it. US metropolitan
     statistical areas are named after their principal cities ("Los

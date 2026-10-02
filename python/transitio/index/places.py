@@ -20,10 +20,12 @@ same service (no more than the margin beyond the city's feeds) is the city
 itself, and a place inside it or, not being a city, in its country that
 reaches its name only through an alias is named after it. Where no exact
 match is a city, a region or country of the name (a province, an emirate, a
-dependency) stands as the city. With ``kind="metro"``, metros of the name
-sharing a member place are one metro under several definitions, and only
-those of the earliest definition in the default order compete; a named
-definition keeps only its metros. Anything else raises
+dependency) stands as the city. Metros of the name sharing a member place
+are one metro under several definitions, and only those of the earliest
+definition in the default order compete, except a city's own metros (those
+in its country), which keep every definition so that dropping the others
+cannot hand the city's name to one of them; a named definition keeps only
+its metros. Anything else raises
 :class:`AmbiguousPlaceError` with the candidates, or
 :class:`PlaceNotFoundError` with the partial matches, if any.
 """
@@ -92,10 +94,10 @@ _EXACT, _PREFIX, _SUBSET = 3, 2, 1
 # contains, which outranks the region, which outranks the country.
 _KIND_ORDER = {"metro": 0, "city": 1, "region": 2, "country": 3}
 
-# The metro definitions (a metro's ``source_subtype``) in the order
-# ``kind="metro"`` picks among one metro's: the commuting-based ones (Urban
-# Audit FUAs, US MSAs), Eurostat's NUTS-3 metropolitan regions, then the FAO
-# city-regions, global and with uneven boundaries. Any other ranks after these.
+# The metro definitions (a metro's ``source_subtype``) in the order a lookup
+# picks among one metro's: the commuting-based ones (Urban Audit FUAs, US
+# MSAs), Eurostat's NUTS-3 metropolitan regions, then the FAO city-regions,
+# global and with uneven boundaries. Any other ranks after these.
 _METRO_DEFINITIONS = (
     "functional urban area",
     "metropolitan statistical area",
@@ -733,15 +735,13 @@ class _PlaceLookup:
         first = None
         for name, scored in self._readings(query, kind, definition):
             try:
-                return self._answer(query, name, scored, kind, definition)
+                return self._answer(query, name, scored)
             except AmbiguousPlaceError as error:
                 first = first or error
         raise first
 
-    def _answer(self, query, name, scored, kind, definition):
+    def _answer(self, query, name, scored):
         """The place one reading of ``query`` names, or raise."""
-        if kind == "metro" and definition is None:
-            scored = self._one_definition(scored)
         if not scored:
             raise PlaceNotFoundError(f"no place matches {query!r}")
         if all(tier != _EXACT for tier, _ in scored):
@@ -792,6 +792,14 @@ class _PlaceLookup:
         return [(tier, pid) for tier, pid in scored if pid not in dropped]
 
     def _winner(self, query, scored, name):
+        # A city's own metros keep every definition, so the full contest cannot
+        # hand its name to one of them once the others are gone.
+        namesakes, _ = self._namesakes(self._contenders(scored, name), name)
+        rest = self._one_definition(
+            [item for item in scored if item[1] not in namesakes]
+        )
+        kept = namesakes | {pid for _, pid in rest}
+        scored = [item for item in scored if item[1] in kept]
         exact = self._contenders(scored, name)
         namesakes, anchors = self._namesakes(exact, name)
         winner = None
