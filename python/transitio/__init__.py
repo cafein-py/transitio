@@ -16,6 +16,7 @@ __all__ = [
     "build_feed",
     "compare_feed_history",
     "compare_feeds",
+    "credentials",
     "crop_feed",
     "edit",
     "fetch",
@@ -86,6 +87,7 @@ def __getattr__(name):
 
         return getattr(index, name)
     if name in (
+        "credentials",
         "edit",
         "exceptions",
         "gtfs",

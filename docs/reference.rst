@@ -88,6 +88,23 @@ The index lists the feeds serving each place, by tier. ``place``, ``places``,
    Index.discovery_semantics_version
    Index.access_provider
 
+Feed credentials
+----------------
+
+The credentials of feeds that need an account with their provider: one
+environment variable per field, or a private file in the user config
+directory.
+
+.. currentmodule:: transitio.credentials
+
+.. autosummary::
+   :toctree: api/
+
+   set
+   get
+   clear
+   configured
+
 .. currentmodule:: transitio
 
 The feed catalogs

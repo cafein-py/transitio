@@ -5,6 +5,58 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- The reader reads schema-11 indexes. A feed carries its access details
+  (`IndexedFeed.access`, `access_provider`, `auth_method`, `auth_params`,
+  `access_url`, `registration_url`, `download_url` and
+  `access_instructions()`), the
+  index lists the access providers (`Index.access_provider(provider_id)`), and a
+  place carries its centre (`Place.centre`, a point or None). Schema-10
+  indexes read as before; a schema-11 index needs transitio 0.19.0.
+- `transitio.credentials` stores the credentials a key-protected feed
+  needs, per access provider: `set`, `get`, `clear` and `configured`,
+  read from `TRANSITIO_KEY_<PROVIDER>__<FIELD>` environment variables or
+  a TOML file readable by the user alone. The file store is POSIX-only: on
+  Windows `set` and `clear` raise `NotImplementedError` and only the
+  environment variables are read. `fetch` does not use them yet.
+
+### Changed
+
+- Place lookups:
+  - In "Name, Qualifier" the qualifier is read as a containing region or
+    country first, and any containing place only when none matches; the
+    comma form is tried even when the whole string is another place's
+    label in some language. "Copenhagen, Denmark" matched Copenhagen, New
+    York, which lies in a town named Denmark, and "Halifax, Canada" gave
+    the region through a Piedmontese label.
+  - Plain lookups count a metro once across its definitions, as
+    `kind="metro"` did, so "Cambridge, United Kingdom" resolves.
+  - A place that carries a name only as a translation leaves the contest
+    when another place carries it as its name or English label, unless it
+    is far better known. "Bergen" gave Mons, whose Dutch name it is.
+  - Where feeds do not decide, the place far better known by its
+    recorded labels wins: "Moscow", "Delhi" and "Cairo" resolve instead
+    of staying ambiguous.
+- `merge_feeds(check=True)` no longer refuses when an input's validation
+  reached only a warning-severity cap, such as the block-overlap pair
+  check's; the refusal names the validation, the file and the budget.
+  Tampere, Boston, Toronto, Los Angeles and Chicago were refused with
+  "cannot tell inherited errors from introduced ones".
+- The crop drops stop_times rows naming a stop the feed lacks, trips
+  naming a route it lacks, and a trip that drop leaves with fewer than two
+  stop times, and the fetch report gains `summary.droppedRows`. Moscow's
+  feed names three stops its stops.txt lacks, and cafein refused it.
+- The crop drops exact repeats of a trips.txt row and reports them;
+  repeats that differ still refuse. Delhi's feed repeats eight trips.
+- `fetch_pbf` downloads the smallest set of OSM extracts that covers the
+  area (pyrosm's `strategy="smallest_total"`), and `must_cover` names what
+  the extracts must cover; the pipeline passes the delivered stops.
+  Zermatt downloaded the 2.3 GB Alps extract and London all of England.
+  Requires pyrosm 0.15.0.
+
 ## 0.18.0 — 2026-10-01
 
 ### Changed
