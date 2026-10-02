@@ -531,6 +531,7 @@ def test_download_indexed_tries_the_producer_then_the_hosted_copy(
     direct, static, latest = urls
     feed = SimpleNamespace(
         feed_id="f-a",
+        access=None,
         _row={
             "mdb": {"urls": {"direct_download": direct, "latest": latest}},
             "atlas": {"urls": {"static_current": static}},
@@ -1015,54 +1016,85 @@ REFLECTED = {API: (302, {"Location": f"{CDN}?x={urllib.parse.quote(SECRET)}"})}
 DELIVERED = [("GET", API), ("GET", CDN)]
 
 
+FROM_HOSTED = "from the Mobility Database hosted copy"
+MISSING = "protected feed: credentials missing for p-key; {instructions}"
+HOSTED_404 = f"mdb_latest: {HOSTED}: HTTP 404 Not Found"
+NONE = (None, None, None)
+
+
 @pytest.mark.filterwarnings("ignore:no Mobility Database API token")
 @pytest.mark.parametrize(
-    "columns, credentials, routes, seen, reason",
+    "columns, credentials, routes, seen, outcome",
     [
-        ({"download_url": CURATED}, None, {}, [("GET", CURATED)], None),
+        ({"download_url": CURATED}, None, {}, [("GET", CURATED)], NONE),
         (
             {"download_url": CURATED},
             None,
             {CURATED: (404, {})},
             [("GET", CURATED), ("GET", HOSTED)],
-            None,
+            (None, f"download_url: {CURATED}: HTTP 404 Not Found", FROM_HOSTED),
         ),
         (
             _protected(QUERY),
             {"p-pair": {"client_secret": SECRET}},
             TO_CDN,
             DELIVERED,
-            None,
+            NONE,
         ),
-        (_protected(HEADER), None, TO_CDN, DELIVERED, None),
+        (_protected(HEADER), None, TO_CDN, DELIVERED, NONE),
         (
             _protected(BASIC),
             {"p-basic": {"username": "user", "password": PASSWORD}},
             TO_CDN,
             DELIVERED,
-            None,
+            NONE,
         ),
-        (_protected(HEADER), None, ROUND_TRIP, [*DELIVERED, ("GET", BACK)], None),
+        (_protected(HEADER), None, ROUND_TRIP, [*DELIVERED, ("GET", BACK)], NONE),
         (
             {**_protected(HEADER), **ENDED_ETAG},
             None,
             {},
             [("HEAD", API)],
-            R_ENDED + SAME,
+            (R_ENDED + SAME, None, None),
         ),
         (
             _protected(HEADER),
             None,
             {API: (401, {})},
+            [("GET", API), ("GET", HOSTED)],
+            (None, f"download_url: {API}: HTTP 401 Unauthorized", FROM_HOSTED),
+        ),
+        (
+            {**_protected(HEADER), "mdb": {"urls": {"direct_download": API}}},
+            None,
+            REFLECTED,
             [("GET", API)],
-            f"download failed: download_url: {API}: HTTP 401 Unauthorized",
+            (
+                "download failed: download_url: redirect carries a credential",
+                "download_url: redirect carries a credential",
+                None,
+            ),
+        ),
+        (
+            _protected(KEY),
+            None,
+            {},
+            [("GET", HOSTED)],
+            (None, None, f"{FROM_HOSTED}; {MISSING}"),
+        ),
+        (
+            _protected(KEY),
+            None,
+            {HOSTED: (404, {})},
+            [("GET", HOSTED)],
+            (f"download failed: {HOSTED_404}", HOSTED_404, MISSING),
         ),
         (
             _protected(HEADER),
             None,
-            REFLECTED,
-            [("GET", API)],
-            "download failed: download_url: redirect carries a credential",
+            {API: RuntimeError(SECRET)},
+            [("GET", API), ("GET", HOSTED)],
+            (None, "download_url: ***", FROM_HOSTED),
         ),
     ],
     ids=[
@@ -1075,11 +1107,16 @@ DELIVERED = [("GET", API), ("GET", CDN)]
         "probe-unchanged",
         "refused",
         "location-reflects-a-credential",
+        "keyless-hosted-copy",
+        "keyless-hosted-copy-fails",
+        "keyed-error-holding-a-credential",
     ],
 )
 def test_schema_11_downloads(
-    tmp_path, monkeypatch, caplog, columns, credentials, routes, seen, reason
+    tmp_path, monkeypatch, caplog, columns, credentials, routes, seen, outcome
 ):
+    from transitio.index import place
+
     mdb = {"urls": {"direct_download": API, "latest": HOSTED}}
     feeds = {"f-a": {"mdb": mdb, **columns}}
     index = _partitioned_index(tmp_path, monkeypatch, feeds, providers=PROVIDERS)
@@ -1092,7 +1129,10 @@ def test_schema_11_downloads(
     def handler(request):
         url = str(request.url.copy_with(query=None))
         requests.append((request.method, url, request))
-        status, headers = routes.get(url, (200, {}))
+        route = routes.get(url, (200, {}))
+        if isinstance(route, Exception):
+            raise route
+        status, headers = route
         if url == API and not _carried(request):
             status = 401
         elif request.method == "HEAD":
@@ -1116,11 +1156,16 @@ def test_schema_11_downloads(
         )
     (entry,) = result.selection
     assert [(method, url) for method, url, _ in requests] == seen
-    assert entry["reason"] == reason
+    (feed,) = place("Q1757", index=index).feeds()
+    instructions = feed.access_instructions()
+    expected = tuple(v and v.format(instructions=instructions) for v in outcome)
+    assert (entry["reason"], entry["download_errors"], entry["note"]) == expected
     assert all("Cookie" not in request.headers for *_, request in requests)
     # Credentials reach the access URL alone, and the stub below sees them.
     carried = [_carried(request) for *_, request in requests]
     assert carried == [("access" in columns) and url == API for _, url in seen]
+    hosted = [request for _, url, request in requests if url == HOSTED]
+    assert not any(_leaks(f"{r.url} {dict(r.headers)}") for r in hosted)
     if entry["path"] is not None:
         sidecar = entry["path"].with_suffix(".provenance.json").read_text()
         source = ("producer", seen[0][1]) if seen[-1][1] != HOSTED else None
