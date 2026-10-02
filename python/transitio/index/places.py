@@ -77,6 +77,18 @@ def _as_str(value):
     return value
 
 
+def _as_shape(value):
+    """A geometry cell as a shapely geometry, WKB decoded; None for a null
+    or an empty geometry."""
+    import shapely
+
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        value = shapely.from_wkb(bytes(value))
+    return None if value.is_empty else value
+
+
 def _as_concordances(value):
     """The ``{namespace: [ids]}`` block, whether stored as a mapping or as
     its JSON text; anything else is an empty block."""
@@ -296,6 +308,15 @@ class Place:
     @property
     def geometry(self):
         return self._record.get("geometry")
+
+    @property
+    def centre(self):
+        """The point the index gives as the place's centre (schema 11), a
+        shapely ``Point`` in lon/lat; None when the index has none for the
+        place or predates schema 11. For a point inside the place either
+        way, ``place.centre or place.geometry.representative_point()`` (the
+        centroid can lie outside)."""
+        return _as_shape(self._record.get("centre"))
 
     @property
     def parent(self):

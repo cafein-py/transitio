@@ -81,7 +81,7 @@ def edge(place_id, feed_id, **kw):
     }
 
 
-def place(place_id, kind, *, geometry=None, **kw):
+def place(place_id, kind, *, geometry=None, centre=None, **kw):
     return {
         "place_id": place_id,
         "kind": kind,
@@ -100,6 +100,7 @@ def place(place_id, kind, *, geometry=None, **kw):
         "member_ids": kw.get("member_ids", []),
         "geometry": geometry,
         "geometry_source": "overture" if geometry else None,
+        "centre": centre,
     }
 
 
@@ -260,12 +261,16 @@ def _service_by_place(edges):
     return totals
 
 
-def _place_row(record, snapshot_id, service=None, validity=None, dated=False):
+def _place_row(
+    record, snapshot_id, service=None, validity=None, dated=False, centred=False
+):
     # A row keyed by its QID states its identity; any other key is a
     # fixture's and states none.
     qid = record["place_id"] if _QID.match(record["place_id"]) else None
     metro_ids = record.get("metro_ids") or []
     geometry = record.get("geometry")
+    centre = record.get("centre")
+    centre = None if centre is None else bytes.fromhex(centre)
     return {
         "place_id": record["place_id"],
         "kind": record["kind"],
@@ -292,6 +297,7 @@ def _place_row(record, snapshot_id, service=None, validity=None, dated=False):
         "concordances": json.dumps({"wikidata": [qid]} if qid else {}, sort_keys=True),
         "former_ids": [],
         **({"validity": _json_block(validity)} if dated else {}),
+        **({"centre": centre} if centred else {}),
         "geometry": None if geometry is None else bytes.fromhex(geometry),
     }
 
@@ -318,18 +324,15 @@ def _edge_row(record, snapshot_id):
     }
 
 
-def _geo_metadata():
+def _geo_metadata(centre=False):
     import pyproj
 
     crs = json.loads(pyproj.CRS.from_epsg(4326).to_json())
+    columns = {"geometry": {"encoding": "WKB", "geometry_types": [], "crs": crs}}
+    if centre:
+        columns["centre"] = {"encoding": "WKB", "geometry_types": ["Point"], "crs": crs}
     return json.dumps(
-        {
-            "version": "1.0.0",
-            "primary_column": "geometry",
-            "columns": {
-                "geometry": {"encoding": "WKB", "geometry_types": [], "crs": crs}
-            },
-        }
+        {"version": "1.0.0", "primary_column": "geometry", "columns": columns}
     ).encode("utf-8")
 
 
@@ -442,6 +445,35 @@ FEEDS_SCHEMA_10 = FEEDS_SCHEMA_9.insert(
 )
 PLACES_SCHEMA_9 = PLACES_SCHEMA.insert(
     PLACES_SCHEMA.get_field_index("geometry"), pa.field("validity", pa.string())
+)
+# Schema 11: how to get each feed's credentials, the providers issuing them
+# (a table at the root), and each place's centre point.
+ACCESS_COLUMNS = (
+    "download_url",
+    "access",
+    "access_provider",
+    "auth_method",
+    "auth_params",
+    "registration_url",
+)
+FEEDS_SCHEMA_11 = FEEDS_SCHEMA_10
+for _name in ACCESS_COLUMNS:
+    FEEDS_SCHEMA_11 = FEEDS_SCHEMA_11.insert(
+        FEEDS_SCHEMA_11.get_field_index("snapshot"), pa.field(_name, pa.string())
+    )
+PLACES_SCHEMA_11 = PLACES_SCHEMA_9.insert(
+    PLACES_SCHEMA_9.get_field_index("geometry"), pa.field("centre", pa.binary())
+)
+ACCESS_PROVIDERS_SCHEMA = pa.schema(
+    [
+        ("provider_id", pa.string()),
+        ("name", pa.string()),
+        ("registration_url", pa.string()),
+        ("docs_url", pa.string()),
+        ("terms_url", pa.string()),
+        ("credential_fields", pa.list_(pa.string())),
+        ("free", pa.bool_()),
+    ]
 )
 REALTIME_SCHEMA = pa.schema(
     [
@@ -563,6 +595,7 @@ def write_partitioned_index(
     realtime=None,
     validity=None,
     contained=None,
+    access=None,
 ):
     """Write a schema-7 index under ``directory``: feeds by ``home_country``
     (``international`` without one), places by ``country_code``, edges under
@@ -574,9 +607,15 @@ def write_partitioned_index(
     ``validity`` (``{place_id: validity record}``) a schema-9 index: the
     feeds' ``service_start`` / ``service_end`` published, each listed place
     carrying its validity JSON. With ``contained`` (``{feed_id: [container
-    ids]}``) a schema-10 index: every feed lists the feeds containing it."""
+    ids]}``) a schema-10 index: every feed lists the feeds containing it.
+    With ``access`` (``{"providers": [provider records]}``) a schema-11
+    index: the feeds' access columns taken from their records (``access``
+    ``"open"`` unless given), the providers table at the root with its
+    digest in the manifest, and each place's ``centre``."""
     directory.mkdir(parents=True, exist_ok=True)
     version = PARTITIONED_SCHEMA_VERSION if realtime is None else 8
+    if access is not None:
+        contained = contained or {}
     if contained is not None:
         validity = validity or {}
     if validity is not None:  # ``{place_id: validity record}``: schema 9
@@ -584,6 +623,8 @@ def write_partitioned_index(
         realtime = realtime or []
     if contained is not None:
         version = 10
+    if access is not None:
+        version = 11
     home = {feed["feed_id"]: feed.get("home_country") for feed in feeds}
     country = {place["place_id"]: place["country_code"] for place in places}
     companions = {}
@@ -602,6 +643,10 @@ def write_partitioned_index(
             row["service_end"] = feed.get("service_end")
         if version >= 10:
             row["contained_in"] = sorted(contained.get(feed["feed_id"], ()))
+        if version >= 11:
+            row.update({name: feed.get(name) for name in ACCESS_COLUMNS})
+            row["access"] = feed.get("access", "open")
+            row["auth_params"] = _json_block(feed.get("auth_params"))
         parts.setdefault(home[feed["feed_id"]] or "international", {}).setdefault(
             "feeds", []
         ).append(row)
@@ -622,6 +667,7 @@ def write_partitioned_index(
                 service.get(place["place_id"]),
                 validity=(validity or {}).get(place["place_id"]),
                 dated=version >= 9,
+                centred=version >= 11,
             )
         )
     for record in edges:
@@ -643,13 +689,16 @@ def write_partitioned_index(
                     7: FEEDS_SCHEMA_7,
                     8: FEEDS_SCHEMA_8,
                     9: FEEDS_SCHEMA_9,
-                }.get(version, FEEDS_SCHEMA_10)
+                    10: FEEDS_SCHEMA_10,
+                }.get(version, FEEDS_SCHEMA_11)
                 data = _parquet(rows, schema)
             elif table == "realtime":
                 data = _parquet(rows, REALTIME_SCHEMA)
             elif table == "places":
                 schema = PLACES_SCHEMA_9 if version >= 9 else PLACES_SCHEMA
-                data = _parquet(rows, schema.with_metadata({b"geo": _geo_metadata()}))
+                schema = PLACES_SCHEMA_11 if version >= 11 else schema
+                geo = _geo_metadata(centre=version >= 11)
+                data = _parquet(rows, schema.with_metadata({b"geo": geo}))
             else:
                 schema = LINKS_SCHEMA_7 if partition == "links" else EDGES_SCHEMA_7
                 data = _parquet(rows, schema)
@@ -667,6 +716,10 @@ def write_partitioned_index(
         "licensed": notice is not None,
         "notice_sha256": None if notice is None else _sha256(notice),
     }
+    if access is not None:
+        data = _parquet(access.get("providers", []), ACCESS_PROVIDERS_SCHEMA)
+        (directory / reader.ACCESS_PROVIDERS_FILE).write_bytes(data)
+        manifest["access_providers_sha256"] = _sha256(data)
     if notice is not None:
         (directory / "NOTICE").write_bytes(notice)
     (directory / reader.SNAPSHOT_FILE).write_text(

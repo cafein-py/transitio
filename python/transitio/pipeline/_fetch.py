@@ -947,18 +947,15 @@ def _record_source(path, fetched_from, errors):
 
 def _unchanged_since_indexed(feed, http):
     """Whether the archive the index crawled for an indexed feed is still the
-    one served: a conditional ``HEAD`` to the URL the crawl reads (the Atlas
-    static feed, else the Mobility Database direct download), carrying the
+    one served: a conditional ``HEAD`` to the URL the crawl reads
+    (``_crawl_url``: its download URL, else Atlas, else MDB), carrying the
     ETag and Last-Modified it recorded, answers 304 Not Modified. Returns
     that URL, or None: any other answer, a failed probe or no recorded
     validator is no proof. A URL fragment is not sent, so the probe of a
     feed inside a larger archive reaches that archive."""
-    from transitio.catalog._atlas import STATIC_URL
-    from transitio.index.feeds import _parse, _scalar
+    from transitio.index.feeds import _crawl_url, _scalar
 
-    atlas = (_parse(feed._row.get("atlas")) or {}).get("urls") or {}
-    mdb = (_parse(feed._row.get("mdb")) or {}).get("urls") or {}
-    url = atlas.get(STATIC_URL) or mdb.get("direct_download")
+    url = _crawl_url(feed)
     headers = {}
     etag = _scalar(feed._row.get("etag"))
     last_modified = _scalar(feed._row.get("last_modified"))
@@ -1679,8 +1676,6 @@ def _fetch_place(
     indexed; ``window_day`` is what the computed window is tested against.
     The versions among the delivered feeds are settled after the feed loop,
     and the OSM extract comes last, for the parts the remaining feeds serve."""
-    import shapely
-
     from transitio import __version__
     from transitio.catalog import Feed, MobilityDatabase, TransitlandAtlas
     from transitio.catalog._atlas import _feed_dir
@@ -1692,6 +1687,7 @@ def _fetch_place(
         place as resolve_place,
     )
     from transitio.index.feeds import _parse
+    from transitio.index.places import _as_shape
     from transitio.osm._fetch import _buffered
 
     if isinstance(place, Place):
@@ -1705,11 +1701,9 @@ def _fetch_place(
         "discovery_semantics_version": DISCOVERY_SEMANTICS_VERSION,
         "transitio_version": __version__,
     }
-    geometry = place_obj.geometry
+    geometry = _as_shape(place_obj.geometry)
     if geometry is None:
         raise ValueError(f"place {place_obj.id} has no geometry to fetch for")
-    if isinstance(geometry, (bytes, bytearray)):
-        geometry = shapely.from_wkb(bytes(geometry))
     study = when is not None
 
     tag = hashlib.sha256(

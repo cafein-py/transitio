@@ -366,9 +366,15 @@ def test_a_schema_8_index_carries_the_realtime_companions(tmp_path):
 
 def test_a_schema_10_index_lists_the_feeds_containing_a_feed(tmp_path, monkeypatch):
     monkeypatch.setattr(transitio, "__version__", reader.MIN_READER_VERSIONS[10])
+    atlas = {"urls": {"static_current": "https://atlas.example/hsl.zip"}}
+    feeds = [
+        {**FEEDS[0], "atlas": atlas, "mdb": {"urls": {"direct_download": "x"}}},
+        {**FEEDS[1], "mdb": {"urls": {"direct_download": "https://mdb.example/t"}}},
+        FEEDS[2],
+    ]
     directory = write_partitioned_index(
         tmp_path / "index",
-        feeds=FEEDS,
+        feeds=feeds,
         places=PLACES,
         edges=EDGES,
         contained={"f-hsl": ["f-ferry"]},
@@ -379,6 +385,192 @@ def test_a_schema_10_index_lists_the_feeds_containing_a_feed(tmp_path, monkeypat
     served = reader.place("hel", index=index).feeds(categories=None)
     assert {f.feed_id: f.contained_in for f in served}["f-hsl"] == ["f-ferry"]
     assert reader.place("tll", index=index).feeds(categories=None)[0].contained_in == []
+    # No access details or centres before schema 11; the access URL is the
+    # one the crawl reads, the Atlas static feed before the MDB download.
+    assert index.access_providers is None and index.access_provider("x") is None
+    assert reader.place("hel", index=index).centre is None
+    hsl = next(f for f in served if f.feed_id == "f-hsl")
+    assert (hsl.access, hsl.access_provider, hsl.auth_method) == (None, None, None)
+    assert hsl.download_url is None and hsl.access_instructions() is None
+    assert hsl.access_url == "https://atlas.example/hsl.zip"
+    (tlt,) = reader.place("tll", index=index).feeds(categories=None)
+    assert tlt.access_url == "https://mdb.example/t"
+
+
+PROVIDERS = [
+    {
+        "provider_id": "trafiklab",
+        "name": "Trafiklab",
+        "registration_url": "https://trafiklab.example/register",
+        "docs_url": "https://trafiklab.example/docs",
+        "credential_fields": ["key"],
+        "free": True,
+    },
+    {
+        "provider_id": "acme-transit",
+        "name": "Acme Transit",
+        "credential_fields": ["username", "password"],
+    },
+]
+SL = (
+    "SL needs credentials from Trafiklab. Register at "
+    "https://trafiklab.example/register. Documentation: "
+    "https://trafiklab.example/docs. Then run "
+    'transitio.credentials.set("trafiklab", {"key": "..."}) or set '
+    "TRANSITIO_KEY_TRAFIKLAB__KEY."
+)
+# feed id, access columns, the instructions expected.
+ACCESS_CASES = [
+    ("f-open", {"access": "open"}, None),
+    (
+        "f-sl",
+        {
+            "name": "SL",
+            "access_provider": "trafiklab",
+            "auth_method": "query_param",
+            "auth_params": {"key": "key"},
+        },
+        SL,
+    ),
+    (
+        "f-hdr",
+        {
+            "name": "SL",
+            "access_provider": "trafiklab",
+            "auth_method": "header",
+            "auth_params": {"X-Key": "key"},
+        },
+        SL,
+    ),
+    (
+        "f-acme",
+        {
+            "access_provider": "acme-transit",
+            "auth_method": "basic_auth",
+            "auth_params": {},
+            "registration_url": "https://acme.example/join",
+        },
+        "f-acme needs credentials from Acme Transit. Register at "
+        'https://acme.example/join. Then run transitio.credentials.set("acme-transit"'
+        ', {"username": "...", "password": "..."}) or set '
+        "TRANSITIO_KEY_ACME_TRANSIT__USERNAME, TRANSITIO_KEY_ACME_TRANSIT__PASSWORD.",
+    ),
+    (
+        "f-odd",
+        {"name": "SL", "access_provider": "trafiklab", "auth_method": "unsupported"},
+        SL + " transitio cannot send these credentials itself in this version; "
+        "download the feed by hand.",
+    ),
+    (
+        "f-new",
+        {"registration_url": "https://catalog.example/join"},
+        "f-new needs credentials; the index has no access details for it yet. "
+        "Register at https://catalog.example/join.",
+    ),
+]
+
+
+def test_a_schema_11_index_carries_feed_access_and_place_centres(tmp_path, monkeypatch):
+    import shapely
+
+    monkeypatch.setattr(transitio, "__version__", reader.MIN_READER_VERSIONS[11])
+    feeds, edges = list(FEEDS), list(EDGES)
+    for feed_id, columns, _ in ACCESS_CASES:
+        url = f"https://{feed_id}.example/gtfs.zip"
+        feeds.append(
+            {
+                **covered_feed(feed_id),
+                "home_country": "FI",
+                "download_url": url,
+                "access": "key",
+                **columns,
+            }
+        )
+        edges.append(edge("hel", feed_id, tier="local", relevance_category="primary"))
+    centre = shapely.Point(24.94, 60.17)
+    places = [place("hel", "city", name="Helsinki", centre=centre.wkb_hex), *PLACES[1:]]
+    directory = write_partitioned_index(
+        tmp_path / "index",
+        feeds=feeds,
+        places=places,
+        edges=edges,
+        access={"providers": PROVIDERS},
+    )
+    index = reader.read_index(directory)
+    assert index.schema_version == 11
+    assert index.snapshot["min_reader_version"] == "0.19.0"
+    # Places carry their centre when the index has one.
+    helsinki = reader.place("hel", index=index)
+    assert isinstance(helsinki.centre, shapely.Point) and helsinki.centre == centre
+    assert reader.place("tku", index=index).centre is None
+    assert reader.Place({"centre": centre.wkb}, None).centre == centre
+    # The providers, and each feed's access details and instructions.
+    trafiklab = index.access_provider("trafiklab")
+    assert trafiklab.credential_fields == ("key",) and trafiklab.free is True
+    acme = index.access_provider("acme-transit")
+    assert acme.free is None and acme.docs_url is None
+    assert list(acme.env_names) == ["username", "password"]
+    assert index.access_provider("missing") is None
+    served = {f.feed_id: f for f in helsinki.feeds(categories=None)}
+    for feed_id, columns, expected in ACCESS_CASES:
+        feed = served[feed_id]
+        assert feed.access == columns.get("access", "key"), feed_id
+        assert feed.access_provider == columns.get("access_provider"), feed_id
+        assert feed.auth_method == columns.get("auth_method"), feed_id
+        assert feed.auth_params == columns.get("auth_params"), feed_id
+        assert feed.registration_url == columns.get("registration_url"), feed_id
+        assert feed.download_url == feed.access_url, feed_id
+        assert feed.access_url == f"https://{feed_id}.example/gtfs.zip", feed_id
+        assert feed.access_instructions() == expected, feed_id
+    # A country load reads the root table too; the release carries it.
+    assert reader.read_index(directory, country="FI").access_provider("trafiklab")
+    snapshot = json.loads((directory / "snapshot.json").read_text())
+    assert contract.members(snapshot)[:2] == [
+        "snapshot.json",
+        "access_providers.parquet",
+    ]
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    _refresh._unpack(pack(directory)[contract.archive_name(SNAPSHOT_ID)], staging)
+    assert _refresh._whole_members(staging)
+    assert len(reader.read_index(staging).access_providers) == 2
+    # The table must be declared and match its digest.
+    snapshot_path = directory / "snapshot.json"
+    original = snapshot_path.read_text()
+    del snapshot["access_providers_sha256"]
+    snapshot_path.write_text(json.dumps(snapshot))
+    with pytest.raises(IncompatibleIndexError, match="no access_providers_sha256"):
+        reader.read_index(directory)
+    snapshot_path.write_text(original)
+    (directory / "access_providers.parquet").write_bytes(b"other bytes")
+    with pytest.raises(IncompatibleIndexError, match="does not match"):
+        reader.read_index(directory)
+    # A column of another type, an over-large table, a centre not a point.
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    table = pa.table({"provider_id": ["p"], "credential_fields": ["key"]})
+    pq.write_table(table, directory / "access_providers.parquet")
+    snapshot["access_providers_sha256"] = hashlib.sha256(
+        (directory / "access_providers.parquet").read_bytes()
+    ).hexdigest()
+    snapshot_path.write_text(json.dumps(snapshot))
+    with pytest.raises(IncompatibleIndexError, match="'credential_fields' is string"):
+        reader.read_index(directory)
+    monkeypatch.setattr(reader, "_MAX_ACCESS_PROVIDERS_BYTES", 4)
+    with pytest.raises(IncompatibleIndexError, match="over the 4-byte ceiling"):
+        reader.read_index(directory)
+    box = shapely.box(24.9, 60.1, 25.1, 60.3).wkb_hex
+    with pytest.raises(IncompatibleIndexError, match="centre is not a Point"):
+        reader.read_index(
+            write_partitioned_index(
+                tmp_path / "boxed",
+                feeds=FEEDS,
+                places=[place("hel", "city", centre=box), *PLACES[1:]],
+                edges=EDGES,
+                access={"providers": []},
+            )
+        )
 
 
 def test_a_schema_9_index_carries_the_feed_spans_and_place_validity(tmp_path):

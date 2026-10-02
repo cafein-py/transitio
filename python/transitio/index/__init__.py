@@ -26,10 +26,16 @@ import stat
 from pathlib import Path
 
 from transitio.exceptions import IncompatibleIndexError, PlaceNotFoundError
-from transitio.index.feeds import IndexedFeed, Selector
+from transitio.index.feeds import (
+    AccessProvider,
+    IndexedFeed,
+    Selector,
+    _access_provider,
+)
 from transitio.index.places import Delineation, Place, Suggestion, _PlaceLookup
 
 __all__ = [
+    "AccessProvider",
     "Delineation",
     "Index",
     "IndexedFeed",
@@ -53,7 +59,7 @@ __all__ = [
 
 # The index schema versions this reader understands. A snapshot outside the set
 # is refused rather than read against columns that may have moved.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({4, 5, 6, 7, 8, 9, 10})
+SUPPORTED_SCHEMA_VERSIONS = frozenset({4, 5, 6, 7, 8, 9, 10, 11})
 
 # The oldest transitio that reads each schema version: what a snapshot records
 # as its reader floor, fixed per schema rather than taken from the build.
@@ -61,7 +67,8 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset({4, 5, 6, 7, 8, 9, 10})
 # their own id, with the QID beside it; all three ship first in 0.11.0.
 # Schema 7 (partitions), 8 (the GTFS-RT companion table) and 9 (feed service
 # spans and place validity) ship together; schema 10 (the feeds a feed
-# lies within) first in 0.15.0.
+# lies within) first in 0.15.0; schema 11 (feed access details and place
+# centres) first in 0.19.0.
 MIN_READER_VERSIONS = {
     4: "0.11.0",
     5: "0.11.0",
@@ -70,6 +77,7 @@ MIN_READER_VERSIONS = {
     8: "0.12.0",
     9: "0.12.0",
     10: "0.15.0",
+    11: "0.19.0",
 }
 
 # Bumped whenever name resolution, ranking or filtering changes: the snapshot
@@ -82,6 +90,8 @@ REALTIME_FILE = "realtime.parquet"
 PLACES_FILE = "places.parquet"
 EDGES_FILE = "edges.parquet"
 SNAPSHOT_FILE = "snapshot.json"
+# Schema 11 adds the providers of feed credentials, one table at the root.
+ACCESS_PROVIDERS_FILE = "access_providers.parquet"
 # Schema 7 is a directory of partitions: one per country code (its feeds by
 # home country, its places, their domestic edges), ``international`` (the
 # feeds without a home country) and ``links`` (every cross-border edge, with
@@ -113,6 +123,7 @@ _MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 _MAX_FEEDS_BYTES = 512 * 1024 * 1024
 _MAX_PLACES_BYTES = 512 * 1024 * 1024
 _MAX_EDGES_BYTES = 512 * 1024 * 1024
+_MAX_ACCESS_PROVIDERS_BYTES = 8 * 1024 * 1024
 
 # The columns a schema_version 4 feeds table carries. A correctly-hashed but
 # structurally wrong Parquet is refused against this rather than misread later.
@@ -166,6 +177,26 @@ _FEEDS_COLUMNS[8] = (_FEEDS_COLUMNS[7] - {"gbfs"}) | {"realtime_feed_ids"}
 _FEEDS_COLUMNS[9] = _FEEDS_COLUMNS[8] | {"service_start", "service_end"}
 # Schema 10: the larger feeds whose stops and routes contain the feed's.
 _FEEDS_COLUMNS[10] = _FEEDS_COLUMNS[9] | {"contained_in"}
+# Schema 11: the URL the build crawls and how to get the feed's credentials.
+_FEEDS_COLUMNS[11] = _FEEDS_COLUMNS[10] | {
+    "download_url",
+    "access",
+    "access_provider",
+    "auth_method",
+    "auth_params",
+    "registration_url",
+}
+_ACCESS_PROVIDERS_COLUMNS = frozenset(
+    {
+        "provider_id",
+        "name",
+        "registration_url",
+        "docs_url",
+        "terms_url",
+        "credential_fields",
+        "free",
+    }
+)
 _REALTIME_COLUMNS = frozenset(
     {
         "feed_id",
@@ -250,6 +281,8 @@ _PLACES_COLUMNS[8] = _PLACES_COLUMNS[6]
 # Schema 9: the validity of the place's feeds and their overlap.
 _PLACES_COLUMNS[9] = _PLACES_COLUMNS[6] | {"validity"}
 _PLACES_COLUMNS[10] = _PLACES_COLUMNS[9]
+# Schema 11: the place's centre point.
+_PLACES_COLUMNS[11] = _PLACES_COLUMNS[10] | {"centre"}
 # Schema 7 edges carry the rank stage's relevance; the links table also names
 # the partition holding each edge's feed.
 _RELEVANCE_COLUMNS = frozenset({"relevance_category", "relevance", "cross_border"})
@@ -260,7 +293,18 @@ _EDGES_COLUMNS_BY_VERSION[7] = _EDGES_COLUMNS | _RELEVANCE_COLUMNS
 _EDGES_COLUMNS_BY_VERSION[8] = _EDGES_COLUMNS_BY_VERSION[7]
 _EDGES_COLUMNS_BY_VERSION[9] = _EDGES_COLUMNS_BY_VERSION[7]
 _EDGES_COLUMNS_BY_VERSION[10] = _EDGES_COLUMNS_BY_VERSION[7]
+_EDGES_COLUMNS_BY_VERSION[11] = _EDGES_COLUMNS_BY_VERSION[7]
 _LINKS_COLUMNS = _EDGES_COLUMNS_BY_VERSION[7] | {"feed_partition"}
+# The Arrow types of the columns schema 11 adds; an all-null column passes.
+_SCHEMA_11_TYPES = {
+    "feeds": dict.fromkeys(_FEEDS_COLUMNS[11] - _FEEDS_COLUMNS[10], "string"),
+    "places": {"centre": "binary"},
+    "access_providers": {
+        **dict.fromkeys(_ACCESS_PROVIDERS_COLUMNS, "string"),
+        "credential_fields": "list of strings",
+        "free": "bool",
+    },
+}
 
 
 # What a table may declare before it is materialised: the on-disk ceiling
@@ -282,7 +326,8 @@ def _load_table(read, data, path, table):
     import pyarrow.parquet
 
     try:
-        metadata = pyarrow.parquet.ParquetFile(io.BytesIO(data)).metadata
+        parquet = pyarrow.parquet.ParquetFile(io.BytesIO(data))
+        metadata = parquet.metadata
         declared = sum(
             metadata.row_group(i).total_byte_size
             for i in range(metadata.num_row_groups)
@@ -299,10 +344,50 @@ def _load_table(read, data, path, table):
             f"({metadata.num_rows} rows, {metadata.num_row_groups} row groups, "
             f"{declared} uncompressed bytes)"
         )
+    _check_types(parquet.schema_arrow, path, table)
     try:
         return read(io.BytesIO(data))
     except Exception as error:
         raise IncompatibleIndexError(f"{path}: not a readable {table} table ({error})")
+
+
+def _check_types(schema, path, table):
+    """Refuse a schema-11 column stored as another Arrow type."""
+    import pyarrow as pa
+
+    accepts = {
+        "string": (pa.types.is_string, pa.types.is_large_string),
+        "binary": (pa.types.is_binary, pa.types.is_large_binary),
+        "bool": (pa.types.is_boolean,),
+        "list of strings": (pa.types.is_list, pa.types.is_large_list),
+    }
+    for name, expected in _SCHEMA_11_TYPES.get(table, {}).items():
+        index = schema.get_field_index(name)  # -1 when absent or repeated
+        found = None if index < 0 else schema.field(index).type
+        if found is None or pa.types.is_null(found):
+            continue
+        valid = any(test(found) for test in accepts[expected])
+        if valid and expected == "list of strings":
+            valid = any(test(found.value_type) for test in accepts["string"])
+        if not valid:
+            raise IncompatibleIndexError(
+                f"{path}: {table} column {name!r} is {found}, not {expected}"
+            )
+
+
+def _check_centres(places, path):
+    """Refuse a schema-11 place centre that is not a WKB Point."""
+    import geopandas
+
+    centres = places["centre"]
+    try:
+        if centres.dtype.name != "geometry":
+            centres = geopandas.GeoSeries.from_wkb(centres)
+    except Exception as error:
+        raise IncompatibleIndexError(f"{path}: a place centre is not WKB ({error})")
+    kinds = geopandas.GeoSeries(centres).geom_type
+    if (kinds.notna() & (kinds != "Point")).any():
+        raise IncompatibleIndexError(f"{path}: a place centre is not a Point")
 
 
 def _check_columns(frame, expected, path, version, table):
@@ -383,7 +468,9 @@ class Index:
     read for one ``country`` it holds that partition alone. ``links`` is the
     cross-border edge table (with ``feed_partition``), None before schema 7.
     ``realtime`` is the GTFS-RT companion table of schema 8 (the whole
-    index's, or the country's), None before it.
+    index's, or the country's), None before it. ``access_providers`` is the
+    schema-11 table of the providers that issue feed credentials, None
+    before it.
     """
 
     def __init__(
@@ -397,6 +484,7 @@ class Index:
         country=None,
         path=None,
         realtime=None,
+        access_providers=None,
     ):
         self.snapshot = snapshot
         self.feeds = feeds
@@ -404,9 +492,11 @@ class Index:
         self.edges = edges
         self.links = links
         self.realtime = realtime
+        self.access_providers = access_providers
         self.country = country
         self._path = None if path is None else Path(path)
         self._partition_tables = {}
+        self._providers = None
 
     @property
     def partitions(self):
@@ -461,6 +551,19 @@ class Index:
         known = set() if feeds is None else set(feeds["feed_id"])
         static = table["static_feed_id"]
         return table[static.isna() | ~static.isin(known)].reset_index(drop=True)
+
+    def access_provider(self, provider_id):
+        """The :class:`AccessProvider` with this id, or None when the index
+        has none of that id or predates schema 11."""
+        if self.access_providers is None:
+            return None
+        if self._providers is None:
+            providers = {}
+            for record in self.access_providers.to_dict("records"):
+                provider = _access_provider(record)
+                providers.setdefault(provider.provider_id, provider)
+            self._providers = providers
+        return self._providers.get(provider_id)
 
     @property
     def snapshot_id(self):
@@ -575,60 +678,79 @@ def _read_manifest(path):
     return snapshot
 
 
-def _read_places(path, snapshot, version):
-    """The places GeoDataFrame, or None when the index carries no places.
+def _read_root_table(path, snapshot, file, limit, table):
+    """The table ``file`` at the snapshot root, or None when the manifest
+    declares no ``<table>_sha256`` for it.
 
-    Read only when the manifest declares a ``places_sha256``; the Parquet is then
-    a size-bounded regular file, its bytes checked against that digest, and its
-    columns against the schema before it is returned.
+    The Parquet is then a size-bounded regular file whose bytes must match
+    that digest; places are read as a GeoDataFrame, any other table as a
+    DataFrame.
     """
-    expected = snapshot.get("places_sha256")
+    key = f"{table}_sha256"
+    expected = snapshot.get(key)
     if expected is None:
         return None
     if not isinstance(expected, str):
-        raise IncompatibleIndexError(
-            f"{path / SNAPSHOT_FILE}: places_sha256 is not a string"
-        )
-    import geopandas
+        raise IncompatibleIndexError(f"{path / SNAPSHOT_FILE}: {key} is not a string")
+    if table == "places":
+        from geopandas import read_parquet
+    else:
+        from pandas import read_parquet
 
-    data = _read_regular(path / PLACES_FILE, _MAX_PLACES_BYTES)
+    data = _read_regular(path / file, limit)
     if hashlib.sha256(data).hexdigest() != expected:
         raise IncompatibleIndexError(
-            f"{path / PLACES_FILE}: does not match the snapshot's places_sha256"
+            f"{path / file}: does not match the snapshot's {key}"
         )
-    places = _load_table(geopandas.read_parquet, data, path / PLACES_FILE, "places")
-    _check_columns(
-        places, _PLACES_COLUMNS[version], path / PLACES_FILE, version, "places"
-    )
-    _check_snapshot_column(places, snapshot, path / PLACES_FILE, "places")
+    return _load_table(read_parquet, data, path / file, table)
+
+
+def _read_places(path, snapshot, version):
+    """The places GeoDataFrame, or None when the index carries no places;
+    its columns checked against the schema before it is returned."""
+    places = _read_root_table(path, snapshot, PLACES_FILE, _MAX_PLACES_BYTES, "places")
+    if places is not None:
+        _check_columns(
+            places, _PLACES_COLUMNS[version], path / PLACES_FILE, version, "places"
+        )
+        _check_snapshot_column(places, snapshot, path / PLACES_FILE, "places")
     return places
 
 
 def _read_edges(path, snapshot, version):
-    """The edges DataFrame, or None when the index carries no edges.
-
-    Read only when the manifest declares an ``edges_sha256``; the Parquet is then
-    a size-bounded regular file, its bytes checked against that digest, and its
-    columns against the schema before it is returned.
-    """
-    expected = snapshot.get("edges_sha256")
-    if expected is None:
-        return None
-    if not isinstance(expected, str):
-        raise IncompatibleIndexError(
-            f"{path / SNAPSHOT_FILE}: edges_sha256 is not a string"
-        )
-    import pandas
-
-    data = _read_regular(path / EDGES_FILE, _MAX_EDGES_BYTES)
-    if hashlib.sha256(data).hexdigest() != expected:
-        raise IncompatibleIndexError(
-            f"{path / EDGES_FILE}: does not match the snapshot's edges_sha256"
-        )
-    edges = _load_table(pandas.read_parquet, data, path / EDGES_FILE, "edges")
-    _check_columns(edges, _EDGES_COLUMNS, path / EDGES_FILE, version, "edges")
-    _check_snapshot_column(edges, snapshot, path / EDGES_FILE, "edges")
+    """The edges DataFrame, or None when the index carries no edges; its
+    columns checked against the schema before it is returned."""
+    edges = _read_root_table(path, snapshot, EDGES_FILE, _MAX_EDGES_BYTES, "edges")
+    if edges is not None:
+        _check_columns(edges, _EDGES_COLUMNS, path / EDGES_FILE, version, "edges")
+        _check_snapshot_column(edges, snapshot, path / EDGES_FILE, "edges")
     return edges
+
+
+def _read_access_providers(path, snapshot, version):
+    """The schema-11 table of credential providers, which the manifest must
+    declare; None before schema 11."""
+    if version < 11:
+        return None
+    providers = _read_root_table(
+        path,
+        snapshot,
+        ACCESS_PROVIDERS_FILE,
+        _MAX_ACCESS_PROVIDERS_BYTES,
+        "access_providers",
+    )
+    if providers is None:
+        raise IncompatibleIndexError(
+            f"{path / SNAPSHOT_FILE}: manifest declares no access_providers_sha256"
+        )
+    _check_columns(
+        providers,
+        _ACCESS_PROVIDERS_COLUMNS,
+        path / ACCESS_PROVIDERS_FILE,
+        version,
+        "access_providers",
+    )
+    return providers
 
 
 def _partitions(snapshot, path):
@@ -720,6 +842,8 @@ def _read_partition_table(path, snapshot, partition, table):
 
         frame = _load_table(geopandas.read_parquet, data, file, table)
         columns = _PLACES_COLUMNS[version]
+        if version >= 11 and "centre" in frame.columns:
+            _check_centres(frame, file)
     else:
         frame = _load_table(pandas.read_parquet, data, file, table)
         if table == "feeds":
@@ -804,6 +928,7 @@ def _read_partitioned(path, snapshot, version, country):
         country=country,
         path=path,
         realtime=realtime,
+        access_providers=_read_access_providers(path, snapshot, version),
     )
 
 

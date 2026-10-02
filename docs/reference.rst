@@ -56,6 +56,7 @@ The index lists the feeds serving each place, by tier. ``place``, ``places``,
    Place.members
    Place.service
    Place.validity
+   Place.centre
    Place.wikidata_id
    Place.concordances
    Place.former_ids
@@ -74,6 +75,8 @@ The index lists the feeds serving each place, by tier. ``place``, ``places``,
    IndexedFeed.redistribution_allowed
    IndexedFeed.provenance
    IndexedFeed.snapshot
+   IndexedFeed.access_instructions
+   AccessProvider
    Delineation
    Suggestion
    Selector
@@ -83,6 +86,7 @@ The index lists the feeds serving each place, by tier. ``place``, ``places``,
    Index.realtime_in
    Index.realtime_unlinked
    Index.discovery_semantics_version
+   Index.access_provider
 
 .. currentmodule:: transitio
 
