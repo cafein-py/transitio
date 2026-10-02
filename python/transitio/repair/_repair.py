@@ -17,8 +17,8 @@ def repair_feed(path, output, **options):
     with the same attributes from the passenger's perspective; semantically
     ambiguous data is dropped, never reconstructed. Calling this function
     is the opt-in — ``validate_feed`` never modifies anything. Header names
-    and values are written without surrounding whitespace, as
-    ``validate_feed`` reads them.
+    and values are written without surrounding whitespace and with bytes
+    that are not UTF-8 as U+FFFD, as ``validate_feed`` reads them.
 
     Parameters
     ----------

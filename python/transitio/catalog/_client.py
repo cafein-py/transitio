@@ -62,6 +62,21 @@ def _write_provenance(path, data):
         handle.write(body)
 
 
+def _download_recorded(http, url, path, record, **options):
+    """Download ``url`` to ``path`` (:func:`transitio._http.download` with
+    ``options``) beside a provenance sidecar: ``record`` with the source URL,
+    the SHA-256 and the retrieval time. Returns ``path``."""
+    digest = _http.download(http, url, path, **options)
+    provenance = {
+        **record,
+        "source_url": url,
+        "sha256": digest,
+        "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    _write_provenance(path.with_suffix(".provenance.json"), provenance)
+    return path
+
+
 class MobilityDatabase:
     """Synchronous client for the Mobility Database catalog API.
 
@@ -437,15 +452,9 @@ class MobilityDatabase:
             else self._cache_dir / "gtfs" / _safe_id(feed.id)
         )
         path = target_dir / "latest.zip"
-        digest = _http.download(self._http, feed.latest_dataset_url, path)
-        provenance = {
-            "feed_id": feed.id,
-            "source_url": feed.latest_dataset_url,
-            "sha256": digest,
-            "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        }
-        _write_provenance(path.with_suffix(".provenance.json"), provenance)
-        return path
+        return _download_recorded(
+            self._http, feed.latest_dataset_url, path, {"feed_id": feed.id}
+        )
 
     def validation_report(self, dataset):
         """Fetch the hosted canonical-validator JSON report for a dataset.

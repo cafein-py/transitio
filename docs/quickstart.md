@@ -83,6 +83,13 @@ always delivers it whole, `"drop"` skips it and `"error"` raises
 `StaleSelectorError`. National feeds, such as Germany's, are streamed
 through the crop, so they fit in memory bounded by the area.
 
+Some feeds need a free account with their provider. `fetch` sends their
+credentials when they are set, with `transitio.credentials.set`, an
+environment variable or `credentials={"<provider>": {"<field>": "..."}}`,
+and otherwise skips the feed with a reason such as `"protected feed:
+credentials missing for trafiklab"`, followed by the feed's
+`access_instructions()`: who issues the credentials and where to register.
+
 `merge_feeds` writes one feed from the cropped ones. With `check=False` it
 keeps the file when the validator reports ERROR notices; the returned
 report lists them.
@@ -210,6 +217,16 @@ Where a place carries a name as its name or in English, a place carrying it
 only in another of its own languages does not compete either, unless known
 far more widely: "Bergen", Dutch for Mons in Belgium, is no rival to the
 towns named Bergen.
+Before any of these, in an index recording populations (schema 11), a city of
+at least 200,000 people carrying a name as its name or in English wins when it
+has more than twice the population of every other place of that name recording
+one, whatever their feeds or labels: "Lima" is Lima, Peru, not Lima, Ohio,
+while "Meksyk", which Mexico City carries only in Polish, still stays
+ambiguous. It does not where a region or country of the name contains no city
+of the name ("Victoria": the city in British Columbia and the Australian
+state), or where a city of the name without a recorded population is known at
+least as widely, as San Jose, California, a city of the San Francisco urban
+centre, is.
 Other places sharing a name
 are decided by the sole exact match or a clear lead in feeds. Feed counts
 reflect how well each country's feeds are catalogued, so a lead in feeds does
@@ -218,7 +235,7 @@ more languages. Where feeds do not decide, a place of the name recorded in far
 more languages than every other, at home or abroad, wins: "Moscow" is Moscow,
 Russia, however many more feeds Moscow, Idaho, has, and "Cali, Colombia" is
 the city rather than a lesser-known place there. Where nothing decides, as
-for London in the UK and in Canada, or New York City and New York State,
+for Springfield or Victoria,
 `place` raises `AmbiguousPlaceError`. Only a full name resolves: a partial
 one such as `"Augs"` raises `PlaceNotFoundError`, whose `candidates` hold the
 places it partly matches, and `suggest` completes it. A qualifier after a

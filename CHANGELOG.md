@@ -14,14 +14,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `access_url`, `registration_url`, `download_url` and
   `access_instructions()`), the
   index lists the access providers (`Index.access_provider(provider_id)`), and a
-  place carries its centre (`Place.centre`, a point or None). Schema-10
-  indexes read as before; a schema-11 index needs transitio 0.19.0.
+  place carries its centre (`Place.centre`, a point or None) and its
+  population (`Place.population`, an int or None). Schema-10 indexes read
+  as before; a schema-11 index needs transitio 0.19.0.
 - `transitio.credentials` stores the credentials a key-protected feed
   needs, per access provider: `set`, `get`, `clear` and `configured`,
   read from `TRANSITIO_KEY_<PROVIDER>__<FIELD>` environment variables or
   a TOML file readable by the user alone. The file store is POSIX-only: on
   Windows `set` and `clear` raise `NotImplementedError` and only the
-  environment variables are read. `fetch` does not use them yet.
+  environment variables are read.
+- `fetch(place=...)` downloads key-protected feeds with their provider's
+  credentials, from `transitio.credentials` or
+  `credentials={"<provider>": {"<field>": "..."}}`. It sends them only to
+  the origin of the feed's access URL and keeps them out of the reasons,
+  paths, sidecars, reports and `httpx` log records it writes. A protected
+  feed without credentials is skipped with a reason followed by its
+  `access_instructions()`. On a schema-11 index a feed is downloaded from
+  its `download_url` first and the Mobility Database's hosted copy second.
 
 ### Changed
 
@@ -40,6 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Where feeds do not decide, the place far better known by its
     recorded labels wins: "Moscow", "Delhi" and "Cairo" resolve instead
     of staying ambiguous.
+  - In an index recording populations, a city of at least 200,000 people
+    with more than twice the population of every other place of its name
+    wins that name: "Lima" is Lima, Peru, not Lima, Ohio.
+  - A record inside a far better-known city of the same name is set aside
+    as that city's namesake: "Valencia" gave Valencia, Venezuela, because
+    Valencia, Spain, contains a comarca of its name.
 - `merge_feeds(check=True)` no longer refuses when an input's validation
   reached only a warning-severity cap, such as the block-overlap pair
   check's; the refusal names the validation, the file and the budget.
@@ -56,6 +71,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the extracts must cover; the pipeline passes the delivered stops.
   Zermatt downloaded the 2.3 GB Alps extract and London all of England.
   Requires pyrosm 0.15.0.
+- Rows holding U+FFFD, the replacement for an invalid character, are kept
+  with one `invalid_character` notice per field. The reader skipped them
+  while the crop kept the rows naming them: Istanbul's feed writes one in a
+  stop name and a route name.
 
 ## 0.18.0 — 2026-10-01
 

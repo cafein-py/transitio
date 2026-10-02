@@ -40,7 +40,12 @@ pip install .
   writable by group or others), or set one environment variable per field,
   `TRANSITIO_KEY_<PROVIDER>__<FIELD>` (upper case, `-` as `_`); a variable
   wins over the file. On Windows there is no credentials file and the
-  environment variables are the only store.
+  environment variables are the only store. `fetch(place=...)` sends a
+  feed's credentials to the origin of its access URL alone and keeps them
+  out of the reasons, paths, sidecars and reports it writes and out of the
+  `httpx` log records; a server that echoes one into a response body puts
+  it in the cache, and one echoed into a response header shows in
+  `httpcore` debug logging.
 - **cafein** — needed only for `FetchResult.to_cafein()`.
 
 ## Verifying the installation

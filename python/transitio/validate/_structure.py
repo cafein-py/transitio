@@ -42,7 +42,10 @@ def validate_feed(
     characters ``str.strip()`` removes), so the rules see them trimmed. A
     file that had any carries one ``leading_or_trailing_whitespaces``
     warning naming the first occurrence, with ``trimmedCount`` the number
-    of header names and values trimmed.
+    of header names and values trimmed. Bytes that are not UTF-8 read as
+    U+FFFD, and a row holding U+FFFD is kept with one ``invalid_character``
+    error per such field (sampled past ``max_notices_per_file``, as every
+    row-level notice).
 
     Parameters
     ----------

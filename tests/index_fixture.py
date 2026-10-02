@@ -81,7 +81,7 @@ def edge(place_id, feed_id, **kw):
     }
 
 
-def place(place_id, kind, *, geometry=None, centre=None, **kw):
+def place(place_id, kind, *, geometry=None, centre=None, population=None, **kw):
     return {
         "place_id": place_id,
         "kind": kind,
@@ -101,6 +101,7 @@ def place(place_id, kind, *, geometry=None, centre=None, **kw):
         "geometry": geometry,
         "geometry_source": "overture" if geometry else None,
         "centre": centre,
+        "population": population,
     }
 
 
@@ -297,7 +298,11 @@ def _place_row(
         "concordances": json.dumps({"wikidata": [qid]} if qid else {}, sort_keys=True),
         "former_ids": [],
         **({"validity": _json_block(validity)} if dated else {}),
-        **({"centre": centre} if centred else {}),
+        **(
+            {"centre": centre, "population": record.get("population")}
+            if centred
+            else {}
+        ),
         "geometry": None if geometry is None else bytes.fromhex(geometry),
     }
 
@@ -447,7 +452,7 @@ PLACES_SCHEMA_9 = PLACES_SCHEMA.insert(
     PLACES_SCHEMA.get_field_index("geometry"), pa.field("validity", pa.string())
 )
 # Schema 11: how to get each feed's credentials, the providers issuing them
-# (a table at the root), and each place's centre point.
+# (a table at the root), and each place's centre point and population.
 ACCESS_COLUMNS = (
     "download_url",
     "access",
@@ -463,6 +468,9 @@ for _name in ACCESS_COLUMNS:
     )
 PLACES_SCHEMA_11 = PLACES_SCHEMA_9.insert(
     PLACES_SCHEMA_9.get_field_index("geometry"), pa.field("centre", pa.binary())
+)
+PLACES_SCHEMA_11 = PLACES_SCHEMA_11.insert(
+    PLACES_SCHEMA_11.get_field_index("geometry"), pa.field("population", pa.int64())
 )
 ACCESS_PROVIDERS_SCHEMA = pa.schema(
     [

@@ -57,6 +57,7 @@ The index lists the feeds serving each place, by tier. ``place``, ``places``,
    Place.service
    Place.validity
    Place.centre
+   Place.population
    Place.wikidata_id
    Place.concordances
    Place.former_ids

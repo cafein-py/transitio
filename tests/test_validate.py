@@ -141,7 +141,7 @@ def test_duplicate_zip_entries_are_refused(tmp_path):
     assert "missing_required_file" not in codes(report)
 
 
-def test_undecodable_row_skipped_table_kept(tmp_path):
+def test_undecodable_row_kept(tmp_path):
     path = tmp_path / "feed.zip"
     with zipfile.ZipFile(path, "w") as archive:
         for name, content in MINIMAL.items():
@@ -151,8 +151,13 @@ def test_undecodable_row_skipped_table_kept(tmp_path):
             "stops.txt", b"stop_id,stop_name\ns1,Kamppi\ns2,\xff\xfe\ns3,Steissi\n"
         )
     report = validate_feed(path)
-    assert "invalid_character" in codes(report)
-    assert report["row_counts"]["stops.txt"] == 2
+    [notice] = [n for n in report["notices"] if n["code"] == "invalid_character"]
+    assert notice["context"] == {
+        "filename": "stops.txt",
+        "csvRowNumber": 3,
+        "fieldName": "stop_name",
+    }
+    assert report["row_counts"]["stops.txt"] == 3
 
 
 def test_unknown_and_nested_files(tmp_path):

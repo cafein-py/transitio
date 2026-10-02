@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import dataclasses
-import datetime
 import hashlib
 from pathlib import Path
 
 import platformdirs
 
 from transitio import _http
-from transitio.catalog._client import _write_provenance
+from transitio.catalog._client import _download_recorded
 from transitio.exceptions import DownloadError
 
 # The Atlas ``urls`` key that names a feed's current static GTFS download.
@@ -97,6 +96,8 @@ class TransitlandAtlas:
         self._http = _http.client(
             timeout=timeout, transport=transport, follow_redirects=True
         )
+        # Protected downloads build their own clients over it.
+        self._transport = transport
 
     def close(self):
         """Close the underlying HTTP session."""
@@ -140,14 +141,7 @@ class TransitlandAtlas:
         # Namespaced by the feed even under a caller's directory, so several
         # feeds downloaded into one directory never share ``latest.zip``.
         path = base / _feed_dir(feed.feed_id) / "latest.zip"
-        digest = _http.download(self._http, feed.static_url, path)
-        provenance = {
-            "feed_id": feed.feed_id,
-            "onestop_id": feed.onestop_id,
-            "source": "atlas",
-            "source_url": feed.static_url,
-            "sha256": digest,
-            "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        }
-        _write_provenance(path.with_suffix(".provenance.json"), provenance)
-        return path
+        record = {"feed_id": feed.feed_id, "onestop_id": feed.onestop_id}
+        return _download_recorded(
+            self._http, feed.static_url, path, {**record, "source": "atlas"}
+        )

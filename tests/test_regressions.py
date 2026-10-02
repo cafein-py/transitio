@@ -287,7 +287,14 @@ def test_a_city_is_not_outranked_by_the_places_named_after_it():
     # city's namesake, is set aside. Where no city matches, Istanbul's province
     # stands as the city against its metro; Lagos's Portuguese town keeps the
     # Nigerian state from standing as one, so the Nigerian metro stays a rival.
+    # Valencia's comarca, inside the far better-known city with as many feeds,
+    # is the city's namesake, not the other way round: set against the comarca
+    # alone, Venezuela's better-known Valencia won. Antwerp, inside a same-named
+    # city that is not far better known, still sets that city aside.
     from transitio.exceptions import AmbiguousPlaceError
+
+    def labels(count):
+        return {f"l{n}": f"label {n}" for n in range(count)}
 
     feeds = {
         "c-aug": 30,
@@ -302,6 +309,11 @@ def test_a_city_is_not_outranked_by_the_places_named_after_it():
         "m-lag": 1,
         "r-lag": 1,
         "c-lag": 5,
+        "r-val": 7,
+        "c-val": 7,
+        "c-val-com": 7,
+        "c-ant": 23,
+        "c-ant-in": 23,
     }
     lookup = _lookup(
         [
@@ -323,11 +335,25 @@ def test_a_city_is_not_outranked_by_the_places_named_after_it():
             _place("m-lag", "metro", "Lagos", "NG"),
             _place("r-lag", "region", "Lagos", "NG"),
             _place("c-lag", "city", "Lagos", "PT"),
+            _place("r-val", "region", "Valencia", "ES"),
+            _place(
+                "c-val", "city", "Valencia", "ES", names=labels(170), parent="r-val"
+            ),
+            _place(
+                "c-val-com", "city", "Valencia", "ES", names=labels(48), parent="c-val"
+            ),
+            _place("c-val-ve", "city", "Valencia", "VE", names=labels(100)),
+            _place("c-ant", "city", "Antwerp", "BE", names=labels(59)),
+            _place(
+                "c-ant-in", "city", "Antwerp", "BE", names=labels(170), parent="c-ant"
+            ),
         ],
         feeds,
     )
     assert lookup.resolve("Augsburg").id == "c-aug"
     assert lookup.resolve("Istanbul").id == "r-ist"
+    assert lookup.resolve("Valencia").id == "c-val"
+    assert lookup.resolve("Antwerp").id == "c-ant-in"
     for name in ("London", "New York", "Hamilton", "Lagos"):
         with pytest.raises(AmbiguousPlaceError):
             lookup.resolve(name)
@@ -627,6 +653,129 @@ def test_a_far_better_known_place_wins_where_feeds_do_not_decide(name, rows, exp
     places = [
         _place(pid, kind, name, country, names={f"l{n}": name for n in range(labels)})
         for pid, kind, country, _, labels in rows
+    ]
+    lookup = _lookup(places, {row[0]: row[3] for row in rows})
+    if expected is None:
+        with pytest.raises(AmbiguousPlaceError):
+            lookup.resolve(name)
+    else:
+        assert lookup.resolve(name).id == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "rows", "expected"),
+    [
+        # Each row: the id, kind, country, feeds, labels, population and parent.
+        pytest.param(
+            "Lima",
+            [
+                ("pe", "city", "PE", 0, 90, 200_000, None),
+                ("us", "city", "US", 3, 63, None, None),
+            ],
+            "pe",
+            id="lima",
+        ),
+        pytest.param(
+            "Lima",
+            [
+                ("pe", "city", "PE", 0, 90, 199_999, None),
+                ("us", "city", "US", 3, 63, None, None),
+            ],
+            "us",
+            id="below",
+        ),
+        # Japan's region of the name contains its city, so it is no rival.
+        pytest.param(
+            "Kochi",
+            [
+                ("in", "city", "IN", 0, 125, 5_069_022, None),
+                ("jp", "city", "JP", 10, 100, 216_999, "jp-r"),
+                ("jp-r", "region", "JP", 10, 50, None, None),
+            ],
+            "in",
+            id="kochi",
+        ),
+        # Within twice the population the feed margin decides.
+        pytest.param(
+            "Valencia",
+            [
+                ("ve", "city", "VE", 0, 100, 1_601_249, None),
+                ("es", "city", "ES", 7, 170, 1_404_208, None),
+            ],
+            "es",
+            id="valencia",
+        ),
+        pytest.param(
+            "Istanbul",
+            [
+                ("c", "city", "TR", 0, 139, 14_210_222, "r"),
+                ("r", "region", "TR", 6, 114, None, None),
+                ("m", "metro", "TR", 4, 1, None, None),
+            ],
+            "c",
+            id="istanbul",
+        ),
+        # A state of the name containing no city of it is not compared.
+        pytest.param(
+            "Victoria",
+            [
+                ("ca", "city", "CA", 6, 129, 250_760, None),
+                ("au", "region", "AU", 17, 155, None, None),
+            ],
+            None,
+            id="victoria",
+        ),
+        # Mexico City carries "Meksyk" only as a label in other languages.
+        pytest.param(
+            "Meksyk",
+            [
+                ("mx", "city", "MX", 30, 150, 21_000_000, None),
+                ("pl", "city", "PL", 0, 1, None, None),
+            ],
+            None,
+            id="meksyk",
+        ),
+        # A city without a population, known as widely, keeps the rule out.
+        pytest.param(
+            "San Jose",
+            [
+                ("cr", "city", "CR", 0, 168, 2_272_572, None),
+                ("us", "city", "US", 11, 168, None, None),
+            ],
+            "us",
+            id="san-jose",
+        ),
+        pytest.param(
+            "Medan",
+            [
+                ("id", "city", "ID", 0, 128, 4_350_624, None),
+                ("fr", "city", "FR", 3, 108, None, None),
+            ],
+            "id",
+            id="medan",
+        ),
+    ],
+)
+def test_a_city_far_larger_than_its_namesakes_wins(name, rows, expected):
+    # Lima, Peru, with no feeds and fewer labels than the label rule needs, lost
+    # its name to Lima, Ohio, on feeds; a city of 200,000 people or more with
+    # over twice the population of every other place of the name wins.
+    from transitio.exceptions import AmbiguousPlaceError
+
+    own = {"mx": "Mexico City"}
+    places = [
+        {
+            **_place(
+                pid,
+                kind,
+                own.get(pid, name),
+                country,
+                names={f"l{n}": name for n in range(labels)},
+                parent=parent,
+            ),
+            "population": population,
+        }
+        for pid, kind, country, _, labels, population, parent in rows
     ]
     lookup = _lookup(places, {row[0]: row[3] for row in rows})
     if expected is None:
@@ -1519,6 +1668,56 @@ def test_the_crop_drops_exact_repeats_of_a_trip(tmp_path, repeats, count):
         budgets={},
     )
     assert _dropped_note(report) == f"dropped {count} exact duplicate trips.txt rows"
+
+
+@pytest.mark.parametrize(
+    "replaced, fields",
+    [
+        pytest.param(
+            {
+                "stops.txt": (b"in1,Kamppi", "in1,Kamp\ufffdi".encode()),
+                "routes.txt": (b"r-in,hsl,1", "r-in,hsl,\ufffd1".encode()),
+            },
+            {("stops.txt", "stop_name"), ("routes.txt", "route_short_name")},
+            id="text",
+        ),
+        pytest.param(
+            {
+                "stops.txt": (b"in1,", b"in\xff1,"),
+                "stop_times.txt": (b",in1,", b",in\xff1,"),
+            },
+            {("stops.txt", "stop_id"), ("stop_times.txt", "stop_id")},
+            id="id",
+        ),
+    ],
+)
+def test_rows_holding_an_invalid_character_are_kept(tmp_path, replaced, fields):
+    # Istanbul's feed writes U+FFFD in a stop name and a route name; the
+    # reader skipped both rows, and the crop kept the rows naming them.
+    files = dict(FEED)
+    for name, (old, new) in replaced.items():
+        files[name] = FEED[name].encode().replace(old, new)
+    source = write_zip(tmp_path / "feed.zip", files)
+
+    def check(notices):
+        codes = {n["code"] for n in notices}
+        assert "foreign_key_violation" not in codes
+        found = {
+            (n["context"]["filename"], n["context"]["fieldName"])
+            for n in notices
+            if n["code"] == "invalid_character"
+        }
+        assert found == fields
+
+    check(validate_feed(source)["notices"])
+    output = tmp_path / "cropped.zip"
+    result = crop_feed(source, output, aoi=CITY_BBOX)
+    assert result["dropped_rows"] == []
+    assert result["row_counts"]["stop_times.txt"] == 2
+    stop = replaced["stops.txt"][1].decode(errors="replace")
+    assert stop in read_entry(output, "stops.txt").decode()
+    check(result["remaining_notices"])
+    assert repair_feed(source, tmp_path / "repaired.zip")["fixes"] == []
 
 
 MIDLAND = {

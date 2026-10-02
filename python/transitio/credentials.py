@@ -129,9 +129,7 @@ def _lookup(provider, explicit, stored):
     for field, name in provider.env_names.items():
         env = os.environ.get(name)
         if field in explicit:
-            value = explicit[field]
-            secret = value if isinstance(value, _Secret) else _Secret(value)
-            found[field] = (secret, "explicit")
+            found[field] = (_secret(field, explicit[field]), "explicit")
         elif env:
             found[field] = (_Secret(env), "env")
         elif field in table:
@@ -158,11 +156,47 @@ def _checked(provider, fields):
                 f"{provider.provider_id!r} issues no credential field {field!r}; "
                 f"it issues {issued}"
             )
-        # Text UTF-8 can encode, which is what a TOML file holds.
-        if not isinstance(value, str) or not _QUERY_VALUE.fullmatch(value):
-            raise ValueError(f"credential {field!r} must be a non-empty string")
-        values[field] = _Secret(value)
+        values[field] = _secret(field, value)
     return values
+
+
+def _explicit(credentials):
+    """``(wrapped, problem)`` for a ``credentials=`` mapping, ``{provider_id:
+    {field: value}}``: the mapping with each value as a :class:`_Secret`, or
+    None and the error to raise for a malformed one, returned rather than
+    raised so that no frame a traceback keeps holds the values. The
+    providers and fields are checked against an index later
+    (:func:`_checked`)."""
+    if not isinstance(credentials, Mapping):
+        return None, TypeError("credentials must map provider ids to fields")
+    wrapped = {}
+    for provider_id, fields in credentials.items():
+        if not isinstance(fields, Mapping):
+            message = f"credentials[{provider_id!r}] must map fields to values"
+            return None, TypeError(message)
+        secrets = {}
+        for field, value in fields.items():
+            if not _fits(value):
+                message = f"credential {field!r} must be a non-empty string"
+                return None, ValueError(message)
+            secrets[field] = _secret(field, value)
+        wrapped[provider_id] = secrets
+    return wrapped, None
+
+
+def _fits(value):
+    """Whether ``value`` is a :class:`_Secret` or a non-empty string UTF-8 can
+    encode, which is what a TOML file holds."""
+    return isinstance(value, _Secret) or (
+        isinstance(value, str) and _QUERY_VALUE.fullmatch(value) is not None
+    )
+
+
+def _secret(field, value):
+    """``value`` as a :class:`_Secret` (:func:`_fits`)."""
+    if not _fits(value):
+        raise ValueError(f"credential {field!r} must be a non-empty string")
+    return value if isinstance(value, _Secret) else _Secret(value)
 
 
 def _with_providers(index):

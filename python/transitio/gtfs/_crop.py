@@ -80,14 +80,15 @@ def crop_feed(
     its fare goes whole when that leaves the fare without its route rules,
     its origin-destination rules or one of its contains zones, or when its
     agency goes, so no fare applies more widely than in the source. A fare
-    without rules applies everywhere and stays. Header names and values are written without
-    surrounding whitespace, as ``validate_feed`` reads them; retained
-    trips otherwise keep their times and attributes untouched. A trip
-    naming a route that routes.txt lacks is not retained, and a retained
-    trip's stop_times row naming a stop that stops.txt lacks is left out,
-    the trip keeping its other rows unless fewer than two of its two or
-    more remain; a row the reader skips as malformed counts as missing, and
-    an empty ``route_id`` or ``stop_id`` is kept.
+    without rules applies everywhere and stays. Header names and values
+    are written without surrounding whitespace and with bytes that are not
+    UTF-8 as U+FFFD, as ``validate_feed`` reads them; retained trips
+    otherwise keep their times and attributes untouched. A trip naming a
+    route that routes.txt lacks is not retained, and a retained trip's
+    stop_times row naming a stop that stops.txt lacks is left out, the
+    trip keeping its other rows unless fewer than two of its two or more
+    remain; a row the reader skips as malformed counts as missing, and an
+    empty ``route_id`` or ``stop_id`` is kept.
     A routes.txt or stops.txt without its id column refuses the crop with
     an ``OSError``. An exact repeat of a retained trips.txt row (every
     value equal once trimmed) is left out; a repeated ``trip_id`` with any

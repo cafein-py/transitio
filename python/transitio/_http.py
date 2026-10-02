@@ -64,7 +64,7 @@ def sha256_stream(handle):
     return digest.hexdigest()
 
 
-def download(client, url, path):
+def download(client, url, path, *, access=None, transport=None):
     """Stream ``url`` to ``path`` with ``client``; return the SHA-256 hex.
 
     The body goes to a unique partial file beside ``path``, which replaces
@@ -78,12 +78,27 @@ def download(client, url, path):
     adds resumable bytes does not count as failed. A connection that cannot
     be opened and any other status fail at once.
 
+    With ``access`` (a :class:`~transitio.catalog._access._Access` whose URL
+    is ``url``) the download sends its credentials through
+    ``access.session(client, transport)``, which walks the redirects itself;
+    ``transport``, read only then, carries every request and is left open. A
+    failure keeps only the class of an httpx error, its message has every
+    credential masked, and nothing is chained to it.
+
     Raises :class:`~transitio.exceptions.DownloadError` naming ``url`` and
     the last failure.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with replacing(path) as handle:
-        return _fetch(client, url, _Partial(handle))
+    if access is None:
+        with replacing(path) as handle:
+            return _fetch(client, url, _Partial(handle))
+    try:
+        with access.session(client, transport) as session, replacing(path) as handle:
+            return _fetch(session, url, _Partial(handle), access)
+    except DownloadError as error:
+        message = access.redact(str(error))
+    # Raised outside the handler, so nothing is chained to it.
+    raise DownloadError(message)
 
 
 @contextlib.contextmanager
@@ -174,7 +189,7 @@ class _Partial:
         self.added += len(chunk)
 
 
-def _fetch(client, url, partial):
+def _fetch(client, url, partial, access=None):
     """Run a download's requests into ``partial``; return its digest."""
     failures = requests = 0
     while True:
@@ -182,10 +197,10 @@ def _fetch(client, url, partial):
         error = None
         try:
             reason, retry = _request(client, url, partial)
-        except _DROPS as caught:
-            reason, retry, error = f"{type(caught).__name__}: {caught}", True, caught
         except httpx.HTTPError as caught:
-            reason, retry, error = f"{type(caught).__name__}: {caught}", False, caught
+            reason, retry = type(caught).__name__, isinstance(caught, _DROPS)
+            if access is None:
+                reason, error = f"{reason}: {caught}", caught
         if reason is None:
             return partial.digest.hexdigest()
         if partial.pin is None:
