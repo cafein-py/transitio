@@ -139,11 +139,34 @@ def validate_feed(
 
 
 def _unreliable(validation):
-    """Whether a validation saw less than the whole feed."""
-    return bool(validation.get("incomplete")) or any(
-        notice["code"] in ("notice_limit_reached", "too_many_rows")
-        for notice in validation.get("notices", [])
+    """Why a validation may lack error-severity notices, sorted; ``[]`` if none.
+
+    Errors and warnings have separate per-file quotas, so a WARNING-severity
+    ``notice_limit_reached`` drops no error. The block overlap check's pair
+    cap is one too: it limits which trip pairs are checked, and the callers
+    compare feeds whose blocks keep their trips, order and times.
+    """
+    reasons, explained = set(), set()
+    for notice in validation.get("notices", []):
+        context = notice.get("context") or {}
+        if notice["code"] == "too_many_rows":
+            budgets = ["max_rows"]
+        elif notice["code"] == "unreadable_file":
+            budgets = context.get("budgets") or []
+        elif notice["code"] == "notice_limit_reached" and notice["severity"] == "ERROR":
+            budgets = ["max_notices_per_file"]
+        else:
+            continue
+        file = context.get("filename")
+        reasons.update(f"{file} exceeds {budget}" for budget in budgets)
+        if budgets and notice["code"] != "notice_limit_reached":
+            explained.add(file)
+    reasons.update(
+        f"{file} cannot be read whole"
+        for file in validation.get("incomplete", [])
+        if file not in explained
     )
+    return sorted(reasons)
 
 
 def _errors(validation, key=None):

@@ -476,10 +476,12 @@ def test_certification_refuses_a_sampled_validation(monkeypatch):
     from transitio.shapes import _infer
 
     def fake(path, *a, **k):
-        return {
-            "notices": [{"code": "notice_limit_reached", "severity": "WARNING"}],
-            "incomplete": [],
+        capped = {
+            "code": "notice_limit_reached",
+            "severity": "ERROR",
+            "context": {"filename": "stop_times.txt"},
         }
+        return {"notices": [capped], "incomplete": []}
 
     monkeypatch.setattr("transitio.validate.validate_feed", fake)
     with pytest.raises(ShapeInferenceError, match="sampled or truncated"):

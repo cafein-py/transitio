@@ -1006,7 +1006,21 @@ INHERITED = [{"feed": 0, "errors": 1, "codes": {"foreign_key_violation": 1}}]
             {"errors": 1, "codes": {"foreign_key_violation": 1}},
         ),
         (True, "capped", None, INHERITED, {"errors": 0, "codes": {}}),
-        (True, "sampled", "cannot tell", None, None),
+        (
+            True,
+            "sampled",
+            r"input 0 \(f1\) left out .*attributions.txt exceeds max_notices_per_file",
+            None,
+            None,
+        ),
+        (True, "blocked", None, INHERITED, {"errors": 0, "codes": {}}),
+        (
+            True,
+            "blocked-introduced",
+            r"introduced 1 .*\(foreign_key_violation 1\)",
+            INHERITED,
+            {"errors": 1, "codes": {"foreign_key_violation": 1}},
+        ),
     ],
     ids=[
         "inherited",
@@ -1016,6 +1030,8 @@ INHERITED = [{"feed": 0, "errors": 1, "codes": {"foreign_key_violation": 1}}]
         "input-changed-after-read",
         "capped",
         "sampled",
+        "blocked",
+        "blocked-introduced",
     ],
 )
 def test_merge_refuses_only_errors_it_introduced(
@@ -1023,7 +1039,8 @@ def test_merge_refuses_only_errors_it_introduced(
 ):
     # A merge refused every error-severity notice of the merged feed, those
     # its inputs already carried included, so feeds merged clean only when
-    # every input was clean.
+    # every input was clean; and an input whose block reached the overlap
+    # check's pair cap counted as sampled, so its merge was refused.
     from transitio.edit import FeedBuilder
     from transitio.exceptions import InvalidFeedError
     from transitio.gtfs import _merge, merge_feeds
@@ -1043,8 +1060,14 @@ def test_merge_refuses_only_errors_it_introduced(
         "attributions.txt",
         [{"route_id": "gone", "organization_name": "Org", "is_operator": "1"}],
     )
+    if variant in ("blocked", "blocked-introduced"):
+        # 142 trips in one block: 10,011 pairs, over the overlap check's cap.
+        for n in range(142):
+            start = 36_000 + 120 * n
+            stops = [("s1", start, start), ("s2", start + 60, start + 60)]
+            first.add_trip("r1", "wk", f"b{n}", stops, block_id="b")
     second = feed("09:00:00", "09:05:00")
-    if variant in ("dangling-stop", "input-changed-after-read"):
+    if variant in ("dangling-stop", "input-changed-after-read", "blocked-introduced"):
         merge_tables = _merge._merge_tables
 
         def dangling(*args, **kwargs):
@@ -1062,7 +1085,7 @@ def test_merge_refuses_only_errors_it_introduced(
     feeds = [first, second]
     output = tmp_path / "merged.zip"
     budgets = {"reference_date": "20260601"}
-    if variant == "capped":
+    if variant in ("capped", "blocked-introduced"):
         budgets["max_notices_per_file"] = 0
     if refusal is None:
         report = merge_feeds(feeds, output, check=check, **budgets)

@@ -686,10 +686,9 @@ def _gate(report, check, tables, table_sets, prefixes, positions, budgets):
     validations, sources = [report], list(enumerate(table_sets))
     if _structure._unreliable(report):
         validations, sources = [], [("merged", tables), *sources]
+    reasons = []
     with tempfile.TemporaryDirectory(prefix="transitio-merge-") as workdir:
         for name, source in sources:
-            if validations and _structure._unreliable(validations[-1]):
-                break
             builder = FeedBuilder()
             builder.tables = source
             path = pathlib.Path(workdir, f"{name}.zip")
@@ -697,11 +696,24 @@ def _gate(report, check, tables, table_sets, prefixes, positions, budgets):
                 builder.save(path, check=False, change_log=False, **budgets)
             )
             path.unlink()
-    if any(_structure._unreliable(validation) for validation in validations):
+            reasons = _structure._unreliable(validations[-1])
+            if reasons:
+                break
+    if reasons:
         report["inherited_errors"] = report["introduced_errors"] = None
+        subject = (
+            "the merged feed"
+            if name == "merged"
+            else f"input {positions[name]} ({prefixes[name]})"
+        )
+        named = {reason.partition(" exceeds ")[2] for reason in reasons} - {""}
+        advice = "pass check=False"
+        if named:
+            advice = f"raise {'them' if len(named) > 1 else 'it'} or {advice}"
         message = (
-            "cannot tell inherited errors from introduced ones: validation was "
-            "sampled or truncated; raise the budgets or pass check=False"
+            "cannot tell inherited errors from introduced ones: the validation "
+            f"of {subject} left out error-severity notices ({', '.join(reasons)}); "
+            + advice
         )
     else:
         inherited, introduced = _split_errors(validations[0], validations[1:], prefixes)
@@ -781,12 +793,17 @@ def merge_feeds(
         validated only when the written feed has an ERROR-severity notice:
         each as the merge read it, with ``budgets`` and at least 1,000,000
         notices per file, and the merged tables again with those budgets
-        when the written feed's validation was sampled or truncated. Notices
-        compare by code and context, without row numbers and with ids
-        read without their prefix; a notice naming no input's ids counts
-        against the earliest input carrying it. When a validation is still
-        sampled or truncated, inherited notices cannot be told from
-        introduced ones, and ``True`` and ``"strict"`` both raise. Unless
+        when the written feed's validation was sampled or truncated. A
+        validation counts as sampled or truncated when it may have left out
+        an error-severity notice; suppressed warnings and the block overlap
+        check's pair cap do not count, since the merge keeps every block's
+        trips, order and times. Notices compare by code and context,
+        without row numbers and with ids read without their prefix; a
+        notice naming no input's ids counts against the earliest input
+        carrying it. When a validation is still sampled or truncated,
+        inherited notices cannot be told from introduced ones, and ``True``
+        and ``"strict"`` both raise, naming the validation, the file and,
+        when one applies, the budget. Unless
         ``check`` is ``False``, the tables of in-memory inputs are copied
         first, so the merge holds them twice.
     timezones : {"skip", "refuse"}, default "skip"
