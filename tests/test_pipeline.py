@@ -1451,20 +1451,28 @@ _REMOTE = (26.0, 61.0, 26.2, 61.2)
 
 
 @pytest.mark.parametrize(
-    "stops, expected",
+    "stops, expected, inside",
     [
-        pytest.param([[(60.169, 24.931)]], "served", id="one-part"),
-        pytest.param([[(60.169, 24.931)], [(61.1, 26.1)]], "whole", id="both-parts"),
-        pytest.param([[(59.0, 24.0)]], "whole", id="no-part"),
-        pytest.param([], "whole", id="nothing-delivered"),
+        pytest.param([[(60.169, 24.931)]], "served", [(24.931, 60.169)], id="one-part"),
+        pytest.param(
+            [[(60.169, 24.931)], [(61.1, 26.1), (60.169, 24.931)]],
+            "whole",
+            [(24.931, 60.169), (26.1, 61.1)],
+            id="both-parts",
+        ),
+        pytest.param([[(59.0, 24.0)]], "whole", None, id="no-part"),
+        pytest.param([], "whole", None, id="nothing-delivered"),
         # A feed whose stops cannot be read could serve the remote part.
-        pytest.param([[(60.169, 24.931)], None], "whole", id="unreadable-stops"),
+        pytest.param([[(60.169, 24.931)], None], "whole", None, id="unreadable-stops"),
     ],
 )
-def test_osm_parts_are_those_holding_a_delivered_stop(tmp_path, stops, expected):
+def test_osm_parts_are_those_holding_a_delivered_stop(
+    tmp_path, stops, expected, inside
+):
     import shapely
 
-    from transitio.pipeline._fetch import _osm_parts
+    from transitio.osm._fetch import _buffered
+    from transitio.pipeline._fetch import _osm_parts, _osm_stops
 
     geometry = shapely.union_all([shapely.box(*_SERVED), shapely.box(*_REMOTE)])
     feeds = []
@@ -1483,6 +1491,10 @@ def test_osm_parts_are_those_holding_a_delivered_stop(tmp_path, stops, expected)
     assert [None if located[p] is None else located[p].tolist() for p in feeds] == [
         None if coords is None else [[x, y] for y, x in coords] for coords in stops
     ]
+    # What the extract must cover: the located stops inside the grown parts,
+    # each once.
+    must_cover = _osm_stops(_buffered(parts, 1600), located)
+    assert must_cover == (None if inside is None else shapely.multipoints(inside))
 
 
 _PARTS_NOTE = "OSM area: 1 of 2 parts (247 of 487 km²)"
@@ -1543,7 +1555,7 @@ def test_fetch_place_fetches_the_osm_extract_last_for_the_served_parts(
         return download(self, feed, directory=directory)
 
     def recorded_fetch_pbf(aoi, **kwargs):
-        events.append((aoi, kwargs["buffer_m"]))
+        events.append((aoi, kwargs["buffer_m"], kwargs["must_cover"]))
         return fake_pbf
 
     monkeypatch.setattr(
@@ -1555,8 +1567,9 @@ def test_fetch_place_fetches_the_osm_extract_last_for_the_served_parts(
     place_obj._record["geometry"] = shapely.union_all([served, shapely.box(*_REMOTE)])
     result = fetch(place=place_obj, directory=tmp_path / "out", crop=False)
 
-    feed, (aoi, buffer_m) = events
+    feed, (aoi, buffer_m, must_cover) = events
     assert feed == "feed" and aoi.equals(served) and buffer_m == 1600
+    assert must_cover == shapely.multipoints([(24.931, 60.169), (24.941, 60.171)])
     assert result.osm_pbf == fake_pbf
     assert result.osm_area.equals(_buffered(served, 1600))
     *_, note = result.selection

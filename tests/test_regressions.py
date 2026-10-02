@@ -1748,13 +1748,17 @@ def test_an_area_across_a_border_gets_the_smallest_extract_containing_it(
         areas.append(area)
         path = pathlib.Path(directory) / "bbbike_Basel.osm.pbf"
         path.write_bytes(b"\x00pbf")
+        fields = dict(provider="BBBike", extract="Basel", url=url, bytes=100138363)
+        source = types.SimpleNamespace(
+            path=str(path), sha256="0" * 64, snapshot=None, **fields
+        )
         return types.SimpleNamespace(
             path=str(path),
-            provider="BBBike",
-            extract="Basel",
-            url=url,
-            bytes=100138363,
             failed=[],
+            sources=[source],
+            sha256=source.sha256,
+            snapshot=None,
+            **fields,
         )
 
     def get_data_by_bbox(*args, **kwargs):
@@ -1774,20 +1778,84 @@ def test_an_area_across_a_border_gets_the_smallest_extract_containing_it(
     )
 
 
-def _finland_extract(path, update):
+def test_extracts_need_cover_only_the_stops_within_the_buffer(tmp_path, monkeypatch):
+    # A place grown across a border took the one extract containing all of
+    # it (Geofabrik's Alps for Zermatt), though its stops needed far less.
+    import math
+    import pathlib
+
+    import shapely
+
+    from transitio.osm import fetch_pbf
+    from transitio.osm._fetch import _area_km2, _buffered
+
+    calls = []
+
+    def get_data_by_area(area, directory=None, output_path=None, **kwargs):
+        calls.append(kwargs)
+        extract = pathlib.Path(directory) / "geofabrik_finland-latest.osm.pbf"
+        return _finland_extract(extract, False, output_path)
+
+    monkeypatch.setattr("pyrosm.get_data_by_area", get_data_by_area)
+    aoi = shapely.box(7.70, 45.95, 7.80, 46.05)
+    east = 111_320 * math.cos(math.radians(46.0))
+    # Well inside; in the grown margin, 200 m from its edge; 20 km outside.
+    points = [(7.75, 46.0), (7.80 + 1400 / east, 46.0), (7.80 + 20_000 / east, 46.0)]
+    stops = shapely.multipoints(points)
+    path = fetch_pbf(aoi, buffer_m=1600, must_cover=stops, cache_dir=tmp_path)
+    plain = fetch_pbf(aoi, buffer_m=1600, cache_dir=tmp_path)
+
+    call, without = calls
+    assert call["strategy"] == "smallest_total" and without["must_cover"] is None
+    must_cover = call["must_cover"]
+    discs = [_buffered(shapely.Point(point), 1600) for point in points]
+    inner, margin = (_area_km2(must_cover.intersection(disc)) for disc in discs[:2])
+    assert inner == pytest.approx(_area_km2(discs[0]), rel=1e-6)
+    assert 0 < margin < 0.9 * _area_km2(discs[1])
+    assert not must_cover.intersects(discs[2])
+    assert must_cover.equals(
+        _buffered(shapely.multipoints(points[:2]), 1600).intersection(
+            _buffered(aoi, 1600)
+        )
+    )
+    assert path.name != plain.name
+
+
+def _finland_extract(path, update, output_path=None, crop=None):
     """An ``AreaExtract`` stand-in for Geofabrik's Finland extract at ``path``,
-    written as pyrosm would: when missing or on update."""
+    written as pyrosm would: when missing or on update, then cropped to
+    ``output_path`` when given by ``crop(path, output_path)``, by default
+    ``b"crop of "`` and the extract's bytes."""
+    import hashlib
+    import pathlib
     import types
+
+    def crop_of(source, target):
+        target.write_bytes(b"crop of " + source.read_bytes())
 
     if update or not path.exists():
         path.write_bytes(b"\x00new" if update else b"\x00old")
-    return types.SimpleNamespace(
-        path=str(path),
+    written = path
+    if output_path is not None:
+        written = pathlib.Path(output_path)
+        (crop or crop_of)(path, written)
+    fields = dict(
         provider="Geofabrik",
         extract="finland",
         url="https://download.geofabrik.de/europe/finland-latest.osm.pbf",
         bytes=None,
+    )
+    sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    source = types.SimpleNamespace(
+        path=str(path), sha256=sha256, snapshot=None, **fields
+    )
+    return types.SimpleNamespace(
+        path=str(written),
         failed=[],
+        sources=[source],
+        sha256=hashlib.sha256(written.read_bytes()).hexdigest(),
+        snapshot=None,
+        **fields,
     )
 
 
@@ -1798,7 +1866,6 @@ def test_fetches_sharing_a_cache_take_turns(tmp_path, monkeypatch):
     import concurrent.futures
     import hashlib
     import json
-    import pathlib
     import threading
 
     from transitio.osm import fetch_pbf
@@ -1807,22 +1874,17 @@ def test_fetches_sharing_a_cache_take_turns(tmp_path, monkeypatch):
     updates = []
     cropping, release = threading.Event(), threading.Event()
 
-    def get_data_by_area(area, update=False, **kwargs):
+    def slow_crop(source, target):
+        content = source.read_bytes()
+        cropping.set()
+        release.wait(30)
+        target.write_bytes(b"crop of " + content)
+
+    def get_data_by_area(area, update=False, output_path=None, **kwargs):
         updates.append(update)
-        return _finland_extract(extract, update)
-
-    class OSM:
-        def __init__(self, filepath, bounding_box=None):
-            self.filepath = filepath
-
-        def to_pbf(self, output_path=None):
-            source = pathlib.Path(self.filepath).read_bytes()
-            cropping.set()
-            release.wait(30)
-            pathlib.Path(output_path).write_bytes(b"crop of " + source)
+        return _finland_extract(extract, update, output_path, slow_crop)
 
     monkeypatch.setattr("pyrosm.get_data_by_area", get_data_by_area)
-    monkeypatch.setattr("pyrosm.OSM", OSM)
     bbox = (24.6, 60.1, 25.2, 60.4)
     with concurrent.futures.ThreadPoolExecutor(2) as pool:
         try:
@@ -1848,30 +1910,30 @@ def test_fetches_sharing_a_cache_take_turns(tmp_path, monkeypatch):
 def test_a_crop_and_its_sidecar_replace_what_is_at_their_names(tmp_path, monkeypatch):
     # The crop and its sidecar were written straight to their names, so a
     # failed crop left a truncated file that later calls returned as cached,
-    # and a symlink at either name had its target overwritten.
+    # and a symlink at either name had its target overwritten. A failed
+    # update also left the replaced extract's sidecar describing old bytes.
+    import os
     import pathlib
 
     from transitio.osm import fetch_pbf
 
     fail = []
 
-    class OSM:
-        def __init__(self, filepath, bounding_box=None):
-            pass
+    def crop(source, target):
+        target.write_bytes(b"\x00crop")
+        if fail:
+            raise RuntimeError("crop failed")
 
-        def to_pbf(self, output_path=None):
-            pathlib.Path(output_path).write_bytes(b"\x00crop")
-            if fail:
-                raise RuntimeError("crop failed")
+    def get_data_by_area(area, update=False, directory=None, **kwargs):
+        extract = pathlib.Path(directory) / "geofabrik_finland-latest.osm.pbf"
+        return _finland_extract(extract, update, kwargs.get("output_path"), crop)
 
-    monkeypatch.setattr(
-        "pyrosm.get_data_by_area",
-        lambda area, update=False, directory=None, **kwargs: _finland_extract(
-            pathlib.Path(directory) / "geofabrik_finland-latest.osm.pbf", update
-        ),
-    )
-    monkeypatch.setattr("pyrosm.OSM", OSM)
+    monkeypatch.setattr("pyrosm.get_data_by_area", get_data_by_area)
     bbox = (24.6, 60.1, 25.2, 60.4)
+    extract = fetch_pbf(bbox, crop=False, cache_dir=tmp_path)
+    extract_sidecar = extract.with_suffix(".provenance.json")
+    os.utime(extract, (0, 0))
+    os.utime(extract_sidecar, (86400, 86400))
     path = fetch_pbf(bbox, cache_dir=tmp_path)
     names = path, path.with_suffix(".provenance.json")
     for name in names:
@@ -1884,6 +1946,7 @@ def test_a_crop_and_its_sidecar_replace_what_is_at_their_names(tmp_path, monkeyp
     with pytest.raises(RuntimeError, match="crop failed"):
         fetch_pbf(bbox, cache_dir=tmp_path, update=True)
     assert all(name.is_symlink() for name in names)
+    assert not extract_sidecar.exists()
     assert [p for p in path.parent.iterdir() if p.is_dir()] == []
     fail.clear()
     assert fetch_pbf(bbox, cache_dir=tmp_path, update=True) == path

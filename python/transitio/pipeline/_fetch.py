@@ -85,7 +85,8 @@ class FetchResult:
     # its area, or why it was not fetched.
     selection: list = dataclasses.field(default_factory=list)
     # The WGS84 area the OSM extract was fetched for; None without one. A
-    # failed extract download leaves it and osm_pbf None.
+    # failed extract download leaves it and osm_pbf None. On the place path,
+    # its parts farther than 1.6 km from every delivered stop may lack OSM data.
     osm_area: object = None
 
     def __iter__(self):  # convenient (pbf, feeds) unpacking
@@ -1136,7 +1137,9 @@ def fetch(
         after the feeds, for the place's parts that hold a stop of a
         delivered feed (the whole place when none does, nothing was
         delivered or a delivered feed's stops.txt cannot be read), each part
-        grown by 1.6 km, cafein's default snap distance. The crop keeps
+        grown by 1.6 km, cafein's default snap distance. Parts of that area
+        farther than 1.6 km from every delivered stop may lack OSM data, as
+        the extract need only cover the stops' surroundings. The crop keeps
         each trip that serves the area whole, so a delivered feed's stops
         can lie beyond the OSM area and get no footpaths in cafein;
         ``stops_outside_osm`` in ``selection`` counts them. With ``osm=False``
@@ -1508,6 +1511,18 @@ def _stop_coords(path):
     return np.array(list(coords.values()), dtype=float).reshape(-1, 2)
 
 
+def _located_stops(coords):
+    """The located stops of every feed in ``coords`` (:func:`_stop_coords`,
+    by path) as one ``(n, 2)`` array; None when there is no feed or a feed's
+    stops.txt cannot be read."""
+    import numpy as np
+
+    located = list(coords.values())
+    if not located or any(points is None for points in located):
+        return None
+    return np.concatenate(located)
+
+
 def _osm_parts(geometry, feeds):
     """``(parts, coords)``: ``coords`` maps each delivered feed in ``feeds``
     to its located stops (:func:`_stop_coords`), and ``parts`` is what of
@@ -1519,15 +1534,30 @@ def _osm_parts(geometry, feeds):
     import shapely
 
     coords = {path: _stop_coords(path) for path in feeds}
-    located = list(coords.values())
-    if not located or any(points is None for points in located):
+    located = _located_stops(coords)
+    if located is None:
         return geometry, coords
     parts = shapely.get_parts(geometry)
-    points = shapely.points(np.concatenate(located))
+    points = shapely.points(located)
     held = np.unique(shapely.STRtree(parts).query(points, predicate="intersects")[1])
     if len(held) in (0, len(parts)):
         return geometry, coords
     return shapely.union_all(parts[held]), coords
+
+
+def _osm_stops(area, coords):
+    """The located stops in ``coords`` (:func:`_osm_parts`) inside ``area``
+    as a MultiPoint, what the OSM extract must cover; None when nothing was
+    delivered, a feed's stops.txt cannot be read or no stop lies inside."""
+    import numpy as np
+    import shapely
+
+    located = _located_stops(coords)
+    if located is None:
+        return None
+    shapely.prepare(area)
+    inside = np.unique(located[shapely.intersects_xy(area, located)], axis=0)
+    return shapely.multipoints(inside) if len(inside) else None
 
 
 def _hidden_note(place, hidden):
@@ -2022,11 +2052,17 @@ def _fetch_place(
     osm_pbf = osm_area = None
     if osm:
         parts, coords = _osm_parts(geometry, feeds)
+        osm_area = _buffered(parts, _OSM_BUFFER_M)
         osm_pbf, note = _osm_extract(
-            parts, buffer_m=_OSM_BUFFER_M, cache_dir=cache_dir, directory=directory
+            parts,
+            buffer_m=_OSM_BUFFER_M,
+            must_cover=_osm_stops(osm_area, coords),
+            cache_dir=cache_dir,
+            directory=directory,
         )
-        if osm_pbf is not None:
-            osm_area = _buffered(parts, _OSM_BUFFER_M)
+        if osm_pbf is None:
+            osm_area = None
+        else:
             counts = _count_outside(record, osm_area, coords)
             note = _osm_note(geometry, parts, *counts)
         if note is not None:
