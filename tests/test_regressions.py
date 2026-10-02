@@ -594,6 +594,78 @@ def test_kind_metro_picks_one_definition_of_a_metro(name, options, expected):
         assert lookup.resolve(name, **options).id == expected
 
 
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("Copenhagen, Denmark", "r-cph"),
+        # A town qualifies when no region or country does.
+        ("Copenhagen, Town of Denmark", "c-cph"),
+        ("Halifax, Canada", "c-hfx"),
+        # A label in another language answers when the qualified name is
+        # ambiguous or matches nothing.
+        ("Ashington, Anglija", "c-ash-1"),
+        ("Ashington, Anglia", "c-ash-1"),
+        # An alias holding the comma is read as written.
+        ("Andover, USA", "c-and-1"),
+    ],
+)
+def test_a_qualifier_names_a_containing_region_or_country(query, expected):
+    # Any ancestor qualified a name, so a town called Denmark in New York kept
+    # "Copenhagen, Denmark" ambiguous; and a label equal to the whole query in
+    # a language not the place's own (Piedmontese "Halifax (Canadà)" for the
+    # region) skipped the qualifier.
+    lookup = _lookup(
+        [
+            _place("dk", "country", "Denmark", "DK"),
+            _place(
+                "r-cph",
+                "region",
+                "Copenhagen Municipality",
+                "DK",
+                aliases=["Copenhagen"],
+                parent="dk",
+            ),
+            _place("us", "country", "United States", "US", ["USA"]),
+            _place("r-ny", "region", "New York", "US", parent="us"),
+            _place("c-dk", "city", "Denmark", "US", ["Town of Denmark"], parent="r-ny"),
+            _place("c-cph", "city", "Copenhagen", "US", parent="c-dk"),
+            _place("ca", "country", "Canada", "CA"),
+            _place(
+                "r-hfx",
+                "region",
+                "Halifax",
+                "CA",
+                names={"pms": "Halifax (Canadà)"},
+                parent="ca",
+            ),
+            _place("c-hfx", "city", "Halifax", "CA", parent="r-hfx"),
+            _place("r-eng", "region", "England", "GB", names={"lv": "Anglija"}),
+            _place(
+                "c-ash-1",
+                "city",
+                "Ashington",
+                "GB",
+                names={"lt": "Ashington, Anglija", "ro": "Ashington, Anglia"},
+                parent="r-eng",
+            ),
+            _place("c-ash-2", "city", "Ashington", "GB", parent="r-eng"),
+            _place("c-and-1", "city", "Andover", "US", ["Andover, USA"], parent="r-ny"),
+            _place("c-and-2", "city", "Andover", "US", parent="r-ny"),
+        ],
+        {
+            "r-cph": 13,
+            "c-cph": 1,
+            "r-hfx": 3,
+            "c-hfx": 3,
+            "c-ash-1": 1,
+            "c-ash-2": 2,
+            "c-and-1": 1,
+            "c-and-2": 4,
+        },
+    )
+    assert lookup.resolve(query).id == expected
+
+
 def test_padded_header_names_merge_into_one_column(tmp_path):
     # A padded agency.txt header used to reach the merge verbatim, which
     # then wrote both agency_name and " agency_name", and the padded id

@@ -75,7 +75,7 @@ MIN_READER_VERSIONS = {
 # Bumped whenever name resolution, ranking or filtering changes: the snapshot
 # pins the data, this pins how the reader interprets it, and a result that
 # records both (with the transitio version) is reproducible.
-DISCOVERY_SEMANTICS_VERSION = 3
+DISCOVERY_SEMANTICS_VERSION = 4
 
 FEEDS_FILE = "feeds.parquet"
 REALTIME_FILE = "realtime.parquet"
@@ -963,8 +963,13 @@ def place(query, *, kind=None, definition=None, index=None):
     stays ambiguous rather than naming a place in Poland called Meksyk.
     ``kind`` pins the scope. A qualified name, "Name, Qualifier" with one or
     more qualifiers, keeps the places lying within a region or country each
-    qualifier names ("London, Ontario", "City of London, UK"); a label that
-    itself holds a comma still matches as written.
+    qualifier names ("London, Ontario", "City of London, UK"), or within any
+    containing place, such as a town, when that leaves no place of the name:
+    "Copenhagen, Denmark" is in Denmark, not in the town of Denmark, New
+    York. A name or alias that itself holds a comma still matches as
+    written; a label in another language equal to the whole query answers
+    only when the qualified name names no single place (no exact match, or
+    several that nothing decides between).
 
     A metro's definition is its ``subtype``. With ``kind="metro"``, metros
     of the name sharing a member place are one metro under several
@@ -989,7 +994,8 @@ def place(query, *, kind=None, definition=None, index=None):
 
 def places(query, *, index=None):
     """The places matching ``query``, ranked best first; a qualified name
-    lists only the places within its qualifiers, as :func:`place` reads it."""
+    lists only the places within its qualifiers, as :func:`place` first
+    reads it."""
     return _lookup_for(_coerce_index(index)).search(query)
 
 

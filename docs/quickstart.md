@@ -218,8 +218,13 @@ partly matches, and `suggest` completes it. A qualifier after a
 comma names the region or country that holds the place — `"London, Ontario"`,
 `"London, Canada"`, `"City of London, UK"` — and is matched against the names,
 translations and aliases of the place's region and country, so codes such as
-`UK` or `USA` work; a name that itself contains a comma, such as an alias
-`"Queen's Park, Greater London"`, still matches as written. `kind` (`"city"`,
+`UK` or `USA` work. A town or other containing place counts only when no
+region or country holds a place of the name, so `"Copenhagen, Denmark"` is in
+Denmark, not in the town of Denmark, New York. A name that itself contains a
+comma, such as an alias `"Queen's Park, Greater London"`, still matches as
+written; a label in another language equal to the whole query answers only
+when the qualified name names no single place, so `"Halifax, Canada"` is the
+city, not the region labelled "Halifax (Canadà)" in Piedmontese. `kind` (`"city"`,
 `"metro"`, `"region"`, `"country"`) restricts the scope, and a Wikidata id or
 the index's own id picks one place. The metro definitions below each name a
 metro after its core city; with `kind="metro"`, one metro under several

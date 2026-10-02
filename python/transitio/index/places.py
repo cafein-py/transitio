@@ -632,31 +632,55 @@ class _PlaceLookup:
         return scored
 
     def search(self, query, kind=None):
-        return [self.get(place_id) for _, place_id in self._qualified(query, kind)[1]]
+        scored = self._readings(query, kind)[0][1]
+        return [self.get(place_id) for _, place_id in scored]
 
-    def _qualified(self, query, kind, definition=None):
-        """The name the query asks for and its candidates: as written when a
-        label matches it exactly, else, for "Name, Qualifier, ...", the
-        candidates for the name that lie within a place each qualifier names —
-        a region, a country or a country's code ("London, Ontario", "City of
-        London, UK")."""
+    def _readings(self, query, kind, definition=None):
+        """The readings of the query as ``(name, scored)`` pairs, in the order
+        they answer. A query without a qualifier, or one an exact match
+        carries as its own name or an alias, reads as written. Otherwise
+        "Name, Qualifier, ..." reads as the candidates for the name that lie
+        within a place each qualifier names: a containing region or country,
+        or the country its code names ("London, Ontario", "City of London,
+        UK"), or any containing place when that leaves no exact match. A
+        label in another language equal to the whole query answers when the
+        qualified reading has no exact match, and after it when that one
+        cannot decide between several."""
         scored = self._candidates(query, kind, definition)
-        if "," not in query or any(tier == _EXACT for tier, _ in scored):
-            return query, scored
+        norm = _normalize(query)
+        exact = [pid for tier, pid in scored if tier == _EXACT]
+        if "," not in query or any(
+            norm in self._own_names(pid) or self._has_alias(pid, norm) for pid in exact
+        ):
+            return [(query, scored)]
         name, *rest = query.split(",")
         qualifiers = [_normalize(part) for part in rest if _normalize(part)]
         if not _normalize(name) or not qualifiers:
-            return query, scored
-        return name, [
-            (tier, place_id)
-            for tier, place_id in self._candidates(name, kind, definition)
-            if all(self._within(place_id, qualifier) for qualifier in qualifiers)
-        ]
+            return [(query, scored)]
+        candidates = self._candidates(name, kind, definition)
+        for wide in (False, True):
+            within = [
+                (tier, pid)
+                for tier, pid in candidates
+                if all(self._within(pid, qualifier, wide) for qualifier in qualifiers)
+            ]
+            if any(tier == _EXACT for tier, _ in within):
+                break
+        if not exact:
+            return [(name, within)]
+        if all(tier != _EXACT for tier, _ in within):
+            return [(query, scored)]
+        return [(name, within), (query, scored)]
 
-    def _within(self, place_id, qualifier):
-        """Whether a place containing ``place_id`` — an ancestor, or the
-        country its country code names — carries ``qualifier`` as a label."""
-        containing = [place.id for place in self.get(place_id).ancestors]
+    def _within(self, place_id, qualifier, wide):
+        """Whether a place containing ``place_id`` carries ``qualifier`` as a
+        label: an ancestor that is a region or country, or the country its
+        country code names; with ``wide``, any ancestor."""
+        containing = [
+            place.id
+            for place in self.get(place_id).ancestors
+            if wide or place.kind in ("region", "country")
+        ]
         containing += self._countries.get(
             self._records[place_id].get("country_code"), []
         )
@@ -706,7 +730,16 @@ class _PlaceLookup:
             if place is None:
                 raise PlaceNotFoundError(f"no place with id {query!r} in the index")
             return place
-        name, scored = self._qualified(query, kind, definition)
+        first = None
+        for name, scored in self._readings(query, kind, definition):
+            try:
+                return self._answer(query, name, scored, kind, definition)
+            except AmbiguousPlaceError as error:
+                first = first or error
+        raise first
+
+    def _answer(self, query, name, scored, kind, definition):
+        """The place one reading of ``query`` names, or raise."""
         if kind == "metro" and definition is None:
             scored = self._one_definition(scored)
         if not scored:
