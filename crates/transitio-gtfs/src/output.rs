@@ -3,6 +3,7 @@
 //! caller produces them.
 
 use std::collections::BTreeMap;
+use std::io::Seek;
 use std::path::Path;
 
 use crate::scan::Table;
@@ -126,6 +127,21 @@ impl ZipOutput {
             .finish()
             .map_err(|e| format!("cannot finish archive: {e}"))?;
         Ok(())
+    }
+
+    /// Discard every entry written and start again in the same open file.
+    pub(crate) fn restart(self) -> Result<Self, String> {
+        let mut file = self
+            .writer
+            .finish()
+            .map_err(|e| format!("cannot restart archive: {e}"))?;
+        file.set_len(0)
+            .and_then(|()| file.rewind())
+            .map_err(|e| format!("cannot restart archive: {e}"))?;
+        Ok(ZipOutput {
+            writer: zip::ZipWriter::new(file),
+            written: Vec::new(),
+        })
     }
 }
 

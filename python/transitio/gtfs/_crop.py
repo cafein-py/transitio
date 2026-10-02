@@ -82,7 +82,14 @@ def crop_feed(
     agency goes, so no fare applies more widely than in the source. A fare
     without rules applies everywhere and stays. Header names and values are written without
     surrounding whitespace, as ``validate_feed`` reads them; retained
-    trips otherwise keep their times and attributes untouched.
+    trips otherwise keep their times and attributes untouched. A trip
+    naming a route that routes.txt lacks is not retained, and a retained
+    trip's stop_times row naming a stop that stops.txt lacks is left out,
+    the trip keeping its other rows unless fewer than two of its two or
+    more remain; a row the reader skips as malformed counts as missing, and
+    an empty ``route_id`` or ``stop_id`` is kept.
+    A routes.txt or stops.txt without its id column refuses the crop with
+    an ``OSError``.
 
     Parameters
     ----------
@@ -121,13 +128,21 @@ def crop_feed(
     dict
         ``{"row_counts": ..., "source_routes": [...] or None,
         "source_notices": [...], "remaining_notices": [...],
-        "service_window": ...}`` for the cropped feed. ``source_routes`` is
-        the distinct ``route_id`` values in the source routes.txt (before the
-        crop), or ``None`` when it has no route_id column, so a caller can
-        tell what a ``routes`` filter dropped. ``source_notices`` holds one
-        ``leading_or_trailing_whitespaces`` notice per source file the crop
-        read and trimmed, its row numbered as in the source; shapes.txt is
-        read only when a kept trip has a shape.
+        "service_window": ..., "dropped_rows": [...]}`` for the cropped
+        feed. ``source_routes`` is the distinct ``route_id`` values in the
+        source routes.txt (before the crop), or ``None`` without routes.txt,
+        so a caller can tell what a ``routes`` filter dropped.
+        ``source_notices`` holds one ``leading_or_trailing_whitespaces``
+        notice per source file the crop read and trimmed, its row numbered
+        as in the source; shapes.txt is read only when a kept trip has a
+        shape. ``dropped_rows`` has one record per file, field and code
+        whose rows were left out, sorted: ``{"code", "filename",
+        "fieldName", "parentFilename", "rowCount", "valueCount",
+        "sampleValues"}``, the code being ``"foreign_key_violation"`` for a
+        missing stop or route and ``"unusable_trip"`` (trips.txt
+        ``trip_id``, ``parentFilename`` None) for trips left with fewer
+        than two stop_times, the samples up to 50 of the distinct values,
+        sorted.
     """
     if aoi is None and start_date is None and end_date is None and routes is None:
         raise ValueError("nothing to crop: pass aoi, a date window and/or routes")

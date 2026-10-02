@@ -4,8 +4,10 @@
 //! trips are never altered beyond the surrounding whitespace the reader
 //! trims.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
+
+use serde::Serialize;
 
 use crate::notice::Notice;
 use crate::output::ZipOutput;
@@ -51,13 +53,102 @@ pub struct CropResult {
     /// The distinct ``route_id`` values in routes.txt before retention, from
     /// the same scan the crop runs on — so a caller auditing what a route
     /// filter dropped shares one snapshot with the crop rather than re-reading.
-    /// ``None`` when routes.txt or its ``route_id`` column is absent (the drop
-    /// is then undetermined), never an empty vector standing in for it.
+    /// ``None`` when routes.txt is absent (the drop is then undetermined),
+    /// never an empty vector standing in for it.
     pub source_routes: Option<Vec<String>>,
     /// The whitespace the reader trimmed from the source, one notice per
     /// file read, with rows numbered as in the source. shapes.txt is read
     /// only when a kept trip has a shape.
     pub source_notices: Vec<Notice>,
+    /// The rows of kept trips left out because a reference names no row of
+    /// its parent table, and the trips this left with fewer than two
+    /// stop_times, per file, field and code.
+    pub dropped_rows: Vec<DroppedRows>,
+}
+
+/// Rows the crop left out for one reason: a kept trip's stop_times row
+/// naming a stop, or a trip naming a route, that the feed lacks, or a trip
+/// that losing such rows left with fewer than two stop_times.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DroppedRows {
+    /// The notice the rows raise in the source or, kept, in the cropped feed.
+    pub code: &'static str,
+    pub filename: &'static str,
+    pub field_name: &'static str,
+    pub parent_filename: Option<&'static str>,
+    pub row_count: usize,
+    /// The distinct values among the rows.
+    pub value_count: usize,
+    /// Up to 50 of them, sorted and clipped.
+    pub sample_values: Vec<String>,
+}
+
+/// A file, a field and the notice code its left-out rows raise.
+type Reason = (&'static str, &'static str, &'static str);
+
+/// The rows left out, per file, field and code, with the parent table
+/// and the distinct values named. A dangling stop is held here instead of
+/// among the kept stops.
+#[derive(Default, Clone)]
+struct Dropped {
+    rows: BTreeMap<Reason, (Option<&'static str>, usize, BTreeSet<String>)>,
+}
+
+impl Dropped {
+    /// Whether `value`, from `file`'s `field`, names none of `known`, the
+    /// ids of `parent` (None: the feed has no `parent` to check against);
+    /// such a row is counted. An empty value names nothing.
+    fn dangles(
+        &mut self,
+        file: &'static str,
+        field: &'static str,
+        parent: &'static str,
+        known: Option<&HashSet<&str>>,
+        value: &str,
+    ) -> bool {
+        if value.is_empty() || known.is_none_or(|ids| ids.contains(value)) {
+            return false;
+        }
+        self.count("foreign_key_violation", file, field, Some(parent), value);
+        true
+    }
+
+    /// Count a row of `file` left out as `code`, its `field` holding `value`.
+    fn count(
+        &mut self,
+        code: &'static str,
+        file: &'static str,
+        field: &'static str,
+        parent: Option<&'static str>,
+        value: &str,
+    ) {
+        let (_, rows, values) = self
+            .rows
+            .entry((file, field, code))
+            .or_insert_with(|| (parent, 0, BTreeSet::new()));
+        *rows += 1;
+        if !values.contains(value) {
+            values.insert(value.to_string());
+        }
+    }
+
+    fn records(self) -> Vec<DroppedRows> {
+        self.rows
+            .into_iter()
+            .map(
+                |((filename, field_name, code), (parent, row_count, values))| DroppedRows {
+                    code,
+                    filename,
+                    field_name,
+                    parent_filename: parent,
+                    row_count,
+                    value_count: values.len(),
+                    sample_values: values.iter().take(50).map(|v| rules::clip(v)).collect(),
+                },
+            )
+            .collect()
+    }
 }
 
 pub fn crop(
@@ -114,6 +205,20 @@ pub fn crop(
                 .collect()
         })
     });
+    // Kept trips and stop_times must name a route and a stop the feed has,
+    // which a parent table without its id column cannot tell.
+    for (file, field) in [("routes.txt", "route_id"), ("stops.txt", "stop_id")] {
+        if result
+            .tables
+            .get(file)
+            .is_some_and(|table| column(table, field).is_none())
+        {
+            return Err(format!(
+                "{file} has no {field} column; cannot crop this feed"
+            ));
+        }
+    }
+    let mut dropped = Dropped::default();
     let mut source_notices: Vec<Notice> = whitespace(&result.notices).collect();
     let inside = inside_stops(&result, crop_options, area.as_deref());
     let active = active_services(&result, &options, crop_options)?;
@@ -126,13 +231,15 @@ pub fn crop(
         )?),
         None => None,
     };
-    let (kept_trips, trips) = select_trips(
+    let (mut kept_trips, trips) = select_trips(
         &source,
         &options,
         crop_options,
         touched.as_ref(),
         active.as_ref(),
         &mut source_notices,
+        &mut dropped,
+        ids(&result, "routes.txt", "route_id").as_ref(),
     )?;
     result.tables.insert("trips.txt".to_string(), trips);
 
@@ -155,9 +262,10 @@ pub fn crop(
         &staging,
         &options,
         &mut result,
-        &kept_trips,
+        &mut kept_trips,
         crop_options,
         &mut source_notices,
+        &mut dropped,
     ) {
         Ok(counts) => counts,
         Err(error) => {
@@ -197,6 +305,7 @@ pub fn crop(
         validation,
         source_routes,
         source_notices,
+        dropped_rows: dropped.records(),
     })
 }
 
@@ -525,7 +634,8 @@ fn trips_touching(
 }
 
 /// Decide which trips survive every crop, streaming trips.txt and keeping
-/// only the survivors as the trips table.
+/// only the survivors as the trips table. `routes` holds the routes.txt ids.
+#[allow(clippy::too_many_arguments)]
 fn select_trips(
     source: &std::fs::File,
     options: &ScanOptions,
@@ -533,6 +643,8 @@ fn select_trips(
     touched: Option<&HashSet<String>>,
     active: Option<&HashSet<String>>,
     source_notices: &mut Vec<Notice>,
+    dropped: &mut Dropped,
+    routes: Option<&HashSet<&str>>,
 ) -> Result<(HashSet<String>, Table), String> {
     let mut archive = open_archive(source)?;
     let Some(mut reader) = stream_table(&mut archive, "trips.txt", options)? else {
@@ -563,6 +675,17 @@ fn select_trips(
                 continue;
             }
         }
+        if route_index.is_some_and(|i| {
+            dropped.dangles(
+                "trips.txt",
+                "route_id",
+                "routes.txt",
+                routes,
+                &row.fields[i],
+            )
+        }) {
+            continue;
+        }
         if !kept.insert(row.fields[trip_index].clone()) {
             // Ambiguous, and with no row cap on trips.txt a way to grow the
             // kept table without bound.
@@ -583,39 +706,68 @@ fn select_trips(
 
 /// Write the cropped feed: the kept trips' stop_times straight from the
 /// source (pass 2), the parsed tables after the cascade, the kept trips'
-/// shapes straight from the source, and the entries copied through.
+/// shapes straight from the source, and the entries copied through. A
+/// kept trip that the dropped stop_times rows leave with fewer than two of
+/// its two or more goes, its other rows with it.
 /// Returns the row counts of the streamed tables.
+#[allow(clippy::too_many_arguments)]
 fn write_cropped(
     source: &std::fs::File,
     staging: &Path,
     options: &ScanOptions,
     result: &mut ScanResult,
-    kept_trips: &HashSet<String>,
+    kept_trips: &mut HashSet<String>,
     crop_options: &CropOptions,
     source_notices: &mut Vec<Notice>,
+    dropped: &mut Dropped,
 ) -> Result<BTreeMap<String, usize>, String> {
     let mut zip = ZipOutput::create(staging)?;
     let mut counts = BTreeMap::new();
     let mut kept_stops: HashSet<String> = HashSet::new();
     {
-        let mut archive = open_archive(source)?;
-        let opened = stream_table(&mut archive, "stop_times.txt", options)?;
-        if let Some(mut reader) = opened {
-            let headers = reader.headers().to_vec();
-            let trip = position(&headers, "trip_id");
-            let stop = position(&headers, "stop_id");
-            let mut notices = Vec::new();
-            let rows = std::iter::from_fn(|| reader.next_row(&mut notices))
-                .filter(|row| trip.is_some_and(|i| kept_trips.contains(&row.fields[i])))
-                .inspect(|row| {
-                    if let Some(i) = stop {
-                        kept_stops.insert(row.fields[i].clone());
-                    }
-                })
-                .map(|row| row.fields);
-            let count = zip.rows("stop_times.txt", &headers, rows)?;
-            whole(&reader, "stop_times.txt", &notices, options)?;
-            source_notices.extend(whitespace(&notices));
+        let stops = ids(result, "stops.txt", "stop_id");
+        let (before, notices_before) = (dropped.clone(), source_notices.len());
+        let mut short = HashSet::new();
+        let mut written = write_stop_times(
+            source,
+            options,
+            &mut zip,
+            kept_trips,
+            &short,
+            stops.as_ref(),
+            &mut kept_stops,
+            dropped,
+            source_notices,
+        )?;
+        if let Some((_, found)) = written.as_mut().filter(|(_, found)| !found.is_empty()) {
+            // stop_times.txt is the first entry, so the archive starts
+            // again and the second pass counts drops and notices afresh.
+            short = std::mem::take(found);
+            *dropped = before;
+            source_notices.truncate(notices_before);
+            kept_stops.clear();
+            zip = zip.restart()?;
+            written = write_stop_times(
+                source,
+                options,
+                &mut zip,
+                kept_trips,
+                &short,
+                stops.as_ref(),
+                &mut kept_stops,
+                dropped,
+                source_notices,
+            )?;
+            // An unchanged source, read again, leaves the same trips short.
+            if !written.as_ref().is_some_and(|(_, found)| *found == short) {
+                return Err("the source changed while it was cropped".to_string());
+            }
+        }
+        for trip in &short {
+            dropped.count("unusable_trip", "trips.txt", "trip_id", None, trip);
+        }
+        kept_trips.retain(|trip| !short.contains(trip));
+        if let Some((count, _)) = written {
             counts.insert("stop_times.txt".to_string(), count);
         }
     }
@@ -653,6 +805,64 @@ fn write_cropped(
     zip.passthrough(&mut open_archive(source)?, &result.unparsed_entries)?;
     zip.finish()?;
     Ok(counts)
+}
+
+/// Stream the kept trips' stop_times from the source into `zip`, leaving
+/// out a row naming a stop that `stops` lacks and every row of the `short`
+/// trips, and add the stops served to `kept_stops`. Returns the rows
+/// written and the kept trips that lost such a row and kept fewer than two
+/// of their two or more; None without stop_times.txt.
+#[allow(clippy::too_many_arguments)]
+fn write_stop_times(
+    source: &std::fs::File,
+    options: &ScanOptions,
+    zip: &mut ZipOutput,
+    kept_trips: &HashSet<String>,
+    short: &HashSet<String>,
+    stops: Option<&HashSet<&str>>,
+    kept_stops: &mut HashSet<String>,
+    dropped: &mut Dropped,
+    source_notices: &mut Vec<Notice>,
+) -> Result<Option<(usize, HashSet<String>)>, String> {
+    let mut archive = open_archive(source)?;
+    let Some(mut reader) = stream_table(&mut archive, "stop_times.txt", options)? else {
+        return Ok(None);
+    };
+    let headers = reader.headers().to_vec();
+    let trip = position(&headers, "trip_id");
+    let stop = position(&headers, "stop_id");
+    // Per kept trip, its rows and the rows left out.
+    let mut tally: HashMap<&str, (usize, usize)> =
+        kept_trips.iter().map(|t| (t.as_str(), (0, 0))).collect();
+    let mut notices = Vec::new();
+    let rows = std::iter::from_fn(|| reader.next_row(&mut notices)).filter_map(|row| {
+        let id = row.fields[trip?].as_str();
+        let (seen, lost) = tally.get_mut(id)?;
+        *seen += 1;
+        let value = stop.map(|i| &row.fields[i]);
+        if value
+            .is_some_and(|v| dropped.dangles("stop_times.txt", "stop_id", "stops.txt", stops, v))
+        {
+            *lost += 1;
+            return None;
+        }
+        if short.contains(id) {
+            return None;
+        }
+        if let Some(v) = value {
+            kept_stops.insert(v.clone());
+        }
+        Some(row.fields)
+    });
+    let count = zip.rows("stop_times.txt", &headers, rows)?;
+    whole(&reader, "stop_times.txt", &notices, options)?;
+    source_notices.extend(whitespace(&notices));
+    let found = tally
+        .into_iter()
+        .filter(|&(_, (seen, lost))| seen >= 2 && seen - lost < 2)
+        .map(|(trip, _)| trip.to_string())
+        .collect();
+    Ok(Some((count, found)))
 }
 
 /// Retain only the kept trips and everything they reference, then the
@@ -911,20 +1121,23 @@ fn retain_fares(
 }
 
 fn referenced(result: &ScanResult, file: &str, field: &str) -> HashSet<String> {
-    result
-        .tables
-        .get(file)
-        .and_then(|table| {
-            column(table, field).map(|i| {
-                table
-                    .rows
-                    .iter()
-                    .map(|row| row.fields[i].clone())
-                    .filter(|id| !id.is_empty())
-                    .collect()
-            })
-        })
+    ids(result, file, field)
+        .map(|ids| ids.into_iter().map(str::to_string).collect())
         .unwrap_or_default()
+}
+
+/// The non-empty values of a parsed table's column, borrowed, or None when
+/// the table or the column is absent.
+fn ids<'a>(result: &'a ScanResult, file: &str, field: &str) -> Option<HashSet<&'a str>> {
+    let table = result.tables.get(file)?;
+    column(table, field).map(|i| {
+        table
+            .rows
+            .iter()
+            .map(|row| row.fields[i].as_str())
+            .filter(|id| !id.is_empty())
+            .collect()
+    })
 }
 
 fn keep_rows(result: &mut ScanResult, file: &str, field: &str, kept: &HashSet<String>) {

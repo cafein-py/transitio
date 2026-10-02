@@ -298,6 +298,24 @@ def _note(entry, text):
     entry["note"] = text if entry["note"] is None else f"{entry['note']}; {text}"
 
 
+def _dropped_note(report):
+    """``"dropped <n> <file> rows whose <field> is not in <parent>"`` or
+    ``"dropped <n> trips.txt rows left with fewer than two stop_times"`` for
+    the rows the crop of a feed left out (several joined with ``", "``), or
+    None when it left out none."""
+    parts = [
+        (
+            f"dropped {record['rowCount']} {record['filename']} rows left with "
+            "fewer than two stop_times"
+            if record["code"] == "unusable_trip"
+            else f"dropped {record['rowCount']} {record['filename']} rows whose "
+            f"{record['fieldName']} is not in {record['parentFilename']}"
+        )
+        for record in report["summary"].get("droppedRows") or ()
+    ]
+    return ", ".join(parts) or None
+
+
 def _skipped(selection):
     """The ``(feed id, reason)`` pairs of the skipped entries."""
     return [
@@ -346,8 +364,10 @@ def _process_feed(
     route crop, or ``None`` when a ``routes`` filter is not applied or that
     feed's routes.txt cannot be read — so a caller records an *undetermined*
     drop rather than a false empty one — and ``window`` the computed service
-    window as ISO dates, None when unknown. Raises :class:`_SkipFeed` when the
-    feed drops out. Shared by the AOI and the place paths.
+    window as ISO dates, None when unknown. The report's summary carries the
+    crop's ``dropped_rows`` as ``droppedRows``, None when the feed was not
+    cropped. Raises :class:`_SkipFeed` when the feed drops out. Shared by the
+    AOI and the place paths.
     """
     from transitio.gtfs import crop_feed
     from transitio.repair import repair_feed
@@ -360,6 +380,7 @@ def _process_feed(
         provenance = json.loads(sidecar.read_text())
     present_routes = None
     source_notices = []
+    dropped = None
     if crop or routes is not None:
         cropped = path.with_name(f"{path.stem}-cropped-{tag}.zip")
         report = crop_feed(
@@ -368,12 +389,13 @@ def _process_feed(
         if routes is not None:
             # From the crop's own scan of this feed, so the drop audit and the
             # crop describe the same bytes (no second read to race). ``None``
-            # (routes.txt or its column absent) stays undetermined, not empty.
+            # (no routes.txt) stays undetermined, not empty.
             source = report.get("source_routes")
             present_routes = None if source is None else set(source)
         # The crop writes trimmed tables; the source's whitespace is
         # reported with the feed.
         source_notices = report["source_notices"]
+        dropped = report["dropped_rows"]
         path = cropped
     # The crop comes first, so the repair works on the area's feed rather
     # than on the whole source.
@@ -407,6 +429,7 @@ def _process_feed(
             raise _SkipFeed(reason, window)
     validation["notices"].extend(source_notices)
     report = build_report(validation, hosted=hosted, provenance=provenance)
+    report["summary"]["droppedRows"] = dropped
     return path, report, fixes, present_routes, window
 
 
@@ -1098,6 +1121,11 @@ def fetch(
     crop : bool, default True
         Spatially crop each feed to the area: to its polygon when it has
         one (a place's boundary included), otherwise to its bounding box.
+        The crop, also run for a route selection, leaves out a trip naming
+        a route the feed lacks and a stop_times row naming a stop it lacks,
+        and then a trip such rows leave with fewer than two stop_times
+        (:func:`~transitio.gtfs.crop_feed`); a feed whose routes.txt or
+        stops.txt has no id column is skipped.
     osm : bool, default True
         Fetch the OSM extract for the AOI. With ``place``, it is fetched
         after the feeds, for the place's parts that hold a stop of a
@@ -1138,7 +1166,10 @@ def fetch(
         delivered feeds. Reports merge the local validation of the delivered
         feed with the hosted report of the published dataset, so after
         cropping or repair the hosted side describes the pre-transform
-        original. ``selection`` has one entry per candidate feed, in
+        original. A report's ``summary["droppedRows"]`` lists the rows the
+        crop left out (the ``dropped_rows`` of
+        :func:`~transitio.gtfs.crop_feed`), None for a feed not cropped.
+        ``selection`` has one entry per candidate feed, in
         candidate order: ``feed_id``, ``name``, ``decision``
         (``"delivered"`` or ``"skipped"``), ``reason`` (why it was skipped),
         ``note`` (about a delivered feed: the routes it was cut to, why a
@@ -1147,7 +1178,9 @@ def fetch(
         ``agency_timezone`` not equivalent to the zone of most of its stops,
         e.g. ``"agency_timezone America/New_York; stops in
         Pacific/Honolulu"``, a placeholder calendar, which a left-out
-        version keeps; several join with ``"; "``),
+        version keeps, rows the crop left out, e.g. ``"dropped 1860
+        stop_times.txt rows whose stop_id is not in stops.txt"``; several
+        join with ``"; "``),
         ``index_window`` (the index's ``[start, end]``; None undated or on
         the area path), ``feed_window`` (the computed window of a validated
         download, delivered or not; None otherwise or when unknown),
@@ -1371,9 +1404,12 @@ def fetch(
                 _skip(entry, f"processing failed: {error}")
                 continue
             entry.update(decision="delivered", feed_window=window, path=path)
-            note = _timezone_note(path, budgets.get("max_total_bytes"))
-            if note is not None:
-                _note(entry, note)
+            for note in (
+                _timezone_note(path, budgets.get("max_total_bytes")),
+                _dropped_note(report),
+            ):
+                if note is not None:
+                    _note(entry, note)
             reports.append(report)
             repairs.append(fixes)
             feeds.append(path)
@@ -1952,7 +1988,7 @@ def _fetch_place(
                 cropped.add(feed.feed_id)
             else:
                 carriers[feed.feed_id] = feed.feed_id
-            notes.append(_timezone_note(path, budget))
+            notes += [_timezone_note(path, budget), _dropped_note(report)]
             for text in dict.fromkeys(filter(None, notes)):
                 _note(entry, text)
             reports.append(report)

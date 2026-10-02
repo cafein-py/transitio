@@ -1361,11 +1361,113 @@ def test_a_feed_missing_a_required_file_is_skipped(tmp_path, dropped, reason, wi
     )
     if reason is None:
         path, report, *_, kept_window = _process_feed(source, **options)
-        assert (path, kept_window) == (source, window) and report["summary"]
+        assert (path, kept_window) == (source, window)
+        assert report["summary"]["droppedRows"] is None  # not cropped
         return
     with pytest.raises(_SkipFeed) as caught:
         _process_feed(source, **options)
     assert (caught.value.reason, caught.value.window) == (reason, window)
+
+
+FK = "foreign_key_violation"
+
+
+@pytest.mark.parametrize(
+    "changes, dropped, counts, note",
+    [
+        pytest.param(
+            {
+                "stop_times.txt": FEED["stop_times.txt"]
+                + "t-in,08:10:00,08:10:00,ghost,3\n"
+            },
+            [(FK, "stop_times.txt", "stop_id", "stops.txt", "ghost")],
+            (1, 2),
+            "dropped 1 stop_times.txt rows whose stop_id is not in stops.txt",
+            id="stop",
+        ),
+        pytest.param(
+            {
+                "trips.txt": FEED["trips.txt"] + "r-ghost,wk,t-ghost\n",
+                "stop_times.txt": FEED["stop_times.txt"]
+                + "t-ghost,10:00:00,10:00:00,in1,1\nt-ghost,10:05:00,10:05:00,in2,2\n",
+            },
+            [(FK, "trips.txt", "route_id", "routes.txt", "r-ghost")],
+            (1, 2),
+            "dropped 1 trips.txt rows whose route_id is not in routes.txt",
+            id="route",
+        ),
+        pytest.param(
+            {
+                "trips.txt": FEED["trips.txt"] + "r-in,wk,t-short\nr-in,wk,t-one\n",
+                "stop_times.txt": FEED["stop_times.txt"]
+                + "t-short,10:00:00,10:00:00,in1,1\nt-short,10:05:00,10:05:00,ghost,2\n"
+                + "t-one,11:00:00,11:00:00,in2,1\n",
+            },
+            [
+                (FK, "stop_times.txt", "stop_id", "stops.txt", "ghost"),
+                ("unusable_trip", "trips.txt", "trip_id", None, "t-short"),
+            ],
+            (2, 3),  # t-one had a single stop_time in the source and stays
+            "dropped 1 stop_times.txt rows whose stop_id is not in stops.txt, "
+            "dropped 1 trips.txt rows left with fewer than two stop_times",
+            id="short-trip",
+        ),
+        pytest.param({}, [], (1, 2), None, id="consistent"),
+        pytest.param(
+            {"routes.txt": "agency_id,route_short_name,route_type\nhsl,1,3\n"},
+            "routes.txt has no route_id column; cannot crop this feed",
+            None,
+            None,
+            id="no-route-id",
+        ),
+    ],
+)
+def test_the_crop_drops_rows_naming_a_missing_stop_or_route(
+    tmp_path, changes, dropped, counts, note
+):
+    # Moscow's cropped feed kept stop_times rows naming stops its stops.txt
+    # lacked, and cafein refused the whole feed.
+    from transitio.pipeline._fetch import _dropped_note, _process_feed
+
+    source = write_zip(tmp_path / "feed.zip", {**FEED, **changes})
+    output = tmp_path / "cropped.zip"
+    if isinstance(dropped, str):
+        with pytest.raises(OSError, match=dropped):
+            crop_feed(source, output, aoi=CITY_BBOX)
+        assert not output.exists()
+        return
+    result = crop_feed(source, output, aoi=CITY_BBOX)
+    expected = [
+        {
+            "code": code,
+            "filename": filename,
+            "fieldName": field,
+            "parentFilename": parent,
+            "rowCount": 1,
+            "valueCount": 1,
+            "sampleValues": [value],
+        }
+        for code, filename, field, parent, value in dropped
+    ]
+    assert result["dropped_rows"] == expected
+    row_counts = result["row_counts"]
+    assert (row_counts["trips.txt"], row_counts["stop_times.txt"]) == counts
+    codes = {n["code"] for n in validate_feed(output)["notices"]}
+    assert "foreign_key_violation" not in codes
+    _, report, *_ = _process_feed(
+        source,
+        geometry=CITY_BBOX,
+        tag="t",
+        repair=False,
+        crop=True,
+        modes=None,
+        day=None,
+        study=False,
+        hosted=None,
+        budgets={},
+    )
+    assert report["summary"]["droppedRows"] == expected
+    assert _dropped_note(report) == note
 
 
 MIDLAND = {
