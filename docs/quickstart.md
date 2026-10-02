@@ -205,6 +205,10 @@ Names count in a place's own languages, those of its country, and in English:
 label in another language is no rival to the Argentine capital. A label in
 another language still counts for a place known far more widely, so "Meksyk",
 Polish for Mexico, stays ambiguous rather than naming a place in Poland.
+Where a place carries a name as its name or in English, a place carrying it
+only in another of its own languages does not compete either, unless known
+far more widely: "Bergen", Dutch for Mons in Belgium, is no rival to the
+towns named Bergen.
 Other places sharing a name
 are decided by the sole exact match or a clear lead in feeds. Feed counts
 reflect how well each country's feeds are catalogued, so a lead in feeds does

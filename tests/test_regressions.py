@@ -417,7 +417,7 @@ def test_a_label_in_another_language_does_not_compete_with_an_own_name(name, exp
         [
             _place("c-ba", "city", "Buenos Aires", "AR"),
             _place("c-pinto", "city", "Pinto", "ES", names={"ga": "Buenos Aires"}),
-            _place("c-muc", "city", "Munich", "DE", names={"de": "München"}),
+            _place("c-muc", "city", "Munich", "DE", names={**known, "de": "München"}),
             _place("c-mue", "city", "München", "DE"),
             _place("c-par", "city", "Paris", "FR", names={**known, "fi": "Pariisi"}),
             _place("c-pariisi", "city", "Pariisi", "EE"),
@@ -433,6 +433,68 @@ def test_a_label_in_another_language_does_not_compete_with_an_own_name(name, exp
             "c-pariisi": 1,
             "mx": 2,
             "c-mek": 2,
+        },
+    )
+    if expected is None:
+        with pytest.raises(AmbiguousPlaceError):
+            lookup.resolve(name)
+    else:
+        assert lookup.resolve(name).id == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        # Mons carries "Bergen" in Dutch and German and as an alias.
+        ("Bergen", None),
+        # An English label is a primary name.
+        ("Halle", "c-halle-saale"),
+        # Loison-sous-Lens, listing "Lens" as an alias, stays a namesake of the
+        # arrondissement it lies in once the arrondissement leaves.
+        ("Lens", "c-lens"),
+    ],
+)
+def test_a_primary_name_outranks_a_label_in_another_own_language(name, expected):
+    # A place carrying a name only in another of its own languages competed
+    # like the places named so: Mons, Dutch "Bergen", outran the German towns
+    # of that name on feeds, and the arrondissement of Lens outran its city.
+    from transitio.exceptions import AmbiguousPlaceError
+
+    lookup = _lookup(
+        [
+            _place(
+                "c-mons",
+                "city",
+                "Mons",
+                "BE",
+                ["Bergen"],
+                {"nl": "Bergen", "de": "Bergen"},
+            ),
+            _place("c-bergen-1", "city", "Bergen", "DE"),
+            _place("c-bergen-2", "city", "Bergen", "DE"),
+            _place(
+                "c-halle-saale", "city", "Halle (Saale)", "DE", names={"en-ca": "Halle"}
+            ),
+            _place("c-halle", "city", "Halle", "BE"),
+            _place(
+                "c-arr", "city", "Arrondissement of Lens", "FR", names={"fr": "Lens"}
+            ),
+            _place("c-lens", "city", "Lens", "FR", parent="c-arr"),
+            _place(
+                "c-loison", "city", "Loison-sous-Lens", "FR", ["Lens"], parent="c-arr"
+            ),
+            _place("m-lens", "metro", "Lens", "FR"),
+        ],
+        {
+            "c-mons": 15,
+            "c-bergen-1": 3,
+            "c-bergen-2": 2,
+            "c-halle-saale": 19,
+            "c-halle": 4,
+            "c-arr": 30,
+            "c-lens": 12,
+            "c-loison": 7,
+            "m-lens": 16,
         },
     )
     if expected is None:

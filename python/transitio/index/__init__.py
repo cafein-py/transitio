@@ -961,6 +961,10 @@ def place(query, *, kind=None, definition=None, index=None):
     only through a label in another language does not compete unless it is
     far better known: "München" is Munich, and "Meksyk", Polish for Mexico,
     stays ambiguous rather than naming a place in Poland called Meksyk.
+    Where a place carries the name as its name or in English, one carrying
+    it only in another of its own languages does not compete either unless
+    far better known: "Bergen", Dutch for Mons, is no rival to the towns
+    named Bergen.
     ``kind`` pins the scope. A qualified name, "Name, Qualifier" with one or
     more qualifiers, keeps the places lying within a region or country each
     qualifier names ("London, Ontario", "City of London, UK"), or within any

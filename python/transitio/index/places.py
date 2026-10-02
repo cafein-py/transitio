@@ -10,10 +10,12 @@ ambiguity margin. A place's own names are its name and its labels in its
 country's languages (from Unicode CLDR) or English. Where a place carries the
 name as its own, one reaching it only through a label in another language
 does not compete unless it is known far more widely, by the languages its
-name is recorded in. The margin never favours a place reached only through
-an alias or a label in another language over one carrying the name as its
-own, nor decides against a place of the name in another country known far
-more widely. A city's namesakes do not compete
+name is recorded in; where a place carries it as its name or in English, one
+carrying it only in another of its own languages ("Bergen", Dutch for Mons)
+does not compete either, on the same terms. The margin never favours a place
+reached only through an alias or a label in another language over one
+carrying the name as its own, nor decides against a place of the name in
+another country known far more widely. A city's namesakes do not compete
 with it: a metro in its country shares its name because it is the city's
 metro or named after it, a same-named area containing it that runs much the
 same service (no more than the margin beyond the city's feeds) is the city
@@ -556,11 +558,13 @@ class _PlaceLookup:
             for alias in [*record["former_ids"], *qids]:
                 self._aliases.setdefault(alias, place_id)
 
-    def _own_names(self, place_id):
+    def _own_names(self, place_id, primary=False):
         """The normalized name of a place and its labels in its own languages
-        (see ``_own_language``); its aliases and other labels left out."""
+        (see ``_own_language``); its aliases and other labels left out. With
+        ``primary``, only its name and its English and ``mul`` labels, the
+        names it carries whatever the reader's language."""
         record = self._records[place_id]
-        country = record["country_code"]
+        country = None if primary else record["country_code"]
         own = [
             text
             for language, text in record["names"].items()
@@ -830,7 +834,12 @@ class _PlaceLookup:
         own (Pinto, Spain, lists Buenos Aires in Irish). A place with an alias
         of the name stays, and so does one far better known than every
         own-name match that is not a metro, so an exonym ("Meksyk", Polish for
-        Mexico) is not handed to a place in Poland of that name."""
+        Mexico) is not handed to a place in Poland of that name. Where a place
+        that is not a metro carries ``name`` as a primary name (see
+        ``_own_names``), one carrying it only in another of its languages
+        leaves too, its aliases aside, unless far better known than every such
+        place: "Bergen", Dutch for Mons, is no rival to the towns named Bergen.
+        Metros, which carry their city's name in its language, stay."""
         records = self._records
         exact = [pid for tier, pid in scored if tier == _EXACT]
         norm = _normalize(name)
@@ -839,12 +848,21 @@ class _PlaceLookup:
             return exact
         named = [pid for pid in own if records[pid]["kind"] != "metro"]
         labels = max((len(records[pid]["names"]) for pid in named), default=0)
-        return [
+        exact = [
             pid
             for pid in exact
             if pid in own
             or self._has_alias(pid, norm)
             or self._far_better_known(pid, labels)
+        ]
+        primary = {pid for pid in named if norm in self._own_names(pid, primary=True)}
+        if not primary:
+            return exact
+        labels = max(len(records[pid]["names"]) for pid in primary)
+        return [
+            pid
+            for pid in exact
+            if pid in primary or pid not in named or self._far_better_known(pid, labels)
         ]
 
     def _has_alias(self, place_id, norm):
@@ -922,13 +940,14 @@ class _PlaceLookup:
         are the metros in its country and the areas containing it whose feeds
         stay within the margin of its own. A place reaching ``name`` only
         through an alias is a namesake, never an anchor, when it lies inside a
-        city carrying ``name`` as a name of its own (Puente Aranda, a district
-        of Bogotá, lists Bogotá) or, not being a city, in such a city's
-        country (New Taipei and Taiwan list Taipei). A metro elsewhere shares
-        the name by coincidence (London, UK against London, Ontario), a
-        containing area with far more service is a place of its own (New York
-        State against New York City), and a city elsewhere may use an alias as
-        its everyday name (Newcastle for Newcastle upon Tyne); all stay."""
+        city carrying ``name`` as a name of its own, whether or not that city
+        still competes (Puente Aranda, a district of Bogotá, lists Bogotá),
+        or, not being a city, in such a city's country (New Taipei and Taiwan
+        list Taipei). A metro elsewhere shares the name by coincidence
+        (London, UK against London, Ontario), a containing area with far more
+        service is a place of its own (New York State against New York City),
+        and a city elsewhere may use an alias as its everyday name (Newcastle
+        for Newcastle upon Tyne); all stay."""
         records = self._records
         norm = _normalize(name)
         own = {pid for pid in exact if norm in self._own_names(pid)}
@@ -945,7 +964,10 @@ class _PlaceLookup:
                     records[pid]["kind"] != "city"
                     and records[pid].get("country_code") in named_countries
                 )
-                or named & {place.id for place in self.get(pid).ancestors}
+                or any(
+                    place.kind == "city" and norm in self._own_names(place.id)
+                    for place in self.get(pid).ancestors
+                )
             )
         }
         cities = [pid for pid in exact if records[pid]["kind"] == "city"]
