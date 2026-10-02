@@ -1,10 +1,20 @@
+import os
+import re
 import urllib.parse
 
 import h11
 import httpx
 import pytest
 
-from transitio.catalog._access import _redact, _Secret, _secrets, _unsendable
+from transitio.catalog._access import (
+    _Borrowed,
+    _proxy,
+    _redact,
+    _Secret,
+    _secrets,
+    _unsendable,
+)
+from transitio.exceptions import DownloadError
 
 # Reserved characters and a space; SHORT is a prefix of LONG.
 LONG = "a&b=c/d%e f"
@@ -116,3 +126,67 @@ def test_values_each_method_can_carry(method, auth_params, values, unsendable):
             assert sent == {
                 name: [values[field]] for name, field in auth_params.items()
             }
+
+
+PROXY = "http://proxy.test:3128"
+API = "https://api.example.com/feed"
+VIA = {"HTTPS_PROXY": PROXY}
+
+
+@pytest.mark.parametrize(
+    ("env", "url", "expected"),
+    [
+        ({}, API, None),
+        ({"ALL_PROXY": PROXY}, API, PROXY),
+        ({"https_proxy": PROXY, "HTTPS_PROXY": "x:1", "ALL_PROXY": "y:2"}, API, PROXY),
+        ({"https_proxy": "", "HTTPS_PROXY": "x:1", "all_proxy": PROXY}, API, PROXY),
+        ({"HTTPS_PROXY": "proxy.test:3128"}, API, PROXY),
+        ({"NO_PROXY": "*.example.com"}, API, None),
+        ({**VIA, "NO_PROXY": "other.org, *"}, API, None),
+        ({**VIA, "NO_PROXY": "Example.COM"}, API, None),
+        ({**VIA, "NO_PROXY": "example.com"}, "https://notexample.com/feed", PROXY),
+        ({**VIA, "NO_PROXY": ".example.com"}, API, None),
+        ({**VIA, "NO_PROXY": ".example.com"}, "https://example.com/feed", PROXY),
+        ({**VIA, "NO_PROXY": "api.example.com:443"}, API, None),
+        ({**VIA, "NO_PROXY": "api.example.com:8443"}, API, PROXY),
+        ({**VIA, "no_proxy": "other.org", "NO_PROXY": "example.com"}, API, PROXY),
+        ({**VIA, "NO_PROXY": "10.0.0.0/8,::1"}, "https://10.1.2.3:8443/feed", None),
+        ({**VIA, "NO_PROXY": "10.0.0.0/8,::1"}, "https://[::1]/feed", None),
+        ({**VIA, "NO_PROXY": "10.0.0.0/8,localhost"}, API, PROXY),
+        ({**VIA, "NO_PROXY": "https://api.example.com"}, API, DownloadError),
+        ({**VIA, "NO_PROXY": "*.example.com"}, API, DownloadError),
+        ({**VIA, "NO_PROXY": "*.example.com,example.com"}, API, None),
+    ],
+)
+def test_proxy_of_a_credentialed_request(monkeypatch, env, url, expected):
+    for name in list(os.environ):
+        if name.lower().endswith("_proxy"):
+            monkeypatch.delenv(name)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    if expected is DownloadError:
+        message = (
+            f"NO_PROXY entry {env['NO_PROXY']} is not supported for protected feeds"
+        )
+        with pytest.raises(DownloadError, match=f"^{re.escape(message)}$"):
+            _proxy(url)
+    else:
+        assert _proxy(url) == expected
+
+
+def test_borrowed_transport_stays_open():
+    class Stub(httpx.MockTransport):
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    stub = Stub(lambda request: httpx.Response(200, text=request.url.host))
+    mounts = {"https://a.org": _Borrowed(stub)}
+    with httpx.Client(transport=_Borrowed(stub), mounts=mounts) as client:
+        hosts = [client.get(f"https://{host}/").text for host in ("a.org", "b.org")]
+    assert hosts == ["a.org", "b.org"]
+    assert not stub.closed
+    with httpx.Client(transport=stub) as client:
+        assert client.get("https://a.org/").text == "a.org"
+    assert stub.closed

@@ -1,12 +1,23 @@
 """Credential values of protected feeds: hidden from text, checked against
-what each access method can carry, and masked in messages."""
+what each access method can carry, and masked in messages; the proxy a
+credentialed request takes and a transport adapter that leaves its transport
+open."""
 
 from __future__ import annotations
 
 import base64
+import ipaddress
 import re
+import urllib.request
+
+import httpx
+
+from transitio.exceptions import DownloadError
 
 _MASK = "***"
+_PORTS = {"http": 80, "https": 443}
+# A NO_PROXY name with an optional leading dot and port.
+_NO_PROXY_NAME = re.compile(r"(\.?[a-z0-9_-]+(?:\.[a-z0-9_-]+)*)(?::([0-9]+))?")
 
 # The values each access method can carry: a query value is any text UTF-8
 # encodes, a header value printable ASCII with no space at either end, a
@@ -125,3 +136,83 @@ def _redact(text, secrets):
         kept = end
     parts.append(text[kept:])
     return "".join(parts)
+
+
+def _origin(url):
+    """The ``(scheme, host, port)`` of ``url``, the host lower-cased and the
+    port the effective one."""
+    url = httpx.URL(url)
+    return url.scheme, url.host.lower(), url.port or _PORTS.get(url.scheme)
+
+
+def _proxy(url):
+    """The proxy URL a credentialed request to ``url`` goes through, or None
+    for a direct connection.
+
+    The proxy is the environment's one for the scheme of ``url``, else its
+    ``all`` one, read as urllib reads them (a lower-case name wins over the
+    upper-case one). NO_PROXY exempts the host when it is ``*`` or holds an
+    entry matching it: an IP address or range holding it, a name equal to it
+    or to a domain above it, a name with a leading dot equal to a domain above
+    it, each with an optional port equal to the effective port. With a proxy
+    set, an entry of any other shape (a scheme, a wildcard in a name) raises
+    :class:`~transitio.exceptions.DownloadError` unless another entry exempts
+    the host.
+    """
+    scheme, host, port = _origin(url)
+    proxies = urllib.request.getproxies_environment()
+    proxy = proxies.get(scheme) or proxies.get("all")
+    if not proxy:
+        return None
+    unread = None
+    for entry in proxies.get("no", "").split(","):
+        entry = entry.strip()
+        exempt = _exempts(entry.lower(), host, port) if entry else False
+        if exempt:
+            return None
+        if exempt is None and unread is None:
+            unread = entry
+    if unread is not None:
+        raise DownloadError(
+            f"NO_PROXY entry {unread} is not supported for protected feeds"
+        )
+    return proxy if "://" in proxy else "http://" + proxy
+
+
+def _exempts(entry, host, port):
+    """Whether the lower-case NO_PROXY ``entry`` exempts ``host`` at
+    ``port``; None for an entry of a shape :func:`_proxy` does not read."""
+    if entry == "*":
+        return True
+    try:
+        network = ipaddress.ip_network(entry, strict=False)
+    except ValueError:
+        pass
+    else:
+        try:
+            return ipaddress.ip_address(host) in network
+        except ValueError:
+            return False
+    match = _NO_PROXY_NAME.fullmatch(entry)
+    if match is None:
+        return None
+    name, entry_port = match.groups()
+    if entry_port is not None and int(entry_port) != port:
+        return False
+    if name.startswith("."):
+        return host.endswith(name)
+    return host == name or host.endswith("." + name)
+
+
+class _Borrowed(httpx.BaseTransport):
+    """A transport that hands each request to ``inner`` and leaves ``inner``
+    open when it is closed, for a client that does not own ``inner``."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def handle_request(self, request):
+        return self._inner.handle_request(request)
+
+    def close(self):
+        pass
