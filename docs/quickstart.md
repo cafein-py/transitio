@@ -16,9 +16,10 @@ The area of interest can be a place name (geocoded via Nominatim), a shapely
 geometry, a GeoDataFrame/GeoSeries, or a `(minx, miny, maxx, maxy)` bounding
 box in WGS84. The pipeline:
 
-1. downloads the smallest single OpenStreetMap extract that contains the
-   area (Geofabrik, BBBike or Movisda) and crops it to the area's bounding
-   box (skipped with `osm=False`),
+1. downloads the smallest OpenStreetMap extract that contains the area, or
+   a set of extracts smaller in total, merged into one (Geofabrik, BBBike or
+   Movisda), and crops it to the area's bounding box (skipped with
+   `osm=False`),
 2. discovers every GTFS feed overlapping the area in the Mobility Database
    (official feeds first, then by spatial specificity) — or, for a place,
    takes the feeds the index lists for it,
@@ -205,29 +206,43 @@ Names count in a place's own languages, those of its country, and in English:
 label in another language is no rival to the Argentine capital. A label in
 another language still counts for a place known far more widely, so "Meksyk",
 Polish for Mexico, stays ambiguous rather than naming a place in Poland.
+Where a place carries a name as its name or in English, a place carrying it
+only in another of its own languages does not compete either, unless known
+far more widely: "Bergen", Dutch for Mons in Belgium, is no rival to the
+towns named Bergen.
 Other places sharing a name
 are decided by the sole exact match or a clear lead in feeds. Feed counts
 reflect how well each country's feeds are catalogued, so a lead in feeds does
 not decide against a place of that name abroad whose name is recorded in far
-more languages: "Moscow" is not Moscow, Idaho, however many more feeds it
-has than Moscow, Russia. Where nothing decides, as for London in the UK and in
-Canada, or New York City and New York State, `place` raises
-`AmbiguousPlaceError`. Only a full name resolves: a partial one such as
-`"Augs"` raises `PlaceNotFoundError`, whose `candidates` hold the places it
-partly matches, and `suggest` completes it. A qualifier after a
+more languages. Where feeds do not decide, a place of the name recorded in far
+more languages than every other, at home or abroad, wins: "Moscow" is Moscow,
+Russia, however many more feeds Moscow, Idaho, has, and "Cali, Colombia" is
+the city rather than a lesser-known place there. Where nothing decides, as
+for London in the UK and in Canada, or New York City and New York State,
+`place` raises `AmbiguousPlaceError`. Only a full name resolves: a partial
+one such as `"Augs"` raises `PlaceNotFoundError`, whose `candidates` hold the
+places it partly matches, and `suggest` completes it. A qualifier after a
 comma names the region or country that holds the place — `"London, Ontario"`,
 `"London, Canada"`, `"City of London, UK"` — and is matched against the names,
 translations and aliases of the place's region and country, so codes such as
-`UK` or `USA` work; a name that itself contains a comma, such as an alias
-`"Queen's Park, Greater London"`, still matches as written. `kind` (`"city"`,
+`UK` or `USA` work. A town or other containing place counts only when no
+region or country holds a place of the name, so `"Copenhagen, Denmark"` is in
+Denmark, not in the town of Denmark, New York. A name that itself contains a
+comma, such as an alias `"Queen's Park, Greater London"`, still matches as
+written; a label in another language equal to the whole query answers only
+when the qualified name names no single place, so `"Halifax, Canada"` is the
+city, not the region labelled "Halifax (Canadà)" in Piedmontese. `kind` (`"city"`,
 `"metro"`, `"region"`, `"country"`) restricts the scope, and a Wikidata id or
 the index's own id picks one place. The metro definitions below each name a
-metro after its core city; with `kind="metro"`, one metro under several
-definitions (they share member places) answers with the first of
-`functional urban area`, `metropolitan statistical area`,
-`metropolitan region` and `city-region (FAO)`, so
-`transitio.place("Stockholm", kind="metro")` is its functional urban area,
-and `definition="metropolitan region"` picks another definition. A US
+metro after its core city; one metro under several definitions (they share
+member places) answers with the first of `functional urban area`,
+`metropolitan statistical area`, `metropolitan region` and
+`city-region (FAO)`, so `transitio.place("Stockholm", kind="metro")` is its
+functional urban area, and `definition="metropolitan region"` picks another
+definition. A city's own metros, those in its country, keep every
+definition, so that dropping the others cannot hand the city's name to one
+of them; `"Cambridge, United Kingdom"`, with no city of the name in the UK,
+is its metropolitan region. A US
 metropolitan statistical area is named after its principal cities, so a
 city's name matches it only in part; the city's `metros` lists it.
 

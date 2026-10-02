@@ -47,6 +47,7 @@ _MEMBER_LIMITS = {
     "realtime.parquet": 512 * 1024 * 1024,
     "places.parquet": 512 * 1024 * 1024,
     "edges.parquet": 512 * 1024 * 1024,
+    "access_providers.parquet": 8 * 1024 * 1024,
 }
 
 
@@ -57,7 +58,11 @@ def _member_limit(name):
 
 
 def _is_member_name(name):
-    return name in contract.MEMBERS or bool(contract.PARTITION_MEMBER.fullmatch(name))
+    return (
+        name in contract.MEMBERS
+        or name == contract.ACCESS_PROVIDERS_MEMBER
+        or bool(contract.PARTITION_MEMBER.fullmatch(name))
+    )
 
 
 # The most a decompressed archive may stream, extension headers included:

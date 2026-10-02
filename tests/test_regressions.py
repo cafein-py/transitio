@@ -417,7 +417,7 @@ def test_a_label_in_another_language_does_not_compete_with_an_own_name(name, exp
         [
             _place("c-ba", "city", "Buenos Aires", "AR"),
             _place("c-pinto", "city", "Pinto", "ES", names={"ga": "Buenos Aires"}),
-            _place("c-muc", "city", "Munich", "DE", names={"de": "München"}),
+            _place("c-muc", "city", "Munich", "DE", names={**known, "de": "München"}),
             _place("c-mue", "city", "München", "DE"),
             _place("c-par", "city", "Paris", "FR", names={**known, "fi": "Pariisi"}),
             _place("c-pariisi", "city", "Pariisi", "EE"),
@@ -433,6 +433,68 @@ def test_a_label_in_another_language_does_not_compete_with_an_own_name(name, exp
             "c-pariisi": 1,
             "mx": 2,
             "c-mek": 2,
+        },
+    )
+    if expected is None:
+        with pytest.raises(AmbiguousPlaceError):
+            lookup.resolve(name)
+    else:
+        assert lookup.resolve(name).id == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        # Mons carries "Bergen" in Dutch and German and as an alias.
+        ("Bergen", None),
+        # An English label is a primary name.
+        ("Halle", "c-halle-saale"),
+        # Loison-sous-Lens, listing "Lens" as an alias, stays a namesake of the
+        # arrondissement it lies in once the arrondissement leaves.
+        ("Lens", "c-lens"),
+    ],
+)
+def test_a_primary_name_outranks_a_label_in_another_own_language(name, expected):
+    # A place carrying a name only in another of its own languages competed
+    # like the places named so: Mons, Dutch "Bergen", outran the German towns
+    # of that name on feeds, and the arrondissement of Lens outran its city.
+    from transitio.exceptions import AmbiguousPlaceError
+
+    lookup = _lookup(
+        [
+            _place(
+                "c-mons",
+                "city",
+                "Mons",
+                "BE",
+                ["Bergen"],
+                {"nl": "Bergen", "de": "Bergen"},
+            ),
+            _place("c-bergen-1", "city", "Bergen", "DE"),
+            _place("c-bergen-2", "city", "Bergen", "DE"),
+            _place(
+                "c-halle-saale", "city", "Halle (Saale)", "DE", names={"en-ca": "Halle"}
+            ),
+            _place("c-halle", "city", "Halle", "BE"),
+            _place(
+                "c-arr", "city", "Arrondissement of Lens", "FR", names={"fr": "Lens"}
+            ),
+            _place("c-lens", "city", "Lens", "FR", parent="c-arr"),
+            _place(
+                "c-loison", "city", "Loison-sous-Lens", "FR", ["Lens"], parent="c-arr"
+            ),
+            _place("m-lens", "metro", "Lens", "FR"),
+        ],
+        {
+            "c-mons": 15,
+            "c-bergen-1": 3,
+            "c-bergen-2": 2,
+            "c-halle-saale": 19,
+            "c-halle": 4,
+            "c-arr": 30,
+            "c-lens": 12,
+            "c-loison": 7,
+            "m-lens": 16,
         },
     )
     if expected is None:
@@ -470,7 +532,7 @@ def test_suggestions_rank_a_label_in_another_language_after_aliases():
         pytest.param(
             "Moscow",
             [("us", "city", "US", 3, 77), ("ru", "city", "RU", 0, 336)],
-            None,
+            "ru",
             id="moscow",
         ),
         # Delhi, India, a region, ranks below two American townships.
@@ -482,7 +544,7 @@ def test_suggestions_rank_a_label_in_another_language_after_aliases():
                 ("us-2", "city", "US", 1, 1),
                 ("in", "region", "IN", 2, 101),
             ],
-            None,
+            "in",
             id="delhi",
         ),
         # An American metro leads and counts the labels of its country's city,
@@ -494,7 +556,7 @@ def test_suggestions_rank_a_label_in_another_language_after_aliases():
                 ("us", "city", "US", 0, 117),
                 ("ru", "region", "RU", 0, 264),
             ],
-            None,
+            "ru",
             id="metro-leader",
         ),
         pytest.param(
@@ -531,14 +593,35 @@ def test_suggestions_rank_a_label_in_another_language_after_aliases():
             "us",
             id="twice",
         ),
+        # Neither well-known place abroad is far better known than the other.
+        pytest.param(
+            "Moscow",
+            [
+                ("us", "city", "US", 3, 77),
+                ("ru", "city", "RU", 0, 336),
+                ("ca", "city", "CA", 0, 200),
+            ],
+            None,
+            id="two-known-rivals",
+        ),
+        pytest.param(
+            "Cali",
+            [
+                ("co-m", "metro", "CO", 1, 1),
+                ("co", "city", "CO", 1, 129),
+                ("co-2", "city", "CO", 1, 5),
+            ],
+            "co",
+            id="within-country",
+        ),
     ],
 )
-def test_a_feed_lead_does_not_beat_a_far_better_known_place_abroad(
-    name, rows, expected
-):
+def test_a_far_better_known_place_wins_where_feeds_do_not_decide(name, rows, expected):
     # Feed counts measure how well each country's feeds are catalogued: Moscow,
     # Idaho, with three feeds, won over Moscow, Russia, with none. The labels a
-    # place carries in many languages mark it as known far beyond its country.
+    # place carries in many languages mark it as known far beyond its country,
+    # and where feeds do not decide, such a place wins, at home or abroad: of
+    # Colombia's two cities named Cali, one feed each, the one with 129 labels.
     from transitio.exceptions import AmbiguousPlaceError
 
     places = [
@@ -560,38 +643,135 @@ def test_a_feed_lead_does_not_beat_a_far_better_known_place_abroad(
         ("Stockholm", {"definition": "metropolitan region"}, "m-mr"),
         ("Stockholm", {"definition": "city-region (FAO)"}, "m-fao"),
         ("Athens", {"kind": "metro"}, None),
+        # The definition that answers carries the name only in another language.
+        ("Kansas City", {"kind": "metro"}, "m-kc-msa"),
+        ("Stockholm", {}, "m-fua"),
+        # A city of the name abroad leaves the British metros one metro.
+        ("Ipswich", {}, "m-ips-mr"),
+        # The city's own metros keep both definitions, so neither outruns it.
+        ("Firenze", {}, None),
     ],
 )
-def test_kind_metro_picks_one_definition_of_a_metro(name, options, expected):
+def test_one_definition_of_a_metro_answers(name, options, expected):
     # Each metro definition names its metro after the core city, so Stockholm's
-    # three metros tied under kind="metro". The FAO region shares a member only
-    # with the metropolitan region, and that one with the FUA; Athens, US and
-    # Greece, share none and stay rivals.
+    # three metros tied, and without kind="metro" so did Cambridge's two in the
+    # UK. The FAO region shares a member only with the metropolitan region, and
+    # that one with the FUA; Athens, US and Greece, share none and stay rivals.
+    # Florence's metros are the city's namesakes: with one definition dropped,
+    # its FUA would beat the city by the margin.
     from transitio.exceptions import AmbiguousPlaceError
 
-    rows = [
-        ("m-fao", "Stockholm", "SE", "city-region (FAO)", ["a", "b"]),
-        ("m-mr", "Stockholm", "SE", "metropolitan region", ["b", "c"]),
-        ("m-fua", "Stockholm", "SE", "functional urban area", ["c", "d"]),
-        ("m-ath-us", "Athens", "US", "city-region (FAO)", ["e"]),
-        ("m-ath-gr", "Athens", "GR", "city-region (FAO)", ["f"]),
+    metros = [
+        # Each row: the id, name, country, definition, members and feeds.
+        ("m-fao", "Stockholm", "SE", "city-region (FAO)", ["a", "b"], 3),
+        ("m-mr", "Stockholm", "SE", "metropolitan region", ["b", "c"], 3),
+        ("m-fua", "Stockholm", "SE", "functional urban area", ["c", "d"], 3),
+        ("m-ath-us", "Athens", "US", "city-region (FAO)", ["e"], 3),
+        ("m-ath-gr", "Athens", "GR", "city-region (FAO)", ["f"], 3),
+        ("m-kc-fao", "Kansas City", "US", "city-region (FAO)", ["j"], 14),
+        ("m-ips-mr", "Ipswich", "GB", "metropolitan region", ["g"], 6),
+        ("m-ips-fao", "Ipswich", "GB", "city-region (FAO)", ["g", "h"], 6),
+        ("m-flr-fua", "Firenze", "IT", "functional urban area", ["i"], 26),
+        ("m-flr-mr", "Firenze", "IT", "metropolitan region", ["i"], 25),
     ]
-    lookup = _lookup(
-        [
-            {
-                **_place(pid, "metro", label, country),
-                "source_subtype": subtype,
-                "member_ids": members,
-            }
-            for pid, label, country, subtype, members in rows
-        ],
-        {row[0]: 3 for row in rows},
-    )
+    florence = {"en": "Florence", "it": "Firenze"}
+    places = [
+        {
+            **_place(pid, "metro", label, country),
+            "source_subtype": subtype,
+            "member_ids": members,
+        }
+        for pid, label, country, subtype, members, _ in metros
+    ] + [
+        _place("c-ips", "city", "Ipswich", "AU"),
+        _place("r-flr", "region", "Florence", "IT", names=florence),
+        _place("c-flr", "city", "Florence", "IT", names=florence, parent="r-flr"),
+        {
+            **_place("m-kc-msa", "metro", "KC area", "US", names={"da": "Kansas City"}),
+            "source_subtype": "metropolitan statistical area",
+            "member_ids": ["j"],
+        },
+    ]
+    feeds = {row[0]: row[-1] for row in metros}
+    feeds.update({"c-ips": 1, "r-flr": 26, "c-flr": 11, "m-kc-msa": 7})
+    lookup = _lookup(places, feeds)
     if expected is None:
         with pytest.raises(AmbiguousPlaceError):
             lookup.resolve(name, **options)
     else:
         assert lookup.resolve(name, **options).id == expected
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("Copenhagen, Denmark", "r-cph"),
+        # A town qualifies when no region or country does.
+        ("Copenhagen, Town of Denmark", "c-cph"),
+        ("Halifax, Canada", "c-hfx"),
+        # A label in another language answers when the qualified name is
+        # ambiguous or matches nothing.
+        ("Ashington, Anglija", "c-ash-1"),
+        ("Ashington, Anglia", "c-ash-1"),
+        # An alias holding the comma is read as written.
+        ("Andover, USA", "c-and-1"),
+    ],
+)
+def test_a_qualifier_names_a_containing_region_or_country(query, expected):
+    # Any ancestor qualified a name, so a town called Denmark in New York kept
+    # "Copenhagen, Denmark" ambiguous; and a label equal to the whole query in
+    # a language not the place's own (Piedmontese "Halifax (Canadà)" for the
+    # region) skipped the qualifier.
+    lookup = _lookup(
+        [
+            _place("dk", "country", "Denmark", "DK"),
+            _place(
+                "r-cph",
+                "region",
+                "Copenhagen Municipality",
+                "DK",
+                aliases=["Copenhagen"],
+                parent="dk",
+            ),
+            _place("us", "country", "United States", "US", ["USA"]),
+            _place("r-ny", "region", "New York", "US", parent="us"),
+            _place("c-dk", "city", "Denmark", "US", ["Town of Denmark"], parent="r-ny"),
+            _place("c-cph", "city", "Copenhagen", "US", parent="c-dk"),
+            _place("ca", "country", "Canada", "CA"),
+            _place(
+                "r-hfx",
+                "region",
+                "Halifax",
+                "CA",
+                names={"pms": "Halifax (Canadà)"},
+                parent="ca",
+            ),
+            _place("c-hfx", "city", "Halifax", "CA", parent="r-hfx"),
+            _place("r-eng", "region", "England", "GB", names={"lv": "Anglija"}),
+            _place(
+                "c-ash-1",
+                "city",
+                "Ashington",
+                "GB",
+                names={"lt": "Ashington, Anglija", "ro": "Ashington, Anglia"},
+                parent="r-eng",
+            ),
+            _place("c-ash-2", "city", "Ashington", "GB", parent="r-eng"),
+            _place("c-and-1", "city", "Andover", "US", ["Andover, USA"], parent="r-ny"),
+            _place("c-and-2", "city", "Andover", "US", parent="r-ny"),
+        ],
+        {
+            "r-cph": 13,
+            "c-cph": 1,
+            "r-hfx": 3,
+            "c-hfx": 3,
+            "c-ash-1": 1,
+            "c-ash-2": 2,
+            "c-and-1": 1,
+            "c-and-2": 4,
+        },
+    )
+    assert lookup.resolve(query).id == expected
 
 
 def test_padded_header_names_merge_into_one_column(tmp_path):
@@ -826,7 +1006,21 @@ INHERITED = [{"feed": 0, "errors": 1, "codes": {"foreign_key_violation": 1}}]
             {"errors": 1, "codes": {"foreign_key_violation": 1}},
         ),
         (True, "capped", None, INHERITED, {"errors": 0, "codes": {}}),
-        (True, "sampled", "cannot tell", None, None),
+        (
+            True,
+            "sampled",
+            r"input 0 \(f1\) left out .*attributions.txt exceeds max_notices_per_file",
+            None,
+            None,
+        ),
+        (True, "blocked", None, INHERITED, {"errors": 0, "codes": {}}),
+        (
+            True,
+            "blocked-introduced",
+            r"introduced 1 .*\(foreign_key_violation 1\)",
+            INHERITED,
+            {"errors": 1, "codes": {"foreign_key_violation": 1}},
+        ),
     ],
     ids=[
         "inherited",
@@ -836,6 +1030,8 @@ INHERITED = [{"feed": 0, "errors": 1, "codes": {"foreign_key_violation": 1}}]
         "input-changed-after-read",
         "capped",
         "sampled",
+        "blocked",
+        "blocked-introduced",
     ],
 )
 def test_merge_refuses_only_errors_it_introduced(
@@ -843,7 +1039,8 @@ def test_merge_refuses_only_errors_it_introduced(
 ):
     # A merge refused every error-severity notice of the merged feed, those
     # its inputs already carried included, so feeds merged clean only when
-    # every input was clean.
+    # every input was clean; and an input whose block reached the overlap
+    # check's pair cap counted as sampled, so its merge was refused.
     from transitio.edit import FeedBuilder
     from transitio.exceptions import InvalidFeedError
     from transitio.gtfs import _merge, merge_feeds
@@ -863,8 +1060,14 @@ def test_merge_refuses_only_errors_it_introduced(
         "attributions.txt",
         [{"route_id": "gone", "organization_name": "Org", "is_operator": "1"}],
     )
+    if variant in ("blocked", "blocked-introduced"):
+        # 142 trips in one block: 10,011 pairs, over the overlap check's cap.
+        for n in range(142):
+            start = 36_000 + 120 * n
+            stops = [("s1", start, start), ("s2", start + 60, start + 60)]
+            first.add_trip("r1", "wk", f"b{n}", stops, block_id="b")
     second = feed("09:00:00", "09:05:00")
-    if variant in ("dangling-stop", "input-changed-after-read"):
+    if variant in ("dangling-stop", "input-changed-after-read", "blocked-introduced"):
         merge_tables = _merge._merge_tables
 
         def dangling(*args, **kwargs):
@@ -882,7 +1085,7 @@ def test_merge_refuses_only_errors_it_introduced(
     feeds = [first, second]
     output = tmp_path / "merged.zip"
     budgets = {"reference_date": "20260601"}
-    if variant == "capped":
+    if variant in ("capped", "blocked-introduced"):
         budgets["max_notices_per_file"] = 0
     if refusal is None:
         report = merge_feeds(feeds, output, check=check, **budgets)
@@ -1158,11 +1361,164 @@ def test_a_feed_missing_a_required_file_is_skipped(tmp_path, dropped, reason, wi
     )
     if reason is None:
         path, report, *_, kept_window = _process_feed(source, **options)
-        assert (path, kept_window) == (source, window) and report["summary"]
+        assert (path, kept_window) == (source, window)
+        assert report["summary"]["droppedRows"] is None  # not cropped
         return
     with pytest.raises(_SkipFeed) as caught:
         _process_feed(source, **options)
     assert (caught.value.reason, caught.value.window) == (reason, window)
+
+
+FK = "foreign_key_violation"
+
+
+@pytest.mark.parametrize(
+    "changes, dropped, counts, note",
+    [
+        pytest.param(
+            {
+                "stop_times.txt": FEED["stop_times.txt"]
+                + "t-in,08:10:00,08:10:00,ghost,3\n"
+            },
+            [(FK, "stop_times.txt", "stop_id", "stops.txt", "ghost")],
+            (1, 2),
+            "dropped 1 stop_times.txt rows whose stop_id is not in stops.txt",
+            id="stop",
+        ),
+        pytest.param(
+            {
+                "trips.txt": FEED["trips.txt"] + "r-ghost,wk,t-ghost\n",
+                "stop_times.txt": FEED["stop_times.txt"]
+                + "t-ghost,10:00:00,10:00:00,in1,1\nt-ghost,10:05:00,10:05:00,in2,2\n",
+            },
+            [(FK, "trips.txt", "route_id", "routes.txt", "r-ghost")],
+            (1, 2),
+            "dropped 1 trips.txt rows whose route_id is not in routes.txt",
+            id="route",
+        ),
+        pytest.param(
+            {
+                "trips.txt": FEED["trips.txt"] + "r-in,wk,t-short\nr-in,wk,t-one\n",
+                "stop_times.txt": FEED["stop_times.txt"]
+                + "t-short,10:00:00,10:00:00,in1,1\nt-short,10:05:00,10:05:00,ghost,2\n"
+                + "t-one,11:00:00,11:00:00,in2,1\n",
+            },
+            [
+                (FK, "stop_times.txt", "stop_id", "stops.txt", "ghost"),
+                ("unusable_trip", "trips.txt", "trip_id", None, "t-short"),
+            ],
+            (2, 3),  # t-one had a single stop_time in the source and stays
+            "dropped 1 stop_times.txt rows whose stop_id is not in stops.txt, "
+            "dropped 1 trips.txt rows left with fewer than two stop_times",
+            id="short-trip",
+        ),
+        pytest.param({}, [], (1, 2), None, id="consistent"),
+        pytest.param(
+            {"routes.txt": "agency_id,route_short_name,route_type\nhsl,1,3\n"},
+            "routes.txt has no route_id column; cannot crop this feed",
+            None,
+            None,
+            id="no-route-id",
+        ),
+    ],
+)
+def test_the_crop_drops_rows_naming_a_missing_stop_or_route(
+    tmp_path, changes, dropped, counts, note
+):
+    # Moscow's cropped feed kept stop_times rows naming stops its stops.txt
+    # lacked, and cafein refused the whole feed.
+    from transitio.pipeline._fetch import _dropped_note, _process_feed
+
+    source = write_zip(tmp_path / "feed.zip", {**FEED, **changes})
+    output = tmp_path / "cropped.zip"
+    if isinstance(dropped, str):
+        with pytest.raises(OSError, match=dropped):
+            crop_feed(source, output, aoi=CITY_BBOX)
+        assert not output.exists()
+        return
+    result = crop_feed(source, output, aoi=CITY_BBOX)
+    expected = [
+        {
+            "code": code,
+            "filename": filename,
+            "fieldName": field,
+            "parentFilename": parent,
+            "rowCount": 1,
+            "valueCount": 1,
+            "sampleValues": [value],
+        }
+        for code, filename, field, parent, value in dropped
+    ]
+    assert result["dropped_rows"] == expected
+    row_counts = result["row_counts"]
+    assert (row_counts["trips.txt"], row_counts["stop_times.txt"]) == counts
+    codes = {n["code"] for n in validate_feed(output)["notices"]}
+    assert "foreign_key_violation" not in codes
+    _, report, *_ = _process_feed(
+        source,
+        geometry=CITY_BBOX,
+        tag="t",
+        repair=False,
+        crop=True,
+        modes=None,
+        day=None,
+        study=False,
+        hosted=None,
+        budgets={},
+    )
+    assert report["summary"]["droppedRows"] == expected
+    assert _dropped_note(report) == note
+
+
+@pytest.mark.parametrize(
+    "repeats, count",
+    [
+        pytest.param("r-in,wk,t-in\n" * 3, 3, id="exact"),
+        pytest.param(" r-in ,wk, t-in\n", 1, id="padded"),
+        pytest.param("r-out,wk,t-in\n", None, id="differing"),
+    ],
+)
+def test_the_crop_drops_exact_repeats_of_a_trip(tmp_path, repeats, count):
+    # Delhi's feed repeats eight trips.txt rows exactly, and the crop
+    # refused the feed as ambiguous.
+    from transitio.pipeline._fetch import _dropped_note, _process_feed
+
+    trips = FEED["trips.txt"] + repeats
+    source = write_zip(tmp_path / "feed.zip", {**FEED, "trips.txt": trips})
+    output = tmp_path / "cropped.zip"
+    if count is None:
+        with pytest.raises(OSError, match='repeats trip_id "t-in"'):
+            crop_feed(source, output, aoi=CITY_BBOX)
+        assert not output.exists()
+        return
+    result = crop_feed(source, output, aoi=CITY_BBOX)
+    assert result["dropped_rows"] == [
+        {
+            "code": "duplicate_key",
+            "filename": "trips.txt",
+            "fieldName": "trip_id",
+            "parentFilename": None,
+            "rowCount": count,
+            "valueCount": 1,
+            "sampleValues": ["t-in"],
+        }
+    ]
+    assert result["row_counts"]["trips.txt"] == 1
+    codes = {n["code"] for n in validate_feed(output)["notices"]}
+    assert "duplicate_key" not in codes
+    _, report, *_ = _process_feed(
+        source,
+        geometry=CITY_BBOX,
+        tag="t",
+        repair=False,
+        crop=True,
+        modes=None,
+        day=None,
+        study=False,
+        hosted=None,
+        budgets={},
+    )
+    assert _dropped_note(report) == f"dropped {count} exact duplicate trips.txt rows"
 
 
 MIDLAND = {
@@ -1392,13 +1748,17 @@ def test_an_area_across_a_border_gets_the_smallest_extract_containing_it(
         areas.append(area)
         path = pathlib.Path(directory) / "bbbike_Basel.osm.pbf"
         path.write_bytes(b"\x00pbf")
+        fields = dict(provider="BBBike", extract="Basel", url=url, bytes=100138363)
+        source = types.SimpleNamespace(
+            path=str(path), sha256="0" * 64, snapshot=None, **fields
+        )
         return types.SimpleNamespace(
             path=str(path),
-            provider="BBBike",
-            extract="Basel",
-            url=url,
-            bytes=100138363,
             failed=[],
+            sources=[source],
+            sha256=source.sha256,
+            snapshot=None,
+            **fields,
         )
 
     def get_data_by_bbox(*args, **kwargs):
@@ -1418,20 +1778,84 @@ def test_an_area_across_a_border_gets_the_smallest_extract_containing_it(
     )
 
 
-def _finland_extract(path, update):
+def test_extracts_need_cover_only_the_stops_within_the_buffer(tmp_path, monkeypatch):
+    # A place grown across a border took the one extract containing all of
+    # it (Geofabrik's Alps for Zermatt), though its stops needed far less.
+    import math
+    import pathlib
+
+    import shapely
+
+    from transitio.osm import fetch_pbf
+    from transitio.osm._fetch import _area_km2, _buffered
+
+    calls = []
+
+    def get_data_by_area(area, directory=None, output_path=None, **kwargs):
+        calls.append(kwargs)
+        extract = pathlib.Path(directory) / "geofabrik_finland-latest.osm.pbf"
+        return _finland_extract(extract, False, output_path)
+
+    monkeypatch.setattr("pyrosm.get_data_by_area", get_data_by_area)
+    aoi = shapely.box(7.70, 45.95, 7.80, 46.05)
+    east = 111_320 * math.cos(math.radians(46.0))
+    # Well inside; in the grown margin, 200 m from its edge; 20 km outside.
+    points = [(7.75, 46.0), (7.80 + 1400 / east, 46.0), (7.80 + 20_000 / east, 46.0)]
+    stops = shapely.multipoints(points)
+    path = fetch_pbf(aoi, buffer_m=1600, must_cover=stops, cache_dir=tmp_path)
+    plain = fetch_pbf(aoi, buffer_m=1600, cache_dir=tmp_path)
+
+    call, without = calls
+    assert call["strategy"] == "smallest_total" and without["must_cover"] is None
+    must_cover = call["must_cover"]
+    discs = [_buffered(shapely.Point(point), 1600) for point in points]
+    inner, margin = (_area_km2(must_cover.intersection(disc)) for disc in discs[:2])
+    assert inner == pytest.approx(_area_km2(discs[0]), rel=1e-6)
+    assert 0 < margin < 0.9 * _area_km2(discs[1])
+    assert not must_cover.intersects(discs[2])
+    assert must_cover.equals(
+        _buffered(shapely.multipoints(points[:2]), 1600).intersection(
+            _buffered(aoi, 1600)
+        )
+    )
+    assert path.name != plain.name
+
+
+def _finland_extract(path, update, output_path=None, crop=None):
     """An ``AreaExtract`` stand-in for Geofabrik's Finland extract at ``path``,
-    written as pyrosm would: when missing or on update."""
+    written as pyrosm would: when missing or on update, then cropped to
+    ``output_path`` when given by ``crop(path, output_path)``, by default
+    ``b"crop of "`` and the extract's bytes."""
+    import hashlib
+    import pathlib
     import types
+
+    def crop_of(source, target):
+        target.write_bytes(b"crop of " + source.read_bytes())
 
     if update or not path.exists():
         path.write_bytes(b"\x00new" if update else b"\x00old")
-    return types.SimpleNamespace(
-        path=str(path),
+    written = path
+    if output_path is not None:
+        written = pathlib.Path(output_path)
+        (crop or crop_of)(path, written)
+    fields = dict(
         provider="Geofabrik",
         extract="finland",
         url="https://download.geofabrik.de/europe/finland-latest.osm.pbf",
         bytes=None,
+    )
+    sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    source = types.SimpleNamespace(
+        path=str(path), sha256=sha256, snapshot=None, **fields
+    )
+    return types.SimpleNamespace(
+        path=str(written),
         failed=[],
+        sources=[source],
+        sha256=hashlib.sha256(written.read_bytes()).hexdigest(),
+        snapshot=None,
+        **fields,
     )
 
 
@@ -1442,7 +1866,6 @@ def test_fetches_sharing_a_cache_take_turns(tmp_path, monkeypatch):
     import concurrent.futures
     import hashlib
     import json
-    import pathlib
     import threading
 
     from transitio.osm import fetch_pbf
@@ -1451,22 +1874,17 @@ def test_fetches_sharing_a_cache_take_turns(tmp_path, monkeypatch):
     updates = []
     cropping, release = threading.Event(), threading.Event()
 
-    def get_data_by_area(area, update=False, **kwargs):
+    def slow_crop(source, target):
+        content = source.read_bytes()
+        cropping.set()
+        release.wait(30)
+        target.write_bytes(b"crop of " + content)
+
+    def get_data_by_area(area, update=False, output_path=None, **kwargs):
         updates.append(update)
-        return _finland_extract(extract, update)
-
-    class OSM:
-        def __init__(self, filepath, bounding_box=None):
-            self.filepath = filepath
-
-        def to_pbf(self, output_path=None):
-            source = pathlib.Path(self.filepath).read_bytes()
-            cropping.set()
-            release.wait(30)
-            pathlib.Path(output_path).write_bytes(b"crop of " + source)
+        return _finland_extract(extract, update, output_path, slow_crop)
 
     monkeypatch.setattr("pyrosm.get_data_by_area", get_data_by_area)
-    monkeypatch.setattr("pyrosm.OSM", OSM)
     bbox = (24.6, 60.1, 25.2, 60.4)
     with concurrent.futures.ThreadPoolExecutor(2) as pool:
         try:
@@ -1492,30 +1910,30 @@ def test_fetches_sharing_a_cache_take_turns(tmp_path, monkeypatch):
 def test_a_crop_and_its_sidecar_replace_what_is_at_their_names(tmp_path, monkeypatch):
     # The crop and its sidecar were written straight to their names, so a
     # failed crop left a truncated file that later calls returned as cached,
-    # and a symlink at either name had its target overwritten.
+    # and a symlink at either name had its target overwritten. A failed
+    # update also left the replaced extract's sidecar describing old bytes.
+    import os
     import pathlib
 
     from transitio.osm import fetch_pbf
 
     fail = []
 
-    class OSM:
-        def __init__(self, filepath, bounding_box=None):
-            pass
+    def crop(source, target):
+        target.write_bytes(b"\x00crop")
+        if fail:
+            raise RuntimeError("crop failed")
 
-        def to_pbf(self, output_path=None):
-            pathlib.Path(output_path).write_bytes(b"\x00crop")
-            if fail:
-                raise RuntimeError("crop failed")
+    def get_data_by_area(area, update=False, directory=None, **kwargs):
+        extract = pathlib.Path(directory) / "geofabrik_finland-latest.osm.pbf"
+        return _finland_extract(extract, update, kwargs.get("output_path"), crop)
 
-    monkeypatch.setattr(
-        "pyrosm.get_data_by_area",
-        lambda area, update=False, directory=None, **kwargs: _finland_extract(
-            pathlib.Path(directory) / "geofabrik_finland-latest.osm.pbf", update
-        ),
-    )
-    monkeypatch.setattr("pyrosm.OSM", OSM)
+    monkeypatch.setattr("pyrosm.get_data_by_area", get_data_by_area)
     bbox = (24.6, 60.1, 25.2, 60.4)
+    extract = fetch_pbf(bbox, crop=False, cache_dir=tmp_path)
+    extract_sidecar = extract.with_suffix(".provenance.json")
+    os.utime(extract, (0, 0))
+    os.utime(extract_sidecar, (86400, 86400))
     path = fetch_pbf(bbox, cache_dir=tmp_path)
     names = path, path.with_suffix(".provenance.json")
     for name in names:
@@ -1528,6 +1946,7 @@ def test_a_crop_and_its_sidecar_replace_what_is_at_their_names(tmp_path, monkeyp
     with pytest.raises(RuntimeError, match="crop failed"):
         fetch_pbf(bbox, cache_dir=tmp_path, update=True)
     assert all(name.is_symlink() for name in names)
+    assert not extract_sidecar.exists()
     assert [p for p in path.parent.iterdir() if p.is_dir()] == []
     fail.clear()
     assert fetch_pbf(bbox, cache_dir=tmp_path, update=True) == path

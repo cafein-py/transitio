@@ -70,10 +70,11 @@ leads, as for London in the UK and in Canada, `place` raises
 `AmbiguousPlaceError`; a qualifier names the region or country that holds
 the place, as in `"London, Ontario"` or `"City of London, UK"`, `kind="city"`
 (or `"metro"`, `"region"`, `"country"`) restricts the scope, and a Wikidata
-id picks one place. With `kind="metro"`, a metro delineated under several
-definitions resolves to one of them, by the order functional urban area,
-metropolitan statistical area, metropolitan region, FAO city-region;
-`definition=` names one instead. A partial name raises
+id picks one place. A metro delineated under several definitions resolves
+to one of them, by the order functional urban area, metropolitan
+statistical area, metropolitan region, FAO city-region, though a city's own
+metros (those in its country) keep every definition; `definition=` names
+one instead. A partial name raises
 `PlaceNotFoundError`, which lists the places it partly matches;
 `transitio.suggest` completes names.
 

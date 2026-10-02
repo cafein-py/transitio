@@ -13,7 +13,9 @@ pub mod scan;
 pub mod schema;
 pub mod semantics;
 
-pub use crop::{closed_parts, crop, validate_polygon, CropOptions, CropResult, PolygonRings};
+pub use crop::{
+    closed_parts, crop, validate_polygon, CropOptions, CropResult, DroppedRows, PolygonRings,
+};
 pub use notice::{Notice, Severity};
 pub use readiness::{DistanceReadiness, Readiness};
 pub use repair::{repair, Fix, RepairResult};

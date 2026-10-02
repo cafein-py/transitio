@@ -85,7 +85,8 @@ class FetchResult:
     # its area, or why it was not fetched.
     selection: list = dataclasses.field(default_factory=list)
     # The WGS84 area the OSM extract was fetched for; None without one. A
-    # failed extract download leaves it and osm_pbf None.
+    # failed extract download leaves it and osm_pbf None. On the place path,
+    # its parts farther than 1.6 km from every delivered stop may lack OSM data.
     osm_area: object = None
 
     def __iter__(self):  # convenient (pbf, feeds) unpacking
@@ -298,6 +299,28 @@ def _note(entry, text):
     entry["note"] = text if entry["note"] is None else f"{entry['note']}; {text}"
 
 
+def _dropped_note(report):
+    """``"dropped <n> <file> rows whose <field> is not in <parent>"``,
+    ``"dropped <n> trips.txt rows left with fewer than two stop_times"`` or
+    ``"dropped <n> exact duplicate <file> rows"`` for the rows the crop of a
+    feed left out (several joined with ``", "``), or None when it left out
+    none."""
+    parts = []
+    for record in report["summary"].get("droppedRows") or ():
+        dropped = f"dropped {record['rowCount']}"
+        if record["code"] == "unusable_trip":
+            text = f"{record['filename']} rows left with fewer than two stop_times"
+        elif record["code"] == "duplicate_key":
+            text = f"exact duplicate {record['filename']} rows"
+        else:
+            text = (
+                f"{record['filename']} rows whose {record['fieldName']} is not in "
+                f"{record['parentFilename']}"
+            )
+        parts.append(f"{dropped} {text}")
+    return ", ".join(parts) or None
+
+
 def _skipped(selection):
     """The ``(feed id, reason)`` pairs of the skipped entries."""
     return [
@@ -346,8 +369,10 @@ def _process_feed(
     route crop, or ``None`` when a ``routes`` filter is not applied or that
     feed's routes.txt cannot be read — so a caller records an *undetermined*
     drop rather than a false empty one — and ``window`` the computed service
-    window as ISO dates, None when unknown. Raises :class:`_SkipFeed` when the
-    feed drops out. Shared by the AOI and the place paths.
+    window as ISO dates, None when unknown. The report's summary carries the
+    crop's ``dropped_rows`` as ``droppedRows``, None when the feed was not
+    cropped. Raises :class:`_SkipFeed` when the feed drops out. Shared by the
+    AOI and the place paths.
     """
     from transitio.gtfs import crop_feed
     from transitio.repair import repair_feed
@@ -360,6 +385,7 @@ def _process_feed(
         provenance = json.loads(sidecar.read_text())
     present_routes = None
     source_notices = []
+    dropped = None
     if crop or routes is not None:
         cropped = path.with_name(f"{path.stem}-cropped-{tag}.zip")
         report = crop_feed(
@@ -368,12 +394,13 @@ def _process_feed(
         if routes is not None:
             # From the crop's own scan of this feed, so the drop audit and the
             # crop describe the same bytes (no second read to race). ``None``
-            # (routes.txt or its column absent) stays undetermined, not empty.
+            # (no routes.txt) stays undetermined, not empty.
             source = report.get("source_routes")
             present_routes = None if source is None else set(source)
         # The crop writes trimmed tables; the source's whitespace is
         # reported with the feed.
         source_notices = report["source_notices"]
+        dropped = report["dropped_rows"]
         path = cropped
     # The crop comes first, so the repair works on the area's feed rather
     # than on the whole source.
@@ -407,6 +434,7 @@ def _process_feed(
             raise _SkipFeed(reason, window)
     validation["notices"].extend(source_notices)
     report = build_report(validation, hosted=hosted, provenance=provenance)
+    report["summary"]["droppedRows"] = dropped
     return path, report, fixes, present_routes, window
 
 
@@ -919,18 +947,15 @@ def _record_source(path, fetched_from, errors):
 
 def _unchanged_since_indexed(feed, http):
     """Whether the archive the index crawled for an indexed feed is still the
-    one served: a conditional ``HEAD`` to the URL the crawl reads (the Atlas
-    static feed, else the Mobility Database direct download), carrying the
+    one served: a conditional ``HEAD`` to the URL the crawl reads
+    (``_crawl_url``: its download URL, else Atlas, else MDB), carrying the
     ETag and Last-Modified it recorded, answers 304 Not Modified. Returns
     that URL, or None: any other answer, a failed probe or no recorded
     validator is no proof. A URL fragment is not sent, so the probe of a
     feed inside a larger archive reaches that archive."""
-    from transitio.catalog._atlas import STATIC_URL
-    from transitio.index.feeds import _parse, _scalar
+    from transitio.index.feeds import _crawl_url, _scalar
 
-    atlas = (_parse(feed._row.get("atlas")) or {}).get("urls") or {}
-    mdb = (_parse(feed._row.get("mdb")) or {}).get("urls") or {}
-    url = atlas.get(STATIC_URL) or mdb.get("direct_download")
+    url = _crawl_url(feed)
     headers = {}
     etag = _scalar(feed._row.get("etag"))
     last_modified = _scalar(feed._row.get("last_modified"))
@@ -1098,12 +1123,20 @@ def fetch(
     crop : bool, default True
         Spatially crop each feed to the area: to its polygon when it has
         one (a place's boundary included), otherwise to its bounding box.
+        The crop, also run for a route selection, leaves out a trip naming
+        a route the feed lacks, a stop_times row naming a stop it lacks, a
+        trip such rows leave with fewer than two stop_times, and an exact
+        repeat of a trips.txt row (:func:`~transitio.gtfs.crop_feed`); a
+        feed whose routes.txt or stops.txt has no id column, or whose
+        trips.txt repeats a ``trip_id`` with other values, is skipped.
     osm : bool, default True
         Fetch the OSM extract for the AOI. With ``place``, it is fetched
         after the feeds, for the place's parts that hold a stop of a
         delivered feed (the whole place when none does, nothing was
         delivered or a delivered feed's stops.txt cannot be read), each part
-        grown by 1.6 km, cafein's default snap distance. The crop keeps
+        grown by 1.6 km, cafein's default snap distance. Parts of that area
+        farther than 1.6 km from every delivered stop may lack OSM data, as
+        the extract need only cover the stops' surroundings. The crop keeps
         each trip that serves the area whole, so a delivered feed's stops
         can lie beyond the OSM area and get no footpaths in cafein;
         ``stops_outside_osm`` in ``selection`` counts them. With ``osm=False``
@@ -1138,7 +1171,10 @@ def fetch(
         delivered feeds. Reports merge the local validation of the delivered
         feed with the hosted report of the published dataset, so after
         cropping or repair the hosted side describes the pre-transform
-        original. ``selection`` has one entry per candidate feed, in
+        original. A report's ``summary["droppedRows"]`` lists the rows the
+        crop left out (the ``dropped_rows`` of
+        :func:`~transitio.gtfs.crop_feed`), None for a feed not cropped.
+        ``selection`` has one entry per candidate feed, in
         candidate order: ``feed_id``, ``name``, ``decision``
         (``"delivered"`` or ``"skipped"``), ``reason`` (why it was skipped),
         ``note`` (about a delivered feed: the routes it was cut to, why a
@@ -1147,7 +1183,10 @@ def fetch(
         ``agency_timezone`` not equivalent to the zone of most of its stops,
         e.g. ``"agency_timezone America/New_York; stops in
         Pacific/Honolulu"``, a placeholder calendar, which a left-out
-        version keeps; several join with ``"; "``),
+        version keeps, rows the crop left out, e.g. ``"dropped 1860
+        stop_times.txt rows whose stop_id is not in stops.txt"`` or
+        ``"dropped 8 exact duplicate trips.txt rows"``; several join with
+        ``"; "``),
         ``index_window`` (the index's ``[start, end]``; None undated or on
         the area path), ``feed_window`` (the computed window of a validated
         download, delivered or not; None otherwise or when unknown),
@@ -1371,9 +1410,12 @@ def fetch(
                 _skip(entry, f"processing failed: {error}")
                 continue
             entry.update(decision="delivered", feed_window=window, path=path)
-            note = _timezone_note(path, budgets.get("max_total_bytes"))
-            if note is not None:
-                _note(entry, note)
+            for note in (
+                _timezone_note(path, budgets.get("max_total_bytes")),
+                _dropped_note(report),
+            ):
+                if note is not None:
+                    _note(entry, note)
             reports.append(report)
             repairs.append(fixes)
             feeds.append(path)
@@ -1466,6 +1508,18 @@ def _stop_coords(path):
     return np.array(list(coords.values()), dtype=float).reshape(-1, 2)
 
 
+def _located_stops(coords):
+    """The located stops of every feed in ``coords`` (:func:`_stop_coords`,
+    by path) as one ``(n, 2)`` array; None when there is no feed or a feed's
+    stops.txt cannot be read."""
+    import numpy as np
+
+    located = list(coords.values())
+    if not located or any(points is None for points in located):
+        return None
+    return np.concatenate(located)
+
+
 def _osm_parts(geometry, feeds):
     """``(parts, coords)``: ``coords`` maps each delivered feed in ``feeds``
     to its located stops (:func:`_stop_coords`), and ``parts`` is what of
@@ -1477,15 +1531,30 @@ def _osm_parts(geometry, feeds):
     import shapely
 
     coords = {path: _stop_coords(path) for path in feeds}
-    located = list(coords.values())
-    if not located or any(points is None for points in located):
+    located = _located_stops(coords)
+    if located is None:
         return geometry, coords
     parts = shapely.get_parts(geometry)
-    points = shapely.points(np.concatenate(located))
+    points = shapely.points(located)
     held = np.unique(shapely.STRtree(parts).query(points, predicate="intersects")[1])
     if len(held) in (0, len(parts)):
         return geometry, coords
     return shapely.union_all(parts[held]), coords
+
+
+def _osm_stops(area, coords):
+    """The located stops in ``coords`` (:func:`_osm_parts`) inside ``area``
+    as a MultiPoint, what the OSM extract must cover; None when nothing was
+    delivered, a feed's stops.txt cannot be read or no stop lies inside."""
+    import numpy as np
+    import shapely
+
+    located = _located_stops(coords)
+    if located is None:
+        return None
+    shapely.prepare(area)
+    inside = np.unique(located[shapely.intersects_xy(area, located)], axis=0)
+    return shapely.multipoints(inside) if len(inside) else None
 
 
 def _hidden_note(place, hidden):
@@ -1607,8 +1676,6 @@ def _fetch_place(
     indexed; ``window_day`` is what the computed window is tested against.
     The versions among the delivered feeds are settled after the feed loop,
     and the OSM extract comes last, for the parts the remaining feeds serve."""
-    import shapely
-
     from transitio import __version__
     from transitio.catalog import Feed, MobilityDatabase, TransitlandAtlas
     from transitio.catalog._atlas import _feed_dir
@@ -1620,6 +1687,7 @@ def _fetch_place(
         place as resolve_place,
     )
     from transitio.index.feeds import _parse
+    from transitio.index.places import _as_shape
     from transitio.osm._fetch import _buffered
 
     if isinstance(place, Place):
@@ -1633,11 +1701,9 @@ def _fetch_place(
         "discovery_semantics_version": DISCOVERY_SEMANTICS_VERSION,
         "transitio_version": __version__,
     }
-    geometry = place_obj.geometry
+    geometry = _as_shape(place_obj.geometry)
     if geometry is None:
         raise ValueError(f"place {place_obj.id} has no geometry to fetch for")
-    if isinstance(geometry, (bytes, bytearray)):
-        geometry = shapely.from_wkb(bytes(geometry))
     study = when is not None
 
     tag = hashlib.sha256(
@@ -1952,7 +2018,7 @@ def _fetch_place(
                 cropped.add(feed.feed_id)
             else:
                 carriers[feed.feed_id] = feed.feed_id
-            notes.append(_timezone_note(path, budget))
+            notes += [_timezone_note(path, budget), _dropped_note(report)]
             for text in dict.fromkeys(filter(None, notes)):
                 _note(entry, text)
             reports.append(report)
@@ -1980,11 +2046,17 @@ def _fetch_place(
     osm_pbf = osm_area = None
     if osm:
         parts, coords = _osm_parts(geometry, feeds)
+        osm_area = _buffered(parts, _OSM_BUFFER_M)
         osm_pbf, note = _osm_extract(
-            parts, buffer_m=_OSM_BUFFER_M, cache_dir=cache_dir, directory=directory
+            parts,
+            buffer_m=_OSM_BUFFER_M,
+            must_cover=_osm_stops(osm_area, coords),
+            cache_dir=cache_dir,
+            directory=directory,
         )
-        if osm_pbf is not None:
-            osm_area = _buffered(parts, _OSM_BUFFER_M)
+        if osm_pbf is None:
+            osm_area = None
+        else:
             counts = _count_outside(record, osm_area, coords)
             note = _osm_note(geometry, parts, *counts)
         if note is not None:

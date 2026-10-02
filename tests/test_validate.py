@@ -330,6 +330,54 @@ def test_row_cap_is_configurable(tmp_path):
     assert report["row_counts"]["stop_times.txt"] == 1
 
 
+def _notice(code, severity, filename, **context):
+    return {
+        "code": code,
+        "severity": severity,
+        "context": {"filename": filename, **context},
+    }
+
+
+@pytest.mark.parametrize(
+    "notices, incomplete, expected",
+    [
+        (
+            [
+                _notice("notice_limit_reached", "WARNING", "trips.txt", blockId="b"),
+                _notice("notice_limit_reached", "WARNING", "stops.txt"),
+            ],
+            [],
+            [],
+        ),
+        (
+            [
+                _notice("notice_limit_reached", "ERROR", "shapes.txt"),
+                _notice("too_many_rows", "ERROR", "stop_times.txt"),
+                _notice(
+                    "unreadable_file",
+                    "ERROR",
+                    "trips.txt",
+                    budgets=["max_entry_bytes", "max_total_bytes"],
+                ),
+            ],
+            ["trips.txt", "stop_times.txt", "calendar.txt"],
+            [
+                "calendar.txt cannot be read whole",
+                "shapes.txt exceeds max_notices_per_file",
+                "stop_times.txt exceeds max_rows",
+                "trips.txt exceeds max_entry_bytes",
+                "trips.txt exceeds max_total_bytes",
+            ],
+        ),
+    ],
+    ids=["warnings-capped", "errors-left-out"],
+)
+def test_unreliable_names_what_may_have_left_out_errors(notices, incomplete, expected):
+    from transitio.validate._structure import _unreliable
+
+    assert _unreliable({"notices": notices, "incomplete": incomplete}) == expected
+
+
 def test_not_a_zip_raises(tmp_path):
     bogus = tmp_path / "feed.zip"
     bogus.write_text("plain text")

@@ -18,11 +18,13 @@ categories and shows unknown edges only when every category is asked for),
 and ``needs_review`` marks the tiers a person should check.
 """
 
+import dataclasses
 import datetime
 import json
 import math
 
 __all__ = [
+    "AccessProvider",
     "IndexedFeed",
     "PlaceService",
     "RealtimeFeed",
@@ -229,6 +231,49 @@ class Validity:
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class AccessProvider:
+    """A provider that issues the credentials key-protected feeds take
+    (schema 11): where to register, its documentation and terms, the
+    credential fields it issues and whether an account is free (None when
+    unknown)."""
+
+    provider_id: str
+    name: str | None
+    registration_url: str | None
+    docs_url: str | None
+    terms_url: str | None
+    credential_fields: tuple
+    free: bool | None
+
+    @property
+    def env_names(self):
+        """Each credential field, in order, with the environment variable
+        that supplies it: ``TRANSITIO_KEY_<ID>__<FIELD>``, upper-cased with
+        ``-`` as ``_``."""
+
+        def upper(text):
+            return text.upper().replace("-", "_")
+
+        prefix = f"TRANSITIO_KEY_{upper(self.provider_id)}__"
+        return {field: prefix + upper(field) for field in self.credential_fields}
+
+
+def _access_provider(record):
+    """An :class:`AccessProvider` from a row of the providers table."""
+    fields = record.get("credential_fields")
+    free = _scalar(record.get("free"))
+    return AccessProvider(
+        provider_id=record["provider_id"],
+        name=_scalar(record.get("name")),
+        registration_url=_scalar(record.get("registration_url")),
+        docs_url=_scalar(record.get("docs_url")),
+        terms_url=_scalar(record.get("terms_url")),
+        credential_fields=() if fields is None else tuple(str(f) for f in fields),
+        free=None if free is None else bool(free),
+    )
+
+
 class RealtimeFeed:
     """A GTFS-RT companion of a static feed (schema 8): its identity, the
     static feed it describes and the endpoints the catalogues carry."""
@@ -259,12 +304,14 @@ class RealtimeFeed:
 
 class IndexedFeed:
     """A feed serving a place: its identity row plus the matched tier edges,
-    and on schema 8 its GTFS-RT companions."""
+    on schema 8 its GTFS-RT companions, and on schema 11 how to get the
+    credentials a protected feed needs (from ``index``, when given)."""
 
-    def __init__(self, row, edges, realtime=()):
+    def __init__(self, row, edges, realtime=(), index=None):
         self._row = row
         self.edges = edges
         self.realtime = list(realtime)
+        self._index = index
 
     @property
     def feed_id(self):
@@ -300,6 +347,85 @@ class IndexedFeed:
         trip is carried. Empty before schema 10."""
         ids = self._row.get("contained_in")
         return [] if ids is None else [str(feed_id) for feed_id in ids]
+
+    @property
+    def download_url(self):
+        """The URL the index crawls the feed from (schema 11); None for a
+        feed without a static URL, and before schema 11."""
+        return _scalar(self._row.get("download_url"))
+
+    @property
+    def access(self):
+        """``"open"``, or ``"key"`` for a feed that needs credentials
+        (schema 11); None before schema 11."""
+        return _scalar(self._row.get("access"))
+
+    @property
+    def access_provider(self):
+        """The id of the provider whose credentials the feed takes (schema
+        11); None for an open feed, a protected feed the index has no access
+        details for, and before schema 11."""
+        return _scalar(self._row.get("access_provider"))
+
+    @property
+    def auth_method(self):
+        """How the credentials are sent (schema 11): ``"query_param"``,
+        ``"header"``, ``"basic_auth"`` or ``"unsupported"``; None for an open
+        feed."""
+        return _scalar(self._row.get("auth_method"))
+
+    @property
+    def auth_params(self):
+        """Where each credential goes (schema 11): for ``query_param`` each
+        query parameter with the credential field it carries, for ``header``
+        the header with its field, empty for ``basic_auth``; None for an
+        open feed."""
+        return _parse(self._row.get("auth_params"))
+
+    @property
+    def registration_url(self):
+        """The catalogue's registration page for the feed (schema 11), or
+        None."""
+        return _scalar(self._row.get("registration_url"))
+
+    @property
+    def access_url(self):
+        """The URL the credentials belong to, the one the index crawls:
+        ``download_url`` on schema 11, else the Atlas static feed URL, else
+        the Mobility Database direct download."""
+        return _crawl_url(self)
+
+    def access_instructions(self):
+        """How to get and give the credentials a protected feed needs, as one
+        paragraph: who issues them, where to register, and how to hand them
+        to transitio. None for an open feed and before schema 11."""
+        if self.access != "key":
+            return None
+        name = self.name or self.feed_id
+        provider = None
+        if self._index is not None and self.access_provider is not None:
+            provider = self._index.access_provider(self.access_provider)
+        if provider is None:
+            lead = "needs credentials; the index has no access details for it yet"
+        else:
+            lead = f"needs credentials from {provider.name or provider.provider_id}"
+        parts = [f"{name} {lead}."]
+        register = (provider and provider.registration_url) or self.registration_url
+        if register:
+            parts.append(f"Register at {register}.")
+        if provider is not None:
+            if provider.docs_url:
+                parts.append(f"Documentation: {provider.docs_url}.")
+            fields = ", ".join(f'"{f}": "..."' for f in provider.credential_fields)
+            run = f'transitio.credentials.set("{provider.provider_id}", {{{fields}}})'
+            names = ", ".join(provider.env_names.values())
+            parts.append(f"Then run {run}" + (f" or set {names}." if names else "."))
+        if self.auth_method == "unsupported":
+            parts.append(
+                "transitio cannot send these credentials itself in this version; "
+                "download the feed by hand."
+            )
+        return " ".join(parts)
 
     @property
     def coverage_source(self):
@@ -532,16 +658,27 @@ def _default_categories(place, tiers, categories, international):
 
 def _town_sized(place):
     """Whether ``place`` has a boundary of at most :data:`TOWN_MAX_KM2`."""
-    import shapely
-
+    from transitio.index.places import _as_shape
     from transitio.osm._fetch import _area_km2
 
-    geometry = place.geometry
-    if isinstance(geometry, (bytes, bytearray)):
-        geometry = shapely.from_wkb(bytes(geometry))
-    if geometry is None or geometry.is_empty:
+    geometry = _as_shape(place.geometry)
+    if geometry is None:
         return False
     return _area_km2(geometry) <= TOWN_MAX_KM2
+
+
+def _crawl_url(feed):
+    """The URL the index crawls ``feed`` from: ``download_url`` on schema 11,
+    else the Atlas static feed URL, else the Mobility Database direct
+    download."""
+    from transitio.catalog._atlas import STATIC_URL
+
+    row = feed._row
+    if "download_url" in row:
+        return _scalar(row["download_url"])
+    atlas = (_parse(row.get("atlas")) or {}).get("urls") or {}
+    mdb = (_parse(row.get("mdb")) or {}).get("urls") or {}
+    return atlas.get(STATIC_URL) or mdb.get("direct_download")
 
 
 def _companions(index, feed_id, partition=None):
@@ -661,7 +798,10 @@ def feeds_for_place(
         if not matched:
             continue
         feed = IndexedFeed(
-            row, matched, _companions(index, feed_id, row.get("_partition"))
+            row,
+            matched,
+            _companions(index, feed_id, row.get("_partition")),
+            index=index,
         )
         if needed <= feed.files:
             found.append(feed)

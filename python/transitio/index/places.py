@@ -5,25 +5,32 @@ included), or a :class:`Place` — resolves to one :class:`Place` through a
 defined ranking, never a guess: the query is normalised and matched
 against every place's labels and aliases in every language, candidates score on
 match strength then ``kind`` precedence then feed count, and only an exact
-match can win: the sole exact match, or one that beats the runner-up by the
-ambiguity margin. A place's own names are its name and its labels in its
-country's languages (from Unicode CLDR) or English. Where a place carries the
+match can win: the sole exact match, one that beats the runner-up by the
+ambiguity margin, or, where the margin does not decide, the place of the name
+known far more widely than every other exact match that is not a metro, at
+home or abroad ("Moscow" is Moscow, Russia, not Moscow, Idaho). A place's own
+names are its name and its labels in its country's languages (from Unicode
+CLDR) or English. Where a place carries the
 name as its own, one reaching it only through a label in another language
 does not compete unless it is known far more widely, by the languages its
-name is recorded in. The margin never favours a place reached only through
-an alias or a label in another language over one carrying the name as its
-own, nor decides against a place of the name in another country known far
-more widely. A city's namesakes do not compete
+name is recorded in; where a place carries it as its name or in English, one
+carrying it only in another of its own languages ("Bergen", Dutch for Mons)
+does not compete either, on the same terms. The margin never favours a place
+reached only through an alias or a label in another language over one
+carrying the name as its own, nor decides against a place of the name in
+another country known far more widely. A city's namesakes do not compete
 with it: a metro in its country shares its name because it is the city's
 metro or named after it, a same-named area containing it that runs much the
 same service (no more than the margin beyond the city's feeds) is the city
 itself, and a place inside it or, not being a city, in its country that
 reaches its name only through an alias is named after it. Where no exact
 match is a city, a region or country of the name (a province, an emirate, a
-dependency) stands as the city. With ``kind="metro"``, metros of the name
-sharing a member place are one metro under several definitions, and only
-those of the earliest definition in the default order compete; a named
-definition keeps only its metros. Anything else raises
+dependency) stands as the city. Metros of the name sharing a member place
+are one metro under several definitions, and only those of the earliest
+definition in the default order compete, except a city's own metros (those
+in its country), which keep every definition so that dropping the others
+cannot hand the city's name to one of them; a named definition keeps only
+its metros. Anything else raises
 :class:`AmbiguousPlaceError` with the candidates, or
 :class:`PlaceNotFoundError` with the partial matches, if any.
 """
@@ -70,6 +77,18 @@ def _as_str(value):
     return value
 
 
+def _as_shape(value):
+    """A geometry cell as a shapely geometry, WKB decoded; None for a null
+    or an empty geometry."""
+    import shapely
+
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        value = shapely.from_wkb(bytes(value))
+    return None if value.is_empty else value
+
+
 def _as_concordances(value):
     """The ``{namespace: [ids]}`` block, whether stored as a mapping or as
     its JSON text; anything else is an empty block."""
@@ -92,10 +111,10 @@ _EXACT, _PREFIX, _SUBSET = 3, 2, 1
 # contains, which outranks the region, which outranks the country.
 _KIND_ORDER = {"metro": 0, "city": 1, "region": 2, "country": 3}
 
-# The metro definitions (a metro's ``source_subtype``) in the order
-# ``kind="metro"`` picks among one metro's: the commuting-based ones (Urban
-# Audit FUAs, US MSAs), Eurostat's NUTS-3 metropolitan regions, then the FAO
-# city-regions, global and with uneven boundaries. Any other ranks after these.
+# The metro definitions (a metro's ``source_subtype``) in the order a lookup
+# picks among one metro's: the commuting-based ones (Urban Audit FUAs, US
+# MSAs), Eurostat's NUTS-3 metropolitan regions, then the FAO city-regions,
+# global and with uneven boundaries. Any other ranks after these.
 _METRO_DEFINITIONS = (
     "functional urban area",
     "metropolitan statistical area",
@@ -117,7 +136,8 @@ _VETOED = object()
 
 # A place with at least this many language labels, and more than twice
 # another's, is known far more widely: abroad it keeps the feed margin from
-# deciding, and a label in another language keeps it in the contest.
+# deciding, where feeds do not decide it wins, and a label in another language
+# keeps it in the contest.
 _WELL_KNOWN = 100
 
 # The partial matches a PlaceNotFoundError message names; all are candidates.
@@ -288,6 +308,15 @@ class Place:
     @property
     def geometry(self):
         return self._record.get("geometry")
+
+    @property
+    def centre(self):
+        """The point the index gives as the place's centre (schema 11), a
+        shapely ``Point`` in lon/lat; None when the index has none for the
+        place or predates schema 11. For a point inside the place either
+        way, ``place.centre or place.geometry.representative_point()`` (the
+        centroid can lie outside)."""
+        return _as_shape(self._record.get("centre"))
 
     @property
     def parent(self):
@@ -554,11 +583,13 @@ class _PlaceLookup:
             for alias in [*record["former_ids"], *qids]:
                 self._aliases.setdefault(alias, place_id)
 
-    def _own_names(self, place_id):
+    def _own_names(self, place_id, primary=False):
         """The normalized name of a place and its labels in its own languages
-        (see ``_own_language``); its aliases and other labels left out."""
+        (see ``_own_language``); its aliases and other labels left out. With
+        ``primary``, only its name and its English and ``mul`` labels, the
+        names it carries whatever the reader's language."""
         record = self._records[place_id]
-        country = record["country_code"]
+        country = None if primary else record["country_code"]
         own = [
             text
             for language, text in record["names"].items()
@@ -632,31 +663,55 @@ class _PlaceLookup:
         return scored
 
     def search(self, query, kind=None):
-        return [self.get(place_id) for _, place_id in self._qualified(query, kind)[1]]
+        scored = self._readings(query, kind)[0][1]
+        return [self.get(place_id) for _, place_id in scored]
 
-    def _qualified(self, query, kind, definition=None):
-        """The name the query asks for and its candidates: as written when a
-        label matches it exactly, else, for "Name, Qualifier, ...", the
-        candidates for the name that lie within a place each qualifier names —
-        a region, a country or a country's code ("London, Ontario", "City of
-        London, UK")."""
+    def _readings(self, query, kind, definition=None):
+        """The readings of the query as ``(name, scored)`` pairs, in the order
+        they answer. A query without a qualifier, or one an exact match
+        carries as its own name or an alias, reads as written. Otherwise
+        "Name, Qualifier, ..." reads as the candidates for the name that lie
+        within a place each qualifier names: a containing region or country,
+        or the country its code names ("London, Ontario", "City of London,
+        UK"), or any containing place when that leaves no exact match. A
+        label in another language equal to the whole query answers when the
+        qualified reading has no exact match, and after it when that one
+        cannot decide between several."""
         scored = self._candidates(query, kind, definition)
-        if "," not in query or any(tier == _EXACT for tier, _ in scored):
-            return query, scored
+        norm = _normalize(query)
+        exact = [pid for tier, pid in scored if tier == _EXACT]
+        if "," not in query or any(
+            norm in self._own_names(pid) or self._has_alias(pid, norm) for pid in exact
+        ):
+            return [(query, scored)]
         name, *rest = query.split(",")
         qualifiers = [_normalize(part) for part in rest if _normalize(part)]
         if not _normalize(name) or not qualifiers:
-            return query, scored
-        return name, [
-            (tier, place_id)
-            for tier, place_id in self._candidates(name, kind, definition)
-            if all(self._within(place_id, qualifier) for qualifier in qualifiers)
-        ]
+            return [(query, scored)]
+        candidates = self._candidates(name, kind, definition)
+        for wide in (False, True):
+            within = [
+                (tier, pid)
+                for tier, pid in candidates
+                if all(self._within(pid, qualifier, wide) for qualifier in qualifiers)
+            ]
+            if any(tier == _EXACT for tier, _ in within):
+                break
+        if not exact:
+            return [(name, within)]
+        if all(tier != _EXACT for tier, _ in within):
+            return [(query, scored)]
+        return [(name, within), (query, scored)]
 
-    def _within(self, place_id, qualifier):
-        """Whether a place containing ``place_id`` — an ancestor, or the
-        country its country code names — carries ``qualifier`` as a label."""
-        containing = [place.id for place in self.get(place_id).ancestors]
+    def _within(self, place_id, qualifier, wide):
+        """Whether a place containing ``place_id`` carries ``qualifier`` as a
+        label: an ancestor that is a region or country, or the country its
+        country code names; with ``wide``, any ancestor."""
+        containing = [
+            place.id
+            for place in self.get(place_id).ancestors
+            if wide or place.kind in ("region", "country")
+        ]
         containing += self._countries.get(
             self._records[place_id].get("country_code"), []
         )
@@ -706,9 +761,16 @@ class _PlaceLookup:
             if place is None:
                 raise PlaceNotFoundError(f"no place with id {query!r} in the index")
             return place
-        name, scored = self._qualified(query, kind, definition)
-        if kind == "metro" and definition is None:
-            scored = self._one_definition(scored)
+        first = None
+        for name, scored in self._readings(query, kind, definition):
+            try:
+                return self._answer(query, name, scored)
+            except AmbiguousPlaceError as error:
+                first = first or error
+        raise first
+
+    def _answer(self, query, name, scored):
+        """The place one reading of ``query`` names, or raise."""
         if not scored:
             raise PlaceNotFoundError(f"no place matches {query!r}")
         if all(tier != _EXACT for tier, _ in scored):
@@ -759,6 +821,14 @@ class _PlaceLookup:
         return [(tier, pid) for tier, pid in scored if pid not in dropped]
 
     def _winner(self, query, scored, name):
+        # A city's own metros keep every definition, so the full contest cannot
+        # hand its name to one of them once the others are gone.
+        namesakes, _ = self._namesakes(self._contenders(scored, name), name)
+        rest = self._one_definition(
+            [item for item in scored if item[1] not in namesakes]
+        )
+        kept = namesakes | {pid for _, pid in rest}
+        scored = [item for item in scored if item[1] in kept]
         exact = self._contenders(scored, name)
         namesakes, anchors = self._namesakes(exact, name)
         winner = None
@@ -789,7 +859,12 @@ class _PlaceLookup:
         own (Pinto, Spain, lists Buenos Aires in Irish). A place with an alias
         of the name stays, and so does one far better known than every
         own-name match that is not a metro, so an exonym ("Meksyk", Polish for
-        Mexico) is not handed to a place in Poland of that name."""
+        Mexico) is not handed to a place in Poland of that name. Where a place
+        that is not a metro carries ``name`` as a primary name (see
+        ``_own_names``), one carrying it only in another of its languages
+        leaves too, its aliases aside, unless far better known than every such
+        place: "Bergen", Dutch for Mons, is no rival to the towns named Bergen.
+        Metros, which carry their city's name in its language, stay."""
         records = self._records
         exact = [pid for tier, pid in scored if tier == _EXACT]
         norm = _normalize(name)
@@ -798,12 +873,21 @@ class _PlaceLookup:
             return exact
         named = [pid for pid in own if records[pid]["kind"] != "metro"]
         labels = max((len(records[pid]["names"]) for pid in named), default=0)
-        return [
+        exact = [
             pid
             for pid in exact
             if pid in own
             or self._has_alias(pid, norm)
             or self._far_better_known(pid, labels)
+        ]
+        primary = {pid for pid in named if norm in self._own_names(pid, primary=True)}
+        if not primary:
+            return exact
+        labels = max(len(records[pid]["names"]) for pid in primary)
+        return [
+            pid
+            for pid in exact
+            if pid in primary or pid not in named or self._far_better_known(pid, labels)
         ]
 
     def _has_alias(self, place_id, norm):
@@ -813,13 +897,13 @@ class _PlaceLookup:
 
     def _decide(self, exact, name):
         """Among the exact matches ``exact``, ranked: the sole one, or the top
-        one when it beats the runner-up by the margin; None when neither
-        holds or a better-known place abroad bars the margin, and ``_VETOED``
-        when the margin alone would decide against the name. The margin never
-        favours a place reached only through an alias or a label in another
-        language over one carrying ``name`` as its own (see ``_own_names``):
-        Saint Paul, Minnesota, whose aliases include São Paulo, has more feeds
-        than São Paulo itself in a thinly covered index."""
+        one when it beats the runner-up by the margin and no better-known
+        place abroad bars it; otherwise the place ``_best_known`` finds, or
+        None. ``_VETOED`` when the margin alone would decide against the name:
+        it never favours a place reached only through an alias or a label in
+        another language over one carrying ``name`` as its own (see
+        ``_own_names``): Saint Paul, Minnesota, whose aliases include São
+        Paulo, has more feeds than São Paulo itself in a thinly covered index."""
         if len(exact) < 2:
             return exact[0] if exact else None
         top_id, runner_id = exact[0], exact[1]
@@ -833,10 +917,26 @@ class _PlaceLookup:
             own = {pid for pid in exact if norm in self._own_names(pid)}
             if own and top_id not in own:
                 return _VETOED
-            if self._better_known_abroad(top_id, exact, name):
-                return None
-            return top_id
-        return None
+            if not self._better_known_abroad(top_id, exact, name):
+                return top_id
+        return self._best_known(exact, name)
+
+    def _best_known(self, exact, name):
+        """The exact match, not a metro, carrying ``name`` as its name and far
+        better known (``_far_better_known``) than every other exact match that
+        is not a metro, in its country or abroad; None when there is none.
+        Metros carry at most one label and do not count. Of Colombia's two
+        cities named Cali, one feed each, the one with 129 labels is the Cali
+        a reader means, not the one with 5."""
+        records = self._records
+        rivals = sorted(
+            (pid for pid in exact if records[pid]["kind"] != "metro"),
+            key=lambda pid: -len(records[pid]["names"]),
+        )
+        if not rivals or _normalize(records[rivals[0]]["name"]) != _normalize(name):
+            return None
+        labels = len(records[rivals[1]]["names"]) if len(rivals) > 1 else 0
+        return rivals[0] if self._far_better_known(rivals[0], labels) else None
 
     def _better_known_abroad(self, top_id, exact, name):
         """Whether an exact match in another country, not a metro, carrying
@@ -845,7 +945,8 @@ class _PlaceLookup:
         so a metro leader counts those of the best-labelled such place in its
         own country, or none. Feed counts compare service within one
         country's coverage; labels in many languages mark a place known far
-        beyond it, as Moscow, Russia, is beside Moscow, Idaho."""
+        beyond it, as Moscow, Russia, is beside Moscow, Idaho. A barred margin
+        leaves the decision to ``_best_known``."""
         records = self._records
         norm = _normalize(name)
         named = [
@@ -881,13 +982,14 @@ class _PlaceLookup:
         are the metros in its country and the areas containing it whose feeds
         stay within the margin of its own. A place reaching ``name`` only
         through an alias is a namesake, never an anchor, when it lies inside a
-        city carrying ``name`` as a name of its own (Puente Aranda, a district
-        of Bogotá, lists Bogotá) or, not being a city, in such a city's
-        country (New Taipei and Taiwan list Taipei). A metro elsewhere shares
-        the name by coincidence (London, UK against London, Ontario), a
-        containing area with far more service is a place of its own (New York
-        State against New York City), and a city elsewhere may use an alias as
-        its everyday name (Newcastle for Newcastle upon Tyne); all stay."""
+        city carrying ``name`` as a name of its own, whether or not that city
+        still competes (Puente Aranda, a district of Bogotá, lists Bogotá),
+        or, not being a city, in such a city's country (New Taipei and Taiwan
+        list Taipei). A metro elsewhere shares the name by coincidence
+        (London, UK against London, Ontario), a containing area with far more
+        service is a place of its own (New York State against New York City),
+        and a city elsewhere may use an alias as its everyday name (Newcastle
+        for Newcastle upon Tyne); all stay."""
         records = self._records
         norm = _normalize(name)
         own = {pid for pid in exact if norm in self._own_names(pid)}
@@ -904,7 +1006,10 @@ class _PlaceLookup:
                     records[pid]["kind"] != "city"
                     and records[pid].get("country_code") in named_countries
                 )
-                or named & {place.id for place in self.get(pid).ancestors}
+                or any(
+                    place.kind == "city" and norm in self._own_names(place.id)
+                    for place in self.get(pid).ancestors
+                )
             )
         }
         cities = [pid for pid in exact if records[pid]["kind"] == "city"]

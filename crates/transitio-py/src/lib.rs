@@ -259,6 +259,7 @@ fn crop_feed(
             "source_notices": result.source_notices,
             "remaining_notices": result.validation.notices,
             "service_window": result.validation.service_window,
+            "dropped_rows": result.dropped_rows,
         });
         Ok(report.to_string())
     })

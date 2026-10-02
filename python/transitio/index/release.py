@@ -65,13 +65,17 @@ TABLES = ("feeds", "realtime", "places", "edges")
 # ``international`` holds feeds and their companions only, ``links`` edges
 # only; the realtime table exists from schema 8.
 PARTITION_TABLES = {"international": {"feeds", "realtime"}, "links": {"edges"}}
+# From schema 11 the archive also holds the credential providers' table at
+# its root.
+ACCESS_PROVIDERS_MEMBER = "access_providers.parquet"
 
 
 def members(snapshot):
     """The members an archive of ``snapshot`` must hold, in packing order:
-    the flat five before schema 7, else the snapshot, every listed partition
-    table and the NOTICE. A schema-7 snapshot must list places and edges
-    somewhere, as the flat contract required them."""
+    the flat five before schema 7, else the snapshot, from schema 11 the
+    providers table, every listed partition table and the NOTICE. A schema-7
+    snapshot must list places and edges somewhere, as the flat contract
+    required them."""
     version = snapshot.get("schema_version")
     if not isinstance(version, int) or isinstance(version, bool) or version < 7:
         # A malformed version is the reader's to refuse; the members owed
@@ -96,7 +100,8 @@ def members(snapshot):
     for table in ("places", "edges"):
         if not any(name.endswith(f"/{table}.parquet") for name in found):
             raise ValueError(f"the snapshot lists no {table} partition")
-    return ["snapshot.json", *found, "NOTICE"]
+    root = [ACCESS_PROVIDERS_MEMBER] if version >= 11 else []
+    return ["snapshot.json", *root, *found, "NOTICE"]
 
 
 _SNAPSHOT_ID = re.compile(r"[0-9a-f]{16}")
