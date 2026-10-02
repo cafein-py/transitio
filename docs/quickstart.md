@@ -83,6 +83,13 @@ always delivers it whole, `"drop"` skips it and `"error"` raises
 `StaleSelectorError`. National feeds, such as Germany's, are streamed
 through the crop, so they fit in memory bounded by the area.
 
+Some feeds need a free account with their provider. `fetch` sends their
+credentials when they are set, with `transitio.credentials.set`, an
+environment variable or `credentials={"<provider>": {"<field>": "..."}}`,
+and otherwise skips the feed with a reason such as `"protected feed:
+credentials missing for trafiklab"`, followed by the feed's
+`access_instructions()`: who issues the credentials and where to register.
+
 `merge_feeds` writes one feed from the cropped ones. With `check=False` it
 keeps the file when the validator reports ERROR notices; the returned
 report lists them.

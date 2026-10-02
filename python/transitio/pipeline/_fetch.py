@@ -831,34 +831,44 @@ class _Archives:
         self._directory = pathlib.Path(directory)
         self._found = {}
 
-    def get(self, http, url):
+    def get(self, http, url, access=None, transport=None):
         """``(path, sha256, retrieved_at)`` of the archive at ``url``,
-        downloaded with the ``http`` client when first asked for. Raises
-        :class:`DownloadError` with the failure's text when that download
-        failed."""
+        downloaded with the ``http`` client when first asked for, with the
+        credentials of ``access`` over ``transport`` when given
+        (:func:`transitio._http.download`). Raises :class:`DownloadError`
+        with the failure's text when that download failed."""
         from transitio import _http
         from transitio.exceptions import DownloadError
 
-        if url not in self._found:
+        key = (url, access)
+        if key not in self._found:
             path = self._directory / f"{len(self._found)}.zip"
             try:
-                digest = _http.download(http, url, path)
+                digest = _http.download(
+                    http, url, path, access=access, transport=transport
+                )
             except Exception as error:  # noqa: B902 — recorded for later calls
-                self._found[url] = str(error)
+                self._found[key] = str(error)
             else:
                 now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                self._found[url] = (path, digest, now)
-        found = self._found[url]
+                self._found[key] = (path, digest, now)
+        found = self._found[key]
         if isinstance(found, str):
             raise DownloadError(found)
         return found
 
 
-def _download_indexed(feed, db, atlas, base_dir, archives, max_total_bytes=None):
+def _download_indexed(
+    feed, db, atlas, base_dir, archives, max_total_bytes=None, access=None
+):
     """Download an indexed feed from the first of its URLs that serves a zip
     archive: the Mobility Database direct download, the Transitland Atlas
     static feed (decision I: MDB wins where a feed has both), then the
-    Mobility Database hosted copy (``urls.latest``). Each URL is tried once;
+    Mobility Database hosted copy (``urls.latest``). On schema 11 the
+    feed's ``download_url`` comes first and the hosted copy second; a
+    protected feed, with ``access``
+    (:class:`~transitio.catalog._access._Access`), is read from its access
+    URL alone, with its credentials. Each URL is tried once;
     an attempt fails on any error or when the download is not a zip archive.
     Each feed lands in its own digest-named directory under ``base_dir``, so
     several never collide. A URL whose fragment names a member of the archive
@@ -867,13 +877,13 @@ def _download_indexed(feed, db, atlas, base_dir, archives, max_total_bytes=None)
     its sidecar records the archive's URL and SHA-256 beside the feed's.
 
     Returns ``(path, fetched_from, failures)``: ``fetched_from`` is
-    ``"producer"`` for the first two URLs and ``"mdb_latest"`` for the hosted
+    ``"producer"`` for the feed's own URLs and ``"mdb_latest"`` for the hosted
     copy, ``failures`` the ``"<source>: <error>"`` of each failed attempt.
     Raises :class:`DownloadError` naming the failures when every attempt
     fails."""
     from transitio.catalog import AtlasFeed, Feed
     from transitio.catalog._atlas import _feed_dir
-    from transitio.catalog._client import _write_provenance
+    from transitio.catalog._client import _download_recorded, _write_provenance
     from transitio.catalog._nested import extract_feed, split_fragment
     from transitio.exceptions import DownloadError
     from transitio.index.feeds import _parse
@@ -892,8 +902,16 @@ def _download_indexed(feed, db, atlas, base_dir, archives, max_total_bytes=None)
     def from_atlas(url):
         return atlas.download(atlas_feed, directory=base_dir)
 
+    def from_url(url):
+        path = base_dir / _feed_dir(feed.feed_id) / "latest.zip"
+        record = {"feed_id": feed.feed_id}
+        options = {"access": access, "transport": atlas._transport}
+        return _download_recorded(atlas._http, url, path, record, **options)
+
     def from_archive(client, url, outer, member):
-        archive, archive_sha256, retrieved_at = archives.get(client._http, outer)
+        archive, archive_sha256, retrieved_at = archives.get(
+            client._http, outer, access, atlas._transport
+        )
         path = base_dir / _feed_dir(feed.feed_id) / "latest.zip"
         provenance = {
             "feed_id": feed.feed_id,
@@ -906,11 +924,15 @@ def _download_indexed(feed, db, atlas, base_dir, archives, max_total_bytes=None)
         _write_provenance(path.with_suffix(".provenance.json"), provenance)
         return path
 
-    attempts = (
-        ("mdb", "producer", mdb_urls.get("direct_download"), from_mdb, db),
-        ("atlas", "producer", atlas_feed.static_url, from_atlas, atlas),
-        ("mdb_latest", "mdb_latest", mdb_urls.get("latest"), from_mdb, db),
-    )
+    mdb = ("mdb", "producer", mdb_urls.get("direct_download"), from_mdb, db)
+    static = ("atlas", "producer", atlas_feed.static_url, from_atlas, atlas)
+    hosted = ("mdb_latest", "mdb_latest", mdb_urls.get("latest"), from_mdb, db)
+    attempts = (mdb, static, hosted)
+    if access is not None:
+        attempts = (("download_url", "producer", access.url, from_url, atlas),)
+    elif "download_url" in feed._row:
+        crawled = ("download_url", "producer", feed.download_url, from_url, atlas)
+        attempts = (crawled, hosted, mdb, static)
     tried, failures = set(), []
     for label, source, url, download, client in attempts:
         if not url or url in tried:
@@ -945,14 +967,16 @@ def _record_source(path, fetched_from, errors):
     return provenance
 
 
-def _unchanged_since_indexed(feed, http):
+def _unchanged_since_indexed(feed, http, access=None, transport=None):
     """Whether the archive the index crawled for an indexed feed is still the
     one served: a conditional ``HEAD`` to the URL the crawl reads
     (``_crawl_url``: its download URL, else Atlas, else MDB), carrying the
     ETag and Last-Modified it recorded, answers 304 Not Modified. Returns
     that URL, or None: any other answer, a failed probe or no recorded
     validator is no proof. A URL fragment is not sent, so the probe of a
-    feed inside a larger archive reaches that archive."""
+    feed inside a larger archive reaches that archive. A protected feed's
+    probe sends the credentials of ``access`` over ``transport``, as its
+    download does."""
     from transitio.index.feeds import _crawl_url, _scalar
 
     url = _crawl_url(feed)
@@ -966,10 +990,53 @@ def _unchanged_since_indexed(feed, http):
     if not url or not headers:
         return None
     try:
-        response = http.head(url, headers=headers, timeout=_PROBE_TIMEOUT)
+        if access is None:
+            status = http.head(url, headers=headers, timeout=_PROBE_TIMEOUT).status_code
+        else:
+            with (
+                access.session(http, transport) as session,
+                session.stream(
+                    "HEAD", url, headers=headers, timeout=_PROBE_TIMEOUT
+                ) as response,
+            ):
+                status = response.status_code
     except Exception:  # noqa: B902 — an unanswered probe proves nothing
         return None
-    return url if response.status_code == 304 else None
+    return url if status == 304 else None
+
+
+def _access_for(feed, explicit):
+    """``(access, reason)`` for a protected indexed feed: the
+    :class:`~transitio.catalog._access._Access` its requests send its
+    credentials with, or None and why it is skipped before download.
+    ``explicit`` maps provider ids to the ``credentials=`` fields, which win
+    over the stored ones (:mod:`transitio.credentials`)."""
+    from transitio.catalog._access import _Access, _origin, _sends
+    from transitio.credentials import _resolve
+
+    provider = None
+    if feed.access_provider is not None and feed._index is not None:
+        provider = feed._index.access_provider(feed.access_provider)
+    if provider is None:
+        return None, "the index has no access details for it"
+    method, params = feed.auth_method, feed.auth_params
+    if not _sends(method, params, provider.credential_fields):
+        return None, "its access method is not supported"
+    url = feed.access_url
+    try:
+        https = _origin(url)[0] == "https"
+    except Exception:  # noqa: B902 — no URL, or none httpx reads
+        https = False
+    if not https:
+        return None, "its URL is not https"
+    fields, missing = _resolve(provider, explicit.get(provider.provider_id))
+    if missing:
+        state = "incomplete" if fields else "missing"
+        return None, f"credentials {state} for {provider.provider_id}"
+    try:
+        return _Access(url, method, params or {}, fields), None
+    except ValueError as error:
+        return None, str(error)
 
 
 def fetch(
@@ -983,6 +1050,7 @@ def fetch(
     on_untrusted_selector="auto",
     contained="drop",
     index=None,
+    credentials=None,
     modes=None,
     expired="skip",
     repair=False,
@@ -1001,9 +1069,10 @@ def fetch(
     ``place``, feeds are selected from the built index by tier -- ``tiers``,
     ``exclude`` and ``on_unknown`` filter the edges -- and the place geometry
     supplies the AOI; ``tiers``, ``exclude``, ``on_unknown``,
-    ``on_untrusted_selector``, ``contained`` and ``index`` apply only with
-    ``place``, and ``country_code`` only with ``aoi``. When a selector cannot be trusted --
-    its evidence was missing at build time, or its fingerprint no longer
+    ``on_untrusted_selector``, ``contained``, ``index`` and ``credentials``
+    apply only with ``place``, and ``country_code`` only with ``aoi``. When
+    a selector cannot be trusted -- its evidence was missing at build time,
+    or its fingerprint no longer
     matches the download -- ``on_untrusted_selector`` decides the outcome:
     ``"auto"`` (default) skips the feed when an ``exclude`` was asked for and
     otherwise delivers it whole with its tier treated as ``unknown``;
@@ -1035,7 +1104,9 @@ def fetch(
     or whose dataset download fails, is read from the first of its indexed
     URLs that serves a zip archive: the Mobility Database direct download,
     the Transitland Atlas static feed, then the Mobility Database hosted
-    copy. A URL fragment names the member of the archive the feed is read
+    copy; on a schema-11 index the URL the index crawled
+    (``IndexedFeed.download_url``) comes first and the hosted copy second.
+    A URL fragment names the member of the archive the feed is read
     from, a nested zip (``.../gtfs.zip#1/google_transit.zip``) or a folder;
     each such archive is downloaded once per call, and the feed's sidecar
     records its ``archive_url`` and ``archive_sha256``. The sidecar and the
@@ -1099,6 +1170,31 @@ def fetch(
         and one that starts later or runs on other weekdays stays. An
         unknown window passes the window checks, and a report without a
         ``moment`` for the day passes the day check.
+    credentials : mapping, optional
+        Credentials for feeds that need an account with their provider, as
+        ``{provider_id: {field: value}}``. They win, field by field, over
+        the environment and the credentials file
+        (:mod:`transitio.credentials`); a provider the index does not list,
+        a field it does not issue or a value that is not a non-empty string
+        raises ``ValueError`` before anything is downloaded. A protected
+        feed (``IndexedFeed.access == "key"``) is skipped before download
+        when the index has no access details for it (``"protected feed: the
+        index has no access details for it"``), transitio cannot send its
+        credentials (``"protected feed: its access method is not
+        supported"``, a cookie included), its URL is not https
+        (``"protected feed: its URL is not https"``), none or only some of
+        the provider's fields are set (``"protected feed: credentials
+        missing for <provider>"``, ``"... credentials incomplete for
+        <provider>"``) or a value has characters its method cannot carry
+        (``"protected feed: credential <field> has characters its method
+        cannot carry"``); each reason ends with ``"; "`` and the feed's
+        :meth:`~transitio.index.IndexedFeed.access_instructions`. Otherwise
+        the feed is probed (for ``expired``) and downloaded from its access
+        URL alone, never from a catalogue copy, the credentials sent only to
+        that URL's scheme, host and port: a redirect elsewhere carries none,
+        and a redirect to http or holding a credential fails the download.
+        No reason, note, path, sidecar or report holds a credential, beyond
+        what a server writes into the feed itself, which is kept as served.
     modes : str or list of str, optional
         Keep only feeds serving at least one of ``tram``, ``subway``,
         ``rail``, ``bus``, ``ferry`` — decided from the delivered
@@ -1197,11 +1293,12 @@ def fetch(
         with, for an undated feed the highest-ranked dated one starting after
         its placeholder start when one does), ``fetched_from`` (where the
         download came from: ``"mdb_dataset"`` a catalogued dataset,
-        ``"producer"`` the feed's own URL from the Mobility Database or
-        Transitland Atlas, ``"mdb_latest"`` the Mobility Database hosted
-        copy; None when nothing was downloaded), ``download_errors`` (the
-        failed download attempts before the one that worked, or all of them
-        when none did, joined with ``"; "``; None when none failed),
+        ``"producer"`` the feed's own URL, its ``download_url`` or one from
+        the Mobility Database or Transitland Atlas, ``"mdb_latest"`` the
+        Mobility Database hosted copy; None when nothing was downloaded),
+        ``download_errors`` (the failed download attempts before the one that
+        worked, or all of them when none did, joined with ``"; "``; None when
+        none failed),
         ``stops_outside_osm`` (the delivered feed's located stops, the
         stops.txt rows with usable coordinates, outside ``osm_area``; None
         without an extract or when its stops.txt cannot be read) and
@@ -1228,6 +1325,12 @@ def fetch(
         extract was fetched for (None with ``osm=False`` or a failed
         download).
     """
+    if credentials is not None:
+        from transitio.credentials import _explicit
+
+        credentials, problem = _explicit(credentials)
+        if problem is not None:
+            raise problem
     from transitio.catalog import MobilityDatabase
     from transitio.catalog._models import as_date
     from transitio.osm._fetch import _as_geometry
@@ -1238,13 +1341,14 @@ def fetch(
         tiers is not None
         or exclude is not None
         or index is not None
+        or credentials is not None
         or on_unknown != "include"
         or on_untrusted_selector != "auto"
         or contained != "drop"
     ):
         raise ValueError(
-            "tiers=, exclude=, on_unknown=, on_untrusted_selector=, contained= "
-            "and index= apply only with place="
+            "tiers=, exclude=, on_unknown=, on_untrusted_selector=, contained=, "
+            "index= and credentials= apply only with place="
         )
     if contained not in ("keep", "drop"):
         raise ValueError("contained= must be 'keep' or 'drop'")
@@ -1289,6 +1393,7 @@ def fetch(
             on_untrusted_selector=on_untrusted_selector,
             contained=contained,
             index=index,
+            credentials=credentials,
             when=when,
             day=day,
             window_day=window_day,
@@ -1654,6 +1759,7 @@ def _fetch_place(
     on_untrusted_selector,
     contained,
     index,
+    credentials,
     when,
     day,
     window_day,
@@ -1674,11 +1780,14 @@ def _fetch_place(
     recorded in ``selections``. A feed whose index window misses ``day`` is
     skipped before download when a probe proves the archive unchanged since
     indexed; ``window_day`` is what the computed window is tested against.
-    The versions among the delivered feeds are settled after the feed loop,
+    A protected feed is decided before anything else (:func:`_access_for`),
+    and its texts in the record are masked (:meth:`_Access.redact`). The
+    versions among the delivered feeds are settled after the feed loop,
     and the OSM extract comes last, for the parts the remaining feeds serve."""
     from transitio import __version__
     from transitio.catalog import Feed, MobilityDatabase, TransitlandAtlas
     from transitio.catalog._atlas import _feed_dir
+    from transitio.credentials import _checked, _provider
     from transitio.exceptions import StaleSelectorError
     from transitio.index import (
         DISCOVERY_SEMANTICS_VERSION,
@@ -1721,6 +1830,16 @@ def _fetch_place(
 
     offered = place_obj.feeds(tiers=tiers, exclude=exclude, on_unknown=on_unknown)
     kept = _containers_first(offered) if contained == "drop" else offered
+    # Credentials are checked and resolved before any download.
+    explicit = {
+        provider_id: _checked(_provider(provider_id, resolved_index), fields)
+        for provider_id, fields in (credentials or {}).items()
+    }
+    decided = {
+        feed.feed_id: _access_for(feed, explicit)
+        for feed in kept
+        if feed.access == "key"
+    }
     feeds, reports, repairs, selections, record = [], [], [], [], []
     delivered = _Delivered()
     delivered_ids = []
@@ -1786,7 +1905,10 @@ def _fetch_place(
         def unchanged(feed):
             # One probe per feed, shared by the date and containment rules.
             if feed.feed_id not in probes:
-                probes[feed.feed_id] = _unchanged_since_indexed(feed, atlas._http)
+                access = decided.get(feed.feed_id, (None, None))[0]
+                probes[feed.feed_id] = _unchanged_since_indexed(
+                    feed, atlas._http, access, atlas._transport
+                )
             return probes[feed.feed_id]
 
         def expired_unchanged(feed, entry):
@@ -1801,9 +1923,15 @@ def _fetch_place(
 
         for feed in kept:
             entry = entry_for(feed)
+            access, refusal = decided.get(feed.feed_id, (None, None))
+            if refusal is not None:
+                instructions = feed.access_instructions()
+                _skip(entry, f"protected feed: {refusal}; {instructions}")
+                continue
             dataset = None
             errors = []
-            if db._refresh_token:
+            # A protected feed is read from its access URL alone.
+            if db._refresh_token and access is None:
                 mdb_id = (_parse(feed._row.get("mdb")) or {}).get("mdb_id")
                 if mdb_id:
                     try:
@@ -1847,7 +1975,7 @@ def _fetch_place(
                 probed = probed and unchanged(feed)
                 try:
                     path, fetched_from, failures = _download_indexed(
-                        feed, db, atlas, base_dir, archives, budget
+                        feed, db, atlas, base_dir, archives, budget, access
                     )
                     errors.extend(failures)
                 except Exception as error:  # noqa: B902
@@ -2033,6 +2161,11 @@ def _fetch_place(
                 services[feed.feed_id] = service
 
     removed = _settle_versions(record, services, protected, day if study else None)
+    for feed_id, (access, _) in decided.items():
+        entry = entries[feed_id]
+        for key in ("reason", "note", "download_errors"):
+            if access is not None and entry[key] is not None:
+                entry[key] = access.redact(entry[key])
     rows = [n for n, feed_id in enumerate(delivered_ids) if feed_id not in removed]
     delivered_ids, feeds, reports, repairs = (
         [column[n] for n in rows] for column in (delivered_ids, feeds, reports, repairs)

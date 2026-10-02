@@ -483,6 +483,20 @@ def test_redirect_walk(tmp_path, method, routes, seen, error):
     assert [str(request.url) for request in stub.seen] == seen
 
 
+@pytest.mark.parametrize(
+    ("token", "location"), [("/", "/%2F"), ("/", "/g?token=/"), ("a#b", "/a#b")]
+)
+def test_delimiters_count_only_as_data(tmp_path, token, location):
+    fields = {"token": _Secret(token)}
+    access = _Access(API, "header", {"X-Api-Key": "token"}, fields)
+    v2 = "https://api.example.com/v2"
+    routes = {API: _to("/v2?a=b"), v2: _to(f"{CDN}/f"), f"{CDN}/f": _to(location)}
+    stub = _Stub(routes)
+    with pytest.raises(DownloadError, match=f"^{_CARRIES}$"):
+        _download(tmp_path, access, stub)
+    assert [str(request.url) for request in stub.seen] == [API, f"{v2}?a=b", f"{CDN}/f"]
+
+
 def test_header_holding_a_secret_stays_on_the_access_origin():
     access = _access("header")
     stub = _Stub({API: _to(f"{CDN}/f")})

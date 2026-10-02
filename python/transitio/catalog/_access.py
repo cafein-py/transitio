@@ -29,6 +29,9 @@ _INVALID = "redirect location is not a URL"
 _OFF_HTTPS = "redirect to a scheme other than https"
 _REDIRECTS = 10
 _FOLLOWED = frozenset({301, 302, 303, 307, 308})
+_COOKIES = frozenset({"cookie", "set-cookie"})
+# URL delimiters (RFC 3986), which separate components as well as hold data.
+_DELIMITERS = re.compile(r"[:/?#\[\]@!$&'()*+,;=]+")
 # A NO_PROXY name with an optional leading dot and port.
 _NO_PROXY_NAME = re.compile(r"(\.?[a-z0-9_-]+(?:\.[a-z0-9_-]+)*)(?::([0-9]+))?")
 
@@ -121,6 +124,23 @@ def _unsendable(method, auth_params, fields):
         if not fields[field].fits(rule):
             return field
     return None
+
+
+def _sends(method, auth_params, fields):
+    """Whether ``method`` can send credentials of the ``fields`` a provider
+    issues: ``basic_auth`` when they hold ``username`` and ``password``,
+    ``query_param`` and ``header`` when ``auth_params`` maps one or more
+    names, no header a cookie, each to one of ``fields``."""
+    if method == "basic_auth":
+        return {"username", "password"} <= set(fields)
+    if method not in ("query_param", "header") or not isinstance(auth_params, dict):
+        return False
+    if method == "header" and {str(name).lower() for name in auth_params} & _COOKIES:
+        return False
+    return bool(auth_params) and all(
+        isinstance(name, str) and isinstance(field, str) and field in fields
+        for name, field in auth_params.items()
+    )
 
 
 def _secrets(method, fields):
@@ -249,10 +269,7 @@ class _Access:
         self.origin = _origin(url)
         if self.origin[0] != "https":
             raise ValueError("an access URL must be https")
-        if method == "header" and {name.lower() for name in auth_params} & {
-            "cookie",
-            "set-cookie",
-        }:
+        if method == "header" and {name.lower() for name in auth_params} & _COOKIES:
             raise ValueError("a cookie header is not an access method")
         field = _unsendable(method, auth_params, fields)
         if field is not None:
@@ -354,20 +371,39 @@ def _follow(location, base, access):
     """``(url, refusal)`` of a redirect from ``base`` to ``location``: the
     absolute URL without the query parameters a ``query_param`` credential is
     sent in, and None; or None and why it is refused, a location that is no
-    URL or one whose userinfo, path, query or fragment holds a secret of
-    ``access`` in any encoding (:meth:`_Secret.occurs_in`)."""
+    URL or one that holds a secret of ``access`` (:func:`_reflects`)."""
     try:
         url = base.join(location)
         if access.method == "query_param":
             query = _without(url.query.decode("ascii"), access.params)
             url = url.copy_with(query=query.encode("ascii") or None)
-        parts = (url.userinfo.decode("ascii"), url.raw_path.decode("ascii"))
-        holds = any(access.holds(part) for part in (*parts, url.fragment))
+        holds = _reflects(url, access)
     except Exception:  # noqa: B902 — no error may carry the location away
         return None, _INVALID
     if not url.host:
         return None, _INVALID
     return (None, _CARRIES) if holds else (url, None)
+
+
+def _reflects(url, access):
+    """Whether a secret of ``access`` occurs, in any encoding, inside one
+    component of ``url`` (its userinfo, a path segment, a query key or value,
+    its fragment), or across them as more than the URL delimiters between
+    them."""
+    userinfo, target = url.userinfo.decode("ascii"), url.raw_path.decode("ascii")
+    # The raw fragment: a "#" before it is percent-encoded.
+    tail, mark, fragment = str(url).partition("#")
+    path, _, query = target.partition("?")
+    keyed = [part for pair in query.split("&") for part in pair.split("=", 1)]
+    parts = [userinfo, *path.split("/"), *keyed, fragment]
+    if any(map(access.holds, parts)):
+        return True
+    return any(
+        not _DELIMITERS.fullmatch(text[start:end])
+        for text in (userinfo, target + mark + fragment)
+        for secret in access.secrets
+        for start, end in secret.spans(text)
+    )
 
 
 def _refusing_jar():
@@ -411,8 +447,9 @@ class _Session:
         self._other.close()
 
     @contextlib.contextmanager
-    def stream(self, method, url, headers=None):
-        """The streamed response to ``method`` on ``url`` after its redirects.
+    def stream(self, method, url, headers=None, timeout=httpx.USE_CLIENT_DEFAULT):
+        """The streamed response to ``method`` on ``url`` after its redirects,
+        each request under ``timeout`` (the client's by default).
 
         Each hop is armed while every earlier hop stayed on the access origin.
         A 304 or a status other than 3xx ends the walk; a 301, 302, 303, 307
@@ -422,13 +459,13 @@ class _Session:
         a header holding a secret for another origin and more than ten
         redirects; the message holds no URL.
         """
-        response = self._walk(method, httpx.URL(url), headers)
+        response = self._walk(method, httpx.URL(url), headers, timeout)
         try:
             yield response
         finally:
             response.close()
 
-    def _walk(self, method, url, headers):
+    def _walk(self, method, url, headers, timeout):
         armed = True
         for _ in range(_REDIRECTS + 1):
             own = _origin(url) == self._access.origin
@@ -436,14 +473,15 @@ class _Session:
             client = self._own if own else self._other
             extensions = {_ARMED: True} if armed else None
             request = client.build_request(
-                method, url, headers=headers, extensions=extensions
+                method, url, headers=headers, timeout=timeout, extensions=extensions
             )
             request.headers.pop("Cookie", None)
             if not own:
                 request.headers.pop("Authorization", None)
                 request.headers.pop("Proxy-Authorization", None)
-                # No header left, a resume's If-Range included, may hold a secret.
-                if any(map(self._access.holds, request.headers.values())):
+                # No header passed in, a resume's If-Range included, may hold
+                # a secret; the others are the client's own.
+                if any(map(self._access.holds, (headers or {}).values())):
                     raise DownloadError(_CARRIES)
             # A no-op auth, so httpx makes no Authorization from the userinfo.
             response = client.send(request, stream=True, auth=httpx.Auth())

@@ -1,4 +1,10 @@
+import base64
 import datetime
+import json
+import logging
+import os
+import urllib.parse
+import warnings
 import zipfile
 
 import httpx
@@ -626,6 +632,7 @@ def test_fetch_aoi_rejects_place_only_arguments():
         {"tiers": ["local"]},
         {"on_unknown": "exclude"},
         {"contained": "keep"},
+        {"credentials": {"p": {"key": "k"}}},
     ):
         with pytest.raises(ValueError, match="apply only with place="):
             fetch((0, 0, 1, 1), **kwargs)
@@ -637,15 +644,19 @@ def test_fetch_aoi_rejects_place_only_arguments():
         fetch(place="X", when="2026-06-01", reference_date="20260602")
 
 
-def _partitioned_index(tmp_path, monkeypatch, feeds, contained=None, edges=None):
+def _partitioned_index(
+    tmp_path, monkeypatch, feeds, contained=None, edges=None, providers=None
+):
     """A schema-10 index serving Q1757 with ``feeds`` (``{feed id: extra
     columns}``) in that order, each a local feed at
-    ``https://feeds.example/<feed id>``; ``edges`` adds edge fields by feed id."""
+    ``https://feeds.example/<feed id>``; ``edges`` adds edge fields by feed id.
+    With ``providers`` (access provider records) a schema-11 index."""
     import transitio.index as transitio_index
     from index_fixture import HULL, PLACES, covered_feed, edge, write_partitioned_index
 
+    version = 10 if providers is None else 11
     monkeypatch.setattr(
-        "transitio.__version__", transitio_index.MIN_READER_VERSIONS[10]
+        "transitio.__version__", transitio_index.MIN_READER_VERSIONS[version]
     )
     rows = [
         {
@@ -677,6 +688,7 @@ def _partitioned_index(tmp_path, monkeypatch, feeds, contained=None, edges=None)
         places=[PLACES[0]],
         edges=records,
         contained=contained or {},
+        access=None if providers is None else {"providers": providers},
     )
     return transitio_index.read_index(directory)
 
@@ -836,6 +848,308 @@ def test_date_rules_decide_before_and_after_download(
     assert (entry["path"] is not None) == (entry["decision"] == "delivered")
     assert result.skipped == [("f-a", reason)] * bool(reason)
     assert result.selection_table().to_dict("records") == result.selection
+
+
+API = "https://api.example.com/feed"
+CDN = "https://cdn.example.org/feed.zip"
+CURATED = "https://curated.example/feed.zip"
+HOSTED = "https://files.example.com/f-a/latest.zip"
+# Credential values with reserved characters and a space, one a prefix of
+# another, and a Basic-auth password.
+SECRET, PREFIX, PASSWORD = "a&b=c/d%e f", "a&b", "p@ss/w%rd=&"
+PAYLOAD = base64.b64encode(f"user:{PASSWORD}".encode()).decode()
+PROVIDERS = [
+    {
+        "provider_id": "p-key",
+        "name": "Key Co",
+        "registration_url": "https://key.example/join",
+        "credential_fields": ["key"],
+    },
+    {"provider_id": "p-pair", "credential_fields": ["client_id", "client_secret"]},
+    {"provider_id": "p-token", "credential_fields": ["token"]},
+    {"provider_id": "p-basic", "credential_fields": ["username", "password"]},
+]
+KEY = {"access_provider": "p-key", "auth_method": "query_param"}
+KEY["auth_params"] = {"key": "key"}
+QUERY = {"access_provider": "p-pair", "auth_method": "query_param"}
+QUERY["auth_params"] = {"id": "client_id", "secret": "client_secret"}
+HEADER = {"access_provider": "p-token", "auth_method": "header"}
+HEADER["auth_params"] = {"X-Api-Key": "token"}
+BASIC = {"access_provider": "p-basic", "auth_method": "basic_auth", "auth_params": {}}
+
+
+def _protected(columns, url=API):
+    return {"access": "key", "download_url": url, **columns}
+
+
+def _credentials_env(monkeypatch, tmp_path, env):
+    """The credential variables ``env`` (``{name suffix: value}``) alone and
+    an empty config directory."""
+    import transitio.credentials
+
+    for name in list(os.environ):
+        if name.startswith("TRANSITIO_KEY_"):
+            monkeypatch.delenv(name)
+    for name, value in env.items():
+        monkeypatch.setenv(f"TRANSITIO_KEY_{name}", value)
+    config = str(tmp_path / "config")
+    monkeypatch.setattr(
+        transitio.credentials.platformdirs, "user_config_dir", lambda name: config
+    )
+
+
+def _serve(monkeypatch, handler):
+    """Both catalogue clients over one stub transport running ``handler``."""
+    from transitio.catalog import MobilityDatabase, TransitlandAtlas
+
+    class Atlas(TransitlandAtlas):
+        def __init__(self, **kwargs):
+            super().__init__(transport=httpx.MockTransport(handler), **kwargs)
+
+    class Mdb(MobilityDatabase):
+        def __init__(self, refresh_token=None, **kwargs):
+            transport = httpx.MockTransport(handler)
+            super().__init__(refresh_token, transport=transport, **kwargs)
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas", Atlas)
+    monkeypatch.setattr("transitio.catalog.MobilityDatabase", Mdb)
+
+
+@pytest.mark.filterwarnings("ignore:no Mobility Database API token")
+def test_protected_feeds_are_decided_before_download(tmp_path, monkeypatch):
+    from transitio.index import place
+
+    unsupported = "its access method is not supported"
+    cookie = {**HEADER, "auth_params": {"Cookie": "token"}}
+    # Feed id, its access columns and why it is skipped.
+    cases = [
+        (
+            "f-unresolved",
+            {"access": "key", "download_url": API},
+            "the index has no access details for it",
+        ),
+        (
+            "f-unsupported",
+            _protected({**HEADER, "auth_method": "unsupported"}),
+            unsupported,
+        ),
+        ("f-cookie", _protected(cookie), unsupported),
+        ("f-http", _protected(KEY, "http://api.example.com/f"), "its URL is not https"),
+        ("f-missing", _protected(KEY), "credentials missing for p-key"),
+        ("f-incomplete", _protected(QUERY), "credentials incomplete for p-pair"),
+        (
+            "f-header",
+            _protected(HEADER),
+            "credential token has characters its method cannot carry",
+        ),
+        (
+            "f-basic",
+            _protected(BASIC),
+            "credential username has characters its method cannot carry",
+        ),
+    ]
+    feeds = {feed_id: columns for feed_id, columns, _ in cases}
+    index = _partitioned_index(tmp_path, monkeypatch, feeds, providers=PROVIDERS)
+    env = {"P_KEY__KEY": "", "P_PAIR__CLIENT_ID": "i", "P_TOKEN__TOKEN": "tök"}
+    env.update(P_BASIC__USERNAME="us:er", P_BASIC__PASSWORD="pw")
+    _credentials_env(monkeypatch, tmp_path, env)
+    requests = []
+    _serve(monkeypatch, lambda request: requests.append(request))
+    options = {"index": index, "directory": tmp_path / "out", "osm": False}
+    result = fetch(place="Q1757", crop=False, **options)
+    instructions = {
+        feed.feed_id: feed.access_instructions()
+        for feed in place("Q1757", index=index).feeds()
+    }
+    expected = [
+        (feed_id, f"protected feed: {reason}; {instructions[feed_id]}")
+        for feed_id, _, reason in cases
+    ]
+    assert result.skipped == expected
+    assert "Register at https://key.example/join" in instructions["f-missing"]
+    # The explicit argument is checked against the index before any download,
+    # and no transitio frame of the traceback holds a value given with it.
+    valid = {"p-token": {"token": SECRET}}
+    for credentials, message in [
+        ({"p-none": {"key": "k"}}, "lists no credential provider 'p-none'"),
+        ({"p-key": {"other": "k"}}, "issues no credential field 'other'"),
+        ({"p-key": {"key": ""}}, "credential 'key' must be a non-empty string"),
+    ]:
+        with pytest.raises(ValueError, match=message) as caught:
+            fetch(place="Q1757", credentials={**valid, **credentials}, **options)
+        trace = caught.value.__traceback__
+        while trace is not None:
+            frame = trace.tb_frame
+            if frame.f_globals["__name__"].startswith("transitio."):
+                assert not any(_leaks(repr(v)) for v in frame.f_locals.values())
+            trace = trace.tb_next
+    assert requests == []
+
+
+def _leaks(text):
+    """Whether ``text`` holds a credential of these tests in any encoding."""
+    from transitio.catalog._access import _Secret
+
+    forms = (SECRET, PREFIX, PASSWORD, PAYLOAD, f"Basic {PAYLOAD}")
+    return any(_Secret(form).occurs_in(text) for form in forms)
+
+
+def _carried(request):
+    """Whether ``request`` carries the credentials of the test's method."""
+    query = urllib.parse.parse_qs(request.url.query.decode())
+    return (
+        query == {"id": [PREFIX], "secret": [SECRET]}
+        or request.headers.get("X-Api-Key") == SECRET
+        or request.headers.get("Authorization") == f"Basic {PAYLOAD}"
+    )
+
+
+ENDED_ETAG = {"service_start": "2021-01-01", "service_end": "2021-12-31", **ETAG}
+BACK = "https://api.example.com/back"
+COOKIE = {"Set-Cookie": "s=1; Domain=example.org; Path=/"}
+# The access URL redirecting to the CDN, which redirects back to it.
+TO_CDN = {API: (302, {"Location": CDN, **COOKIE})}
+ROUND_TRIP = {**TO_CDN, CDN: (302, {"Location": BACK})}
+REFLECTED = {API: (302, {"Location": f"{CDN}?x={urllib.parse.quote(SECRET)}"})}
+DELIVERED = [("GET", API), ("GET", CDN)]
+
+
+@pytest.mark.filterwarnings("ignore:no Mobility Database API token")
+@pytest.mark.parametrize(
+    "columns, credentials, routes, seen, reason",
+    [
+        ({"download_url": CURATED}, None, {}, [("GET", CURATED)], None),
+        (
+            {"download_url": CURATED},
+            None,
+            {CURATED: (404, {})},
+            [("GET", CURATED), ("GET", HOSTED)],
+            None,
+        ),
+        (
+            _protected(QUERY),
+            {"p-pair": {"client_secret": SECRET}},
+            TO_CDN,
+            DELIVERED,
+            None,
+        ),
+        (_protected(HEADER), None, TO_CDN, DELIVERED, None),
+        (
+            _protected(BASIC),
+            {"p-basic": {"username": "user", "password": PASSWORD}},
+            TO_CDN,
+            DELIVERED,
+            None,
+        ),
+        (_protected(HEADER), None, ROUND_TRIP, [*DELIVERED, ("GET", BACK)], None),
+        (
+            {**_protected(HEADER), **ENDED_ETAG},
+            None,
+            {},
+            [("HEAD", API)],
+            R_ENDED + SAME,
+        ),
+        (
+            _protected(HEADER),
+            None,
+            {API: (401, {})},
+            [("GET", API)],
+            f"download failed: download_url: {API}: HTTP 401 Unauthorized",
+        ),
+        (
+            _protected(HEADER),
+            None,
+            REFLECTED,
+            [("GET", API)],
+            "download failed: download_url: redirect carries a credential",
+        ),
+    ],
+    ids=[
+        "open-download-url",
+        "open-hosted-copy-second",
+        "query-explicit-over-env",
+        "header-env",
+        "basic-explicit",
+        "back-to-the-access-origin",
+        "probe-unchanged",
+        "refused",
+        "location-reflects-a-credential",
+    ],
+)
+def test_schema_11_downloads(
+    tmp_path, monkeypatch, caplog, columns, credentials, routes, seen, reason
+):
+    mdb = {"urls": {"direct_download": API, "latest": HOSTED}}
+    feeds = {"f-a": {"mdb": mdb, **columns}}
+    index = _partitioned_index(tmp_path, monkeypatch, feeds, providers=PROVIDERS)
+    env = {"P_PAIR__CLIENT_ID": PREFIX, "P_PAIR__CLIENT_SECRET": "wrong"}
+    env.update(P_TOKEN__TOKEN=SECRET, P_BASIC__USERNAME="wrong")
+    _credentials_env(monkeypatch, tmp_path, env)
+    payload = _zip(_calendar("20260101", "20261231"))
+    requests = []
+
+    def handler(request):
+        url = str(request.url.copy_with(query=None))
+        requests.append((request.method, url, request))
+        status, headers = routes.get(url, (200, {}))
+        if url == API and not _carried(request):
+            status = 401
+        elif request.method == "HEAD":
+            status = 304
+        # The access origin's reason phrase reflects a credential.
+        phrase = {"reason_phrase": SECRET.encode()} if url == API else {}
+        body = payload if status == 200 else b""
+        return httpx.Response(status, headers=headers, content=body, extensions=phrase)
+
+    _serve(monkeypatch, handler)
+    caplog.set_level(logging.DEBUG, logger="httpx")
+    with warnings.catch_warnings(record=True) as caught:
+        result = fetch(
+            place="Q1757",
+            index=index,
+            credentials=credentials,
+            when=DAY,
+            directory=tmp_path / "out",
+            crop=False,
+            osm=False,
+        )
+    (entry,) = result.selection
+    assert [(method, url) for method, url, _ in requests] == seen
+    assert entry["reason"] == reason
+    assert all("Cookie" not in request.headers for *_, request in requests)
+    # Credentials reach the access URL alone, and the stub below sees them.
+    carried = [_carried(request) for *_, request in requests]
+    assert carried == [("access" in columns) and url == API for _, url in seen]
+    if entry["path"] is not None:
+        sidecar = entry["path"].with_suffix(".provenance.json").read_text()
+        source = ("producer", seen[0][1]) if seen[-1][1] != HOSTED else None
+        expected = source or ("mdb_latest", HOSTED)
+        assert (entry["fetched_from"], json.loads(sidecar)["source_url"]) == expected
+    paths = "\n".join(str(path) for path in tmp_path.rglob("*"))
+    sidecars = [p.read_text() for p in tmp_path.rglob("*.provenance.json")]
+    logged = [record.getMessage() for record in caplog.records]
+    texts = [repr(result), paths, *sidecars, *logged, *map(str, caught)]
+    assert not any(map(_leaks, texts))
+
+
+def test_protected_archives_are_not_shared(tmp_path):
+    from transitio import _http
+    from transitio.catalog._access import _Access, _Secret
+    from transitio.pipeline._fetch import _Archives
+
+    def handler(request):
+        return httpx.Response(200, content=request.headers["X-Api-Key"].encode())
+
+    first, second = (
+        _Access(API, "header", {"X-Api-Key": "token"}, {"token": _Secret(token)})
+        for token in ("t1", "t2")
+    )
+    archives, stub = _Archives(tmp_path), httpx.MockTransport(handler)
+    with _http.client() as client:
+        found = [archives.get(client, API, a, stub) for a in (first, second, first)]
+    assert [path.read_bytes() for path, *_ in found] == [b"t1", b"t2", b"t1"]
+    assert found[0] == found[2]
 
 
 def _network(agency="HSL", start="20260101", stops=None, hours=(8,), **options):
