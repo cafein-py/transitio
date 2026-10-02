@@ -2,6 +2,7 @@ import base64
 import logging
 import os
 import re
+import sys
 import urllib.parse
 
 import h11
@@ -143,6 +144,8 @@ def test_values_each_method_can_carry(method, auth_params, values, unsendable):
 PROXY = "http://proxy.test:3128"
 API = "https://api.example.com/feed"
 VIA = {"HTTPS_PROXY": PROXY}
+# Windows reads environment names case-insensitively: one variable per name.
+POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="one name, one case")
 
 
 @pytest.mark.parametrize(
@@ -150,8 +153,18 @@ VIA = {"HTTPS_PROXY": PROXY}
     [
         ({}, API, None),
         ({"ALL_PROXY": PROXY}, API, PROXY),
-        ({"https_proxy": PROXY, "HTTPS_PROXY": "x:1", "ALL_PROXY": "y:2"}, API, PROXY),
-        ({"https_proxy": "", "HTTPS_PROXY": "x:1", "all_proxy": PROXY}, API, PROXY),
+        pytest.param(
+            {"https_proxy": PROXY, "HTTPS_PROXY": "x:1", "ALL_PROXY": "y:2"},
+            API,
+            PROXY,
+            marks=POSIX_ONLY,
+        ),
+        pytest.param(
+            {"https_proxy": "", "HTTPS_PROXY": "x:1", "all_proxy": PROXY},
+            API,
+            PROXY,
+            marks=POSIX_ONLY,
+        ),
         ({"HTTPS_PROXY": "proxy.test:3128"}, API, PROXY),
         ({"NO_PROXY": "*.example.com"}, API, None),
         ({**VIA, "NO_PROXY": "other.org, *"}, API, None),
@@ -161,7 +174,12 @@ VIA = {"HTTPS_PROXY": PROXY}
         ({**VIA, "NO_PROXY": ".example.com"}, "https://example.com/feed", PROXY),
         ({**VIA, "NO_PROXY": "api.example.com:443"}, API, None),
         ({**VIA, "NO_PROXY": "api.example.com:8443"}, API, PROXY),
-        ({**VIA, "no_proxy": "other.org", "NO_PROXY": "example.com"}, API, PROXY),
+        pytest.param(
+            {**VIA, "no_proxy": "other.org", "NO_PROXY": "example.com"},
+            API,
+            PROXY,
+            marks=POSIX_ONLY,
+        ),
         ({**VIA, "NO_PROXY": "10.0.0.0/8,::1"}, "https://10.1.2.3:8443/feed", None),
         ({**VIA, "NO_PROXY": "10.0.0.0/8,::1"}, "https://[::1]/feed", None),
         ({**VIA, "NO_PROXY": "10.0.0.0/8,localhost"}, API, PROXY),
