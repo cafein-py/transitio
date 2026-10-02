@@ -61,14 +61,16 @@ pub struct CropResult {
     /// only when a kept trip has a shape.
     pub source_notices: Vec<Notice>,
     /// The rows of kept trips left out because a reference names no row of
-    /// its parent table, and the trips this left with fewer than two
-    /// stop_times, per file, field and code.
+    /// its parent table, the trips this left with fewer than two
+    /// stop_times, and the exact repeats of a kept trips.txt row, per file,
+    /// field and code.
     pub dropped_rows: Vec<DroppedRows>,
 }
 
 /// Rows the crop left out for one reason: a kept trip's stop_times row
-/// naming a stop, or a trip naming a route, that the feed lacks, or a trip
-/// that losing such rows left with fewer than two stop_times.
+/// naming a stop, or a trip naming a route, that the feed lacks, a trip
+/// that losing such rows left with fewer than two stop_times, or an exact
+/// repeat of a kept trips.txt row.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DroppedRows {
@@ -635,6 +637,7 @@ fn trips_touching(
 
 /// Decide which trips survive every crop, streaming trips.txt and keeping
 /// only the survivors as the trips table. `routes` holds the routes.txt ids.
+/// An exact repeat of a kept row is left out and counted.
 #[allow(clippy::too_many_arguments)]
 fn select_trips(
     source: &std::fs::File,
@@ -654,8 +657,8 @@ fn select_trips(
     let trip_index = position(&headers, "trip_id").ok_or("trips.txt has no trip_id column")?;
     let service_index = position(&headers, "service_id");
     let route_index = position(&headers, "route_id");
-    let mut kept = HashSet::new();
-    let mut rows = Vec::new();
+    let mut kept: HashMap<String, usize> = HashMap::new();
+    let mut rows: Vec<Row> = Vec::new();
     let mut notices = Vec::new();
     while let Some(row) = reader.next_row(&mut notices) {
         if let Some(routes) = &crop_options.routes {
@@ -686,14 +689,19 @@ fn select_trips(
         }) {
             continue;
         }
-        if !kept.insert(row.fields[trip_index].clone()) {
-            // Ambiguous, and with no row cap on trips.txt a way to grow the
-            // kept table without bound.
-            return Err(format!(
-                "trips.txt repeats trip_id {:?}; an ambiguous feed cannot be cropped",
-                row.fields[trip_index]
-            ));
+        let trip = &row.fields[trip_index];
+        if let Some(&first) = kept.get(trip) {
+            // An exact repeat is left out; any other is ambiguous, and with no
+            // row cap on trips.txt a way to grow the kept table without bound.
+            if rows[first].fields != row.fields {
+                return Err(format!(
+                    "trips.txt repeats trip_id {trip:?}; an ambiguous feed cannot be cropped"
+                ));
+            }
+            dropped.count("duplicate_key", "trips.txt", "trip_id", None, trip);
+            continue;
         }
+        kept.insert(trip.clone(), rows.len());
         rows.push(Row {
             csv_row: row.csv_row,
             fields: row.fields,
@@ -701,7 +709,7 @@ fn select_trips(
     }
     whole(&reader, "trips.txt", &notices, options)?;
     source_notices.extend(whitespace(&notices));
-    Ok((kept, Table { headers, rows }))
+    Ok((kept.into_keys().collect(), Table { headers, rows }))
 }
 
 /// Write the cropped feed: the kept trips' stop_times straight from the

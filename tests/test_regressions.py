@@ -1470,6 +1470,57 @@ def test_the_crop_drops_rows_naming_a_missing_stop_or_route(
     assert _dropped_note(report) == note
 
 
+@pytest.mark.parametrize(
+    "repeats, count",
+    [
+        pytest.param("r-in,wk,t-in\n" * 3, 3, id="exact"),
+        pytest.param(" r-in ,wk, t-in\n", 1, id="padded"),
+        pytest.param("r-out,wk,t-in\n", None, id="differing"),
+    ],
+)
+def test_the_crop_drops_exact_repeats_of_a_trip(tmp_path, repeats, count):
+    # Delhi's feed repeats eight trips.txt rows exactly, and the crop
+    # refused the feed as ambiguous.
+    from transitio.pipeline._fetch import _dropped_note, _process_feed
+
+    trips = FEED["trips.txt"] + repeats
+    source = write_zip(tmp_path / "feed.zip", {**FEED, "trips.txt": trips})
+    output = tmp_path / "cropped.zip"
+    if count is None:
+        with pytest.raises(OSError, match='repeats trip_id "t-in"'):
+            crop_feed(source, output, aoi=CITY_BBOX)
+        assert not output.exists()
+        return
+    result = crop_feed(source, output, aoi=CITY_BBOX)
+    assert result["dropped_rows"] == [
+        {
+            "code": "duplicate_key",
+            "filename": "trips.txt",
+            "fieldName": "trip_id",
+            "parentFilename": None,
+            "rowCount": count,
+            "valueCount": 1,
+            "sampleValues": ["t-in"],
+        }
+    ]
+    assert result["row_counts"]["trips.txt"] == 1
+    codes = {n["code"] for n in validate_feed(output)["notices"]}
+    assert "duplicate_key" not in codes
+    _, report, *_ = _process_feed(
+        source,
+        geometry=CITY_BBOX,
+        tag="t",
+        repair=False,
+        crop=True,
+        modes=None,
+        day=None,
+        study=False,
+        hosted=None,
+        budgets={},
+    )
+    assert _dropped_note(report) == f"dropped {count} exact duplicate trips.txt rows"
+
+
 MIDLAND = {
     "agency.txt": (
         "agency_id,agency_name,agency_url,agency_timezone\n"

@@ -299,20 +299,24 @@ def _note(entry, text):
 
 
 def _dropped_note(report):
-    """``"dropped <n> <file> rows whose <field> is not in <parent>"`` or
-    ``"dropped <n> trips.txt rows left with fewer than two stop_times"`` for
-    the rows the crop of a feed left out (several joined with ``", "``), or
-    None when it left out none."""
-    parts = [
-        (
-            f"dropped {record['rowCount']} {record['filename']} rows left with "
-            "fewer than two stop_times"
-            if record["code"] == "unusable_trip"
-            else f"dropped {record['rowCount']} {record['filename']} rows whose "
-            f"{record['fieldName']} is not in {record['parentFilename']}"
-        )
-        for record in report["summary"].get("droppedRows") or ()
-    ]
+    """``"dropped <n> <file> rows whose <field> is not in <parent>"``,
+    ``"dropped <n> trips.txt rows left with fewer than two stop_times"`` or
+    ``"dropped <n> exact duplicate <file> rows"`` for the rows the crop of a
+    feed left out (several joined with ``", "``), or None when it left out
+    none."""
+    parts = []
+    for record in report["summary"].get("droppedRows") or ():
+        dropped = f"dropped {record['rowCount']}"
+        if record["code"] == "unusable_trip":
+            text = f"{record['filename']} rows left with fewer than two stop_times"
+        elif record["code"] == "duplicate_key":
+            text = f"exact duplicate {record['filename']} rows"
+        else:
+            text = (
+                f"{record['filename']} rows whose {record['fieldName']} is not in "
+                f"{record['parentFilename']}"
+            )
+        parts.append(f"{dropped} {text}")
     return ", ".join(parts) or None
 
 
@@ -1122,10 +1126,11 @@ def fetch(
         Spatially crop each feed to the area: to its polygon when it has
         one (a place's boundary included), otherwise to its bounding box.
         The crop, also run for a route selection, leaves out a trip naming
-        a route the feed lacks and a stop_times row naming a stop it lacks,
-        and then a trip such rows leave with fewer than two stop_times
-        (:func:`~transitio.gtfs.crop_feed`); a feed whose routes.txt or
-        stops.txt has no id column is skipped.
+        a route the feed lacks, a stop_times row naming a stop it lacks, a
+        trip such rows leave with fewer than two stop_times, and an exact
+        repeat of a trips.txt row (:func:`~transitio.gtfs.crop_feed`); a
+        feed whose routes.txt or stops.txt has no id column, or whose
+        trips.txt repeats a ``trip_id`` with other values, is skipped.
     osm : bool, default True
         Fetch the OSM extract for the AOI. With ``place``, it is fetched
         after the feeds, for the place's parts that hold a stop of a
@@ -1179,8 +1184,9 @@ def fetch(
         e.g. ``"agency_timezone America/New_York; stops in
         Pacific/Honolulu"``, a placeholder calendar, which a left-out
         version keeps, rows the crop left out, e.g. ``"dropped 1860
-        stop_times.txt rows whose stop_id is not in stops.txt"``; several
-        join with ``"; "``),
+        stop_times.txt rows whose stop_id is not in stops.txt"`` or
+        ``"dropped 8 exact duplicate trips.txt rows"``; several join with
+        ``"; "``),
         ``index_window`` (the index's ``[start, end]``; None undated or on
         the area path), ``feed_window`` (the computed window of a validated
         download, delivered or not; None otherwise or when unknown),

@@ -89,7 +89,9 @@ def crop_feed(
     more remain; a row the reader skips as malformed counts as missing, and
     an empty ``route_id`` or ``stop_id`` is kept.
     A routes.txt or stops.txt without its id column refuses the crop with
-    an ``OSError``.
+    an ``OSError``. An exact repeat of a retained trips.txt row (every
+    value equal once trimmed) is left out; a repeated ``trip_id`` with any
+    value different refuses the crop with an ``OSError``.
 
     Parameters
     ----------
@@ -139,10 +141,11 @@ def crop_feed(
         whose rows were left out, sorted: ``{"code", "filename",
         "fieldName", "parentFilename", "rowCount", "valueCount",
         "sampleValues"}``, the code being ``"foreign_key_violation"`` for a
-        missing stop or route and ``"unusable_trip"`` (trips.txt
-        ``trip_id``, ``parentFilename`` None) for trips left with fewer
-        than two stop_times, the samples up to 50 of the distinct values,
-        sorted.
+        missing stop or route, ``"unusable_trip"`` (trips.txt ``trip_id``,
+        ``parentFilename`` None) for trips left with fewer than two
+        stop_times and ``"duplicate_key"`` (``parentFilename`` None) for
+        exact repeats of a trips.txt row, the samples up to 50 of the
+        distinct values, sorted.
     """
     if aoi is None and start_date is None and end_date is None and routes is None:
         raise ValueError("nothing to crop: pass aoi, a date window and/or routes")

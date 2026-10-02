@@ -437,12 +437,6 @@ def test_streamed_tables_are_cropped_without_a_row_cap(tmp_path):
     with pytest.raises(OSError, match=r"stop_times.txt exceeds max_rows \(3\)"):
         crop_feed(source, tmp_path / "over.zip", aoi=CITY_BBOX, max_rows=3)
     assert not (tmp_path / "over.zip").exists()
-    # a trip_id repeated in trips.txt is ambiguous, and uncapped it could
-    # grow the kept trips without bound
-    feed["trips.txt"] += "r-in,wk,t-in,s-in\n" * 1000
-    source = write_zip(tmp_path / "repeated.zip", feed)
-    with pytest.raises(OSError, match="repeats trip_id"):
-        crop_feed(source, tmp_path / "repeated-out.zip", aoi=CITY_BBOX)
 
 
 def test_optional_tables_the_crop_empties_are_left_out(tmp_path):
