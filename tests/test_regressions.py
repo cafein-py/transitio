@@ -1521,6 +1521,56 @@ def test_the_crop_drops_exact_repeats_of_a_trip(tmp_path, repeats, count):
     assert _dropped_note(report) == f"dropped {count} exact duplicate trips.txt rows"
 
 
+@pytest.mark.parametrize(
+    "replaced, fields",
+    [
+        pytest.param(
+            {
+                "stops.txt": (b"in1,Kamppi", "in1,Kamp\ufffdi".encode()),
+                "routes.txt": (b"r-in,hsl,1", "r-in,hsl,\ufffd1".encode()),
+            },
+            {("stops.txt", "stop_name"), ("routes.txt", "route_short_name")},
+            id="text",
+        ),
+        pytest.param(
+            {
+                "stops.txt": (b"in1,", b"in\xff1,"),
+                "stop_times.txt": (b",in1,", b",in\xff1,"),
+            },
+            {("stops.txt", "stop_id"), ("stop_times.txt", "stop_id")},
+            id="id",
+        ),
+    ],
+)
+def test_rows_holding_an_invalid_character_are_kept(tmp_path, replaced, fields):
+    # Istanbul's feed writes U+FFFD in a stop name and a route name; the
+    # reader skipped both rows, and the crop kept the rows naming them.
+    files = dict(FEED)
+    for name, (old, new) in replaced.items():
+        files[name] = FEED[name].encode().replace(old, new)
+    source = write_zip(tmp_path / "feed.zip", files)
+
+    def check(notices):
+        codes = {n["code"] for n in notices}
+        assert "foreign_key_violation" not in codes
+        found = {
+            (n["context"]["filename"], n["context"]["fieldName"])
+            for n in notices
+            if n["code"] == "invalid_character"
+        }
+        assert found == fields
+
+    check(validate_feed(source)["notices"])
+    output = tmp_path / "cropped.zip"
+    result = crop_feed(source, output, aoi=CITY_BBOX)
+    assert result["dropped_rows"] == []
+    assert result["row_counts"]["stop_times.txt"] == 2
+    stop = replaced["stops.txt"][1].decode(errors="replace")
+    assert stop in read_entry(output, "stops.txt").decode()
+    check(result["remaining_notices"])
+    assert repair_feed(source, tmp_path / "repaired.zip")["fixes"] == []
+
+
 MIDLAND = {
     "agency.txt": (
         "agency_id,agency_name,agency_url,agency_timezone\n"

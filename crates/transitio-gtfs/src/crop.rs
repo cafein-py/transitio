@@ -2,7 +2,7 @@
 //! area and date window and cascade everything else away, keeping the
 //! result referentially consistent. Times and attributes of retained
 //! trips are never altered beyond the surrounding whitespace the reader
-//! trims.
+//! trims and the bytes that are not UTF-8 it reads as U+FFFD.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;

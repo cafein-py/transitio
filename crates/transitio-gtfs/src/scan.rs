@@ -85,8 +85,10 @@ pub struct Row {
 }
 
 /// One parsed file: headers plus the rows that survived the structural
-/// checks, names and values trimmed of surrounding whitespace; malformed,
-/// empty and undecodable rows are noticed and skipped.
+/// checks, names and values trimmed of surrounding whitespace; malformed
+/// and empty rows are noticed and skipped. Bytes that are not UTF-8 read
+/// as U+FFFD, and a row holding U+FFFD is kept with one
+/// `invalid_character` notice per such field.
 pub struct Table {
     pub headers: Vec<String>,
     pub rows: Vec<Row>,
@@ -841,9 +843,10 @@ impl<R: Read> TableReader<R> {
     }
 
     /// The next row that passes the structural checks; malformed rows are
-    /// noticed and skipped. Ends at the row cap with `too_many_rows`, and
-    /// at a read failure with `unreadable_file`; the suppressed-notice
-    /// summary is recorded once when the rows end.
+    /// noticed and skipped, and a field holding U+FFFD is noticed as
+    /// `invalid_character` with its row kept. Ends at the row cap with
+    /// `too_many_rows`, and at a read failure with `unreadable_file`; the
+    /// suppressed-notice summary is recorded once when the rows end.
     pub fn next_row(&mut self, notices: &mut Vec<Notice>) -> Option<Row> {
         if self.finished {
             return None;
@@ -934,10 +937,12 @@ impl<R: Read> TableReader<R> {
                 push_sampled(notices, &mut self.warning_notices, notice);
                 continue;
             }
-            if fields.iter().any(|field| field.contains('\u{FFFD}')) {
-                let notice = invalid_character(self.spec.name, self.csv_row);
-                push_sampled(notices, &mut self.error_notices, notice);
-                continue;
+            for (header, field) in self.headers.iter().zip(&fields) {
+                if field.contains('\u{FFFD}') {
+                    let notice = invalid_character(self.spec.name, self.csv_row)
+                        .with("fieldName", clip(header));
+                    push_sampled(notices, &mut self.error_notices, notice);
+                }
             }
             return Some(Row {
                 csv_row: self.csv_row,
@@ -1658,7 +1663,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn undecodable_rows_are_skipped_not_fatal() {
+    fn undecodable_rows_are_kept_with_a_notice_per_field() {
         let mut files: Vec<(&str, &[u8])> = minimal()
             .into_iter()
             .filter(|(name, _)| *name != "stops.txt")
@@ -1666,16 +1671,30 @@ pub(crate) mod tests {
             .collect();
         files.push((
             "stops.txt",
-            b"stop_id,stop_name\ns1,Kamppi\ns2,\xff\xfe\ns3,Steissi\n",
+            b"stop_id,stop_name\ns1,Kamppi\ns2,\xff\xfe\ns\xff3,B\xffad\ns4,Steissi\n",
         ));
         files.push(("shapes.txt", b""));
         let result = scan_reader(zip_with(&files)).unwrap();
         let codes = codes(&result);
-        assert!(codes.contains(&"invalid_character"));
         assert!(codes.contains(&"empty_file")); // shapes.txt
         assert!(!codes.contains(&"missing_required_file"));
-        // the two clean stop rows survive
-        assert_eq!(result.tables["stops.txt"].rows.len(), 2);
+        let rows = &result.tables["stops.txt"].rows;
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[1].csv_row, 3);
+        assert_eq!(rows[1].fields, ["s2", "\u{FFFD}\u{FFFD}"]);
+        let found: Vec<(u64, &str)> = result
+            .notices
+            .iter()
+            .filter(|n| n.code == "invalid_character")
+            .map(|n| {
+                assert_eq!(n.severity, Severity::Error);
+                (
+                    n.context["csvRowNumber"].as_u64().unwrap(),
+                    n.context["fieldName"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(found, [(3, "stop_name"), (4, "stop_id"), (4, "stop_name")]);
     }
 
     #[test]
