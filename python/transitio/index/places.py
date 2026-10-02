@@ -8,7 +8,14 @@ match strength then ``kind`` precedence then feed count, and only an exact
 match can win: the sole exact match, one that beats the runner-up by the
 ambiguity margin, or, where the margin does not decide, the place of the name
 known far more widely than every other exact match that is not a metro, at
-home or abroad ("Moscow" is Moscow, Russia, not Moscow, Idaho). A place's own
+home or abroad ("Moscow" is Moscow, Russia, not Moscow, Idaho). Before any of
+these, a city of at least 200,000 people (schema 11) carrying the name as its
+name or in English wins when it has more than twice the population of every
+other exact match recording one ("Lima" is Lima, Peru, not Lima, Ohio), unless
+a region or country of the name contains no city of the name (Victoria, the
+city in British Columbia and the Australian state) or a city of the name
+without a recorded population is known at least as widely, as San Jose,
+California, a city of the San Francisco urban centre, is. A place's own
 names are its name and its labels in its country's languages (from Unicode
 CLDR) or English. Where a place carries the
 name as its own, one reaching it only through a label in another language
@@ -142,6 +149,10 @@ _VETOED = object()
 # deciding, where feeds do not decide it wins, and a label in another language
 # keeps it in the contest.
 _WELL_KNOWN = 100
+
+# A city of at least this many people wins its name over far smaller places
+# of it (see ``_most_populous``).
+_LARGE_CITY = 200_000
 
 # The partial matches a PlaceNotFoundError message names; all are candidates.
 _PARTIAL_SHOWN = 10
@@ -320,6 +331,17 @@ class Place:
         way, ``place.centre or place.geometry.representative_point()`` (the
         centroid can lie outside)."""
         return _as_shape(self._record.get("centre"))
+
+    @property
+    def population(self):
+        """The 2025 population of the urban centre (GHS-UCDB) the index
+        matched the place to (schema 11), which can extend beyond the
+        place's boundary: for Kochi, India, the 5 million of the
+        conurbation. None when the index records none for the place or
+        predates schema 11."""
+        from transitio.index.feeds import _count, _scalar
+
+        return _count(_scalar(self._record.get("population")))
 
     @property
     def parent(self):
@@ -824,9 +846,13 @@ class _PlaceLookup:
         return [(tier, pid) for tier, pid in scored if pid not in dropped]
 
     def _winner(self, query, scored, name):
+        exact = self._contenders(scored, name)
+        populous = self._most_populous(exact, name)
+        if populous is not None:
+            return populous
         # A city's own metros keep every definition, so the full contest cannot
         # hand its name to one of them once the others are gone.
-        namesakes, _ = self._namesakes(self._contenders(scored, name), name)
+        namesakes, _ = self._namesakes(exact, name)
         rest = self._one_definition(
             [item for item in scored if item[1] not in namesakes]
         )
@@ -892,6 +918,56 @@ class _PlaceLookup:
             for pid in exact
             if pid in primary or pid not in named or self._far_better_known(pid, labels)
         ]
+
+    def _most_populous(self, exact, name):
+        """The exact-match city carrying ``name`` as a primary name (see
+        ``_own_names``) with the largest population, when that is at least
+        ``_LARGE_CITY`` and more than twice that of every other exact match
+        recording one; otherwise None. None, too, where another city carrying
+        ``name`` as a primary name records no population and has at least
+        ``_WELL_KNOWN`` labels and no fewer than the largest, since the index
+        records a centre's population on its main city only (San Jose,
+        California, lies in the San Francisco centre); and where a region or
+        country carrying ``name`` as its own contains none of the exact-match
+        cities, a rival whose population cannot be compared (Australia's
+        Victoria). One containing such a city is that city's unit (Istanbul's
+        province)."""
+        records = self._records
+        norm = _normalize(name)
+        population = {pid: self.get(pid).population for pid in exact}
+        primary = [
+            pid
+            for pid in exact
+            if records[pid]["kind"] == "city"
+            and norm in self._own_names(pid, primary=True)
+        ]
+        recorded = [pid for pid in primary if population[pid] is not None]
+        if not recorded:
+            return None
+        top = max(recorded, key=population.get)
+        size = population[top]
+        if size < _LARGE_CITY or any(
+            size <= 2 * population[pid]
+            for pid in exact
+            if pid != top and population[pid] is not None
+        ):
+            return None
+        labels = max(_WELL_KNOWN, len(records[top]["names"]))
+        if any(
+            population[pid] is None and len(records[pid]["names"]) >= labels
+            for pid in primary
+        ):
+            return None
+        cities = [pid for pid in exact if records[pid]["kind"] == "city"]
+        containing = {place.id for pid in cities for place in self.get(pid).ancestors}
+        if any(
+            records[pid]["kind"] in ("region", "country")
+            and pid not in containing
+            and norm in self._own_names(pid)
+            for pid in exact
+        ):
+            return None
+        return top
 
     def _has_alias(self, place_id, norm):
         """Whether a place carries an alias normalizing to ``norm``."""

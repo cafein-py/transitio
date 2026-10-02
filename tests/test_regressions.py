@@ -663,6 +663,129 @@ def test_a_far_better_known_place_wins_where_feeds_do_not_decide(name, rows, exp
 
 
 @pytest.mark.parametrize(
+    ("name", "rows", "expected"),
+    [
+        # Each row: the id, kind, country, feeds, labels, population and parent.
+        pytest.param(
+            "Lima",
+            [
+                ("pe", "city", "PE", 0, 90, 200_000, None),
+                ("us", "city", "US", 3, 63, None, None),
+            ],
+            "pe",
+            id="lima",
+        ),
+        pytest.param(
+            "Lima",
+            [
+                ("pe", "city", "PE", 0, 90, 199_999, None),
+                ("us", "city", "US", 3, 63, None, None),
+            ],
+            "us",
+            id="below",
+        ),
+        # Japan's region of the name contains its city, so it is no rival.
+        pytest.param(
+            "Kochi",
+            [
+                ("in", "city", "IN", 0, 125, 5_069_022, None),
+                ("jp", "city", "JP", 10, 100, 216_999, "jp-r"),
+                ("jp-r", "region", "JP", 10, 50, None, None),
+            ],
+            "in",
+            id="kochi",
+        ),
+        # Within twice the population the feed margin decides.
+        pytest.param(
+            "Valencia",
+            [
+                ("ve", "city", "VE", 0, 100, 1_601_249, None),
+                ("es", "city", "ES", 7, 170, 1_404_208, None),
+            ],
+            "es",
+            id="valencia",
+        ),
+        pytest.param(
+            "Istanbul",
+            [
+                ("c", "city", "TR", 0, 139, 14_210_222, "r"),
+                ("r", "region", "TR", 6, 114, None, None),
+                ("m", "metro", "TR", 4, 1, None, None),
+            ],
+            "c",
+            id="istanbul",
+        ),
+        # A state of the name containing no city of it is not compared.
+        pytest.param(
+            "Victoria",
+            [
+                ("ca", "city", "CA", 6, 129, 250_760, None),
+                ("au", "region", "AU", 17, 155, None, None),
+            ],
+            None,
+            id="victoria",
+        ),
+        # Mexico City carries "Meksyk" only as a label in other languages.
+        pytest.param(
+            "Meksyk",
+            [
+                ("mx", "city", "MX", 30, 150, 21_000_000, None),
+                ("pl", "city", "PL", 0, 1, None, None),
+            ],
+            None,
+            id="meksyk",
+        ),
+        # A city without a population, known as widely, keeps the rule out.
+        pytest.param(
+            "San Jose",
+            [
+                ("cr", "city", "CR", 0, 168, 2_272_572, None),
+                ("us", "city", "US", 11, 168, None, None),
+            ],
+            "us",
+            id="san-jose",
+        ),
+        pytest.param(
+            "Medan",
+            [
+                ("id", "city", "ID", 0, 128, 4_350_624, None),
+                ("fr", "city", "FR", 3, 108, None, None),
+            ],
+            "id",
+            id="medan",
+        ),
+    ],
+)
+def test_a_city_far_larger_than_its_namesakes_wins(name, rows, expected):
+    # Lima, Peru, with no feeds and fewer labels than the label rule needs, lost
+    # its name to Lima, Ohio, on feeds; a city of 200,000 people or more with
+    # over twice the population of every other place of the name wins.
+    from transitio.exceptions import AmbiguousPlaceError
+
+    own = {"mx": "Mexico City"}
+    places = [
+        {
+            **_place(
+                pid,
+                kind,
+                own.get(pid, name),
+                country,
+                names={f"l{n}": name for n in range(labels)},
+                parent=parent,
+            ),
+            "population": population,
+        }
+        for pid, kind, country, _, labels, population, parent in rows
+    ]
+    lookup = _lookup(places, {row[0]: row[3] for row in rows})
+    if expected is None:
+        with pytest.raises(AmbiguousPlaceError):
+            lookup.resolve(name)
+    else:
+        assert lookup.resolve(name).id == expected
+
+
+@pytest.mark.parametrize(
     ("name", "options", "expected"),
     [
         ("Stockholm", {"kind": "metro"}, "m-fua"),

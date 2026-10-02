@@ -281,8 +281,8 @@ _PLACES_COLUMNS[8] = _PLACES_COLUMNS[6]
 # Schema 9: the validity of the place's feeds and their overlap.
 _PLACES_COLUMNS[9] = _PLACES_COLUMNS[6] | {"validity"}
 _PLACES_COLUMNS[10] = _PLACES_COLUMNS[9]
-# Schema 11: the place's centre point.
-_PLACES_COLUMNS[11] = _PLACES_COLUMNS[10] | {"centre"}
+# Schema 11: the place's centre point and its urban centre's population.
+_PLACES_COLUMNS[11] = _PLACES_COLUMNS[10] | {"centre", "population"}
 # Schema 7 edges carry the rank stage's relevance; the links table also names
 # the partition holding each edge's feed.
 _RELEVANCE_COLUMNS = frozenset({"relevance_category", "relevance", "cross_border"})
@@ -298,7 +298,7 @@ _LINKS_COLUMNS = _EDGES_COLUMNS_BY_VERSION[7] | {"feed_partition"}
 # The Arrow types of the columns schema 11 adds; an all-null column passes.
 _SCHEMA_11_TYPES = {
     "feeds": dict.fromkeys(_FEEDS_COLUMNS[11] - _FEEDS_COLUMNS[10], "string"),
-    "places": {"centre": "binary"},
+    "places": {"centre": "binary", "population": "integer"},
     "access_providers": {
         **dict.fromkeys(_ACCESS_PROVIDERS_COLUMNS, "string"),
         "credential_fields": "list of strings",
@@ -359,6 +359,7 @@ def _check_types(schema, path, table):
         "string": (pa.types.is_string, pa.types.is_large_string),
         "binary": (pa.types.is_binary, pa.types.is_large_binary),
         "bool": (pa.types.is_boolean,),
+        "integer": (pa.types.is_integer,),
         "list of strings": (pa.types.is_list, pa.types.is_large_list),
     }
     for name, expected in _SCHEMA_11_TYPES.get(table, {}).items():
@@ -1092,7 +1093,15 @@ def place(query, *, kind=None, definition=None, index=None):
     Where a place carries the name as its name or in English, one carrying
     it only in another of its own languages does not compete either unless
     far better known: "Bergen", Dutch for Mons, is no rival to the towns
-    named Bergen.
+    named Bergen. Before any of these, a city of at least 200,000 people
+    (schema 11, :attr:`Place.population`) carrying the name as its name or
+    in English wins when it has more than twice the population of every
+    other place of the name recording one, whatever their feeds or labels:
+    "Lima" is Lima, Peru, not Lima, Ohio. It does not where a region or
+    country of the name contains no city of the name ("Victoria": the city
+    in British Columbia and the Australian state), or where a city of the
+    name without a recorded population is known at least as widely, as San
+    Jose, California, a city of the San Francisco urban centre, is.
     ``kind`` pins the scope. A qualified name, "Name, Qualifier" with one or
     more qualifiers, keeps the places lying within a region or country each
     qualifier names ("London, Ontario", "City of London, UK"), or within any

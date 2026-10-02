@@ -388,7 +388,8 @@ def test_a_schema_10_index_lists_the_feeds_containing_a_feed(tmp_path, monkeypat
     # No access details or centres before schema 11; the access URL is the
     # one the crawl reads, the Atlas static feed before the MDB download.
     assert index.access_providers is None and index.access_provider("x") is None
-    assert reader.place("hel", index=index).centre is None
+    helsinki = reader.place("hel", index=index)
+    assert helsinki.centre is None and helsinki.population is None
     hsl = next(f for f in served if f.feed_id == "f-hsl")
     assert (hsl.access, hsl.access_provider, hsl.auth_method) == (None, None, None)
     assert hsl.download_url is None and hsl.access_instructions() is None
@@ -488,7 +489,10 @@ def test_a_schema_11_index_carries_feed_access_and_place_centres(tmp_path, monke
         )
         edges.append(edge("hel", feed_id, tier="local", relevance_category="primary"))
     centre = shapely.Point(24.94, 60.17)
-    places = [place("hel", "city", name="Helsinki", centre=centre.wkb_hex), *PLACES[1:]]
+    helsinki = place(
+        "hel", "city", name="Helsinki", centre=centre.wkb_hex, population=1_305_893
+    )
+    places = [helsinki, *PLACES[1:]]
     directory = write_partitioned_index(
         tmp_path / "index",
         feeds=feeds,
@@ -499,10 +503,12 @@ def test_a_schema_11_index_carries_feed_access_and_place_centres(tmp_path, monke
     index = reader.read_index(directory)
     assert index.schema_version == 11
     assert index.snapshot["min_reader_version"] == "0.19.0"
-    # Places carry their centre when the index has one.
+    # Places carry their centre and population when the index has them.
     helsinki = reader.place("hel", index=index)
     assert isinstance(helsinki.centre, shapely.Point) and helsinki.centre == centre
-    assert reader.place("tku", index=index).centre is None
+    assert helsinki.population == 1_305_893 and type(helsinki.population) is int
+    turku = reader.place("tku", index=index)
+    assert turku.centre is None and turku.population is None
     assert reader.Place({"centre": centre.wkb}, None).centre == centre
     # The providers, and each feed's access details and instructions.
     trafiklab = index.access_provider("trafiklab")
@@ -557,6 +563,9 @@ def test_a_schema_11_index_carries_feed_access_and_place_centres(tmp_path, monke
     snapshot_path.write_text(json.dumps(snapshot))
     with pytest.raises(IncompatibleIndexError, match="'credential_fields' is string"):
         reader.read_index(directory)
+    floats = pa.schema([("population", pa.float64())])
+    with pytest.raises(IncompatibleIndexError, match="is double, not integer"):
+        reader._check_types(floats, "places.parquet", "places")
     monkeypatch.setattr(reader, "_MAX_ACCESS_PROVIDERS_BYTES", 4)
     with pytest.raises(IncompatibleIndexError, match="over the 4-byte ceiling"):
         reader.read_index(directory)
