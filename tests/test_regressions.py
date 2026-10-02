@@ -287,7 +287,14 @@ def test_a_city_is_not_outranked_by_the_places_named_after_it():
     # city's namesake, is set aside. Where no city matches, Istanbul's province
     # stands as the city against its metro; Lagos's Portuguese town keeps the
     # Nigerian state from standing as one, so the Nigerian metro stays a rival.
+    # Valencia's comarca, inside the far better-known city with as many feeds,
+    # is the city's namesake, not the other way round: set against the comarca
+    # alone, Venezuela's better-known Valencia won. Antwerp, inside a same-named
+    # city that is not far better known, still sets that city aside.
     from transitio.exceptions import AmbiguousPlaceError
+
+    def labels(count):
+        return {f"l{n}": f"label {n}" for n in range(count)}
 
     feeds = {
         "c-aug": 30,
@@ -302,6 +309,11 @@ def test_a_city_is_not_outranked_by_the_places_named_after_it():
         "m-lag": 1,
         "r-lag": 1,
         "c-lag": 5,
+        "r-val": 7,
+        "c-val": 7,
+        "c-val-com": 7,
+        "c-ant": 23,
+        "c-ant-in": 23,
     }
     lookup = _lookup(
         [
@@ -323,11 +335,25 @@ def test_a_city_is_not_outranked_by_the_places_named_after_it():
             _place("m-lag", "metro", "Lagos", "NG"),
             _place("r-lag", "region", "Lagos", "NG"),
             _place("c-lag", "city", "Lagos", "PT"),
+            _place("r-val", "region", "Valencia", "ES"),
+            _place(
+                "c-val", "city", "Valencia", "ES", names=labels(170), parent="r-val"
+            ),
+            _place(
+                "c-val-com", "city", "Valencia", "ES", names=labels(48), parent="c-val"
+            ),
+            _place("c-val-ve", "city", "Valencia", "VE", names=labels(100)),
+            _place("c-ant", "city", "Antwerp", "BE", names=labels(59)),
+            _place(
+                "c-ant-in", "city", "Antwerp", "BE", names=labels(170), parent="c-ant"
+            ),
         ],
         feeds,
     )
     assert lookup.resolve("Augsburg").id == "c-aug"
     assert lookup.resolve("Istanbul").id == "r-ist"
+    assert lookup.resolve("Valencia").id == "c-val"
+    assert lookup.resolve("Antwerp").id == "c-ant-in"
     for name in ("London", "New York", "Hamilton", "Lagos"):
         with pytest.raises(AmbiguousPlaceError):
             lookup.resolve(name)

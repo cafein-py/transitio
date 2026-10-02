@@ -23,7 +23,10 @@ with it: a metro in its country shares its name because it is the city's
 metro or named after it, a same-named area containing it that runs much the
 same service (no more than the margin beyond the city's feeds) is the city
 itself, and a place inside it or, not being a city, in its country that
-reaches its name only through an alias is named after it. Where no exact
+reaches its name only through an alias is named after it. Where that
+containing area is a city of the name known far more widely, the inner one
+is the namesake instead: one city recorded twice (València and its
+comarca). Where no exact
 match is a city, a region or country of the name (a province, an emirate, a
 dependency) stands as the city. Metros of the name sharing a member place
 are one metro under several definitions, and only those of the earliest
@@ -980,7 +983,11 @@ class _PlaceLookup:
         which then stand as the city (Istanbul's province, the Hong Kong
         dependency). An anchor's namesakes, sharing its name because of it,
         are the metros in its country and the areas containing it whose feeds
-        stay within the margin of its own. A place reaching ``name`` only
+        stay within the margin of its own. Where such an area is a city
+        carrying ``name`` as its own and far better known
+        (``_far_better_known``) than the anchor, the anchor is the namesake
+        instead: one city recorded twice (València and its comarca), the
+        better-known record standing for both. A place reaching ``name`` only
         through an alias is a namesake, never an anchor, when it lies inside a
         city carrying ``name`` as a name of its own, whether or not that city
         still competes (Puente Aranda, a district of Bogotá, lists Bogotá),
@@ -1034,9 +1041,12 @@ class _PlaceLookup:
             if not feeds:
                 continue  # without feed counts the service cannot be compared
             containing = {place.id for place in self.get(anchor).ancestors}
-            namesakes.update(
-                pid
-                for pid in exact
-                if pid in containing and self._feed_count(pid) <= 2 * feeds
-            )
+            labels = len(records[anchor]["names"])
+            for pid in exact:
+                if pid not in containing or self._feed_count(pid) > 2 * feeds:
+                    continue
+                if pid in named and self._far_better_known(pid, labels):
+                    namesakes.add(anchor)
+                else:
+                    namesakes.add(pid)
         return namesakes, anchors
