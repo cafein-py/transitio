@@ -532,7 +532,7 @@ def test_suggestions_rank_a_label_in_another_language_after_aliases():
         pytest.param(
             "Moscow",
             [("us", "city", "US", 3, 77), ("ru", "city", "RU", 0, 336)],
-            None,
+            "ru",
             id="moscow",
         ),
         # Delhi, India, a region, ranks below two American townships.
@@ -544,7 +544,7 @@ def test_suggestions_rank_a_label_in_another_language_after_aliases():
                 ("us-2", "city", "US", 1, 1),
                 ("in", "region", "IN", 2, 101),
             ],
-            None,
+            "in",
             id="delhi",
         ),
         # An American metro leads and counts the labels of its country's city,
@@ -556,7 +556,7 @@ def test_suggestions_rank_a_label_in_another_language_after_aliases():
                 ("us", "city", "US", 0, 117),
                 ("ru", "region", "RU", 0, 264),
             ],
-            None,
+            "ru",
             id="metro-leader",
         ),
         pytest.param(
@@ -593,14 +593,35 @@ def test_suggestions_rank_a_label_in_another_language_after_aliases():
             "us",
             id="twice",
         ),
+        # Neither well-known place abroad is far better known than the other.
+        pytest.param(
+            "Moscow",
+            [
+                ("us", "city", "US", 3, 77),
+                ("ru", "city", "RU", 0, 336),
+                ("ca", "city", "CA", 0, 200),
+            ],
+            None,
+            id="two-known-rivals",
+        ),
+        pytest.param(
+            "Cali",
+            [
+                ("co-m", "metro", "CO", 1, 1),
+                ("co", "city", "CO", 1, 129),
+                ("co-2", "city", "CO", 1, 5),
+            ],
+            "co",
+            id="within-country",
+        ),
     ],
 )
-def test_a_feed_lead_does_not_beat_a_far_better_known_place_abroad(
-    name, rows, expected
-):
+def test_a_far_better_known_place_wins_where_feeds_do_not_decide(name, rows, expected):
     # Feed counts measure how well each country's feeds are catalogued: Moscow,
     # Idaho, with three feeds, won over Moscow, Russia, with none. The labels a
-    # place carries in many languages mark it as known far beyond its country.
+    # place carries in many languages mark it as known far beyond its country,
+    # and where feeds do not decide, such a place wins, at home or abroad: of
+    # Colombia's two cities named Cali, one feed each, the one with 129 labels.
     from transitio.exceptions import AmbiguousPlaceError
 
     places = [

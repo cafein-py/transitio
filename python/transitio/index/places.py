@@ -5,9 +5,12 @@ included), or a :class:`Place` — resolves to one :class:`Place` through a
 defined ranking, never a guess: the query is normalised and matched
 against every place's labels and aliases in every language, candidates score on
 match strength then ``kind`` precedence then feed count, and only an exact
-match can win: the sole exact match, or one that beats the runner-up by the
-ambiguity margin. A place's own names are its name and its labels in its
-country's languages (from Unicode CLDR) or English. Where a place carries the
+match can win: the sole exact match, one that beats the runner-up by the
+ambiguity margin, or, where the margin does not decide, the place of the name
+known far more widely than every other exact match that is not a metro, at
+home or abroad ("Moscow" is Moscow, Russia, not Moscow, Idaho). A place's own
+names are its name and its labels in its country's languages (from Unicode
+CLDR) or English. Where a place carries the
 name as its own, one reaching it only through a label in another language
 does not compete unless it is known far more widely, by the languages its
 name is recorded in; where a place carries it as its name or in English, one
@@ -121,7 +124,8 @@ _VETOED = object()
 
 # A place with at least this many language labels, and more than twice
 # another's, is known far more widely: abroad it keeps the feed margin from
-# deciding, and a label in another language keeps it in the contest.
+# deciding, where feeds do not decide it wins, and a label in another language
+# keeps it in the contest.
 _WELL_KNOWN = 100
 
 # The partial matches a PlaceNotFoundError message names; all are candidates.
@@ -872,13 +876,13 @@ class _PlaceLookup:
 
     def _decide(self, exact, name):
         """Among the exact matches ``exact``, ranked: the sole one, or the top
-        one when it beats the runner-up by the margin; None when neither
-        holds or a better-known place abroad bars the margin, and ``_VETOED``
-        when the margin alone would decide against the name. The margin never
-        favours a place reached only through an alias or a label in another
-        language over one carrying ``name`` as its own (see ``_own_names``):
-        Saint Paul, Minnesota, whose aliases include São Paulo, has more feeds
-        than São Paulo itself in a thinly covered index."""
+        one when it beats the runner-up by the margin and no better-known
+        place abroad bars it; otherwise the place ``_best_known`` finds, or
+        None. ``_VETOED`` when the margin alone would decide against the name:
+        it never favours a place reached only through an alias or a label in
+        another language over one carrying ``name`` as its own (see
+        ``_own_names``): Saint Paul, Minnesota, whose aliases include São
+        Paulo, has more feeds than São Paulo itself in a thinly covered index."""
         if len(exact) < 2:
             return exact[0] if exact else None
         top_id, runner_id = exact[0], exact[1]
@@ -892,10 +896,26 @@ class _PlaceLookup:
             own = {pid for pid in exact if norm in self._own_names(pid)}
             if own and top_id not in own:
                 return _VETOED
-            if self._better_known_abroad(top_id, exact, name):
-                return None
-            return top_id
-        return None
+            if not self._better_known_abroad(top_id, exact, name):
+                return top_id
+        return self._best_known(exact, name)
+
+    def _best_known(self, exact, name):
+        """The exact match, not a metro, carrying ``name`` as its name and far
+        better known (``_far_better_known``) than every other exact match that
+        is not a metro, in its country or abroad; None when there is none.
+        Metros carry at most one label and do not count. Of Colombia's two
+        cities named Cali, one feed each, the one with 129 labels is the Cali
+        a reader means, not the one with 5."""
+        records = self._records
+        rivals = sorted(
+            (pid for pid in exact if records[pid]["kind"] != "metro"),
+            key=lambda pid: -len(records[pid]["names"]),
+        )
+        if not rivals or _normalize(records[rivals[0]]["name"]) != _normalize(name):
+            return None
+        labels = len(records[rivals[1]]["names"]) if len(rivals) > 1 else 0
+        return rivals[0] if self._far_better_known(rivals[0], labels) else None
 
     def _better_known_abroad(self, top_id, exact, name):
         """Whether an exact match in another country, not a metro, carrying
@@ -904,7 +924,8 @@ class _PlaceLookup:
         so a metro leader counts those of the best-labelled such place in its
         own country, or none. Feed counts compare service within one
         country's coverage; labels in many languages mark a place known far
-        beyond it, as Moscow, Russia, is beside Moscow, Idaho."""
+        beyond it, as Moscow, Russia, is beside Moscow, Idaho. A barred margin
+        leaves the decision to ``_best_known``."""
         records = self._records
         norm = _normalize(name)
         named = [

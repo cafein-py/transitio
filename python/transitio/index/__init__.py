@@ -955,7 +955,10 @@ def place(query, *, kind=None, definition=None, index=None):
     other shared names go to the place with more than twice the runner-up's
     feeds, unless a place of the name in another country is far better
     known (by the languages its name is recorded in), since feed counts
-    measure how well each country's feeds are catalogued. A place's own
+    measure how well each country's feeds are catalogued. Where feeds do not
+    decide, a place of the name known far more widely than every other, in
+    its country or abroad, wins: "Moscow" is Moscow, Russia, and "Cali,
+    Colombia" the city rather than a lesser-known place there. A place's own
     names are its name and its labels in its country's languages or
     English; where a place carries the name as its own, one reaching it
     only through a label in another language does not compete unless it is
