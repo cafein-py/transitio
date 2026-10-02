@@ -681,6 +681,12 @@ def _crawl_url(feed):
     return atlas.get(STATIC_URL) or mdb.get("direct_download")
 
 
+def _hosted_url(feed):
+    """The Mobility Database's hosted copy of ``feed`` (``urls.latest`` of
+    its catalogue record), or None."""
+    return ((_parse(feed._row.get("mdb")) or {}).get("urls") or {}).get("latest")
+
+
 def _companions(index, feed_id, partition=None):
     """The :class:`RealtimeFeed` companions naming ``feed_id`` as their
     static feed: from the index's own realtime table, or from the partition

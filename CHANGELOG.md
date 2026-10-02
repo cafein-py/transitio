@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+
+- Without credentials, `fetch(place=...)` reads a key-protected feed from
+  the Mobility Database's keyless hosted copy when there is one, and the
+  feed's note gives the reason and its `access_instructions()`; a feed
+  without a copy is skipped as before. Trafiklab's Swedish feeds and most
+  feeds of Spain's national access point have such copies. When a download
+  with credentials fails, the copy is read without them.
+
 ## 0.19.0 — 2026-10-02
 
 ### Added
