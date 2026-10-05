@@ -2211,7 +2211,7 @@ def test_feeds_nested_in_one_archive_are_read_from_it_once(
         place="Q1757", index=index, directory=out, crop=False, osm=False, expired="keep"
     )
     assert requests == [("GET", "/outer.zip")]
-    assert all(path.name.startswith("id-") for path in out.iterdir())
+    assert all(path.name.startswith("id-") for path in out.glob("*"))
     if status == 404:
         reason = f"download failed: atlas: {outer}: HTTP 404 Not Found"
         assert sorted(result.skipped) == [("f-1", reason), ("f-2", reason)]

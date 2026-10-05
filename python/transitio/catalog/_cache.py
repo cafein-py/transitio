@@ -99,11 +99,26 @@ def _well_formed(sidecar, feed_id, digest):
 
 
 def _directory(path):
-    """Create the cache directory ``path``; a symlink there is refused, so the
-    cache never writes or deletes through one."""
+    """Create the directory ``path``; a symlink there is refused, so nothing
+    is written or deleted through one."""
     path.mkdir(parents=True, exist_ok=True)
     if path.is_symlink():
-        raise DownloadError(f"{path}: the cache directory is a symlink")
+        raise DownloadError(f"{path} is a symlink")
+
+
+def _copy(path, target, provenance):
+    """A writable copy of ``path`` at ``target`` beside a sidecar of
+    ``provenance``; returns ``target``."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "rb") as source, _http.replacing(target) as handle:
+        shutil.copyfileobj(source, handle)
+    try:
+        _write_provenance(target.with_suffix(_SIDECAR), provenance)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(target)
+        raise
+    return target
 
 
 def _now():
@@ -139,6 +154,11 @@ class Version:
     def retrieved_at(self):
         return self.sidecar.get("retrieved_at", "")
 
+    @property
+    def first_source(self):
+        """The record of the first acquisition of these bytes."""
+        return self.sidecar["cache"]["sources"][0]
+
     def acquired_as(self, fetched_from):
         """Whether any acquisition of these bytes came ``fetched_from``."""
         sources = self.sidecar.get("cache", {}).get("sources", [])
@@ -150,7 +170,7 @@ class Version:
         datasets these bytes represent."""
         dropped = ("cache", "last_used_at", "dataset_id", "service_date_range")
         flat = {k: v for k, v in self.sidecar.items() if k not in dropped}
-        first = self.sidecar["cache"]["sources"][0]
+        first = self.first_source
         flat.update(source_url=first["source_url"], retrieved_at=first["retrieved_at"])
         entry = self.datasets.get(dataset_id) if dataset_id else None
         if entry is not None:
@@ -219,11 +239,8 @@ class FeedCache:
         differ from ``expected`` or are not a zip; nothing is published or
         deleted then."""
         expected = options.pop("expected", None)
-        staging = self.folder(feed_id) / ".staging"
-        for directory in (self.root, staging.parent, staging):
-            _directory(directory)
-        staged = staging / f"{uuid.uuid4().hex}.zip"
-        try:
+        with self.staging(feed_id) as staging:
+            staged = staging / "download.zip"
             digest = _http.download(client, url, staged)
             if expected and digest != expected:
                 raise DownloadError(
@@ -238,19 +255,44 @@ class FeedCache:
                 "retrieved_at": _now(),
             }
             return self.publish(feed_id, staged, digest, record, source, **options)
+
+    @contextlib.contextmanager
+    def staging(self, feed_id):
+        """A fresh folder for the feed's downloads, removed after the block
+        with whatever was not published from it."""
+        staging = self.folder(feed_id) / ".staging"
+        for directory in (self.root, staging.parent, staging):
+            _directory(directory)
+        folder = staging / uuid.uuid4().hex
+        folder.mkdir()
+        try:
+            yield folder
         finally:
-            _unlink(staged)
+            shutil.rmtree(folder, ignore_errors=True)
+            # Under the feed's lock no other download shares these folders.
+            for empty in (staging, staging.parent):
+                with contextlib.suppress(OSError):
+                    empty.rmdir()
 
     def publish(
-        self, feed_id, staged, digest, record, source, dataset=None, replace=False
+        self,
+        feed_id,
+        staged,
+        digest,
+        record,
+        source,
+        dataset=None,
+        replace=False,
+        used=True,
     ):
         """Add the staged file as a version of ``feed_id``: ``record`` gives
         the flat provenance fields of a first acquisition, ``source`` the
         acquisition record and ``dataset`` an optional ``{id: entry}`` of the
         MDB dataset the bytes represent. Identical bytes already cached keep
         their version and gain the record and the dataset. With ``replace``
-        the feed's other versions are deleted afterwards. Raises
-        :class:`DownloadError` when the staged file is not a zip."""
+        the feed's other versions are deleted afterwards; with ``used`` the
+        version counts as delivered now. Raises :class:`DownloadError` when
+        the staged file is not a zip."""
         if not zipfile.is_zipfile(staged):
             raise DownloadError(f"{source['source_url']}: not a zip archive")
         target = self.folder(feed_id) / f"{digest}.zip"
@@ -281,7 +323,9 @@ class FeedCache:
         for dataset_id, entry in (dataset or {}).items():
             # A dataset's first recorded context stays its context.
             cache["datasets"].setdefault(dataset_id, entry)
-        sidecar["retrieved_at"] = sidecar["last_used_at"] = source["retrieved_at"]
+        sidecar["retrieved_at"] = source["retrieved_at"]
+        if used:
+            sidecar["last_used_at"] = source["retrieved_at"]
         _write_provenance(target.with_suffix(_SIDECAR), sidecar)
         version = Version(target, sidecar)
         if replace:
@@ -291,20 +335,27 @@ class FeedCache:
         return version
 
     def touch(self, version):
-        """Record that a call delivered ``version``."""
-        version.sidecar["last_used_at"] = _now()
-        _write_provenance(version.path.with_suffix(_SIDECAR), version.sidecar)
+        """Record that a call delivered ``version``. The sidecar is read
+        again first, so a record added since is kept and a version deleted
+        since stays deleted."""
+        sidecar = version.path.with_suffix(_SIDECAR)
+        try:
+            current = json.loads(sidecar.read_text())
+        except (OSError, ValueError):
+            return
+        current["last_used_at"] = _now()
+        _write_provenance(sidecar, current)
+        version.sidecar = current
 
     def delete(self, version):
         """Remove a version's archive and sidecar."""
         _unlink(version.path)
         _unlink(version.path.with_suffix(_SIDECAR))
 
-    def deliver(self, version, target, dataset_id=None):
-        """A writable copy of ``version`` at ``target``, with the flat
-        provenance sidecar a direct download writes there; returns ``target``."""
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with open(version.path, "rb") as source, _http.replacing(target) as handle:
-            shutil.copyfileobj(source, handle)
-        _write_provenance(target.with_suffix(_SIDECAR), version.provenance(dataset_id))
-        return target
+    def deliver(self, version, target, provenance=None):
+        """A writable copy of ``version`` at ``target`` beside a sidecar of
+        ``provenance`` (default: :meth:`Version.provenance`); returns
+        ``target``."""
+        if provenance is None:
+            provenance = version.provenance()
+        return _copy(version.path, target, provenance)

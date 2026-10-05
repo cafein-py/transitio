@@ -356,8 +356,10 @@ def _process_feed(
     hosted,
     budgets,
     routes=None,
+    provenance=None,
 ):
-    """Crop, repair, mode-filter, validate and report one downloaded feed.
+    """Crop, repair, mode-filter, validate and report one downloaded feed,
+    writing what it makes beside it; the report carries ``provenance``.
 
     A feed whose validation finds a required file missing drops out on any
     day. The computed service window is tested against ``day`` (None tests
@@ -379,10 +381,6 @@ def _process_feed(
     from transitio.report import build_report
     from transitio.validate import validate_feed
 
-    provenance = None
-    sidecar = path.with_suffix(".provenance.json")
-    if sidecar.exists():
-        provenance = json.loads(sidecar.read_text())
     present_routes = None
     source_notices = []
     dropped = None
@@ -401,14 +399,14 @@ def _process_feed(
         # reported with the feed.
         source_notices = report["source_notices"]
         dropped = report["dropped_rows"]
-        path = cropped
+        path = _read_only(cropped)
     # The crop comes first, so the repair works on the area's feed rather
     # than on the whole source.
     fixes = []
     if repair:
         repaired = path.with_name(f"{path.stem}-repaired-{tag}.zip")
         fixes = repair_feed(path, repaired, **budgets)["fixes"]
-        path = repaired
+        path = _read_only(repaired)
     if modes is not None:
         served = _feed_modes(path)
         if served is None:
@@ -436,6 +434,13 @@ def _process_feed(
     report = build_report(validation, hosted=hosted, provenance=provenance)
     report["summary"]["droppedRows"] = dropped
     return path, report, fixes, present_routes, window
+
+
+def _read_only(path):
+    """``path``, made read-only on POSIX systems, as cached files are."""
+    if os.name != "nt":
+        os.chmod(path, 0o444)
+    return path
 
 
 def _snapshot(path):
@@ -878,9 +883,10 @@ def _download_indexed(
     from ``archives`` and extracts that member within ``max_total_bytes``;
     its sidecar records the archive's URL and SHA-256 beside the feed's.
 
-    Returns ``(path, fetched_from, failures)``: ``fetched_from`` is
+    Returns ``(path, fetched_from, failures, url)``: ``fetched_from`` is
     ``"producer"`` for the feed's own URLs and ``"mdb_latest"`` for the hosted
-    copy, ``failures`` the ``"<source>: <error>"`` of each failed attempt.
+    copy, ``failures`` the ``"<source>: <error>"`` of each failed attempt and
+    ``url`` the one the feed was read from.
     Raises :class:`DownloadError` naming the failures when every attempt
     fails."""
     from transitio.catalog import AtlasFeed, Feed
@@ -955,23 +961,101 @@ def _download_indexed(
             failures.append(f"{label}: {error}")
             continue
         if zipfile.is_zipfile(path):
-            return path, source, failures
+            return path, source, failures, url
         failures.append(f"{label}: not a zip archive")
     if failures:
         raise DownloadError("; ".join(failures))
     raise DownloadError(f"feed {feed.feed_id} has no downloadable url")
 
 
-def _record_source(path, fetched_from, errors):
-    """Add where a download came from and the failed attempts before it to
-    its provenance sidecar (created when absent); returns the sidecar."""
-    from transitio.catalog._client import _write_provenance
+def _held(cache, feeds, feed_id):
+    """``(feed, staging)`` for each of ``feeds``, the loop body running under
+    the feed's cache lock with a fresh staging folder
+    (:meth:`~transitio.catalog._cache.FeedCache.staging`); ``feed_id`` gives
+    a feed's id."""
+    for feed in feeds:
+        with cache.lock(feed_id(feed)), cache.staging(feed_id(feed)) as staging:
+            yield feed, staging
+
+
+def _add_version(cache, feed_id, path, url, fetched_from, errors, **options):
+    """Add the download staged at ``path`` from ``url`` as a version of
+    ``feed_id`` (:meth:`~transitio.catalog._cache.FeedCache.publish`), the
+    acquisition recorded with ``fetched_from``, the failed attempts before it
+    (``errors``), ``with_credentials``, the ``snapshot`` in use and, from the
+    sidecar beside a feed read out of a larger archive, that archive's URL and
+    SHA-256; ``dataset`` and ``replace`` pass through. Returns the version."""
+    from transitio import _http
+    from transitio.catalog._cache import _now
 
     sidecar = path.with_suffix(".provenance.json")
-    provenance = json.loads(sidecar.read_text()) if sidecar.exists() else {}
-    provenance.update(fetched_from=fetched_from, download_errors=errors)
-    _write_provenance(sidecar, provenance)
-    return provenance
+    staged = json.loads(sidecar.read_text()) if sidecar.exists() else {}
+    nested = {k: staged[k] for k in ("archive_url", "archive_sha256") if k in staged}
+    source = {
+        "source_url": url,
+        **nested,
+        "fetched_from": fetched_from,
+        "with_credentials": options.pop("with_credentials", False),
+        "download_errors": errors,
+        "index_snapshot": options.pop("snapshot", None),
+        "retrieved_at": _now(),
+    }
+    acquired = ("source_url", "sha256", "retrieved_at")
+    record = {k: v for k, v in staged.items() if k not in acquired}
+    record["feed_id"] = feed_id
+    digest = _http.sha256_file(path)
+    return cache.publish(feed_id, path, digest, record, source, used=False, **options)
+
+
+def _feed_cache(cache_dir, directory):
+    """The download cache under ``cache_dir`` (default: the platform cache),
+    its root created; a ``directory`` inside it, where a delivered copy could
+    replace a cached version, is refused."""
+    import platformdirs
+
+    from transitio.catalog._cache import FeedCache, _directory
+
+    cache = FeedCache(cache_dir or platformdirs.user_cache_dir("transitio"))
+    if directory is not None:
+        path, root = pathlib.Path(directory).resolve(), cache.root.resolve()
+        if path == root or root in path.parents:
+            raise ValueError("directory= must lie outside the download cache")
+    _directory(cache.root)
+    return cache
+
+
+def _deliver(path, directory, provenance):
+    """``path``, a feed made from a cached version, as delivered: copied into
+    ``directory`` beside a sidecar of its ``provenance`` when given, in its
+    feed's digest-named folder."""
+    from transitio.catalog._cache import _copy, _directory, _feed_dir
+
+    if directory:
+        folder = pathlib.Path(directory) / _feed_dir(provenance["feed_id"])
+        _directory(folder)
+        path = _copy(path, folder / path.name, provenance)
+    return path
+
+
+def _report_provenance(version, dataset_id=None):
+    """What a report on ``version`` records of its origin: the feed, the
+    SHA-256 and its first acquisition (URL, retrieval time, where it came
+    from, the attempts that failed before it, the archive it was read out
+    of); for ``dataset_id`` the dataset and its service dates."""
+    first = version.first_source
+    origin = {"feed_id": version.sidecar["feed_id"], "sha256": version.sha256}
+    for key in ("source_url", "archive_url", "archive_sha256", "retrieved_at"):
+        if key in first:
+            origin[key] = first[key]
+    origin.update(
+        fetched_from=first["fetched_from"], download_errors=first["download_errors"]
+    )
+    entry = version.datasets.get(dataset_id) if dataset_id else None
+    if entry is not None:
+        origin.update(
+            dataset_id=dataset_id, service_date_range=entry["service_date_range"]
+        )
+    return origin
 
 
 def _unchanged_since_indexed(feed, http, access=None, transport=None):
@@ -1116,9 +1200,15 @@ def fetch(
     A URL fragment names the member of the archive the feed is read
     from, a nested zip (``.../gtfs.zip#1/google_transit.zip``) or a folder;
     each such archive is downloaded once per call, and the feed's sidecar
-    records its ``archive_url`` and ``archive_sha256``. The sidecar and the
-    report's provenance carry ``fetched_from`` and ``download_errors`` as
-    ``selection`` does. Every overlapping feed is processed, in a
+    records its ``archive_url`` and ``archive_sha256``. Each download is
+    kept in the cache as a version of its feed, ``<cache_dir>/gtfs/<feed
+    folder>/<sha256>.zip`` beside a ``.provenance.json`` sidecar recording
+    every acquisition of those bytes; a download identical to a cached
+    version keeps that version. A report's provenance describes the
+    version's first acquisition: its ``source_url``, ``retrieved_at``,
+    ``fetched_from`` and ``download_errors``, with ``sha256``, ``feed_id``
+    and, for a catalogued dataset, ``dataset_id`` and
+    ``service_date_range``. Every overlapping feed is processed, in a
     deterministic order with official feeds first; one broken feed never
     aborts the others — it lands in ``skipped`` with its reason. A feed
     lacking a file GTFS requires is skipped, with or without ``when`` and
@@ -1260,8 +1350,17 @@ def fetch(
         <error>"``; ``to_cafein`` then builds without a walking network, as
         with ``osm=False``. Other errors, such as ``ExtractNotFoundError``
         when no extract covers the area, still raise.
-    refresh_token, cache_dir, directory, country_code
-        Passed to the catalog and OSM layers.
+    directory : str or pathlib.Path, optional
+        Where the delivered feeds are copied, each in its feed's
+        digest-named folder beside its provenance sidecar: the cropped,
+        route-filtered or repaired feed, or the cached version when none of
+        those ran. A feed skipped or left out leaves nothing there. Without
+        it the delivered feeds are the files in the cache, an untransformed
+        one the read-only cached version itself. The OSM extract goes here
+        too. It must lie outside the download cache (``ValueError``).
+    refresh_token, cache_dir, country_code
+        Passed to the catalog and OSM layers; downloads are cached under
+        ``cache_dir``, by default the platform cache.
     **budgets
         The ``validate_feed`` keyword arguments. A feed with a table that a
         budget cuts short cannot be cropped and lands in ``skipped``, the
@@ -1348,6 +1447,7 @@ def fetch(
             raise problem
     from transitio.catalog import MobilityDatabase
     from transitio.catalog._models import as_date
+    from transitio.exceptions import DownloadError
     from transitio.osm._fetch import _as_geometry
 
     if (aoi is None) == (place is None):
@@ -1438,13 +1538,14 @@ def fetch(
         ).encode()
     ).hexdigest()[:16]
 
+    cache = _feed_cache(cache_dir, directory)
     osm_pbf = osm_note = None
     if osm:
         osm_pbf, osm_note = _osm_extract(
             geometry, cache_dir=cache_dir, directory=directory
         )
 
-    from transitio.catalog._atlas import _feed_dir
+    from transitio.catalog._client import _dataset_entry
 
     feeds, reports, repairs, record = [], [], [], []
     delivered = _Delivered()
@@ -1459,7 +1560,7 @@ def fetch(
         candidates = sorted(
             db.search_feeds(aoi=geometry, country_code=country_code), key=_rank
         )
-        for feed in candidates:
+        for feed, staging in _held(cache, candidates, lambda feed: feed.id):
             entry = _entry(feed.id, feed.raw.get("feed_name") or feed.provider)
             record.append(entry)
             dataset = None
@@ -1478,28 +1579,40 @@ def fetch(
                 except Exception as error:  # noqa: B902
                     _skip(entry, f"dataset selection failed: {error}")
                     continue
-            # Each feed downloads into its own digest-named folder, so two
-            # hosted latest.zip files never overwrite each other.
-            target = pathlib.Path(directory) / _feed_dir(feed.id) if directory else None
             try:
                 if dataset is not None:
-                    path = db._fetch_dataset(dataset, directory=target)
+                    path = db._fetch_dataset(dataset, directory=staging)
                 else:
-                    path = db._fetch_latest(feed, directory=target)
+                    path = db._fetch_latest(feed, directory=staging)
             except Exception as error:  # noqa: B902
                 _skip(entry, f"download failed: {error}", download_errors=str(error))
                 continue
-            entry["fetched_from"] = "mdb_latest" if dataset is None else "mdb_dataset"
+            fetched_from = "mdb_latest" if dataset is None else "mdb_dataset"
+            dataset_id = None if dataset is None else dataset.id
             try:
-                _record_source(path, entry["fetched_from"], None)
+                version = _add_version(
+                    cache,
+                    feed.id,
+                    path,
+                    feed.latest_dataset_url if dataset is None else dataset.hosted_url,
+                    fetched_from,
+                    None,
+                    dataset=dataset and {dataset.id: _dataset_entry(dataset)},
+                )
+            except DownloadError as error:  # not a zip archive
+                _skip(entry, f"download failed: {error}", download_errors=str(error))
+                continue
             except Exception as error:  # noqa: B902 — isolate per-feed failures
                 _skip(entry, f"processing failed: {error}")
                 continue
+            entry["fetched_from"] = fetched_from
+            path = version.path
             twins = [twin for twin, _ in delivered.same_as(path)]
             if twins:
                 _skip(entry, f"same content as {', '.join(twins)}", same_as=twins)
                 continue
             download = path
+            origin = _report_provenance(version, dataset_id)
             hosted = None
             if dataset is not None:
                 try:
@@ -1513,6 +1626,7 @@ def fetch(
                 # bus filter.
                 path, report, fixes, _, window = _process_feed(
                     path,
+                    provenance=origin,
                     geometry=geometry,
                     tag=tag,
                     repair=repair,
@@ -1523,6 +1637,8 @@ def fetch(
                     hosted=hosted,
                     budgets=budgets,
                 )
+                path = _deliver(path, directory, origin)
+                cache.touch(version)
             except _SkipFeed as skip:
                 _skip(entry, skip.reason, feed_window=skip.window)
                 continue
@@ -1803,9 +1919,9 @@ def _fetch_place(
     parts the remaining feeds serve."""
     from transitio import __version__
     from transitio.catalog import Feed, MobilityDatabase, TransitlandAtlas
-    from transitio.catalog._atlas import _feed_dir
+    from transitio.catalog._client import _dataset_entry
     from transitio.credentials import _checked, _provider
-    from transitio.exceptions import StaleSelectorError
+    from transitio.exceptions import DownloadError, StaleSelectorError
     from transitio.index import (
         DISCOVERY_SEMANTICS_VERSION,
         Place,
@@ -1859,7 +1975,7 @@ def _fetch_place(
     }
     feeds, reports, repairs, selections, record = [], [], [], [], []
     delivered = _Delivered()
-    delivered_ids = []
+    delivered_ids, used = [], []
     entries = {}
     # Containment state: the feeds carried by a feed delivered whole (itself,
     # or the feed whose content it repeats), those delivered cut to routes,
@@ -1895,20 +2011,12 @@ def _fetch_place(
             record.append({**_entry(None, None), "note": note})
             warnings.warn(note, UserWarning, stacklevel=3)
 
-    import platformdirs
-
-    base_dir = (
-        pathlib.Path(directory)
-        if directory
-        else pathlib.Path(cache_dir or platformdirs.user_cache_dir("transitio"))
-        / "gtfs"
-    )
-    base_dir.mkdir(parents=True, exist_ok=True)
+    cache = _feed_cache(cache_dir, directory)
     # Archives read by URL fragment live only for the call.
     with (
         MobilityDatabase(refresh_token, cache_dir=cache_dir) as db,
         TransitlandAtlas(cache_dir=cache_dir) as atlas,
-        tempfile.TemporaryDirectory(dir=base_dir) as scratch,
+        tempfile.TemporaryDirectory(dir=cache.root) as scratch,
     ):
         archives = _Archives(scratch)
         if when is not None and not db._refresh_token:
@@ -1938,7 +2046,7 @@ def _fetch_place(
                 return True
             return False
 
-        for feed in kept:
+        for feed, staging in _held(cache, kept, lambda feed: feed.feed_id):
             entry = entry_for(feed)
             access, refusal = decided.get(feed.feed_id, (None, None))
             keyless = None
@@ -1980,12 +2088,14 @@ def _fetch_place(
                     notes.append("kept: containment not proven current")
             # The hosted validation report only describes the dataset's own
             # bytes, so it is attached only when the dataset supplied them.
-            path = fetched_from = probed = None
+            path = fetched_from = probed = url = None
             if dataset is not None:
                 try:
-                    path = db._fetch_dataset(
-                        dataset, directory=base_dir / _feed_dir(feed.feed_id)
-                    )
+                    url = dataset.hosted_url
+                    path = db._fetch_dataset(dataset, directory=staging)
+                    if not zipfile.is_zipfile(path):
+                        path = None
+                        raise DownloadError("not a zip archive")
                     fetched_from = "mdb_dataset"
                 except Exception as error:  # noqa: B902 — try the fallback next
                     errors.append(f"mdb dataset: {error}")
@@ -1995,8 +2105,8 @@ def _fetch_place(
                 probed = contained == "drop" and feed.feed_id in container_ids
                 probed = probed and unchanged(feed)
                 try:
-                    path, fetched_from, failures = _download_indexed(
-                        feed, db, atlas, base_dir, archives, budget, access
+                    path, fetched_from, failures, url = _download_indexed(
+                        feed, db, atlas, staging, archives, budget, access
                     )
                     errors.extend(failures)
                 except Exception as error:  # noqa: B902
@@ -2010,14 +2120,27 @@ def _fetch_place(
             if path is None:
                 _skip(entry, f"download failed: {download_errors}", note=keyless)
                 continue
+            dataset_id = dataset.id if fetched_from == "mdb_dataset" else None
             try:
-                sidecar = _record_source(path, fetched_from, download_errors)
+                version = _add_version(
+                    cache,
+                    feed.feed_id,
+                    path,
+                    url,
+                    fetched_from,
+                    download_errors,
+                    with_credentials=access is not None and fetched_from == "producer",
+                    snapshot=provenance["snapshot"],
+                    dataset=dataset_id and {dataset_id: _dataset_entry(dataset)},
+                )
             except Exception as error:  # noqa: B902 — isolate per-feed failures
                 _skip(entry, f"processing failed: {error}")
                 continue
+            path = version.path
             if probed:
                 # The proof covers only a download from the probed URL.
-                current[feed.feed_id] = sidecar.get("source_url") == probed
+                acquired = version.sidecar["cache"]["sources"][-1]
+                current[feed.feed_id] = acquired["source_url"] == probed
             if fetched_from == "mdb_latest" and (download_errors or keyless):
                 notes.append("from the Mobility Database hosted copy")
             notes.append(keyless)
@@ -2122,9 +2245,11 @@ def _fetch_place(
                         {"tag": tag, "routes": sorted(routes)}, sort_keys=True
                     ).encode()
                 ).hexdigest()[:16]
+            origin = _report_provenance(version, dataset_id)
             try:
                 path, report, fixes, present, window = _process_feed(
                     path,
+                    provenance=origin,
                     geometry=geometry,
                     tag=feed_tag,
                     repair=repair,
@@ -2178,6 +2303,7 @@ def _fetch_place(
             feeds.append(path)
             delivered.add(feed.feed_id, download, routes)
             delivered_ids.append(feed.feed_id)
+            used.append((version, origin))
             if selection is not None:
                 selections.append(selection)
             service = _service(path, day if study else None, budget)
@@ -2185,6 +2311,19 @@ def _fetch_place(
                 services[feed.feed_id] = service
 
     removed = _settle_versions(record, services, protected, day if study else None)
+    # A feed is delivered once the versions are settled and it stays.
+    for n, (feed_id, (version, origin)) in enumerate(zip(delivered_ids, used)):
+        if feed_id in removed:
+            continue
+        try:
+            with cache.lock(feed_id):
+                feeds[n] = _deliver(feeds[n], directory, origin)
+                cache.touch(version)
+        except Exception as error:  # noqa: B902 — isolate per-feed failures
+            _skip(entries[feed_id], f"processing failed: {error}", path=None)
+            removed.add(feed_id)
+            continue
+        entries[feed_id]["path"] = feeds[n]
     for feed_id, (access, _) in decided.items():
         entry = entries[feed_id]
         for key in ("reason", "note", "download_errors"):

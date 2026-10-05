@@ -6,6 +6,16 @@ import pytest
 DATA_DIRECTORY = pathlib.Path(__file__).parent / "data"
 
 
+@pytest.fixture(autouse=True)
+def _platform_cache(tmp_path_factory, monkeypatch):
+    """A fresh platform cache per test: downloads are cached there, never in
+    the user's own cache."""
+    import platformdirs
+
+    cache = str(tmp_path_factory.mktemp("platform-cache"))
+    monkeypatch.setattr(platformdirs, "user_cache_dir", lambda *args, **kw: cache)
+
+
 def _data_path(name):
     path = DATA_DIRECTORY / name
     if not path.exists():

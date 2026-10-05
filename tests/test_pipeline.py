@@ -145,7 +145,6 @@ def _area_fetch(monkeypatch, tmp_path, second):
 
     def patched(refresh_token=None, **kwargs):
         kwargs["transport"] = httpx.MockTransport(handler)
-        kwargs["cache_dir"] = tmp_path / "cache"
         return MobilityDatabase(refresh_token, **kwargs)
 
     monkeypatch.setattr("transitio.catalog.MobilityDatabase", patched)
@@ -153,6 +152,7 @@ def _area_fetch(monkeypatch, tmp_path, second):
         return fetch(
             (24.6, 60.1, 25.2, 60.4),
             directory=tmp_path / "out",
+            cache_dir=tmp_path / "cache",
             reference_date="20260601",
         )
 
@@ -160,10 +160,23 @@ def _area_fetch(monkeypatch, tmp_path, second):
 def test_an_area_fetch_keeps_each_feeds_download_apart(pipeline_env, monkeypatch):
     tmp_path, _ = pipeline_env
     other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "HKL")}
+    _area_fetch(monkeypatch, tmp_path, _zip(other))
     result = _area_fetch(monkeypatch, tmp_path, _zip(other))
     assert len(set(result.feeds)) == 2
     agencies = {zipfile.ZipFile(p).read("agency.txt") for p in result.feeds}
     assert len(agencies) == 2
+    # Each feed's repeated download is one cached version acquired twice; the
+    # directory holds only the crops.
+    cached = [p for p in (tmp_path / "cache").rglob("*.zip") if len(p.stem) == 64]
+    assert len(cached) == len({p.parent for p in cached}) == 2
+    for path in cached:
+        sidecar = json.loads(path.with_suffix(".provenance.json").read_text())
+        assert len(sidecar["cache"]["sources"]) == 2
+    assert sorted((tmp_path / "out").rglob("*.zip")) == sorted(result.feeds)
+    assert all("-cropped-" in p.name for p in result.feeds)
+    if os.name != "nt":
+        crops = (tmp_path / "cache").rglob("*-cropped-*.zip")
+        assert not any(os.access(path, os.W_OK) for path in crops)
 
 
 def test_an_area_fetch_delivers_the_same_content_once(pipeline_env, monkeypatch):
@@ -180,6 +193,17 @@ def test_an_area_fetch_delivers_the_same_content_once(pipeline_env, monkeypatch)
     assert first["index_window"] is None and first["name"] in {"HSL", "HKL"}
     # A feed skipped after its download still records where it came from.
     assert [e["fetched_from"] for e in result.selection] == ["mdb_latest"] * 2
+
+
+def test_an_area_fetch_reports_a_page_that_is_no_zip_as_a_failed_download(
+    pipeline_env, monkeypatch
+):
+    tmp_path, _ = pipeline_env
+    result = _area_fetch(monkeypatch, tmp_path, b"<html>maintenance</html>")
+    (entry,) = [e for e in result.selection if e["decision"] == "skipped"]
+    assert entry["reason"] == f"download failed: {entry['download_errors']}"
+    assert entry["download_errors"].endswith("not a zip archive")
+    assert entry["fetched_from"] is None and len(result.feeds) == 1
 
 
 OTHER_TRIPS = {**GTFS, "trips.txt": "route_id,service_id,trip_id\nr1,wk,t2\n"}
@@ -562,11 +586,14 @@ def test_download_indexed_tries_the_producer_then_the_hosted_copy(
         expected = "; ".join(failures) or "feed f-a has no downloadable url"
         assert str(caught.value) == expected
     else:
-        path, fetched_from, seen = _download_indexed(feed, db, atlas, tmp_path, None)
-        assert (zipfile.is_zipfile(path), fetched_from, seen) == (
+        path, fetched_from, seen, url = _download_indexed(
+            feed, db, atlas, tmp_path, None
+        )
+        assert (zipfile.is_zipfile(path), fetched_from, seen, url) == (
             True,
             source,
             failures,
+            calls[-1],
         )
     assert called == calls
 
@@ -621,7 +648,7 @@ def test_fetch_place_selects_downloads_and_processes(tmp_path, monkeypatch):
         reference_date="20260601",
     )
     assert result.osm_pbf == fake_pbf
-    assert [p.name for p in result.feeds] == ["latest.zip"]
+    assert len(result.feeds) == 1
     ((feed_id, reason),) = result.skipped
     assert reason == f"same content as {({'f-a', 'f-b'} - {feed_id}).pop()}"
     assert result.selections == []
@@ -1448,6 +1475,8 @@ def test_fetch_delivers_one_copy_per_service(
     )
     paths = [e["path"] for e in result.selection if e["decision"] == "delivered"]
     assert sorted(result.feeds) == sorted(paths) and len(result.reports) == len(paths)
+    # A feed skipped or left out as a version leaves nothing in the directory.
+    assert sorted((tmp_path / "out").rglob("*.zip")) == sorted(paths)
 
 
 def test_fetch_place_rejects_country_code():
@@ -1510,7 +1539,7 @@ def test_fetch_place_when_without_token_warns(tmp_path, monkeypatch):
             crop=False,
             when="2026-06-01",
         )
-    assert [p.name for p in result.feeds] == ["latest.zip"]
+    assert [e["fetched_from"] for e in result.selection] == ["producer"]
 
 
 def test_fetch_place_with_token_selects_the_covering_dataset(tmp_path, monkeypatch):
@@ -1549,7 +1578,7 @@ def test_fetch_place_with_token_selects_the_covering_dataset(tmp_path, monkeypat
         when="2026-06-01",
         refresh_token="tok",
     )
-    assert [p.name for p in result.feeds] == ["mdb-9-2026.zip"]
+    assert result.reports[0]["summary"]["provenance"]["dataset_id"] == "mdb-9-2026"
 
 
 def test_fetch_place_records_index_provenance(tmp_path, monkeypatch):
@@ -1650,8 +1679,13 @@ def test_a_delivered_feed_notes_an_agency_timezone_its_stops_disagree_with(
     assert note.endswith(f"agency_timezone {NEW_YORK}; stops in Europe/Helsinki")
 
 
+@pytest.mark.parametrize(
+    "served, error",
+    [(None, "dataset download boom"), (b"<html></html>", "not a zip archive")],
+    ids=["raises", "no-zip"],
+)
 def test_fetch_place_falls_back_to_atlas_when_the_dataset_download_fails(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, served, error
 ):
     from transitio.catalog._models import Dataset
 
@@ -1672,7 +1706,11 @@ def test_fetch_place_falls_back_to_atlas_when_the_dataset_download_fails(
     )
 
     def failing(self, dataset, directory=None):
-        raise RuntimeError("dataset download boom")
+        if served is None:
+            raise RuntimeError("dataset download boom")
+        path = directory / f"{dataset.id}.zip"
+        path.write_bytes(served)
+        return path
 
     monkeypatch.setattr("transitio.catalog.MobilityDatabase._fetch_dataset", failing)
     result = fetch(
@@ -1683,13 +1721,13 @@ def test_fetch_place_falls_back_to_atlas_when_the_dataset_download_fails(
         when="2026-06-01",
         refresh_token="tok",
     )
-    # The dataset download failed, so the Atlas fallback delivered latest.zip.
-    assert [p.name for p in result.feeds] == ["latest.zip"]
+    # The dataset download failed, so the Atlas fallback delivered the feed.
+    assert len(result.feeds) == 1
     assert result.skipped == []
     (entry,) = result.selection
     assert (entry["fetched_from"], entry["download_errors"]) == (
         "producer",
-        "mdb dataset: dataset download boom",
+        f"mdb dataset: {error}",
     )
 
 
@@ -1700,14 +1738,54 @@ def test_fetch_place_skips_a_feed_whose_provenance_sidecar_is_unreadable(
         tmp_path, {"atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}}}
     )
     _stub_pbf_and_atlas(monkeypatch, tmp_path, _gtfs_payload())
+    from transitio.catalog import TransitlandAtlas
+
+    stub = TransitlandAtlas._fetch_static
+
+    def truncated(self, feed, directory):
+        path = stub(self, feed, directory)
+        path.with_suffix(".provenance.json").write_text("{")
+        return path
+
+    monkeypatch.setattr(TransitlandAtlas, "_fetch_static", truncated)
     out = tmp_path / "out"
-    out.mkdir()
-    # The stub writes no sidecar, so this truncated one stays beside the zip.
-    (out / "latest.provenance.json").write_text("{")
     result = fetch(place="Q1757", index=index, directory=out, crop=False, osm=False)
     ((feed_id, reason),) = result.skipped
     assert feed_id == "f-a" and reason.startswith("processing failed: ")
     assert result.feeds == []
+
+
+def test_a_place_fetch_keeps_its_download_as_a_cached_version(tmp_path, monkeypatch):
+    index = _place_index(
+        tmp_path, {"atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}}}
+    )
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, _gtfs_payload())
+    out, cache = tmp_path / "out", tmp_path / "cache"
+    options = dict(place="Q1757", index=index, directory=out, crop=False, osm=False)
+    first, second = (fetch(cache_dir=cache, **options) for _ in range(2))
+    # Identical downloads keep one version and record each acquisition.
+    (version,) = (cache / "gtfs").glob("id-*/*.zip")
+    sidecar = json.loads(version.with_suffix(".provenance.json").read_text())
+    sources = sidecar["cache"]["sources"]
+    assert [(s["fetched_from"], s["index_snapshot"]) for s in sources] == [
+        ("producer", index.snapshot_id)
+    ] * 2
+    assert not list(cache.rglob(".staging"))
+    # The directory holds the delivered copy; reports describe the first download.
+    assert [p.name for p in out.rglob("*.zip")] == [version.name]
+    origin = [r["summary"]["provenance"] for r in first.reports + second.reports]
+    assert origin[0] == origin[1]
+    assert origin[0]["retrieved_at"] == sources[0]["retrieved_at"]
+    with pytest.raises(ValueError, match="outside the download cache"):
+        fetch(cache_dir=cache, **{**options, "directory": cache / "gtfs" / "out"})
+    if os.name != "nt":
+        # A feed folder in the directory linking into the cache is refused.
+        linked = tmp_path / "linked"
+        linked.mkdir()
+        (linked / version.parent.name).symlink_to(version.parent)
+        result = fetch(cache_dir=cache, **{**options, "directory": linked})
+        assert result.skipped[0][1].endswith(" is a symlink")
+        assert version.read_bytes() == _gtfs_payload()
 
 
 def test_fetch_place_from_a_bound_index_uses_its_snapshot(tmp_path, monkeypatch):
@@ -1720,7 +1798,7 @@ def test_fetch_place_from_a_bound_index_uses_its_snapshot(tmp_path, monkeypatch)
     place_obj = transitio.place("Q1757", index=index)
     result = fetch(place=place_obj, directory=tmp_path / "out", crop=False)
     assert result.provenance["snapshot"] == index.snapshot_id
-    assert [p.name for p in result.feeds] == ["latest.zip"]
+    assert len(result.feeds) == 1
 
 
 def test_fetch_place_with_token_and_no_date_uses_the_newest_dataset(
@@ -1763,7 +1841,7 @@ def test_fetch_place_with_token_and_no_date_uses_the_newest_dataset(
         crop=False,
         refresh_token="tok",
     )
-    assert [p.name for p in result.feeds] == ["mdb-9-newest.zip"]
+    assert result.reports[0]["summary"]["provenance"]["dataset_id"] == "mdb-9-newest"
 
 
 def test_fetch_place_dataset_selection_failure_falls_back(tmp_path, monkeypatch):
@@ -1788,7 +1866,7 @@ def test_fetch_place_dataset_selection_failure_falls_back(tmp_path, monkeypatch)
         refresh_token="tok",
     )
     # The catalogue lookup failed, but the Atlas url still delivered the feed.
-    assert [p.name for p in result.feeds] == ["latest.zip"]
+    assert len(result.feeds) == 1
     assert result.skipped == []
 
 
@@ -2098,9 +2176,13 @@ def test_fetch_place_crops_bundles_to_the_selected_routes(
         tiers=["local", "regional"],
         exclude=["national"],
     )
-    # the repair, when asked for, receives the cropped feed
+    # the repair, when asked for, receives the cropped feed, kept read-only
     assert bool(repaired_inputs) == repair
     assert all("-cropped-" in path for path in repaired_inputs)
+    if os.name != "nt":
+        assert not any(os.access(path, os.W_OK) for path in repaired_inputs)
+    # Only the delivered feed reaches the directory, not the crop it repaired.
+    assert list((tmp_path / "out").rglob("*.zip")) == result.feeds
     # The delivered feed keeps only the selected tiers' routes, and the crop
     # cascade drops the entities only the removed routes referenced.
     tables = _feed_tables(result.feeds[0])
@@ -2435,7 +2517,7 @@ def test_fetch_place_without_osm_skips_the_extract(tmp_path, monkeypatch):
         reference_date="20260601",
     )
     assert result.osm_pbf is None
-    assert [p.name for p in result.feeds] == ["latest.zip"]
+    assert len(result.feeds) == 1
 
 
 def test_to_pyrosm_without_an_extract_is_refused(tmp_path):

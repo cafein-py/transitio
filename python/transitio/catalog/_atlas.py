@@ -162,12 +162,13 @@ class TransitlandAtlas:
                 return cache.deliver(version, target)
         return version.path
 
-    def _fetch_static(self, feed, directory=None):
-        """:meth:`download` without the cache, for ``fetch``."""
+    def _fetch_static(self, feed, directory):
+        """Download a feed into its digest-named folder under ``directory``
+        beside its provenance sidecar, without the cache; ``fetch`` stages its
+        downloads so."""
         if not feed.static_url:
             raise DownloadError(f"atlas feed {feed.feed_id} has no static download url")
-        base = Path(directory) if directory else self._cache_dir / "gtfs"
-        path = base / _feed_dir(feed.feed_id) / "latest.zip"
+        path = Path(directory) / _feed_dir(feed.feed_id) / "latest.zip"
         record = {"feed_id": feed.feed_id, "onestop_id": feed.onestop_id}
         return _download_recorded(
             self._http, feed.static_url, path, {**record, "source": "atlas"}

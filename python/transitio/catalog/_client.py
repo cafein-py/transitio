@@ -51,6 +51,17 @@ def _bounds(aoi):
     return values
 
 
+def _dataset_entry(dataset):
+    """A dataset's entry in a cached version's ``datasets`` map."""
+    return {
+        "hash": dataset.hash,
+        "service_date_range": [
+            str(dataset.service_start) if dataset.service_start else None,
+            str(dataset.service_end) if dataset.service_end else None,
+        ],
+    }
+
+
 def _download_recorded(http, url, path, record, **options):
     """Download ``url`` to ``path`` (:func:`transitio._http.download` with
     ``options``) beside a provenance sidecar: ``record`` with the source URL,
@@ -384,13 +395,6 @@ class MobilityDatabase:
             raise DownloadError(f"dataset {dataset.id} has no hosted download url")
         _safe_id(dataset.id)
         cache = FeedCache(self._cache_dir)
-        entry = {
-            "hash": dataset.hash,
-            "service_date_range": [
-                str(dataset.service_start) if dataset.service_start else None,
-                str(dataset.service_end) if dataset.service_end else None,
-            ],
-        }
 
         def holds(version):
             return dataset.id in version.datasets and (
@@ -408,13 +412,13 @@ class MobilityDatabase:
                     {"feed_id": dataset.feed_id},
                     "mdb_dataset",
                     expected=dataset.hash,
-                    dataset={dataset.id: entry},
+                    dataset={dataset.id: _dataset_entry(dataset)},
                 )
             else:
                 cache.touch(version)
             if directory:
                 target = Path(directory) / f"{dataset.id}.zip"
-                return cache.deliver(version, target, dataset.id)
+                return cache.deliver(version, target, version.provenance(dataset.id))
         return version.path
 
     def download_latest(self, feed, directory=None, use_cache=True):
@@ -474,19 +478,13 @@ class MobilityDatabase:
                 return cache.deliver(version, Path(directory) / "latest.zip")
         return version.path
 
-    def _fetch_dataset(self, dataset, directory=None):
-        """:meth:`download` without the cache, for ``fetch``."""
+    def _fetch_dataset(self, dataset, directory):
+        """Download a dataset into ``directory`` beside its provenance
+        sidecar, checksum-verified and without the cache; ``fetch`` stages
+        its downloads so."""
         if not dataset.hosted_url:
             raise DownloadError(f"dataset {dataset.id} has no hosted download url")
-        target_dir = (
-            Path(directory)
-            if directory
-            else self._cache_dir / "gtfs" / _safe_id(dataset.feed_id)
-        )
-        target_dir.mkdir(parents=True, exist_ok=True)
-        path = target_dir / f"{_safe_id(dataset.id)}.zip"
-        if path.exists() and dataset.hash and _http.sha256_file(path) == dataset.hash:
-            return path
+        path = Path(directory) / f"{_safe_id(dataset.id)}.zip"
         # The catalog token is never sent to download hosts.
         digest = _http.download(self._http, dataset.hosted_url, path)
         if dataset.hash and digest != dataset.hash:
@@ -500,25 +498,19 @@ class MobilityDatabase:
             "dataset_id": dataset.id,
             "source_url": dataset.hosted_url,
             "sha256": digest,
-            "service_date_range": [
-                str(dataset.service_start) if dataset.service_start else None,
-                str(dataset.service_end) if dataset.service_end else None,
-            ],
+            "service_date_range": _dataset_entry(dataset)["service_date_range"],
             "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         _write_provenance(path.with_suffix(".provenance.json"), provenance)
         return path
 
-    def _fetch_latest(self, feed, directory=None):
-        """:meth:`download_latest` without the cache, for ``fetch``."""
+    def _fetch_latest(self, feed, directory):
+        """Download a feed's latest hosted dataset into ``directory`` beside
+        its provenance sidecar, without the cache; ``fetch`` stages its
+        downloads so."""
         if not feed.latest_dataset_url:
             raise DownloadError(f"feed {feed.id} has no hosted latest-dataset url")
-        target_dir = (
-            Path(directory)
-            if directory
-            else self._cache_dir / "gtfs" / _safe_id(feed.id)
-        )
-        path = target_dir / "latest.zip"
+        path = Path(directory) / "latest.zip"
         return _download_recorded(
             self._http, feed.latest_dataset_url, path, {"feed_id": feed.id}
         )
