@@ -55,6 +55,7 @@ def _dataset_entry(dataset):
     """A dataset's entry in a cached version's ``datasets`` map."""
     return {
         "hash": dataset.hash,
+        "validation_report_url": dataset.validation_report_url,
         "service_date_range": [
             str(dataset.service_start) if dataset.service_start else None,
             str(dataset.service_end) if dataset.service_end else None,

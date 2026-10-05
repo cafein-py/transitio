@@ -10,7 +10,11 @@ versions), ``last_used_at`` (when a call last delivered the version) and the
 cache's records under ``cache``:
 
 - ``sources``: every acquisition of these bytes, oldest first, append-only;
-- ``datasets``: the Mobility Database datasets the bytes represent, by id.
+- ``datasets``: the Mobility Database datasets the bytes represent, by id;
+- ``served``: the requests of ``fetch`` the version served, by key, each with
+  the dataset it was read as;
+- ``index_proofs``: the index snapshots under which a probe proved the bytes
+  to be the archive the index crawled, each with the URL probed.
 
 A delivered copy's sidecar describes the first acquisition. A version is
 published only after its download completed and the file is a readable zip;
@@ -95,6 +99,8 @@ def _well_formed(sidecar, feed_id, digest):
             isinstance(e, dict) and "service_date_range" in e
             for e in cache["datasets"].values()
         )
+        and isinstance(cache.get("served", {}), dict)
+        and isinstance(cache.get("index_proofs", {}), dict)
     )
 
 
@@ -153,6 +159,14 @@ class Version:
     @property
     def retrieved_at(self):
         return self.sidecar.get("retrieved_at", "")
+
+    @property
+    def served(self):
+        return self.sidecar.get("cache", {}).get("served", {})
+
+    @property
+    def index_proofs(self):
+        return self.sidecar.get("cache", {}).get("index_proofs", {})
 
     @property
     def first_source(self):
@@ -224,13 +238,17 @@ class FeedCache:
         ``accept(version)`` takes, or None. A version whose bytes no longer
         match is deleted; only versions tried are hashed."""
         for version in self.versions(feed_id):
-            if accept is not None and not accept(version):
-                continue
-            if _http.sha256_file(version.path) != version.sha256:
-                self.delete(version)
-                continue
-            return version
+            if (accept is None or accept(version)) and self.intact(version):
+                return version
         return None
+
+    def intact(self, version):
+        """Whether ``version``'s bytes still match their digest; a version
+        whose bytes do not is deleted."""
+        if _http.sha256_file(version.path) == version.sha256:
+            return True
+        self.delete(version)
+        return False
 
     def download(self, client, url, feed_id, record, fetched_from, **options):
         """Download ``url`` with ``client`` into staging and publish it
@@ -334,18 +352,31 @@ class FeedCache:
                     self.delete(other)
         return version
 
-    def touch(self, version):
-        """Record that a call delivered ``version``. The sidecar is read
-        again first, so a record added since is kept and a version deleted
-        since stays deleted."""
+    def update(self, version, change):
+        """Apply ``change`` to ``version``'s sidecar and write it. The
+        sidecar is read again first, so a record added since is kept and a
+        version deleted since stays deleted."""
         sidecar = version.path.with_suffix(_SIDECAR)
         try:
             current = json.loads(sidecar.read_text())
         except (OSError, ValueError):
             return
-        current["last_used_at"] = _now()
+        change(current)
         _write_provenance(sidecar, current)
         version.sidecar = current
+
+    def touch(self, version, served=None):
+        """Record that a call delivered ``version``, and with ``served`` the
+        ``(request key, dataset id)`` it served; a key keeps its first
+        dataset."""
+
+        def change(sidecar):
+            sidecar["last_used_at"] = _now()
+            if served is not None:
+                key, dataset_id = served
+                sidecar["cache"].setdefault("served", {}).setdefault(key, dataset_id)
+
+        self.update(version, change)
 
     def delete(self, version):
         """Remove a version's archive and sidecar."""

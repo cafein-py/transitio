@@ -1,5 +1,6 @@
 import base64
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -1182,6 +1183,7 @@ def test_schema_11_downloads(
             credentials=credentials,
             when=DAY,
             directory=tmp_path / "out",
+            cache_dir=tmp_path / "cache",
             crop=False,
             osm=False,
         )
@@ -1479,6 +1481,243 @@ def test_fetch_delivers_one_copy_per_service(
     assert sorted((tmp_path / "out").rglob("*.zip")) == sorted(paths)
 
 
+def _timeless(reports):
+    """``reports`` without the time each was generated."""
+    return [
+        {**r, "summary": {k: v for k, v in r["summary"].items() if k != "generatedAt"}}
+        for r in reports
+    ]
+
+
+@pytest.mark.filterwarnings("ignore:no Mobility Database API token")
+def test_a_cached_version_serves_the_study_days_it_covers(tmp_path, monkeypatch):
+    from transitio.catalog import TransitlandAtlas
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    # The index saw the feed ended, so a download is preceded by a probe.
+    index = _partitioned_index(tmp_path, monkeypatch, {"f-a": ENDED_ETAG})
+    spring = _zip(_calendar("20260101", "20260501"))
+    weekdays = _zip(_calendar("20260101", "20261231", "1111100"))
+    sha = {body: hashlib.sha256(body).hexdigest() for body in (spring, weekdays)}
+    served, requests = {}, []
+
+    def handler(request):
+        requests.append(request.method)
+        if served["body"] is None:
+            raise httpx.ConnectError("offline", request=request)
+        return httpx.Response(200, content=served["body"])
+
+    class Served(TransitlandAtlas):
+        def __init__(self, **kwargs):
+            super().__init__(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas", Served)
+    options = dict(place="Q1757", index=index, crop=False, osm=False)
+    options["cache_dir"] = tmp_path / "cache"
+
+    def run(when, body, **extra):
+        served["body"], before = body, len(requests)
+        result = fetch(when=when, **options, **extra)
+        (entry,) = result.selection
+        report = result.reports[0]["summary"]["provenance"]["sha256"]
+        return result, [entry["cache"], report, requests[before:]]
+
+    first, seen = run("2026-03-02", spring)
+    assert seen == ["downloaded", sha[spring], ["HEAD", "GET"]]
+    # Offline, the day is served from the cache with neither download nor probe.
+    again, seen = run("2026-03-02", None)
+    assert seen == ["reused", sha[spring], []]
+    columns = ("cache", "download_errors")
+    tables = [
+        [{k: v for k, v in e.items() if k not in columns} for e in r.selection]
+        for r in (first, again)
+    ]
+    assert tables[0] == tables[1]
+    assert _timeless(first.reports) == _timeless(again.reports)
+    # A day the version misses downloads another and keeps it.
+    assert run("2026-06-01", weekdays)[1] == [
+        "downloaded",
+        sha[weekdays],
+        ["HEAD", "GET"],
+    ]
+    # The first day keeps its version though the newer one serves it too; a
+    # new Sunday passes over the newer one, which runs no Sunday service.
+    assert run("2026-03-02", None)[1] == ["reused", sha[spring], []]
+    assert run("2026-03-08", None)[1] == ["reused", sha[spring], []]
+    # A refresh whose every attempt fails falls back, deleting nothing.
+    with pytest.warns(UserWarning, match="f-a: refresh failed"):
+        _, seen = run("2026-06-01", b"<html>maintenance</html>", use_cache=False)
+    assert seen == ["fallback", sha[weekdays], ["HEAD", "GET"]]
+    assert len(list((tmp_path / "cache" / "gtfs").glob("id-*/*.zip"))) == 2
+
+
+@pytest.mark.filterwarnings("ignore:no Mobility Database API token")
+def test_containment_from_the_cache_follows_the_proofs_of_the_snapshot(
+    tmp_path, monkeypatch
+):
+    from transitio.catalog import TransitlandAtlas
+    from transitio.catalog._cache import FeedCache
+    from transitio.pipeline._fetch import _prove
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    columns = {"f-a": ETAG, "f-b": ETAG}
+    index = _partitioned_index(tmp_path, monkeypatch, columns, {"f-a": ["f-b"]})
+    other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "HKL")}
+    payloads = {"f-a": _zip(GTFS), "f-b": _zip(other)}
+    online, requests = [True], []
+
+    def handler(request):
+        feed_id = request.url.path.strip("/")
+        requests.append((request.method, feed_id))
+        if not online[0]:
+            raise httpx.ConnectError("offline", request=request)
+        if request.method == "HEAD":
+            # The container is unchanged since indexed, f-a is not.
+            return httpx.Response(304 if feed_id == "f-b" else 200)
+        return httpx.Response(200, content=payloads[feed_id])
+
+    class Served(TransitlandAtlas):
+        def __init__(self, **kwargs):
+            super().__init__(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas", Served)
+    cache_dir = tmp_path / "cache"
+    options = dict(place="Q1757", index=index, crop=False, osm=False)
+
+    def decisions():
+        result = fetch(cache_dir=cache_dir, **options)
+        return [(e["feed_id"], e["decision"], e["note"]) for e in result.selection]
+
+    kept = "kept: containment not proven current"
+    assert decisions() == [("f-a", "delivered", kept), ("f-b", "delivered", None)]
+    # f-a's version as a probe under this snapshot would have proven it.
+    cache = FeedCache(cache_dir)
+    (version,) = cache.versions("f-a")
+    _prove(cache, version, index.snapshot_id, "https://feeds.example/f-a")
+    online[0], before = False, len(requests)
+    assert decisions() == [("f-a", "skipped", None), ("f-b", "delivered", None)]
+    # Under another snapshot neither version is proven, so f-a stays.
+    index.snapshot["snapshot_id"] = "another"
+    assert decisions() == [("f-a", "delivered", kept), ("f-b", "delivered", None)]
+    assert requests[before:] == []
+
+
+def test_a_container_read_from_the_hosted_copy_proves_nothing(tmp_path, monkeypatch):
+    from transitio.catalog._cache import FeedCache
+
+    hosted = "https://files.example.com/f-b/latest.zip"
+    columns = {"f-a": ETAG, "f-b": {**ETAG, "mdb": {"urls": {"latest": hosted}}}}
+    index = _partitioned_index(tmp_path, monkeypatch, columns, {"f-a": ["f-b"]})
+    other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "HKL")}
+    payloads = {"/f-a": _zip(GTFS), "/f-b/latest.zip": _zip(other)}
+    online = [True]
+
+    def handler(request):
+        if not online[0]:
+            raise httpx.ConnectError("offline", request=request)
+        if request.method == "HEAD":
+            return httpx.Response(304)  # both unchanged since indexed
+        if request.url.path in payloads:
+            return httpx.Response(200, content=payloads[request.url.path])
+        return httpx.Response(404)  # the container's producer URL
+
+    _serve(monkeypatch, handler)
+    cache_dir = tmp_path / "cache"
+    options = dict(place="Q1757", index=index, crop=False, osm=False)
+    first = fetch(cache_dir=cache_dir, **options)
+    online[0] = False
+    again = fetch(cache_dir=cache_dir, **options)
+    kept = "kept: containment not proven current"
+    for result in (first, again):
+        notes = {e["feed_id"]: (e["decision"], e["note"]) for e in result.selection}
+        assert notes["f-a"] == ("delivered", kept)
+        assert notes["f-b"][1].startswith("from the Mobility Database hosted copy")
+    # The probe proved the producer's archive, not the hosted copy read.
+    (version,) = FeedCache(cache_dir).versions("f-b")
+    assert version.index_proofs == {}
+    columns = ("cache", "download_errors")
+    tables = [
+        [{k: v for k, v in e.items() if k not in columns} for e in r.selection]
+        for r in (first, again)
+    ]
+    assert tables[0] == tables[1]
+    assert _timeless(first.reports) == _timeless(again.reports)
+
+
+@pytest.mark.filterwarnings("ignore:no Mobility Database API token")
+def test_a_cached_producer_copy_is_used_only_with_credentials(tmp_path, monkeypatch):
+    mdb = {"urls": {"latest": HOSTED}}
+    feeds = {"f-a": {"mdb": mdb, **_protected(KEY)}}
+    index = _partitioned_index(tmp_path, monkeypatch, feeds, providers=PROVIDERS)
+    payload = _zip(_calendar("20260101", "20261231"))
+    requests = []
+
+    def handler(request):
+        requests.append(str(request.url.copy_with(query=None)))
+        return httpx.Response(200, content=payload)
+
+    _serve(monkeypatch, handler)
+    options = dict(place="Q1757", index=index, crop=False, osm=False, when=DAY)
+    options["cache_dir"] = tmp_path / "cache"
+    results = []
+    for env in ({"P_KEY__KEY": SECRET}, {}, {"P_KEY__KEY": SECRET}):
+        _credentials_env(monkeypatch, tmp_path, env)
+        (entry,) = fetch(**options).selection
+        results.append((entry["fetched_from"], entry["cache"]))
+    # Without the key the producer copy is passed over for the hosted copy.
+    assert results == [
+        ("producer", "downloaded"),
+        ("mdb_latest", "downloaded"),
+        ("producer", "reused"),
+    ]
+    assert requests == [API, HOSTED]
+
+
+def test_a_cached_dataset_is_reported_alike_without_the_catalogue(
+    tmp_path, monkeypatch
+):
+    from transitio.catalog._models import Dataset
+
+    index = _place_index(
+        tmp_path, {"mdb": {"mdb_id": "mdb-9", "urls": {"latest": "u"}}}
+    )
+    payload = _gtfs_payload()
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, payload)
+    newest = Dataset.from_api(
+        {
+            "id": "mdb-9-newest",
+            "feed_id": "mdb-9",
+            "hosted_url": "https://x/z.zip",
+            "validation_report": {"url_json": "https://x/r.json"},
+        }
+    )
+    hosted = {"summary": {"validatorVersion": "6.0.0"}, "notices": []}
+
+    def dataset_download(self, dataset, directory):
+        path = directory / f"{dataset.id}.zip"
+        path.write_bytes(payload)
+        return path
+
+    def unreachable(*args, **kwargs):
+        raise RuntimeError("catalogue unreachable")
+
+    catalogue = "transitio.catalog.MobilityDatabase"
+    monkeypatch.setattr(f"{catalogue}.datasets", lambda self, feed: [newest])
+    monkeypatch.setattr(f"{catalogue}.validation_report", lambda self, d: hosted)
+    monkeypatch.setattr(f"{catalogue}._fetch_dataset", dataset_download)
+    options = dict(place="Q1757", index=index, crop=False, refresh_token="tok")
+    first = fetch(**options)
+    for name in ("datasets", "validation_report", "_fetch_dataset"):
+        monkeypatch.setattr(f"{catalogue}.{name}", unreachable)
+    again = fetch(**options)
+    assert [e["cache"] for e in first.selection + again.selection] == [
+        "downloaded",
+        "reused",
+    ]
+    assert _timeless(first.reports) == _timeless(again.reports)
+    assert again.reports[0]["summary"]["provenance"]["dataset_id"] == "mdb-9-newest"
+
+
 def test_fetch_place_rejects_country_code():
     with pytest.raises(ValueError, match="country_code= applies only with aoi="):
         fetch(place="X", country_code="FI")
@@ -1762,7 +2001,12 @@ def test_a_place_fetch_keeps_its_download_as_a_cached_version(tmp_path, monkeypa
     _stub_pbf_and_atlas(monkeypatch, tmp_path, _gtfs_payload())
     out, cache = tmp_path / "out", tmp_path / "cache"
     options = dict(place="Q1757", index=index, directory=out, crop=False, osm=False)
-    first, second = (fetch(cache_dir=cache, **options) for _ in range(2))
+    first = fetch(cache_dir=cache, **options)
+    second = fetch(cache_dir=cache, use_cache=False, **options)
+    assert [e["cache"] for e in first.selection + second.selection] == [
+        "downloaded",
+        "refreshed",
+    ]
     # Identical downloads keep one version and record each acquisition.
     (version,) = (cache / "gtfs").glob("id-*/*.zip")
     sidecar = json.loads(version.with_suffix(".provenance.json").read_text())
@@ -2391,6 +2635,66 @@ def test_fetch_place_stale_selector_follows_on_untrusted_selector(
             tiers=["local"],
             on_untrusted_selector="error",
         )
+
+    # Offline, with only the stale cached version, the policy decides on it.
+    def offline(self, feed, directory):
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas._fetch_static", offline)
+    options = dict(place="Q1757", index=index, crop=False, tiers=["local"])
+    cached = fetch(**options)
+    assert [e["cache"] for e in cached.selection] == ["reused"] and cached.feeds
+    assert fetch(exclude=["national"], **options).feeds == []
+    with pytest.raises(StaleSelectorError):
+        fetch(on_untrusted_selector="error", **options)
+    with pytest.warns(UserWarning, match="f-a: refresh failed"):
+        refreshed = fetch(use_cache=False, **options)
+    assert [e["cache"] for e in refreshed.selection] == ["fallback"]
+
+
+def test_a_cached_version_lacking_a_selected_route_is_passed_over(
+    tmp_path, monkeypatch
+):
+    import itertools
+
+    from index_fixture import edge as _edge
+    from transitio.catalog import _cache
+    from transitio.pipeline import _fetch
+
+    service = {"stops": 1, "routes": 1, "departures_per_day": 1.0}
+    selected = {
+        **_edge("Q1757", "f-a", tier="local", service=service),
+        "selector_state": "complete",
+        "selector": {"route_id": ["r-local"]},
+        "needs_review": False,
+    }
+    index = _selector_index(tmp_path, [selected])
+
+    def present(path, feed, sel):
+        # Fingerprints match; the routes are those the version carries.
+        return True, None, {r["route_id"] for r in _feed_tables(path)["routes.txt"]}
+
+    def offline(self, feed, directory):
+        raise RuntimeError("offline")
+
+    clock = itertools.count()
+    monkeypatch.setattr(_cache, "_now", lambda: f"2026-10-05T00:00:{next(clock):02d}")
+    monkeypatch.setattr(_fetch, "_selector_trusted", present)
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas._fetch_static", offline)
+    carrying, lacking = _multi_route_gtfs(), _multi_route_gtfs(_ROUTE_SPECS[1:])
+    cache = _cache.FeedCache(tmp_path / "cache")
+    for payload in (carrying, lacking):  # the version lacking the route is newer
+        with cache.lock("f-a"), cache.staging("f-a") as staging:
+            (staging / "feed.zip").write_bytes(payload)
+            _fetch._add_version(
+                cache, "f-a", staging / "feed.zip", "u", "producer", None
+            )
+    options = dict(place="Q1757", index=index, crop=False, osm=False, tiers=["local"])
+    result = fetch(cache_dir=tmp_path / "cache", **options)
+    (entry,) = result.selection
+    assert (entry["cache"], entry["note"]) == ("reused", "cut to routes r-local")
+    origin = result.reports[0]["summary"]["provenance"]
+    assert origin["sha256"] == hashlib.sha256(carrying).hexdigest()
 
 
 @pytest.mark.parametrize(

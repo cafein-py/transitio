@@ -56,6 +56,7 @@ _SELECTION_FIELDS = (
     "version_of",
     "fetched_from",
     "download_errors",
+    "cache",
     "stops_outside_osm",
     "path",
 )
@@ -1007,6 +1008,74 @@ def _add_version(cache, feed_id, path, url, fetched_from, errors, **options):
     return cache.publish(feed_id, path, digest, record, source, used=False, **options)
 
 
+def _request_key(**parts):
+    """The SHA-256 naming a request: canonical JSON of ``parts``, what
+    decides whether a cached version serves it."""
+    text = json.dumps(parts, sort_keys=True, default=str)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _candidates(cache, feed_id, key, keyless):
+    """The cached versions of ``feed_id`` to try for the request ``key``:
+    those that served it before first, otherwise newest first; with
+    ``keyless`` only versions once acquired without credentials."""
+    versions = [
+        version
+        for version in cache.versions(feed_id)
+        if not keyless
+        or any(
+            not s.get("with_credentials") for s in version.sidecar["cache"]["sources"]
+        )
+    ]
+    return sorted(versions, key=lambda version: key not in version.served)
+
+
+def _context(version, key):
+    """The dataset the request ``key`` reads ``version`` as: the one it read
+    it as before, else the first the version holds; None for none."""
+    if key in version.served:
+        return version.served[key]
+    return next(iter(version.datasets), None)
+
+
+def _hosted(db, cache, version, dataset_id):
+    """The hosted validation report of ``dataset_id`` stored with
+    ``version``: fetched and stored at its first use (``"unavailable"`` when
+    there is none or it cannot be fetched), read from the cache after."""
+    from transitio.catalog._models import Dataset
+
+    entry = version.datasets.get(dataset_id) if dataset_id else None
+    if entry is None:
+        return None
+    if "report" not in entry:
+        report, url = None, entry.get("validation_report_url")
+        if url:
+            record = {"id": dataset_id, "validation_report": {"url_json": url}}
+            try:
+                report = db.validation_report(Dataset.from_api(record))
+            except Exception:  # noqa: B902 — the hosted report is optional
+                report = None
+
+        def change(sidecar):
+            stored = "unavailable" if report is None else report
+            sidecar["cache"]["datasets"][dataset_id].setdefault("report", stored)
+
+        cache.update(version, change)
+        entry = version.datasets.get(dataset_id, {})
+    report = entry.get("report", "unavailable")
+    return None if report == "unavailable" else report
+
+
+def _prove(cache, version, snapshot, url):
+    """Record that a probe of ``url`` proved ``version`` the archive the
+    index ``snapshot`` crawled; an earlier proof stays."""
+
+    def change(sidecar):
+        sidecar["cache"].setdefault("index_proofs", {}).setdefault(snapshot, url)
+
+    cache.update(version, change)
+
+
 def _feed_cache(cache_dir, directory):
     """The download cache under ``cache_dir`` (default: the platform cache),
     its root created; a ``directory`` inside it, where a delivered copy could
@@ -1151,6 +1220,7 @@ def fetch(
     cache_dir=None,
     directory=None,
     country_code=None,
+    use_cache=True,
     **budgets,
 ):
     """Fetch everything cafein needs for an area in one call.
@@ -1208,7 +1278,26 @@ def fetch(
     version's first acquisition: its ``source_url``, ``retrieved_at``,
     ``fetched_from`` and ``download_errors``, with ``sha256``, ``feed_id``
     and, for a catalogued dataset, ``dataset_id`` and
-    ``service_date_range``. Every overlapping feed is processed, in a
+    ``service_date_range``.
+
+    On the place path a cached version that serves the request is used
+    without a download. A feed's versions are tried before any dataset
+    selection, probe or download: first the one that served the same request
+    before, then the newest first, each checked as a download is (route
+    selector, crop, validation, the day checks). One whose route selector no
+    longer matches the index is passed over; when nothing else serves and no
+    download succeeds, ``on_untrusted_selector`` decides on the newest such
+    one. A day no cached version serves downloads the feed, keeping the older
+    versions, so a repeated call delivers what it delivered before, offline
+    too. A warm cache can decide differently from a cold one: a version that
+    serves the day is used without the ``expired`` probe, and a cached
+    version counts as unchanged since indexed for ``contained`` only when a
+    probe proved it so under the index snapshot in use. A protected feed
+    without usable credentials uses only versions once fetched without
+    them; credentials for a provider count alike whichever key they hold.
+    The hosted validation report of a dataset is stored with it at its first
+    use, so a reused dataset is reported as when downloaded. The area path
+    downloads on every call. Every overlapping feed is processed, in a
     deterministic order with official feeds first; one broken feed never
     aborts the others — it lands in ``skipped`` with its reason. A feed
     lacking a file GTFS requires is skipped, with or without ``when`` and
@@ -1361,6 +1450,11 @@ def fetch(
     refresh_token, cache_dir, country_code
         Passed to the catalog and OSM layers; downloads are cached under
         ``cache_dir``, by default the platform cache.
+    use_cache : bool, default True
+        Serve feeds from the cache as above. ``False`` downloads every feed
+        again and, once a download succeeds, deletes the feed's other
+        versions; when every attempt fails, the version a cached call would
+        use is delivered with a ``UserWarning``.
     **budgets
         The ``validate_feed`` keyword arguments. A feed with a table that a
         budget cuts short cannot be cropped and lands in ``skipped``, the
@@ -1412,7 +1506,10 @@ def fetch(
         Mobility Database hosted copy; None when nothing was downloaded),
         ``download_errors`` (the failed download attempts before the one that
         worked, or all of them when none did, joined with ``"; "``; None when
-        none failed),
+        none failed or none was made), ``cache`` (``"downloaded"``,
+        ``"reused"``, ``"refreshed"`` or ``"fallback"``, how the feed's
+        version was obtained; None when none was), a reused version's
+        ``fetched_from`` being its first acquisition's,
         ``stops_outside_osm`` (the delivered feed's located stops, the
         stops.txt rows with usable coordinates, outside ``osm_area``; None
         without an extract or when its stops.txt cannot be read) and
@@ -1520,6 +1617,7 @@ def fetch(
             refresh_token=refresh_token,
             cache_dir=cache_dir,
             directory=directory,
+            use_cache=use_cache,
             budgets=budgets,
         )
 
@@ -1598,6 +1696,7 @@ def fetch(
                     fetched_from,
                     None,
                     dataset=dataset and {dataset.id: _dataset_entry(dataset)},
+                    replace=not use_cache,
                 )
             except DownloadError as error:  # not a zip archive
                 _skip(entry, f"download failed: {error}", download_errors=str(error))
@@ -1605,7 +1704,10 @@ def fetch(
             except Exception as error:  # noqa: B902 — isolate per-feed failures
                 _skip(entry, f"processing failed: {error}")
                 continue
-            entry["fetched_from"] = fetched_from
+            entry.update(
+                fetched_from=fetched_from,
+                cache="downloaded" if use_cache else "refreshed",
+            )
             path = version.path
             twins = [twin for twin, _ in delivered.same_as(path)]
             if twins:
@@ -1902,6 +2004,7 @@ def _fetch_place(
     refresh_token,
     cache_dir,
     directory,
+    use_cache,
     budgets,
 ):
     """The ``fetch(place=...)`` path: the place geometry is the AOI, feeds come
@@ -1992,11 +2095,18 @@ def _fetch_place(
             record.append(entries[feed.feed_id])
         return entries[feed.feed_id]
 
-    def take(feed, entry, version, notes, dataset_id, hosted):
-        """Check, process and record ``version`` of ``feed`` for the call:
-        its route selection, its content against the feeds delivered so
-        far, then :func:`_process_feed`; the decision goes into ``entry``,
-        ``notes`` and ``hosted`` into the delivered feed's note and report."""
+    def take(
+        feed, entry, version, notes, dataset_id, hosted, key, last=True, inside=()
+    ):
+        """Check, process and record ``version`` of ``feed`` for the request
+        ``key``: its route selection, its content against the feeds delivered
+        so far, then :func:`_process_feed`; ``notes`` and ``hosted`` go into
+        the delivered feed's note and report, and a version that serves is
+        left out as contained in the proven containers ``inside``. Returns
+        ``"delivered"`` or ``"skipped"``, the decision in ``entry``. A cached
+        candidate that is not the ``last`` to try is passed over, ``entry``
+        left undecided: ``"stale"`` when its route selector no longer
+        matches, ``"rejected"`` when processing drops it."""
         path = version.path
         # Route selection: a bundled feed whose matched tiers name a
         # trustworthy complete selector is cropped to those routes; a
@@ -2023,6 +2133,9 @@ def _fetch_place(
             if trusted and sel.state == "complete" and set(sel.route_ids) - in_feed:
                 trusted, reason = False, "route_absent"
             if not trusted:
+                if not last and reason != "unavailable":
+                    # Another version may match the selector.
+                    return "stale"
                 action = _untrusted_action(on_untrusted_selector, exclude, on_unknown)
                 if action == "error":
                     error = StaleSelectorError(
@@ -2043,7 +2156,7 @@ def _fetch_place(
                 if action == "skip":
                     _skip(entry, f"untrustworthy selector ({reason})")
                     selections.append(selection)
-                    return
+                    return "skipped"
                 # action == "whole": deliver unfiltered (routes stays None),
                 # the selection recording why it was not filtered.
             elif sel.state == "complete":
@@ -2078,7 +2191,7 @@ def _fetch_place(
                 carriers[feed.feed_id] = whole[0]
             if selection is not None:
                 selections.append(selection)
-            return
+            return "skipped"
         # A per-feed tag folds in the selected routes so the same feed
         # fetched under different tiers never overwrites an earlier output.
         feed_tag = tag
@@ -2105,15 +2218,25 @@ def _fetch_place(
                 routes=routes,
             )
         except _SkipFeed as skip:
+            if not last:
+                return "rejected"
             _skip(entry, skip.reason, feed_window=skip.window)
             if selection is not None:
                 selections.append(selection)
-            return
+            return "skipped"
         except Exception as error:  # noqa: B902 — isolate per-feed failures
+            if not last:
+                return "rejected"
             _skip(entry, f"processing failed: {error}")
             if selection is not None:
                 selections.append(selection)
-            return
+            return "skipped"
+        if inside:
+            _skip(entry, f"contained in {inside[0]}", contained_in=list(inside))
+            protected.update(carriers[c] for c in inside)
+            if selection is not None:
+                selections.append(selection)
+            return "skipped"
         # ``present`` is the routes.txt the crop scanned, the download
         # before any repair: the audit is the selector's own action over
         # the feed's routes -- the selected routes it carried (``kept``)
@@ -2142,12 +2265,13 @@ def _fetch_place(
         feeds.append(path)
         delivered.add(feed.feed_id, version.path, routes)
         delivered_ids.append(feed.feed_id)
-        used.append((version, origin))
+        used.append((version, origin, key, dataset_id))
         if selection is not None:
             selections.append(selection)
         service = _service(path, day if study else None, budget)
         if service is not None:
             services[feed.feed_id] = service
+        return "delivered"
 
     if on_unknown == "exclude":
         included = place_obj.feeds(tiers=tiers, exclude=exclude, on_unknown="include")
@@ -2169,6 +2293,8 @@ def _fetch_place(
             warnings.warn(note, UserWarning, stacklevel=3)
 
     cache = _feed_cache(cache_dir, directory)
+    snapshot = provenance["snapshot"]
+    area = hashlib.sha256(geometry.wkb).hexdigest()
     # Archives read by URL fragment live only for the call.
     with (
         MobilityDatabase(refresh_token, cache_dir=cache_dir) as db,
@@ -2203,6 +2329,98 @@ def _fetch_place(
                 return True
             return False
 
+        def request(feed, access):
+            # Everything but the version that decides whether one serves.
+            selector = None
+            if tiers is not None or exclude is not None or on_unknown != "include":
+                sel = feed.selector
+                stored = sorted(
+                    f"{edge.fingerprint_kind}:{edge.classification_fingerprint}"
+                    for edge in feed.edges.values()
+                )
+                selector = [sel.state, sorted(sel.route_ids), stored]
+            return _request_key(
+                day=day.isoformat() if study else None,
+                expired=expired,
+                area=area,
+                selector=selector,
+                crop=crop,
+                repair=repair,
+                modes=None if modes is None else sorted(modes),
+                budgets=budgets,
+                credentials=access is not None,
+                on_untrusted_selector=on_untrusted_selector,
+                exclude=exclude,
+                on_unknown=on_unknown,
+                contained=contained,
+                snapshot=snapshot,
+            )
+
+        def attempt(feed, entry, version, key, notes, keyless, label, last, proven):
+            # One cached version through ``take``, the selection columns set
+            # from its first acquisition once it decides the feed. Its proofs
+            # alone, without a probe, show whether it is the archive the index
+            # found contained in the ``proven`` containers.
+            first = version.first_source
+            notes = list(notes)
+            inside = proven if snapshot in version.index_proofs else ()
+            if proven and not inside:
+                notes.append("kept: containment not proven current")
+            if first["fetched_from"] == "mdb_latest" and (
+                first["download_errors"] or keyless
+            ):
+                notes.append("from the Mobility Database hosted copy")
+            notes.append(keyless)
+            context = _context(version, key)
+            hosted = _hosted(db, cache, version, context)
+            current[feed.feed_id] = snapshot in version.index_proofs
+            outcome = take(
+                feed, entry, version, notes, context, hosted, key, last, inside
+            )
+            if outcome in ("delivered", "skipped"):
+                entry.update(fetched_from=first["fetched_from"], cache=label)
+            if label == "fallback" and outcome == "delivered":
+                failed = entry["download_errors"] or "nothing to download"
+                warnings.warn(
+                    f"{feed.feed_id}: refresh failed ({failed}); "
+                    f"using the cached version retrieved {version.retrieved_at}",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            return outcome
+
+        def reuse(feed, entry, candidates, key, notes, keyless, label, proven=()):
+            # The cached candidates in order until one decides the feed;
+            # returns (decided, the newest passed over as stale).
+            deferred = None
+            for version in candidates:
+                if not cache.intact(version):
+                    continue
+                outcome = attempt(
+                    feed, entry, version, key, notes, keyless, label, False, proven
+                )
+                if outcome == "stale":
+                    deferred = deferred or version
+                elif outcome != "rejected":
+                    return True, deferred
+            return False, deferred
+
+        def fall_back(feed, entry, candidates, key, notes, keyless, proven, deferred):
+            # Without a download: a refresh falls back to what the cache
+            # serves, then the selector policy decides on the newest stale
+            # candidate. Returns whether the feed was decided.
+            label = "reused" if use_cache else "fallback"
+            if not use_cache:
+                done, deferred = reuse(
+                    feed, entry, candidates, key, notes, keyless, label, proven
+                )
+                if done:
+                    return True
+            if deferred is None:
+                return False
+            attempt(feed, entry, deferred, key, notes, keyless, label, True, proven)
+            return True
+
         for feed, staging in _held(cache, kept, lambda feed: feed.feed_id):
             entry = entry_for(feed)
             access, refusal = decided.get(feed.feed_id, (None, None))
@@ -2210,9 +2428,27 @@ def _fetch_place(
             if refusal is not None:
                 instructions = feed.access_instructions()
                 keyless = f"protected feed: {refusal}; {instructions}"
-                if _hosted_url(feed) is None:
-                    _skip(entry, keyless)
+            key = request(feed, access)
+            # Without usable credentials only a copy fetched without them serves.
+            candidates = _candidates(cache, feed.feed_id, key, refusal is not None)
+            notes, proven = [], []
+            if contained == "drop":
+                proven, notes = _containers(feed, entries, carriers, cropped, current)
+            deferred = None
+            if use_cache:
+                done, deferred = reuse(
+                    feed, entry, candidates, key, notes, keyless, "reused", proven
+                )
+                if done:
                     continue
+            if keyless is not None and _hosted_url(feed) is None:
+                # Only a cached copy fetched without credentials could serve.
+                if fall_back(
+                    feed, entry, candidates, key, notes, keyless, proven, deferred
+                ):
+                    continue
+                _skip(entry, keyless)
+                continue
             dataset = None
             errors = []
             # A protected feed with credentials skips the dataset versions:
@@ -2234,18 +2470,15 @@ def _fetch_place(
                         errors.append(f"dataset selection: {error}")
             if dataset is None and expired_unchanged(feed, entry):
                 continue
-            notes = []
-            if contained == "drop":
-                proven, notes = _containers(feed, entries, carriers, cropped, current)
-                if proven and dataset is None and unchanged(feed):
+            if proven:
+                if dataset is None and unchanged(feed):
                     _skip(entry, f"contained in {proven[0]}", contained_in=proven)
                     protected.update(carriers[c] for c in proven)
                     continue
-                if proven:
-                    notes.append("kept: containment not proven current")
+                notes.append("kept: containment not proven current")
             # The hosted validation report only describes the dataset's own
             # bytes, so it is attached only when the dataset supplied them.
-            path = fetched_from = probed = url = None
+            path = fetched_from = url = None
             if dataset is not None:
                 try:
                     url = dataset.hosted_url
@@ -2259,8 +2492,9 @@ def _fetch_place(
                 if path is None and expired_unchanged(feed, entry):
                     continue
             if path is None:
-                probed = contained == "drop" and feed.feed_id in container_ids
-                probed = probed and unchanged(feed)
+                if contained == "drop" and feed.feed_id in container_ids:
+                    # Probed before its download, a container can prove itself.
+                    unchanged(feed)
                 try:
                     path, fetched_from, failures, url = _download_indexed(
                         feed, db, atlas, staging, archives, budget, access
@@ -2275,9 +2509,13 @@ def _fetch_place(
                 download_errors = access.redact(download_errors)
             entry.update(fetched_from=fetched_from, download_errors=download_errors)
             if path is None:
+                if fall_back(
+                    feed, entry, candidates, key, notes, keyless, proven, deferred
+                ):
+                    continue
                 _skip(entry, f"download failed: {download_errors}", note=keyless)
                 continue
-            dataset_id = dataset.id if fetched_from == "mdb_dataset" else None
+            acquired_as = dataset.id if fetched_from == "mdb_dataset" else None
             try:
                 version = _add_version(
                     cache,
@@ -2287,37 +2525,40 @@ def _fetch_place(
                     fetched_from,
                     download_errors,
                     with_credentials=access is not None and fetched_from == "producer",
-                    snapshot=provenance["snapshot"],
-                    dataset=dataset_id and {dataset_id: _dataset_entry(dataset)},
+                    snapshot=snapshot,
+                    dataset=acquired_as and {acquired_as: _dataset_entry(dataset)},
+                    replace=not use_cache,
                 )
             except Exception as error:  # noqa: B902 — isolate per-feed failures
                 _skip(entry, f"processing failed: {error}")
                 continue
             path = version.path
-            if probed:
+            # Read as a reuse would, so identical bytes report alike.
+            dataset_id = _context(version, key)
+            probe = probes.get(feed.feed_id)
+            acquired = version.sidecar["cache"]["sources"][-1]
+            if snapshot and probe and acquired["source_url"] == probe:
                 # The proof covers only a download from the probed URL.
-                acquired = version.sidecar["cache"]["sources"][-1]
-                current[feed.feed_id] = acquired["source_url"] == probed
+                _prove(cache, version, snapshot, probe)
+            current[feed.feed_id] = snapshot in version.index_proofs
             if fetched_from == "mdb_latest" and (download_errors or keyless):
                 notes.append("from the Mobility Database hosted copy")
             notes.append(keyless)
-            hosted = None
-            if fetched_from == "mdb_dataset":
-                try:
-                    hosted = db.validation_report(dataset)
-                except Exception:  # noqa: B902 — the hosted report is optional
-                    hosted = None
-            take(feed, entry, version, notes, dataset_id, hosted)
+            hosted = _hosted(db, cache, version, dataset_id)
+            entry["cache"] = "downloaded" if use_cache else "refreshed"
+            take(feed, entry, version, notes, dataset_id, hosted, key)
 
     removed = _settle_versions(record, services, protected, day if study else None)
     # A feed is delivered once the versions are settled and it stays.
-    for n, (feed_id, (version, origin)) in enumerate(zip(delivered_ids, used)):
+    for n, (feed_id, (version, origin, key, context)) in enumerate(
+        zip(delivered_ids, used)
+    ):
         if feed_id in removed:
             continue
         try:
             with cache.lock(feed_id):
                 feeds[n] = _deliver(feeds[n], directory, origin)
-                cache.touch(version)
+                cache.touch(version, served=(key, context))
         except Exception as error:  # noqa: B902 — isolate per-feed failures
             _skip(entries[feed_id], f"processing failed: {error}", path=None)
             removed.add(feed_id)
