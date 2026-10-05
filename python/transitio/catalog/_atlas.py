@@ -3,26 +3,17 @@
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 from pathlib import Path
 
 import platformdirs
 
 from transitio import _http
+from transitio.catalog._cache import FeedCache, _directory, _feed_dir
 from transitio.catalog._client import _download_recorded
 from transitio.exceptions import DownloadError
 
 # The Atlas ``urls`` key that names a feed's current static GTFS download.
 STATIC_URL = "static_current"
-
-
-def _feed_dir(feed_id):
-    """The digest-keyed cache directory for a feed. Paths never key on the id
-    itself: Onestop ids are Unicode, can exceed a filesystem's byte limit and
-    can collide as filenames under normalisation. The whole digest is kept --
-    ids are upstream-controlled, and a truncated hash would make chosen
-    collisions feasible; the real id is recorded in the provenance sidecar."""
-    return "id-" + hashlib.sha256(feed_id.encode("utf-8")).hexdigest()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -109,37 +100,73 @@ class TransitlandAtlas:
     def __exit__(self, *exc_info):
         self.close()
 
-    def download(self, feed, directory=None):
+    def download(self, feed, directory=None, use_cache=True):
         """Download an Atlas feed's static GTFS zip with a provenance sidecar.
 
-        The Atlas static URL is a moving target with no upstream checksum, so
-        the file is re-downloaded on every call and a
-        ``<feed id>.provenance.json`` sidecar records the source URL, the
-        computed SHA-256 and the retrieval time.
+        The Atlas static URL is a moving target with no upstream checksum.
+        The newest cached copy of the feed is reused without a network
+        request; ``use_cache=False`` downloads it again and, once that
+        succeeds, replaces the cached copies. The ``.provenance.json``
+        sidecar records the source URL, the computed SHA-256 and the
+        retrieval time.
 
         Parameters
         ----------
         feed : AtlasFeed
         directory : str or pathlib.Path, optional
-            Base directory; the feed is placed in its own digest-named
-            subdirectory of it. Defaults to the transitio cache.
+            When given, a writable copy is written to the feed's own
+            digest-named subdirectory of it, as ``latest.zip`` beside its
+            sidecar, and its path is returned. Otherwise the read-only cached
+            file is returned.
+        use_cache : bool, default True
+            Reuse the newest cached copy.
 
         Returns
         -------
         pathlib.Path
-            Path of the downloaded zip.
+            Path of the zip.
 
         Raises
         ------
         DownloadError
-            When the feed has no static URL or its download fails (dropped
-            connections and transient HTTP errors are retried first).
+            When the feed has no static URL, or its download fails (dropped
+            connections and transient HTTP errors are retried first) or is
+            not a zip archive; a failed download leaves the cache unchanged.
         """
         if not feed.static_url:
             raise DownloadError(f"atlas feed {feed.feed_id} has no static download url")
+        cache = FeedCache(self._cache_dir)
+        record = {"feed_id": feed.feed_id, "onestop_id": feed.onestop_id}
+        with cache.lock(feed.feed_id):
+            version = None
+            if use_cache:
+                version = cache.newest(
+                    feed.feed_id, lambda v: v.acquired_as("producer")
+                )
+            if version is None:
+                version = cache.download(
+                    self._http,
+                    feed.static_url,
+                    feed.feed_id,
+                    {**record, "source": "atlas"},
+                    "producer",
+                    replace=not use_cache,
+                )
+            else:
+                cache.touch(version)
+            if directory:
+                # Namespaced by the feed, so several feeds delivered into one
+                # directory never share ``latest.zip``.
+                target = Path(directory) / _feed_dir(feed.feed_id) / "latest.zip"
+                _directory(target.parent)
+                return cache.deliver(version, target)
+        return version.path
+
+    def _fetch_static(self, feed, directory=None):
+        """:meth:`download` without the cache, for ``fetch``."""
+        if not feed.static_url:
+            raise DownloadError(f"atlas feed {feed.feed_id} has no static download url")
         base = Path(directory) if directory else self._cache_dir / "gtfs"
-        # Namespaced by the feed even under a caller's directory, so several
-        # feeds downloaded into one directory never share ``latest.zip``.
         path = base / _feed_dir(feed.feed_id) / "latest.zip"
         record = {"feed_id": feed.feed_id, "onestop_id": feed.onestop_id}
         return _download_recorded(

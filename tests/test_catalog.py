@@ -2,7 +2,9 @@ import datetime
 import gzip
 import hashlib
 import io
+import itertools
 import json
+import os
 import time
 import zipfile
 
@@ -11,6 +13,7 @@ import pytest
 from shapely.geometry import box
 
 from transitio import _http
+from transitio.catalog import _cache
 from transitio.catalog import (
     TOKEN_ENV_VAR,
     AtlasFeed,
@@ -234,13 +237,10 @@ def test_download_rejects_unsafe_ids(tmp_path):
         bad_dataset = Dataset.from_api(dict(DATASET_RECORD, id="../evil"))
         with pytest.raises(DownloadError, match="not safe"):
             db.download(bad_dataset)
-        bad_feed = Feed.from_api(dict(FEED_RECORD, id="../evil"))
-        with pytest.raises(DownloadError, match="not safe"):
-            db.download_latest(bad_feed)
 
 
 def test_download_verifies_checksum_and_caches(tmp_path):
-    payload = b"PK\x03\x04 fake gtfs zip"
+    payload = _zip_bytes({"agency.txt": b"agency_id\nd\n"})
     record = dict(DATASET_RECORD, hash=hashlib.sha256(payload).hexdigest())
     dataset = Dataset.from_api(record)
     requests = []
@@ -413,7 +413,7 @@ def test_token_present_skips_csv(tmp_path):
 
 def test_download_latest(tmp_path, monkeypatch):
     monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
-    payload = b"PK\x03\x04 latest zip"
+    payload = _zip_bytes({"agency.txt": b"agency_id\nl\n"})
     requests = []
     routes = {
         "/feeds_v2.csv": lambda request: httpx.Response(200, text=CSV_BODY),
@@ -423,11 +423,15 @@ def test_download_latest(tmp_path, monkeypatch):
         with pytest.warns(UserWarning):
             (feed,) = db.search_feeds(country_code="FI")
         path = db.download_latest(feed)
+        copy = db.download_latest(feed, directory=tmp_path / "out")
 
-    assert path.name == "latest.zip"
-    assert path.read_bytes() == payload
-    provenance = json.loads(path.with_suffix(".provenance.json").read_text())
-    assert provenance["feed_id"] == "mdb-10"
+    # Without a directory the cached version is returned, named by content;
+    # with one, a copy at today's path and the flat provenance fields.
+    assert path.name == f"{hashlib.sha256(payload).hexdigest()}.zip"
+    assert copy == tmp_path / "out" / "latest.zip"
+    assert path.read_bytes() == copy.read_bytes() == payload
+    provenance = json.loads(copy.with_suffix(".provenance.json").read_text())
+    assert provenance["feed_id"] == "mdb-10" and "cache" not in provenance
     assert provenance["source_url"] == feed.latest_dataset_url
     (download,) = [r for r in requests if r.url.path == "/mdb-10/latest.zip"]
     assert "Authorization" not in download.headers
@@ -484,7 +488,7 @@ def test_atlas_feed_from_record_parses_the_block():
 
 
 def test_atlas_download_writes_the_gtfs_and_provenance(tmp_path):
-    payload = b"PK\x03\x04 fake atlas gtfs"
+    payload = _zip_bytes({"agency.txt": b"agency_id\nt\n"})
     requests = []
 
     def handler(request):
@@ -502,8 +506,10 @@ def test_atlas_download_writes_the_gtfs_and_provenance(tmp_path):
         assert provenance["source"] == "atlas"
         assert provenance["source_url"] == feed.static_url
         assert provenance["sha256"] == hashlib.sha256(payload).hexdigest()
-        # No upstream checksum, so the moving target is re-fetched every call.
+        # The cached copy serves the next call; a refresh fetches it again.
         assert atlas.download(feed) == path
+        assert len(requests) == 1
+        assert atlas.download(feed, use_cache=False) == path
     assert len(requests) == 2
     assert not list(tmp_path.rglob("*.part"))
 
@@ -519,7 +525,7 @@ def test_atlas_download_handles_tilde_and_unicode_ids(tmp_path):
     # The cache dir is a digest, so a normal tilde id or a Unicode id -- which
     # an ASCII filesystem-id check would reject -- downloads and keeps its real
     # id in the provenance sidecar.
-    payload = b"PK\x03\x04"
+    payload = _zip_bytes({"agency.txt": b"agency_id\nu\n"})
     transport = httpx.MockTransport(
         lambda request: httpx.Response(200, content=payload)
     )
@@ -535,7 +541,7 @@ def test_atlas_download_handles_tilde_and_unicode_ids(tmp_path):
 
 
 def test_provenance_sidecar_is_not_written_through_a_symlink(tmp_path):
-    payload = b"PK\x03\x04 atlas"
+    payload = _zip_bytes({"agency.txt": b"agency_id\ns\n"})
     transport = httpx.MockTransport(
         lambda request: httpx.Response(200, content=payload)
     )
@@ -557,7 +563,10 @@ def test_provenance_sidecar_is_not_written_through_a_symlink(tmp_path):
 
 def test_atlas_download_namespaces_feeds_in_a_shared_directory(tmp_path):
     # Several feeds downloaded into one directory never collide on latest.zip.
-    payloads = {"/a.zip": b"AAAA", "/b.zip": b"BBBB"}
+    payloads = {
+        "/a.zip": _zip_bytes({"a.txt": b"A"}),
+        "/b.zip": _zip_bytes({"b.txt": b"B"}),
+    }
     transport = httpx.MockTransport(
         lambda request: httpx.Response(200, content=payloads[request.url.path])
     )
@@ -572,8 +581,248 @@ def test_atlas_download_namespaces_feeds_in_a_shared_directory(tmp_path):
         path_a = atlas.download(feed_a, directory=out)
         path_b = atlas.download(feed_b, directory=out)
     assert path_a != path_b
-    assert path_a.read_bytes() == b"AAAA"
-    assert path_b.read_bytes() == b"BBBB"
+    assert path_a.read_bytes() == payloads["/a.zip"]
+    assert path_b.read_bytes() == payloads["/b.zip"]
+
+
+def _moving_target(client, tmp_path, transport):
+    """A download function for the MDB latest dataset or an Atlas feed."""
+    url = "https://files.example.com/feed.zip"
+    if client == "mdb":
+        db = MobilityDatabase(None, cache_dir=tmp_path, transport=transport)
+        feed = Feed.from_api({"id": "mdb-7", "latest_dataset": {"hosted_url": url}})
+        return db, lambda **options: db.download_latest(feed, **options)
+    atlas = TransitlandAtlas(cache_dir=tmp_path, transport=transport)
+    feed = AtlasFeed.from_record({"onestop_id": "f-x", "urls": {"static_current": url}})
+    return atlas, lambda **options: atlas.download(feed, **options)
+
+
+@pytest.mark.parametrize("client", ["mdb", "atlas"])
+def test_a_moving_target_is_served_from_the_cache_until_a_refresh(
+    tmp_path, monkeypatch, client
+):
+    clock = itertools.count()
+    monkeypatch.setattr(_cache, "_now", lambda: f"2026-10-05T00:00:{next(clock):02d}")
+    served = {"body": _zip_bytes({"a.txt": b"1"})}
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, content=served["body"])
+
+    owner, download = _moving_target(client, tmp_path, httpx.MockTransport(handler))
+    with owner:
+        first = download()
+        assert download() == first and len(requests) == 1
+        # Identical bytes keep the version and record the acquisition.
+        assert download(use_cache=False) == first and len(requests) == 2
+        sidecar = json.loads(first.with_suffix(".provenance.json").read_text())
+        acquired = [r["retrieved_at"] for r in sidecar["cache"]["sources"]]
+        assert len(acquired) == 2 and sidecar["retrieved_at"] == acquired[1]
+        # A delivered copy describes the first acquisition.
+        copy = download(directory=tmp_path / "out")
+        provenance = json.loads(copy.with_suffix(".provenance.json").read_text())
+        assert provenance["retrieved_at"] == acquired[0] != acquired[1]
+        served["body"] = _zip_bytes({"a.txt": b"2"})
+        second = download(use_cache=False)
+        assert second != first and not first.exists()
+        # A failed refresh raises and keeps the cached version.
+        served["body"] = b"<html>maintenance</html>"
+        with pytest.raises(DownloadError, match="not a zip archive"):
+            download(use_cache=False)
+        assert download() == second and len(requests) == 4
+        assert not list(tmp_path.rglob("*.part"))
+
+
+def _damage_sidecar(path, **fields):
+    sidecar = path.with_suffix(".provenance.json")
+    sidecar.write_text(json.dumps(dict(json.loads(sidecar.read_text()), **fields)))
+
+
+def _damage_archive(path):
+    path.chmod(0o644)
+    path.write_bytes(b"damaged")
+
+
+def _squat(path):
+    path.unlink()
+    (path / "inner").mkdir(parents=True)
+
+
+def _link_outside(path):
+    outside = path.parent.parent / f"outside{path.suffix}"
+    outside.write_bytes(path.read_bytes())
+    path.unlink()
+    path.symlink_to(outside)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        _damage_archive,
+        lambda path: _damage_sidecar(path, sha256="0" * 64),
+        lambda path: _damage_sidecar(path, cache={"sources": [{}], "datasets": {}}),
+        _squat,
+        lambda path: _squat(path.with_suffix(".provenance.json")),
+        pytest.param(
+            _link_outside,
+            marks=pytest.mark.skipif(os.name == "nt", reason="symlinks need admin"),
+        ),
+        pytest.param(
+            lambda path: _link_outside(path.with_suffix(".provenance.json")),
+            marks=pytest.mark.skipif(os.name == "nt", reason="symlinks need admin"),
+        ),
+    ],
+    ids=[
+        "archive",
+        "digest",
+        "records",
+        "archive-directory",
+        "sidecar-directory",
+        "linked-archive",
+        "linked-sidecar",
+    ],
+)
+def test_a_damaged_version_is_deleted_and_downloaded_again(tmp_path, damage):
+    payload = _zip_bytes({"a.txt": b"1"})
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, content=payload)
+
+    owner, download = _moving_target("mdb", tmp_path, httpx.MockTransport(handler))
+    with owner:
+        path = download()
+        damage(path)
+        fresh = download()
+    assert fresh == path and not fresh.is_symlink()
+    assert fresh.read_bytes() == payload
+    assert len(requests) == 2
+
+
+def test_a_dataset_is_reused_by_id_with_identical_bytes_stored_once(tmp_path):
+    same = _zip_bytes({"a.txt": b"same"})
+    other = _zip_bytes({"a.txt": b"other"})
+    bodies = {"/a.zip": same, "/b.zip": same, "/c.zip": other}
+    requests = []
+
+    def serve(request):
+        requests.append(request)
+        return httpx.Response(200, content=bodies[request.url.path])
+
+    def dataset(name, start):
+        return Dataset.from_api(
+            dict(
+                DATASET_RECORD,
+                id=f"mdb-1-{name}",
+                hosted_url=f"https://files.example.com/{name}.zip",
+                hash=hashlib.sha256(bodies[f"/{name}.zip"]).hexdigest(),
+                service_date_range_start=start,
+            )
+        )
+
+    bodies["/d.zip"] = b"<html>maintenance</html>"
+    a, b, c, d = (
+        dataset("a", "2026-01-01"),
+        dataset("b", "2026-02-01"),
+        dataset("c", "2026-03-01"),
+        dataset("d", "2026-04-01"),
+    )
+    routes = {path: serve for path in bodies}
+    with make_db(routes, tmp_path) as db:
+        path_a = db.download(a)
+        assert db.download(b) == path_a
+        db.download(c)
+        # The newer version does not stand in for a requested dataset.
+        assert db.download(a) == path_a and db.download(b) == path_a
+        # A page matching its catalogued hash is still no archive.
+        with pytest.raises(DownloadError, match="not a zip archive"):
+            db.download(d)
+        assert db.download(a, use_cache=False) == path_a
+        copy = db.download(b, directory=tmp_path / "out")
+    paths = [r.url.path for r in requests]
+    assert paths == ["/a.zip", "/b.zip", "/c.zip", "/d.zip", "/a.zip"]
+    assert len(list((tmp_path / "gtfs").rglob("*.zip"))) == 2
+    assert copy == tmp_path / "out" / "mdb-1-b.zip"
+    provenance = json.loads(copy.with_suffix(".provenance.json").read_text())
+    assert provenance["dataset_id"] == "mdb-1-b" and "cache" not in provenance
+    assert provenance["service_date_range"][0] == "2026-02-01"
+
+
+def test_a_cached_dataset_never_stands_for_the_latest(tmp_path):
+    old = _zip_bytes({"a.txt": b"old"})
+    new = _zip_bytes({"a.txt": b"new"})
+    record = dict(DATASET_RECORD, hash=hashlib.sha256(old).hexdigest())
+    latest = {"body": new}
+    routes = {
+        "/mdb-1-202606.zip": lambda request: httpx.Response(200, content=old),
+        "/mdb-1/latest.zip": lambda request: httpx.Response(
+            200, content=latest["body"]
+        ),
+    }
+    requests = []
+    with make_db(routes, tmp_path, requests) as db:
+        dataset_path = db.download(Dataset.from_api(record))
+        feed = Feed.from_api(FEED_RECORD)
+        assert db.download_latest(feed).read_bytes() == new
+        # A refresh replaces every other version; the dataset comes again.
+        db.download_latest(feed, use_cache=False)
+        assert not dataset_path.exists()
+        assert db.download(Dataset.from_api(record)) == dataset_path
+        # The dataset's bytes served as the latest keep their version and
+        # describe no dataset.
+        latest["body"] = old
+        copy = db.download_latest(feed, use_cache=False, directory=tmp_path / "out")
+    assert copy.read_bytes() == old and dataset_path.exists()
+    provenance = json.loads(copy.with_suffix(".provenance.json").read_text())
+    assert "dataset_id" not in provenance and "service_date_range" not in provenance
+    downloads = [r.url.path for r in requests if r.url.path.endswith(".zip")]
+    assert downloads == [
+        "/mdb-1-202606.zip",
+        "/mdb-1/latest.zip",
+        "/mdb-1/latest.zip",
+        "/mdb-1-202606.zip",
+        "/mdb-1/latest.zip",
+    ]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need admin on Windows")
+@pytest.mark.parametrize("where", ["cache", "delivery"])
+def test_a_symlinked_feed_directory_is_refused(tmp_path, where):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=_zip_bytes({"a.txt": b"1"}))
+    )
+    owner, download = _moving_target("atlas", tmp_path, transport)
+    out = tmp_path / "out"
+    if where == "cache":
+        folder = _cache.FeedCache(tmp_path).folder("f-x")
+    else:
+        folder = out / _cache._feed_dir("f-x")
+    folder.parent.mkdir(parents=True)
+    folder.symlink_to(outside)
+    with owner, pytest.raises(DownloadError, match="is a symlink"):
+        download(directory=out)
+    assert not list(outside.iterdir())
+
+
+@pytest.mark.skipif(os.name == "nt", reason="cached files stay writable on Windows")
+def test_a_cached_file_is_read_only_and_a_delivered_copy_writable(tmp_path):
+    payload = _zip_bytes({"a.txt": b"1"})
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=payload)
+    )
+    owner, download = _moving_target("atlas", tmp_path, transport)
+    with owner:
+        cached = download()
+        copy = download(directory=tmp_path / "out")
+    with pytest.raises(PermissionError):
+        cached.open("ab")
+    with copy.open("ab"):
+        pass
+    assert copy.read_bytes() == payload
 
 
 URL = "https://feeds.example/gtfs.zip"

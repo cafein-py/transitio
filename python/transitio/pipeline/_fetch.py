@@ -899,10 +899,10 @@ def _download_indexed(
         proxy = Feed.from_api(
             {"id": feed.feed_id, "latest_dataset": {"hosted_url": url}}
         )
-        return db.download_latest(proxy, directory=base_dir / _feed_dir(feed.feed_id))
+        return db._fetch_latest(proxy, directory=base_dir / _feed_dir(feed.feed_id))
 
     def from_atlas(url):
-        return atlas.download(atlas_feed, directory=base_dir)
+        return atlas._fetch_static(atlas_feed, directory=base_dir)
 
     def from_url(url):
         path = base_dir / _feed_dir(feed.feed_id) / "latest.zip"
@@ -1483,9 +1483,9 @@ def fetch(
             target = pathlib.Path(directory) / _feed_dir(feed.id) if directory else None
             try:
                 if dataset is not None:
-                    path = db.download(dataset, directory=target)
+                    path = db._fetch_dataset(dataset, directory=target)
                 else:
-                    path = db.download_latest(feed, directory=target)
+                    path = db._fetch_latest(feed, directory=target)
             except Exception as error:  # noqa: B902
                 _skip(entry, f"download failed: {error}", download_errors=str(error))
                 continue
@@ -1983,7 +1983,7 @@ def _fetch_place(
             path = fetched_from = probed = None
             if dataset is not None:
                 try:
-                    path = db.download(
+                    path = db._fetch_dataset(
                         dataset, directory=base_dir / _feed_dir(feed.feed_id)
                     )
                     fetched_from = "mdb_dataset"

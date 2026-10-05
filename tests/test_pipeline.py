@@ -549,12 +549,12 @@ def test_download_indexed_tries_the_producer_then_the_hosted_copy(
         return path
 
     db = SimpleNamespace(
-        download_latest=lambda proxy, directory: serve(
+        _fetch_latest=lambda proxy, directory: serve(
             proxy.latest_dataset_url, directory
         )
     )
     atlas = SimpleNamespace(
-        download=lambda record, directory: serve(record.static_url, directory)
+        _fetch_static=lambda record, directory: serve(record.static_url, directory)
     )
     if source is None:
         with pytest.raises(DownloadError) as caught:
@@ -607,7 +607,9 @@ def test_fetch_place_selects_downloads_and_processes(tmp_path, monkeypatch):
 
     fake_pbf = tmp_path / "aoi.osm.pbf"
     fake_pbf.write_bytes(b"\x00fake")
-    monkeypatch.setattr("transitio.catalog.TransitlandAtlas.download", fake_download)
+    monkeypatch.setattr(
+        "transitio.catalog.TransitlandAtlas._fetch_static", fake_download
+    )
     monkeypatch.setattr("transitio.osm.fetch_pbf", lambda *a, **k: fake_pbf)
     monkeypatch.setattr("transitio.osm._fetch.fetch_pbf", lambda *a, **k: fake_pbf)
 
@@ -715,7 +717,9 @@ def test_a_kept_contained_feed_is_reported(tmp_path, monkeypatch):
 
     fake_pbf = tmp_path / "aoi.osm.pbf"
     fake_pbf.write_bytes(b"\x00fake")
-    monkeypatch.setattr("transitio.catalog.TransitlandAtlas.download", fake_download)
+    monkeypatch.setattr(
+        "transitio.catalog.TransitlandAtlas._fetch_static", fake_download
+    )
     monkeypatch.setattr("transitio.osm.fetch_pbf", lambda *a, **k: fake_pbf)
     monkeypatch.setattr("transitio.osm._fetch.fetch_pbf", lambda *a, **k: fake_pbf)
     result = fetch(
@@ -1484,7 +1488,9 @@ def _stub_pbf_and_atlas(monkeypatch, tmp_path, payload):
 
     fake_pbf = tmp_path / "aoi.osm.pbf"
     fake_pbf.write_bytes(b"\x00fake")
-    monkeypatch.setattr("transitio.catalog.TransitlandAtlas.download", fake_download)
+    monkeypatch.setattr(
+        "transitio.catalog.TransitlandAtlas._fetch_static", fake_download
+    )
     monkeypatch.setattr("transitio.osm.fetch_pbf", lambda *a, **k: fake_pbf)
     monkeypatch.setattr("transitio.osm._fetch.fetch_pbf", lambda *a, **k: fake_pbf)
     return fake_pbf
@@ -1533,7 +1539,7 @@ def test_fetch_place_with_token_selects_the_covering_dataset(tmp_path, monkeypat
         return path
 
     monkeypatch.setattr(
-        "transitio.catalog.MobilityDatabase.download", fake_dataset_download
+        "transitio.catalog.MobilityDatabase._fetch_dataset", fake_dataset_download
     )
     result = fetch(
         place="Q1757",
@@ -1668,7 +1674,7 @@ def test_fetch_place_falls_back_to_atlas_when_the_dataset_download_fails(
     def failing(self, dataset, directory=None):
         raise RuntimeError("dataset download boom")
 
-    monkeypatch.setattr("transitio.catalog.MobilityDatabase.download", failing)
+    monkeypatch.setattr("transitio.catalog.MobilityDatabase._fetch_dataset", failing)
     result = fetch(
         place="Q1757",
         index=index,
@@ -1747,7 +1753,9 @@ def test_fetch_place_with_token_and_no_date_uses_the_newest_dataset(
         path.write_bytes(payload)
         return path
 
-    monkeypatch.setattr("transitio.catalog.MobilityDatabase.download", dataset_download)
+    monkeypatch.setattr(
+        "transitio.catalog.MobilityDatabase._fetch_dataset", dataset_download
+    )
     result = fetch(
         place="Q1757",
         index=index,
@@ -1906,7 +1914,7 @@ def test_fetch_place_fetches_the_osm_extract_last_for_the_served_parts(
         tmp_path, {"atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}}}
     )
     fake_pbf = _stub_pbf_and_atlas(monkeypatch, tmp_path, _gtfs_payload())
-    download = transitio.catalog.TransitlandAtlas.download
+    download = transitio.catalog.TransitlandAtlas._fetch_static
     events = []
 
     def recorded_download(self, feed, directory=None):
@@ -1918,7 +1926,7 @@ def test_fetch_place_fetches_the_osm_extract_last_for_the_served_parts(
         return fake_pbf
 
     monkeypatch.setattr(
-        "transitio.catalog.TransitlandAtlas.download", recorded_download
+        "transitio.catalog.TransitlandAtlas._fetch_static", recorded_download
     )
     monkeypatch.setattr("transitio.osm.fetch_pbf", recorded_fetch_pbf)
     served = shapely.box(*_SERVED)
@@ -2412,7 +2420,9 @@ def test_fetch_place_without_osm_skips_the_extract(tmp_path, monkeypatch):
     def forbidden(*a, **k):
         raise AssertionError("fetch_pbf called despite osm=False")
 
-    monkeypatch.setattr("transitio.catalog.TransitlandAtlas.download", fake_download)
+    monkeypatch.setattr(
+        "transitio.catalog.TransitlandAtlas._fetch_static", fake_download
+    )
     monkeypatch.setattr("transitio.osm.fetch_pbf", forbidden)
     monkeypatch.setattr("transitio.osm._fetch.fetch_pbf", forbidden)
 
