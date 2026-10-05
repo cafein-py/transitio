@@ -1992,6 +1992,163 @@ def _fetch_place(
             record.append(entries[feed.feed_id])
         return entries[feed.feed_id]
 
+    def take(feed, entry, version, notes, dataset_id, hosted):
+        """Check, process and record ``version`` of ``feed`` for the call:
+        its route selection, its content against the feeds delivered so
+        far, then :func:`_process_feed`; the decision goes into ``entry``,
+        ``notes`` and ``hosted`` into the delivered feed's note and report."""
+        path = version.path
+        # Route selection: a bundled feed whose matched tiers name a
+        # trustworthy complete selector is cropped to those routes; a
+        # whole-feed selector filters nothing. Every applied selector is
+        # first validated against the download -- its build-time
+        # fingerprint must recompute and every selected route id must be
+        # present -- and an untrustworthy or unavailable selector routes
+        # through on_untrusted_selector rather than filtering silently.
+        # on_unknown="exclude" is itself an edge filter, so this activates
+        # even without an explicit tiers/exclude query.
+        routes = None
+        selection = None
+        if tiers is not None or exclude is not None or on_unknown != "include":
+            sel = feed.selector
+            selected_by = [
+                {
+                    "tier": edge.tier,
+                    "selector_state": edge.selector_state,
+                    "route_ids": sorted((edge.selector or {}).get("route_id") or []),
+                }
+                for edge in feed.edges.values()
+            ]
+            trusted, reason, in_feed = _selector_trusted(path, feed, sel)
+            if trusted and sel.state == "complete" and set(sel.route_ids) - in_feed:
+                trusted, reason = False, "route_absent"
+            if not trusted:
+                action = _untrusted_action(on_untrusted_selector, exclude, on_unknown)
+                if action == "error":
+                    error = StaleSelectorError(
+                        f"{feed.feed_id}: selector untrustworthy ({reason})"
+                    )
+                    error.feed_id = feed.feed_id
+                    raise error
+                selection = {
+                    "feed_id": feed.feed_id,
+                    "selector_state": sel.state,
+                    "trusted": False,
+                    "reason": reason,
+                    "kept": None,
+                    "dropped": None,
+                    "declared_as": None,
+                    "selected_by": selected_by,
+                }
+                if action == "skip":
+                    _skip(entry, f"untrustworthy selector ({reason})")
+                    selections.append(selection)
+                    return
+                # action == "whole": deliver unfiltered (routes stays None),
+                # the selection recording why it was not filtered.
+            elif sel.state == "complete":
+                routes = set(sel.route_ids)
+                selection = {
+                    "feed_id": feed.feed_id,
+                    "selector_state": "complete",
+                    "trusted": True,
+                    "reason": None,
+                    "kept": None,  # filled from the delivered feed below
+                    "dropped": None,
+                    "declared_as": sel.declared_as,
+                    "selected_by": selected_by,
+                }
+            else:
+                selection = {
+                    "feed_id": feed.feed_id,
+                    "selector_state": sel.state,
+                    "trusted": True,
+                    "reason": None,
+                    "kept": None,
+                    "dropped": [],
+                    "declared_as": None,
+                    "selected_by": selected_by,
+                }
+        twins = delivered.same_as(path)
+        same_as = [twin for twin, _ in twins]
+        if _covers(twins, routes):
+            _skip(entry, f"same content as {', '.join(same_as)}", same_as=same_as)
+            whole = [twin for twin, cut in twins if cut is None]
+            if whole:
+                carriers[feed.feed_id] = whole[0]
+            if selection is not None:
+                selections.append(selection)
+            return
+        # A per-feed tag folds in the selected routes so the same feed
+        # fetched under different tiers never overwrites an earlier output.
+        feed_tag = tag
+        if routes is not None:
+            feed_tag = hashlib.sha256(
+                json.dumps(
+                    {"tag": tag, "routes": sorted(routes)}, sort_keys=True
+                ).encode()
+            ).hexdigest()[:16]
+        origin = _report_provenance(version, dataset_id)
+        try:
+            path, report, fixes, present, window = _process_feed(
+                path,
+                provenance=origin,
+                geometry=geometry,
+                tag=feed_tag,
+                repair=repair,
+                crop=crop,
+                modes=modes,
+                day=window_day,
+                study=study,
+                hosted=hosted,
+                budgets=budgets,
+                routes=routes,
+            )
+        except _SkipFeed as skip:
+            _skip(entry, skip.reason, feed_window=skip.window)
+            if selection is not None:
+                selections.append(selection)
+            return
+        except Exception as error:  # noqa: B902 — isolate per-feed failures
+            _skip(entry, f"processing failed: {error}")
+            if selection is not None:
+                selections.append(selection)
+            return
+        # ``present`` is the routes.txt the crop scanned, the download
+        # before any repair: the audit is the selector's own action over
+        # the feed's routes -- the selected routes it carried (``kept``)
+        # and the rest it held that the selector removed (``dropped``).
+        # A later repair may still change the delivered feed, and any
+        # spatial crop is a separate transform reported in ``reports``,
+        # not here. Both are None (undetermined) when routes.txt could
+        # not be read. Only a trusted complete selector was cropped
+        # (``routes`` is set).
+        if selection is not None and routes is not None:
+            selection["kept"] = None if present is None else sorted(present & routes)
+            selection["dropped"] = None if present is None else sorted(present - routes)
+        entry.update(
+            decision="delivered", feed_window=window, path=path, same_as=same_as
+        )
+        if routes is not None:
+            notes.insert(0, "cut to routes " + ", ".join(sorted(routes)))
+            cropped.add(feed.feed_id)
+        else:
+            carriers[feed.feed_id] = feed.feed_id
+        notes += [_timezone_note(path, budget), _dropped_note(report)]
+        for text in dict.fromkeys(filter(None, notes)):
+            _note(entry, text)
+        reports.append(report)
+        repairs.append(fixes)
+        feeds.append(path)
+        delivered.add(feed.feed_id, version.path, routes)
+        delivered_ids.append(feed.feed_id)
+        used.append((version, origin))
+        if selection is not None:
+            selections.append(selection)
+        service = _service(path, day if study else None, budget)
+        if service is not None:
+            services[feed.feed_id] = service
+
     if on_unknown == "exclude":
         included = place_obj.feeds(tiers=tiers, exclude=exclude, on_unknown="include")
         kept_ids = {f.feed_id for f in kept}
@@ -2150,165 +2307,7 @@ def _fetch_place(
                     hosted = db.validation_report(dataset)
                 except Exception:  # noqa: B902 — the hosted report is optional
                     hosted = None
-            # Route selection: a bundled feed whose matched tiers name a
-            # trustworthy complete selector is cropped to those routes; a
-            # whole-feed selector filters nothing. Every applied selector is
-            # first validated against the download -- its build-time
-            # fingerprint must recompute and every selected route id must be
-            # present -- and an untrustworthy or unavailable selector routes
-            # through on_untrusted_selector rather than filtering silently.
-            # on_unknown="exclude" is itself an edge filter, so this activates
-            # even without an explicit tiers/exclude query.
-            routes = None
-            selection = None
-            if tiers is not None or exclude is not None or on_unknown != "include":
-                sel = feed.selector
-                selected_by = [
-                    {
-                        "tier": edge.tier,
-                        "selector_state": edge.selector_state,
-                        "route_ids": sorted(
-                            (edge.selector or {}).get("route_id") or []
-                        ),
-                    }
-                    for edge in feed.edges.values()
-                ]
-                trusted, reason, in_feed = _selector_trusted(path, feed, sel)
-                if trusted and sel.state == "complete" and set(sel.route_ids) - in_feed:
-                    trusted, reason = False, "route_absent"
-                if not trusted:
-                    action = _untrusted_action(
-                        on_untrusted_selector, exclude, on_unknown
-                    )
-                    if action == "error":
-                        error = StaleSelectorError(
-                            f"{feed.feed_id}: selector untrustworthy ({reason})"
-                        )
-                        error.feed_id = feed.feed_id
-                        raise error
-                    selection = {
-                        "feed_id": feed.feed_id,
-                        "selector_state": sel.state,
-                        "trusted": False,
-                        "reason": reason,
-                        "kept": None,
-                        "dropped": None,
-                        "declared_as": None,
-                        "selected_by": selected_by,
-                    }
-                    if action == "skip":
-                        _skip(entry, f"untrustworthy selector ({reason})")
-                        selections.append(selection)
-                        continue
-                    # action == "whole": deliver unfiltered (routes stays None),
-                    # the selection recording why it was not filtered.
-                elif sel.state == "complete":
-                    routes = set(sel.route_ids)
-                    selection = {
-                        "feed_id": feed.feed_id,
-                        "selector_state": "complete",
-                        "trusted": True,
-                        "reason": None,
-                        "kept": None,  # filled from the delivered feed below
-                        "dropped": None,
-                        "declared_as": sel.declared_as,
-                        "selected_by": selected_by,
-                    }
-                else:
-                    selection = {
-                        "feed_id": feed.feed_id,
-                        "selector_state": sel.state,
-                        "trusted": True,
-                        "reason": None,
-                        "kept": None,
-                        "dropped": [],
-                        "declared_as": None,
-                        "selected_by": selected_by,
-                    }
-            twins = delivered.same_as(path)
-            same_as = [twin for twin, _ in twins]
-            if _covers(twins, routes):
-                _skip(entry, f"same content as {', '.join(same_as)}", same_as=same_as)
-                whole = [twin for twin, cut in twins if cut is None]
-                if whole:
-                    carriers[feed.feed_id] = whole[0]
-                if selection is not None:
-                    selections.append(selection)
-                continue
-            download = path
-            # A per-feed tag folds in the selected routes so the same feed
-            # fetched under different tiers never overwrites an earlier output.
-            feed_tag = tag
-            if routes is not None:
-                feed_tag = hashlib.sha256(
-                    json.dumps(
-                        {"tag": tag, "routes": sorted(routes)}, sort_keys=True
-                    ).encode()
-                ).hexdigest()[:16]
-            origin = _report_provenance(version, dataset_id)
-            try:
-                path, report, fixes, present, window = _process_feed(
-                    path,
-                    provenance=origin,
-                    geometry=geometry,
-                    tag=feed_tag,
-                    repair=repair,
-                    crop=crop,
-                    modes=modes,
-                    day=window_day,
-                    study=study,
-                    hosted=hosted,
-                    budgets=budgets,
-                    routes=routes,
-                )
-            except _SkipFeed as skip:
-                _skip(entry, skip.reason, feed_window=skip.window)
-                if selection is not None:
-                    selections.append(selection)
-                continue
-            except Exception as error:  # noqa: B902 — isolate per-feed failures
-                _skip(entry, f"processing failed: {error}")
-                if selection is not None:
-                    selections.append(selection)
-                continue
-            # ``present`` is the routes.txt the crop scanned, the download
-            # before any repair: the audit is the selector's own action over
-            # the feed's routes -- the selected routes it carried (``kept``)
-            # and the rest it held that the selector removed (``dropped``).
-            # A later repair may still change the delivered feed, and any
-            # spatial crop is a separate transform reported in ``reports``,
-            # not here. Both are None (undetermined) when routes.txt could
-            # not be read. Only a trusted complete selector was cropped
-            # (``routes`` is set).
-            if selection is not None and routes is not None:
-                selection["kept"] = (
-                    None if present is None else sorted(present & routes)
-                )
-                selection["dropped"] = (
-                    None if present is None else sorted(present - routes)
-                )
-            entry.update(
-                decision="delivered", feed_window=window, path=path, same_as=same_as
-            )
-            if routes is not None:
-                notes.insert(0, "cut to routes " + ", ".join(sorted(routes)))
-                cropped.add(feed.feed_id)
-            else:
-                carriers[feed.feed_id] = feed.feed_id
-            notes += [_timezone_note(path, budget), _dropped_note(report)]
-            for text in dict.fromkeys(filter(None, notes)):
-                _note(entry, text)
-            reports.append(report)
-            repairs.append(fixes)
-            feeds.append(path)
-            delivered.add(feed.feed_id, download, routes)
-            delivered_ids.append(feed.feed_id)
-            used.append((version, origin))
-            if selection is not None:
-                selections.append(selection)
-            service = _service(path, day if study else None, budget)
-            if service is not None:
-                services[feed.feed_id] = service
+            take(feed, entry, version, notes, dataset_id, hosted)
 
     removed = _settle_versions(record, services, protected, day if study else None)
     # A feed is delivered once the versions are settled and it stays.
