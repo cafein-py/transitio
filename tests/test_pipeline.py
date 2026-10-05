@@ -128,9 +128,9 @@ def _zip(tables, compression=zipfile.ZIP_DEFLATED):
     return buffer.getvalue()
 
 
-def _area_fetch(monkeypatch, tmp_path, second):
+def _area_fetch(monkeypatch, tmp_path, second, **options):
     """An area fetch over two hosted feeds, mdb-10 serving ``GTFS`` and mdb-11
-    the zip bytes ``second``."""
+    the zip bytes ``second``; ``options`` go to :func:`fetch`."""
     from transitio.catalog._client import MobilityDatabase
 
     payloads = {"/mdb-10/latest.zip": _zip(GTFS), "/mdb-11/latest.zip": second}
@@ -155,29 +155,39 @@ def _area_fetch(monkeypatch, tmp_path, second):
             directory=tmp_path / "out",
             cache_dir=tmp_path / "cache",
             reference_date="20260601",
+            **options,
         )
 
 
 def test_an_area_fetch_keeps_each_feeds_download_apart(pipeline_env, monkeypatch):
     tmp_path, _ = pipeline_env
     other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "HKL")}
-    _area_fetch(monkeypatch, tmp_path, _zip(other))
+    first = _area_fetch(monkeypatch, tmp_path, _zip(other))
     result = _area_fetch(monkeypatch, tmp_path, _zip(other))
     assert len(set(result.feeds)) == 2
     agencies = {zipfile.ZipFile(p).read("agency.txt") for p in result.feeds}
     assert len(agencies) == 2
-    # Each feed's repeated download is one cached version acquired twice; the
-    # directory holds only the crops.
+    # The repeat downloads no feed: each is its one cached version, acquired
+    # once; the directory holds only the crops.
+    assert [e["cache"] for e in first.selection + result.selection] == (
+        ["downloaded"] * 2 + ["reused"] * 2
+    )
     cached = [p for p in (tmp_path / "cache").rglob("*.zip") if len(p.stem) == 64]
     assert len(cached) == len({p.parent for p in cached}) == 2
     for path in cached:
         sidecar = json.loads(path.with_suffix(".provenance.json").read_text())
-        assert len(sidecar["cache"]["sources"]) == 2
+        assert len(sidecar["cache"]["sources"]) == 1
     assert sorted((tmp_path / "out").rglob("*.zip")) == sorted(result.feeds)
     assert all("-cropped-" in p.name for p in result.feeds)
     if os.name != "nt":
         crops = (tmp_path / "cache").rglob("*-cropped-*.zip")
         assert not any(os.access(path, os.W_OK) for path in crops)
+
+    # A refresh served a page instead of mdb-11's archive falls back to it.
+    page = b"<html>maintenance</html>"
+    refreshed = _area_fetch(monkeypatch, tmp_path, page, use_cache=False)
+    assert sorted(e["cache"] for e in refreshed.selection) == ["fallback", "refreshed"]
+    assert len(refreshed.feeds) == 2
 
 
 def test_an_area_fetch_delivers_the_same_content_once(pipeline_env, monkeypatch):

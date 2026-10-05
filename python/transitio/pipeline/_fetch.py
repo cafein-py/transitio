@@ -1066,6 +1066,17 @@ def _hosted(db, cache, version, dataset_id):
     return None if report == "unavailable" else report
 
 
+def _warn_fallback(feed_id, errors, version):
+    """Warn that a refresh of ``feed_id`` failed with ``errors`` and the
+    cached ``version`` is delivered instead."""
+    warnings.warn(
+        f"{feed_id}: refresh failed ({errors or 'nothing to download'}); "
+        f"using the cached version retrieved {version.retrieved_at}",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
 def _prove(cache, version, snapshot, url):
     """Record that a probe of ``url`` proved ``version`` the archive the
     index ``snapshot`` crawled; an earlier proof stays."""
@@ -1297,7 +1308,9 @@ def fetch(
     them; credentials for a provider count alike whichever key they hold.
     The hosted validation report of a dataset is stored with it at its first
     use, so a reused dataset is reported as when downloaded. The area path
-    downloads on every call. Every overlapping feed is processed, in a
+    reuses its feeds' versions alike, though the Mobility Database is still
+    searched for the feeds; a dataset is selected only for a feed no cached
+    version serves. Every overlapping feed is processed, in a
     deterministic order with official feeds first; one broken feed never
     aborts the others — it lands in ``skipped`` with its reason. A feed
     lacking a file GTFS requires is skipped, with or without ``when`` and
@@ -1647,6 +1660,16 @@ def fetch(
 
     feeds, reports, repairs, record = [], [], [], []
     delivered = _Delivered()
+    # Everything but the version that decides whether one serves.
+    key = _request_key(
+        day=day.isoformat() if study else None,
+        expired=expired,
+        area=hashlib.sha256(geometry.wkb).hexdigest(),
+        crop=crop,
+        repair=repair,
+        modes=None if modes is None else sorted(modes),
+        budgets=budgets,
+    )
     with MobilityDatabase(refresh_token, cache_dir=cache_dir) as db:
         if when is not None and not db._refresh_token:
             warnings.warn(
@@ -1658,70 +1681,17 @@ def fetch(
         candidates = sorted(
             db.search_feeds(aoi=geometry, country_code=country_code), key=_rank
         )
-        for feed, staging in _held(cache, candidates, lambda feed: feed.id):
-            entry = _entry(feed.id, feed.raw.get("feed_name") or feed.provider)
-            record.append(entry)
-            dataset = None
-            if db._refresh_token:
-                try:
-                    if when is not None:
-                        dataset = db.dataset_for(feed, when)
-                        if dataset is None:
-                            _skip(entry, "no dataset covers the requested day")
-                            continue
-                    else:
-                        # Prefer a versioned dataset (checksum, hosted
-                        # report) over the unversioned moving target.
-                        versions = db.datasets(feed)
-                        dataset = versions[0] if versions else None
-                except Exception as error:  # noqa: B902
-                    _skip(entry, f"dataset selection failed: {error}")
-                    continue
-            try:
-                if dataset is not None:
-                    path = db._fetch_dataset(dataset, directory=staging)
-                else:
-                    path = db._fetch_latest(feed, directory=staging)
-            except Exception as error:  # noqa: B902
-                _skip(entry, f"download failed: {error}", download_errors=str(error))
-                continue
-            fetched_from = "mdb_latest" if dataset is None else "mdb_dataset"
-            dataset_id = None if dataset is None else dataset.id
-            try:
-                version = _add_version(
-                    cache,
-                    feed.id,
-                    path,
-                    feed.latest_dataset_url if dataset is None else dataset.hosted_url,
-                    fetched_from,
-                    None,
-                    dataset=dataset and {dataset.id: _dataset_entry(dataset)},
-                    replace=not use_cache,
-                )
-            except DownloadError as error:  # not a zip archive
-                _skip(entry, f"download failed: {error}", download_errors=str(error))
-                continue
-            except Exception as error:  # noqa: B902 — isolate per-feed failures
-                _skip(entry, f"processing failed: {error}")
-                continue
-            entry.update(
-                fetched_from=fetched_from,
-                cache="downloaded" if use_cache else "refreshed",
-            )
+
+        def take(feed, entry, version, dataset_id, hosted, last=True):
+            # ``version`` checked against the feeds delivered so far and
+            # processed: "delivered" or "skipped", or "rejected" for a cached
+            # candidate that is not the ``last`` to try and does not serve.
             path = version.path
             twins = [twin for twin, _ in delivered.same_as(path)]
             if twins:
                 _skip(entry, f"same content as {', '.join(twins)}", same_as=twins)
-                continue
-            download = path
+                return "skipped"
             origin = _report_provenance(version, dataset_id)
-            hosted = None
-            if dataset is not None:
-                try:
-                    hosted = db.validation_report(dataset)
-                except Exception:  # noqa: B902 — the hosted report is optional
-                    hosted = None
-
             try:
                 # Modes are read from the delivered feed, after cropping, so an
                 # aggregate serving buses only outside the AOI does not pass a
@@ -1740,13 +1710,17 @@ def fetch(
                     budgets=budgets,
                 )
                 path = _deliver(path, directory, origin)
-                cache.touch(version)
+                cache.touch(version, served=(key, dataset_id))
             except _SkipFeed as skip:
+                if not last:
+                    return "rejected"
                 _skip(entry, skip.reason, feed_window=skip.window)
-                continue
+                return "skipped"
             except Exception as error:  # noqa: B902 — isolate per-feed failures
+                if not last:
+                    return "rejected"
                 _skip(entry, f"processing failed: {error}")
-                continue
+                return "skipped"
             entry.update(decision="delivered", feed_window=window, path=path)
             for note in (
                 _timezone_note(path, budgets.get("max_total_bytes")),
@@ -1757,7 +1731,95 @@ def fetch(
             reports.append(report)
             repairs.append(fixes)
             feeds.append(path)
-            delivered.add(feed.id, download)
+            delivered.add(feed.id, version.path)
+            return "delivered"
+
+        def reuse(feed, entry, versions, label):
+            # The cached versions in order until one decides the feed.
+            for version in versions:
+                if not cache.intact(version):
+                    continue
+                context = _context(version, key)
+                hosted = _hosted(db, cache, version, context)
+                outcome = take(feed, entry, version, context, hosted, last=False)
+                if outcome == "rejected":
+                    continue
+                entry.update(fetched_from=version.first_source["fetched_from"])
+                entry["cache"] = label
+                if label == "fallback" and outcome == "delivered":
+                    _warn_fallback(feed.id, entry["download_errors"], version)
+                return True
+            return False
+
+        def failed(feed, entry, cached, reason, errors):
+            # The feed could not be downloaded, for ``reason``; a refresh
+            # falls back to what the cache serves.
+            entry["download_errors"] = errors
+            if use_cache or not reuse(feed, entry, cached, "fallback"):
+                _skip(entry, reason)
+
+        for feed, staging in _held(cache, candidates, lambda feed: feed.id):
+            entry = _entry(feed.id, feed.raw.get("feed_name") or feed.provider)
+            record.append(entry)
+            cached = _candidates(cache, feed.id, key, False)
+            if use_cache and reuse(feed, entry, cached, "reused"):
+                continue
+            dataset = None
+            if db._refresh_token:
+                try:
+                    if when is not None:
+                        dataset = db.dataset_for(feed, when)
+                        if dataset is None:
+                            _skip(entry, "no dataset covers the requested day")
+                            continue
+                    else:
+                        # Prefer a versioned dataset (checksum, hosted
+                        # report) over the unversioned moving target.
+                        versions = db.datasets(feed)
+                        dataset = versions[0] if versions else None
+                except Exception as error:  # noqa: B902
+                    reason = f"dataset selection failed: {error}"
+                    failed(feed, entry, cached, reason, f"dataset selection: {error}")
+                    continue
+            try:
+                if dataset is not None:
+                    path = db._fetch_dataset(dataset, directory=staging)
+                else:
+                    path = db._fetch_latest(feed, directory=staging)
+            except Exception as error:  # noqa: B902
+                failed(feed, entry, cached, f"download failed: {error}", str(error))
+                continue
+            fetched_from = "mdb_latest" if dataset is None else "mdb_dataset"
+            try:
+                version = _add_version(
+                    cache,
+                    feed.id,
+                    path,
+                    feed.latest_dataset_url if dataset is None else dataset.hosted_url,
+                    fetched_from,
+                    None,
+                    dataset=dataset and {dataset.id: _dataset_entry(dataset)},
+                    replace=not use_cache,
+                )
+            except DownloadError as error:  # not a zip archive
+                failed(feed, entry, cached, f"download failed: {error}", str(error))
+                continue
+            except Exception as error:  # noqa: B902 — isolate per-feed failures
+                _skip(entry, f"processing failed: {error}")
+                continue
+            entry.update(
+                fetched_from=fetched_from,
+                cache="downloaded" if use_cache else "refreshed",
+            )
+            # Read as a reuse would, so identical bytes report alike.
+            dataset_id = _context(version, key)
+            take(
+                feed,
+                entry,
+                version,
+                dataset_id,
+                _hosted(db, cache, version, dataset_id),
+            )
 
     if osm_pbf is not None:
         coords = {path: _stop_coords(path) for path in feeds}
@@ -2008,8 +2070,9 @@ def _fetch_place(
     budgets,
 ):
     """The ``fetch(place=...)`` path: the place geometry is the AOI, feeds come
-    from the index by tier, each is downloaded MDB-then-Atlas (decision I) and
-    then from the MDB hosted copy (:func:`_download_indexed`), and a bundled
+    from the index by tier, each served by a cached version when one serves
+    the request, else downloaded MDB-then-Atlas (decision I) and then from
+    the MDB hosted copy (:func:`_download_indexed`), and a bundled
     feed is cropped to the routes its matched tiers select, the drop
     recorded in ``selections``. A feed whose index window misses ``day`` is
     skipped before download when a probe proves the archive unchanged since
@@ -2380,13 +2443,7 @@ def _fetch_place(
             if outcome in ("delivered", "skipped"):
                 entry.update(fetched_from=first["fetched_from"], cache=label)
             if label == "fallback" and outcome == "delivered":
-                failed = entry["download_errors"] or "nothing to download"
-                warnings.warn(
-                    f"{feed.feed_id}: refresh failed ({failed}); "
-                    f"using the cached version retrieved {version.retrieved_at}",
-                    UserWarning,
-                    stacklevel=2,
-                )
+                _warn_fallback(feed.feed_id, entry["download_errors"], version)
             return outcome
 
         def reuse(feed, entry, candidates, key, notes, keyless, label, proven=()):
