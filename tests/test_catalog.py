@@ -1076,3 +1076,67 @@ def test_extract_feed_writes_the_named_member(tmp_path, member, budget, expected
         with zipfile.ZipFile(target) as feed:
             assert {name: feed.read(name) for name in feed.namelist()} == expected
     assert [path.name for path in target.parent.iterdir()] == ["latest.zip"]
+
+
+def test_the_cache_is_listed_and_cleared_by_age_feed_and_whole(tmp_path):
+    import transitio.cache
+
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=_zip_bytes({"a.txt": b"1"}))
+    )
+    for client in ("mdb", "atlas"):
+        owner, download = _moving_target(client, tmp_path, transport)
+        with owner:
+            download()
+    table = transitio.cache.info(tmp_path)
+    assert sorted(table["feed_id"]) == ["f-x", "mdb-7"]
+    total = int(table["archive_bytes"].sum() + table["outputs_bytes"].sum())
+    assert table.attrs["logical_bytes"] == total > 0
+    # Last used 25 and 23 hours ago: only the first is past a day.
+    cache, now = _cache.FeedCache(tmp_path), datetime.datetime.now(
+        datetime.timezone.utc
+    )
+    for feed_id, hours in (("mdb-7", 25), ("f-x", 23)):
+        (version,) = cache.versions(feed_id)
+        used = (now - datetime.timedelta(hours=hours)).isoformat()
+
+        def age(sidecar, used=used):
+            sidecar["last_used_at"] = used
+
+        cache.update(version, age)
+    assert transitio.cache.clear(tmp_path, older_than=datetime.timedelta(days=1)) > 0
+    assert list(transitio.cache.info(tmp_path)["feed_id"]) == ["f-x"]
+    assert transitio.cache.clear(tmp_path, feeds=["mdb-7"]) == 0
+    # A folder an older transitio left goes with the rest; the locks stay.
+    (tmp_path / "gtfs" / "mdb-1").mkdir()
+    (tmp_path / "gtfs" / "mdb-1" / "latest.zip").write_bytes(b"old")
+    assert transitio.cache.clear(tmp_path) > 0
+    assert [p.name for p in (tmp_path / "gtfs").iterdir()] == [".locks"]
+
+
+def test_clear_waits_for_a_fetch_holding_a_feeds_lock(tmp_path):
+    import threading
+
+    import transitio.cache
+
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=_zip_bytes({"a.txt": b"1"}))
+    )
+    owner, download = _moving_target("mdb", tmp_path, transport)
+    with owner:
+        download()
+    held, order = threading.Event(), []
+
+    def fetching():
+        with _cache.FeedCache(tmp_path).lock("mdb-7"):
+            held.set()
+            time.sleep(0.2)
+            order.append("released")
+
+    thread = threading.Thread(target=fetching)
+    thread.start()
+    held.wait()
+    transitio.cache.clear(tmp_path)
+    order.append("cleared")
+    thread.join()
+    assert order == ["released", "cleared"]

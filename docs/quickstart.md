@@ -158,6 +158,50 @@ reports without footpaths, either way: the extract spans the bounding box
 of the area and cafein snaps a stop up to 1.6 km away, while a stop inside
 the area can still lie far from any street or path.
 
+## The download cache
+
+Every feed `fetch` downloads is kept in the download cache, the `gtfs`
+folder under `cache_dir` (by default the platform's cache directory), one
+version per distinct archive, named by its SHA-256. A later call uses a
+cached version that serves its study day instead of downloading the feed,
+offline too, and a repeated request uses the version it used before, so a
+repeated run delivers the same feeds and reports. A day no cached version
+serves downloads the feed and keeps the older versions. The crops, repairs
+and validation results made from a version are kept with it and read back
+by a call that makes the same.
+
+```python
+transitio.fetch(place="Helsinki", when="2026-09-01")   # downloads
+result = transitio.fetch(place="Helsinki", when="2026-09-01")
+result.selection_table()["cache"]                       # "reused" per feed
+
+transitio.fetch(place="Helsinki", when="2026-09-01", use_cache=False)
+```
+
+`use_cache=False` downloads every feed again and replaces its cached
+versions; when every attempt for a feed fails, the version a cached call
+would use is delivered with a warning. A warm cache can decide differently
+from a cold one: a cached version that serves the day is used without the
+probe `expired="skip"` sends, and a cached feed counts as unchanged since
+indexed for `contained="drop"` only when that was proven under the index
+snapshot in use. For a feed that needs an account, credentials for its
+provider count alike whichever key they hold, and a call without them uses
+only copies fetched without them.
+
+With `directory=` the delivered feeds are copied there; without it they are
+the files in the cache, read-only on Linux and macOS.
+
+```python
+import datetime
+
+transitio.cache.info()        # one row per cached version, with its sizes
+transitio.cache.clear(older_than=datetime.timedelta(days=30))  # unused 30 days
+transitio.cache.clear()       # everything
+```
+
+`clear` waits for a fetch working on a feed; a feed a running fetch adds
+after `clear` started is left for the next call.
+
 ## Using the pieces separately
 
 Every pipeline stage is a standalone function:

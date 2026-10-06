@@ -224,10 +224,14 @@ class FeedCache:
     def folder(self, feed_id):
         return self.root / _feed_dir(feed_id)
 
-    @contextlib.contextmanager
     def lock(self, feed_id):
         """Hold the feed's lock for the block; another process waits."""
-        with _http.locked(self.root / ".locks" / f"{_feed_dir(feed_id)}.lock"):
+        return self.locked(_feed_dir(feed_id))
+
+    @contextlib.contextmanager
+    def locked(self, folder):
+        """Hold the lock of the feed whose folder is named ``folder``."""
+        with _http.locked(self.root / ".locks" / f"{folder}.lock"):
             yield
 
     def versions(self, feed_id):
