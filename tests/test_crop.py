@@ -396,6 +396,33 @@ def test_route_crop_accepts_a_single_string(tmp_path):
     assert "r-in" in routes and "r-out" not in routes
 
 
+def test_excluded_trips_go_with_what_only_they_used(tmp_path):
+    feed = dict(FEED)
+    feed["trips.txt"] = (
+        "route_id,service_id,trip_id,shape_id\n"
+        "r-in,wk,t-in,\nr-out,wk,t-out,s-out\nr-in,old,t-old,\n"
+    )
+    feed["shapes.txt"] = (
+        "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence\n"
+        "s-out,60.205,24.655,1\ns-out,60.206,24.656,2\n"
+    )
+    feed["frequencies.txt"] = (
+        "trip_id,start_time,end_time,headway_secs\nt-out,09:00:00,10:00:00,600\n"
+    )
+    feed["transfers.txt"] = (
+        "from_stop_id,to_stop_id,transfer_type\nout1,in1,0\nin1,in2,0\n"
+    )
+    source = write_zip(tmp_path / "feed.zip", feed)
+    result = crop_feed(source, tmp_path / "out.zip", exclude_trips=["t-out", "t-old"])
+    counts = result["row_counts"]
+    kept = ("trips.txt", "routes.txt", "stops.txt", "calendar.txt", "transfers.txt")
+    assert [counts[name] for name in kept] == [1, 1, 2, 1, 1]
+    assert "shapes.txt" not in counts and "frequencies.txt" not in counts
+    # A bare string is one trip id.
+    result = crop_feed(source, tmp_path / "one.zip", exclude_trips="t-out")
+    assert result["row_counts"]["trips.txt"] == 2
+
+
 def test_route_crop_source_routes_distinguishes_absent_from_empty(tmp_path):
     # With routes.txt the report lists its route ids; without it, source_routes
     # is None (undetermined), never an empty list standing in for absent.

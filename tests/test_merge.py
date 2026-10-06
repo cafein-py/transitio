@@ -1037,6 +1037,26 @@ def test_duplicate_trips(tmp_path, inputs, dropped, expected):
     }
 
 
+def test_repeated_trips_on_a_day():
+    from transitio.gtfs._duplicates import repeated_trips
+
+    # The second input runs t1 a minute later from stops 20 m from the first
+    # input's, and t2 an hour later; t9 names a service no calendar declares.
+    moved = [
+        (
+            "stops.txt",
+            dict(stop_id=f"m{n}", stop_name="m", stop_lat=lat, stop_lon="24.9"),
+        )
+        for n, lat in ((1, "60.10018"), (2, "60.11018"))
+    ]
+    undeclared = ("trips.txt", dict(route_id="r1", service_id="none", trip_id="t9"))
+    later = {"stops": ("m1", "m2"), "times": ("08:01:00", "08:11:00")}
+    second = _repeats(_trips(later, {"times": LATER}), rows=[*moved, undeclared])
+    tables = [_repeats(ONE).tables, second.tables]
+    found = repeated_trips(tables, day=datetime.date(2026, 1, 14))
+    assert found == [(set(), [], {"t1"}), ({"t1"}, [0], {"t1", "t2", "t9"})]
+
+
 def test_rows_of_dropped_trips_go():
     from transitio.gtfs._patch import _drop_trip_rows
 

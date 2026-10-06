@@ -45,6 +45,9 @@ pub struct CropOptions {
     /// Retain only trips whose ``route_id`` is in this set; None keeps every
     /// route. Applied alongside the spatial and temporal crops (all AND).
     pub routes: Option<HashSet<String>>,
+    /// Leave out the trips whose ``trip_id`` is in this set; None leaves out
+    /// none. Applied alongside the other crops.
+    pub exclude_trips: Option<HashSet<String>>,
 }
 
 pub struct CropResult {
@@ -667,6 +670,11 @@ fn select_trips(
                 continue;
             }
         }
+        if let Some(excluded) = &crop_options.exclude_trips {
+            if excluded.contains(&row.fields[trip_index]) {
+                continue;
+            }
+        }
         if let Some(active) = active {
             let service = service_index.map(|i| row.fields[i].as_str()).unwrap_or("");
             if !active.contains(service) {
@@ -1249,6 +1257,7 @@ mod tests {
             end_date: None,
             full_trips_only: false,
             routes: None,
+            exclude_trips: None,
         };
         let error = match crop(
             Path::new("does-not-matter.zip"),
@@ -1286,6 +1295,7 @@ mod tests {
             end_date: None,
             full_trips_only: false,
             routes: None,
+            exclude_trips: None,
         };
         let defaults = ScanOptions::default();
         // the options, a streamed stop_times.txt, and the refusal

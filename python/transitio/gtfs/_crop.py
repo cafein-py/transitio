@@ -66,6 +66,7 @@ def crop_feed(
     end_date=None,
     full_trips_only=False,
     routes=None,
+    exclude_trips=None,
     **options,
 ):
     """Crop a GTFS zip to an area of interest and/or a date window.
@@ -111,6 +112,10 @@ def crop_feed(
     routes : iterable of str, optional
         Keep only trips whose ``route_id`` is in this set (applied alongside
         the area/date crop); ``None`` keeps every route.
+    exclude_trips : iterable of str, optional
+        Leave out the trips whose ``trip_id`` is in this set, with what only
+        they used, as for any trip the crop does not retain; ``None`` leaves
+        out none.
     full_trips_only : bool, default False
         Keep only trips whose every stop lies inside the AOI.
     **options
@@ -148,10 +153,20 @@ def crop_feed(
         exact repeats of a trips.txt row, the samples up to 50 of the
         distinct values, sorted.
     """
-    if aoi is None and start_date is None and end_date is None and routes is None:
-        raise ValueError("nothing to crop: pass aoi, a date window and/or routes")
+    if (
+        aoi is None
+        and start_date is None
+        and end_date is None
+        and routes is None
+        and exclude_trips is None
+    ):
+        raise ValueError(
+            "nothing to crop: pass aoi, a date window, routes and/or exclude_trips"
+        )
     if isinstance(routes, str):
         routes = [routes]
+    if isinstance(exclude_trips, str):
+        exclude_trips = [exclude_trips]
     bbox = None
     polygon = None
     if aoi is not None:
@@ -172,6 +187,9 @@ def crop_feed(
             end_date=end_date,
             full_trips_only=full_trips_only,
             routes=None if routes is None else [str(r) for r in routes],
+            exclude_trips=(
+                None if exclude_trips is None else [str(t) for t in exclude_trips]
+            ),
             **options,
         )
     )

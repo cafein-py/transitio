@@ -188,7 +188,7 @@ fn repair_feed(
 
 /// Crop a feed spatially and/or temporally into `output`.
 #[pyfunction]
-#[pyo3(signature = (path, output, *, bbox=None, polygon=None, start_date=None, end_date=None, full_trips_only=false, routes=None, max_entry_bytes=None, max_total_bytes=None, max_rows=None, max_columns=None, max_notices_per_file=None, reference_date=None, reference_time=None))]
+#[pyo3(signature = (path, output, *, bbox=None, polygon=None, start_date=None, end_date=None, full_trips_only=false, routes=None, exclude_trips=None, max_entry_bytes=None, max_total_bytes=None, max_rows=None, max_columns=None, max_notices_per_file=None, reference_date=None, reference_time=None))]
 #[allow(clippy::too_many_arguments)]
 fn crop_feed(
     py: Python<'_>,
@@ -200,6 +200,7 @@ fn crop_feed(
     end_date: Option<String>,
     full_trips_only: bool,
     routes: Option<Vec<String>>,
+    exclude_trips: Option<Vec<String>>,
     max_entry_bytes: Option<u64>,
     max_total_bytes: Option<u64>,
     max_rows: Option<u64>,
@@ -213,9 +214,10 @@ fn crop_feed(
         && start_date.is_none()
         && end_date.is_none()
         && routes.is_none()
+        && exclude_trips.is_none()
     {
         return Err(PyValueError::new_err(
-            "nothing to crop: pass an area, a date window and/or routes",
+            "nothing to crop: pass an area, a date window, routes and/or trips to exclude",
         ));
     }
     if bbox.is_some() && polygon.is_some() {
@@ -250,6 +252,7 @@ fn crop_feed(
         end_date,
         full_trips_only,
         routes: routes.map(|r| r.into_iter().collect()),
+        exclude_trips: exclude_trips.map(|t| t.into_iter().collect()),
     };
     py.allow_threads(move || {
         let result = transitio_gtfs::crop(&path, &output, options, &crop_options)?;

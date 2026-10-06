@@ -104,16 +104,17 @@ def placeholder_rows(tables):
     return rows[end - start >= np.timedelta64(PLACEHOLDER_DAYS, "D")]
 
 
-def service_dates(tables):
+def service_dates(tables, within=None):
     """The dates each service runs, from calendar.txt and calendar_dates.txt.
 
     Returns ``(dates, unexpanded)``: the ``(service_id, date)`` rows, and
     the ids of the services left out because a date, weekday flag,
     exception type or column of theirs cannot be read, a calendar row of
     theirs spans more than :data:`MAX_SERVICE_DAYS` days, or its days are
-    past :data:`MAX_EXPANDED_DAYS`.
+    past :data:`MAX_EXPANDED_DAYS`. ``within``, a ``(first, last)`` pair of
+    dates, keeps the days between them.
     """
-    dates, unexpanded = _service_days(tables)
+    dates, unexpanded = _service_days(tables, within)
     return dates[~dates["service_id"].isin(unexpanded)], unexpanded
 
 
