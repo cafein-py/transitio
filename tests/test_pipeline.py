@@ -174,7 +174,7 @@ def test_an_area_fetch_keeps_each_feeds_download_apart(pipeline_env, monkeypatch
     assert [e["cache"] for e in first.selection + result.selection] == (
         ["downloaded"] * 2 + ["reused"] * 2
     )
-    cached = [p for p in (tmp_path / "cache").rglob("*.zip") if len(p.stem) == 64]
+    cached = list((tmp_path / "cache").glob("gtfs/id-*/*.zip"))
     assert len(cached) == len({p.parent for p in cached}) == 2
     for path in cached:
         sidecar = json.loads(path.with_suffix(".provenance.json").read_text())

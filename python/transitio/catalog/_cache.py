@@ -21,9 +21,16 @@ cache's records under ``cache``:
 
 A delivered copy's sidecar describes the first acquisition. A version is
 published only after its download completed and the file is a readable zip;
-a version whose bytes no longer match its digest is deleted before use. On
-POSIX systems published versions are read-only. The cache's own directories
-are never symlinks. Work on one feed runs under a lock file in
+a version whose bytes no longer match its digest is linked again to an intact
+blob, or else deleted, before use. On POSIX systems published versions are
+read-only, and the bytes of a version
+are stored once, in ``<cache>/gtfs/blobs/<sha256>.zip``, each feed's version
+a hard link to that blob, so identical archives of two feeds take the space
+once; where a link cannot be made, and on Windows, a version is a copy of its
+own. Blobs are created, linked and removed under the lock
+``<cache>/gtfs/.locks/blobs.lock``, always taken after a feed's lock. The
+cache's own directories are never symlinks. Work on one feed runs under a
+lock file in
 ``<cache>/gtfs/.locks/``, outside the feed's folder, and lock files are never
 deleted.
 """
@@ -148,6 +155,23 @@ def _copy(path, target, provenance):
     return target
 
 
+def _unshared(path):
+    """The bytes of the files at or under ``path`` no hard link outside it
+    shares, each counted once: what removing ``path`` frees."""
+    if path.is_symlink() or not path.is_dir():
+        files = [path]
+    else:
+        files = [Path(r) / n for r, _, names in os.walk(path) for n in names]
+    inside = {}
+    for file in files:
+        with contextlib.suppress(OSError):
+            info = os.lstat(file)
+            key = (info.st_dev, info.st_ino)
+            links, _, size = inside.get(key, (0, info.st_nlink, info.st_size))
+            inside[key] = (links + 1, info.st_nlink, size)
+    return sum(size for links, nlink, size in inside.values() if links >= nlink)
+
+
 def _now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
@@ -241,6 +265,14 @@ class FeedCache:
         folder = self.folder(feed_id)
         if self.root.is_symlink() or folder.is_symlink() or not folder.is_dir():
             return []
+        strays = list(folder.glob(".*.link"))
+        if strays:
+            # Links an interrupted publication left behind, removed as a
+            # feed's link is, with the blobs they held.
+            with self._blob_lock():
+                for stray in strays:
+                    _unlink(stray)
+                self._swept()
         found = []
         for path in folder.glob("*.zip"):
             if not _DIGEST.fullmatch(path.stem):
@@ -283,12 +315,132 @@ class FeedCache:
         return None
 
     def intact(self, version):
-        """Whether ``version``'s bytes still match their digest; a version
-        whose bytes do not is deleted."""
+        """Whether ``version``'s bytes still match their digest. A version
+        whose bytes do not is linked again to its blob when another feed has
+        already replaced the blob with intact bytes, and is deleted
+        otherwise."""
         if _http.sha256_file(version.path) == version.sha256:
+            return True
+        if self._relink(version):
+            # The damaged file may have lost its last other link.
+            self.sweep()
             return True
         self.delete(version)
         return False
+
+    def _blob_lock(self):
+        return _http.locked(self.root / ".locks" / "blobs.lock")
+
+    @contextlib.contextmanager
+    def _blobs(self):
+        """The blob folder, held under the blob lock for the block."""
+        with self._blob_lock():
+            folder = self.root / "blobs"
+            _directory(folder)
+            yield folder
+
+    def _store(self, staged, target, digest):
+        """Move the staged archive to ``target``: a hard link to the blob of
+        its bytes, the blob made from it when there is none or the blob no
+        longer matches its name; a copy of its own where a link cannot be
+        made."""
+        if os.name == "nt":
+            os.replace(staged, target)
+            return
+        with self._blobs() as folder:
+            blob = folder / f"{digest}.zip"
+            made = False
+            if not (_regular(blob) and _http.sha256_file(blob) == digest):
+                self._quarantine(blob)
+                os.replace(staged, blob)
+                os.chmod(blob, 0o444)
+                made = True
+            link = target.with_name(f".{uuid.uuid4().hex}.link")
+            try:
+                os.link(blob, link)
+            except OSError:
+                os.replace(blob if made else staged, target)
+            else:
+                try:
+                    os.replace(link, target)
+                finally:
+                    _unlink(link)
+            # A damaged blob put aside may have had its last link.
+            self._swept()
+
+    def _relink(self, version):
+        """Link a damaged ``version`` to its blob again when the blob is
+        another, intact file, or copy the blob where a link cannot be made; a
+        blob that is the damaged file itself is put aside, to be removed once
+        nothing links to it. Returns whether the version is intact again."""
+        if os.name == "nt":
+            return False
+        with self._blobs() as folder:
+            blob = folder / f"{version.sha256}.zip"
+            try:
+                shared = os.path.samefile(blob, version.path)
+            except OSError:
+                return False
+            if shared:
+                self._quarantine(blob)
+                return False
+            if not (_regular(blob) and _http.sha256_file(blob) == version.sha256):
+                return False
+            link = version.path.with_name(f".{uuid.uuid4().hex}.link")
+            try:
+                os.link(blob, link)
+                os.replace(link, version.path)
+            except OSError:
+                # Where a link cannot be made, the version is a copy of its own.
+                _unlink(link)
+                with open(blob, "rb") as source, _http.replacing(version.path) as out:
+                    shutil.copyfileobj(source, out)
+                os.chmod(version.path, 0o444)
+                return _http.sha256_file(version.path) == version.sha256
+            return True
+
+    def _quarantine(self, blob):
+        """Rename a damaged blob out of the way of a new one."""
+        if blob.exists() or blob.is_symlink():
+            os.replace(blob, blob.with_name(f"{blob.stem}.{uuid.uuid4().hex}.damaged"))
+
+    def sweep(self, prune=False):
+        """Remove the blobs no feed's version links to any more, and with
+        ``prune`` the blob folder when that leaves it empty; returns the
+        bytes freed."""
+        with self._blob_lock():
+            freed = self._swept()
+            if prune:
+                with contextlib.suppress(OSError):
+                    (self.root / "blobs").rmdir()
+            return freed
+
+    def _swept(self):
+        """:meth:`sweep`, the blob lock held."""
+        freed, folder = 0, self.root / "blobs"
+        if folder.is_symlink() or not folder.is_dir():
+            return freed
+        for blob in folder.iterdir():
+            with contextlib.suppress(OSError):
+                info = os.lstat(blob)
+                if not stat.S_ISREG(info.st_mode):
+                    # No blob, whatever squats on its name.
+                    size = _unshared(blob)
+                    _unlink(blob)
+                    freed += size
+                elif info.st_nlink <= 1:
+                    _unlink(blob)
+                    freed += info.st_size
+        return freed
+
+    def remove(self, path):
+        """Remove the file or folder ``path`` of the cache under the blob
+        lock, with the blobs it held the last links to; returns the bytes
+        freed."""
+        with self._blob_lock():
+            before = _unshared(path)
+            _unlink(path)
+            return before - _unshared(path) + self._swept()
 
     def download(self, client, url, feed_id, record, fetched_from, **options):
         """Download ``url`` with ``client`` into staging and publish it
@@ -360,7 +512,7 @@ class FeedCache:
         else:
             if current:
                 self.delete(current[0])
-            os.replace(staged, target)
+            self._store(staged, target, digest)
             if os.name != "nt":
                 os.chmod(target, 0o444)
             sidecar = {
@@ -419,7 +571,8 @@ class FeedCache:
         self.update(version, change)
 
     def delete(self, version):
-        """Remove a version's archive, sidecar and the outputs made of it."""
+        """Remove a version's archive, sidecar and the outputs made of it;
+        returns the bytes the blobs it held the last links to freed."""
         outputs = version.path.parent / "outputs"
         records = version.sidecar.get("cache", {}).get("outputs", {})
         for key, record in records.items() if not outputs.is_symlink() else ():
@@ -429,8 +582,10 @@ class FeedCache:
             if record.get("file") in (f"{key}-cropped.zip", f"{key}-repaired.zip"):
                 _unlink(outputs / record["file"])
             _unlink(outputs / f"{key}.json")
-        _unlink(version.path)
         _unlink(version.path.with_suffix(_SIDECAR))
+        with self._blob_lock():
+            _unlink(version.path)
+            return self._swept()
 
     def deliver(self, version, target, provenance=None):
         """A writable copy of ``version`` at ``target`` beside a sidecar of

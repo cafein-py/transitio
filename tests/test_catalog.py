@@ -743,7 +743,7 @@ def test_a_dataset_is_reused_by_id_with_identical_bytes_stored_once(tmp_path):
         copy = db.download(b, directory=tmp_path / "out")
     paths = [r.url.path for r in requests]
     assert paths == ["/a.zip", "/b.zip", "/c.zip", "/d.zip", "/a.zip"]
-    assert len(list((tmp_path / "gtfs").rglob("*.zip"))) == 2
+    assert len(list((tmp_path / "gtfs").glob("id-*/*.zip"))) == 2
     assert copy == tmp_path / "out" / "mdb-1-b.zip"
     provenance = json.loads(copy.with_suffix(".provenance.json").read_text())
     assert provenance["dataset_id"] == "mdb-1-b" and "cache" not in provenance
@@ -1140,3 +1140,93 @@ def test_clear_waits_for_a_fetch_holding_a_feeds_lock(tmp_path):
     order.append("cleared")
     thread.join()
     assert order == ["released", "cleared"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="each feed keeps its own copy on Windows")
+def test_identical_archives_of_two_feeds_are_stored_once(tmp_path):
+    import transitio.cache
+
+    payload, requests = _zip_bytes({"a.txt": b"1"}), []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, content=payload)
+
+    def download_both():
+        paths = []
+        for client in ("mdb", "atlas"):
+            owner, download = _moving_target(
+                client, tmp_path, httpx.MockTransport(handler)
+            )
+            with owner:
+                paths.append(download())
+        return paths
+
+    mdb, atlas = download_both()
+    blob = tmp_path / "gtfs" / "blobs" / mdb.name
+    assert os.path.samefile(mdb, atlas) and os.path.samefile(blob, mdb)
+    table = transitio.cache.info(tmp_path)
+    assert list(table["shared_with"]) == [1, 1]
+    assert table.attrs["saved_bytes"] == len(payload)
+    # The shared file damaged: the first feed downloads into a new blob and
+    # the second links to that, with no download.
+    blob.chmod(0o644)
+    blob.write_bytes(b"damaged")
+    assert [p.read_bytes() for p in download_both()] == [payload] * 2
+    assert len(requests) == 3
+    # Clearing one feed keeps the blob for the other; the damaged file goes.
+    assert transitio.cache.clear(tmp_path, feeds=["mdb-7"]) > 0
+    assert os.path.samefile(blob, atlas)
+    assert [p.name for p in blob.parent.iterdir()] == [blob.name]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="each feed keeps its own copy on Windows")
+def test_where_links_fail_each_feed_keeps_its_own_copy(tmp_path, monkeypatch):
+    import transitio.cache
+
+    def refuse(*args, **kwargs):
+        raise OSError("hard links not supported")
+
+    monkeypatch.setattr(os, "link", refuse)
+    payload = _zip_bytes({"a.txt": b"1"})
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=payload)
+    )
+    paths = []
+    for client in ("mdb", "atlas"):
+        owner, download = _moving_target(client, tmp_path, transport)
+        with owner:
+            paths.append(download())
+    assert not os.path.samefile(*paths)
+    table = transitio.cache.info(tmp_path)
+    assert list(table["shared_with"]) == [0, 0] and table.attrs["saved_bytes"] == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="each feed keeps its own copy on Windows")
+def test_a_damaged_version_is_copied_from_its_blob_where_links_fail(
+    tmp_path, monkeypatch
+):
+    payload, requests = _zip_bytes({"a.txt": b"1"}), []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, content=payload)
+
+    def download(client):
+        owner, fetch = _moving_target(client, tmp_path, httpx.MockTransport(handler))
+        with owner:
+            return fetch()
+
+    mdb, atlas = download("mdb"), download("atlas")
+    # The shared file damaged: the first feed downloads a new blob.
+    mdb.chmod(0o644)
+    mdb.write_bytes(b"damaged")
+    download("mdb")
+
+    def refuse(*args, **kwargs):
+        raise OSError("hard links not supported")
+
+    monkeypatch.setattr(os, "link", refuse)
+    # The second, unable to link to it, takes a copy without a download.
+    assert download("atlas").read_bytes() == payload and len(requests) == 3
+    assert not os.access(atlas, os.W_OK)

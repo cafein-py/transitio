@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- Downloaded feeds are kept in a download cache, `<cache_dir>/gtfs` (by
+  default the platform cache), one version per distinct archive, named by
+  its SHA-256, beside a `.provenance.json` sidecar recording every
+  acquisition. `fetch` serves a feed from a cached version that serves the
+  request without downloading it: the version that served the same request
+  before, else the newest. A day no cached version serves downloads the feed
+  and keeps the older versions, so a repeated run delivers the same feeds
+  and reports, offline too. The selection table gains a `cache` column
+  (`downloaded`, `reused`, `refreshed` or `fallback`).
+- `use_cache=False` on `fetch`, `MobilityDatabase.download`,
+  `MobilityDatabase.download_latest` and `TransitlandAtlas.download`
+  downloads again and replaces the feed's cached versions; when every
+  attempt of a `fetch` refresh fails, the cached version is delivered with a
+  `UserWarning`.
+- What `fetch` makes of a cached version (crop, repair and validation
+  results) is stored with it and read back by a later call making the same,
+  and a dataset's hosted validation report is stored at its first use.
+- `transitio.cache.info()` lists what the cache holds, with its sizes, and
+  `transitio.cache.clear()` empties it, or removes versions unused for a time
+  (`older_than`) or the versions of some feeds (`feeds`).
+- Identical archives of several feeds are stored once, as hard links to one
+  blob; on Windows, and where a link cannot be made, each feed keeps its own
+  copy.
+
+### Changed
+
+- `fetch(directory=...)` receives only the delivered feeds, the crop,
+  repair or a copy of the cached version, beside their provenance sidecars;
+  downloads always go to the cache, and a `directory` inside it is refused.
+  Without `directory`, the catalog clients' download methods return the
+  read-only cached file; with it, a writable copy at the same path as
+  before.
+- A report's provenance describes the first acquisition of the version
+  delivered, so a reused version is reported as when it was downloaded.
+- On the place path, a cached version counts as unchanged since indexed for
+  `contained="drop"` only by a probe recorded under the index snapshot in
+  use, and a key-protected feed without usable credentials uses only copies
+  fetched without them.
+
 ## 0.19.1 — 2026-10-02
 
 ### Changed
