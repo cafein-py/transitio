@@ -2362,15 +2362,11 @@ def test_a_failed_extract_download_keeps_the_fetched_feeds(
         return
     with pytest.warns(UserWarning, match="OSM extract not fetched"):
         result = fetch(**options)
-    delivered, last = result.selection
+    (delivered,) = result.selection
     assert delivered["decision"] == "delivered"
     assert result.feeds == [delivered["path"]]
     assert (result.osm_pbf, result.osm_area) == (None, None)
-    assert (last["feed_id"], last["decision"], last["note"]) == (
-        None,
-        None,
-        f"OSM extract not fetched: {_EXTRACT_TIMEOUT}",
-    )
+    assert result.osm_note == f"OSM extract not fetched: {_EXTRACT_TIMEOUT}"
 
 
 _HIDDEN_NOTE = (
@@ -2443,9 +2439,7 @@ def test_an_empty_default_view_is_not_fetched_silently(
         assert (warned, calls, entry["decision"]) == ([], ["f-bus"], "delivered")
         return
     assert (warned, calls, result.feeds) == ([note], [], [])
-    assert [(e["feed_id"], e["decision"], e["note"]) for e in result.selection] == [
-        (None, None, note)
-    ]
+    assert (result.selection, result.view_note) == ([], note)
 
 
 @pytest.mark.parametrize("osm", [True, False])
@@ -2489,15 +2483,13 @@ def test_stops_beyond_the_osm_area_are_counted(tmp_path, monkeypatch, osm):
     monkeypatch.setattr("transitio.catalog.TransitlandAtlas._fetch_static", download)
     monkeypatch.setattr("transitio.osm.fetch_pbf", lambda *a, **k: tmp_path / "a.pbf")
     result = fetch(place="c", index=index, directory=tmp_path / "out", osm=osm)
-    entry, *notes = result.selection
+    (entry,) = result.selection
     assert entry["decision"] == "delivered"
     if not osm:
-        assert (entry["stops_outside_osm"], notes) == (None, [])
+        assert (entry["stops_outside_osm"], result.osm_note) == (None, None)
         return
-    (last,) = notes
-    assert (entry["stops_outside_osm"], last["feed_id"], last["note"]) == (
+    assert (entry["stops_outside_osm"], result.osm_note) == (
         1,
-        None,
         "OSM area: 1 of 3 located stops outside it",
     )
 

@@ -119,9 +119,9 @@ def test_fetch_end_to_end(pipeline_env):
         )
     assert result.osm_pbf == fake_pbf
     assert result.osm_area.bounds == (24.6, 60.1, 25.2, 60.4)
-    # Every stop lies in the area, so no OSM note entry follows the feed's.
+    # Every stop lies in the area, so there is no OSM note.
     (entry,) = result.selection
-    assert entry["stops_outside_osm"] == 0
+    assert entry["stops_outside_osm"] == 0 and result.osm_note is None
     assert len(result.feeds) == 1
     assert "-cropped" in result.feeds[0].name
     assert result.feeds[0].suffix == ".zip"
@@ -825,14 +825,13 @@ def _partitioned_index(
     return transitio_index.read_index(directory)
 
 
-def test_a_kept_contained_feed_is_reported(tmp_path, monkeypatch):
+def test_contained_keep_leaves_no_feed_out(tmp_path, monkeypatch):
     import pathlib
 
     ids = ("f-a", "f-b", "f-c")
     index = _partitioned_index(
         tmp_path, monkeypatch, dict.fromkeys(ids, {}), contained={"f-c": ["f-b"]}
     )
-    # f-b repeats f-a's trip, so f-a carries part of f-c's container.
     later = {"stop_times.txt": GTFS["stop_times.txt"].replace("08:", "10:")}
     other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "VR"), **later}
     payloads = {"f-a": _zip(GTFS), "f-b": _zip(PARTIAL), "f-c": _zip(other)}
@@ -865,7 +864,7 @@ def test_a_kept_contained_feed_is_reported(tmp_path, monkeypatch):
         (e["feed_id"], e["decision"], e["contained_in"]) for e in result.selection
     ]
     assert sorted(fetched) == list(ids) and len(result.feeds) == 3
-    assert result.contained == {"f-c": ["f-a", "f-b"]}
+    assert result.contained == {}
     assert decisions == [(i, "delivered", []) for i in ids]
 
 
@@ -1398,7 +1397,8 @@ NEAR_NINE = {
 # A network on a placeholder calendar, and the note it gets.
 HELD = {"start": "20000101", "end": "20990101"}
 HELD_NOTE = "placeholder calendar 2000-01-01 to 2099-01-01"
-KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
+KEPT = "+ kept: containment in C not proven current"
+SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
 
 
 @pytest.mark.filterwarnings("ignore:no Mobility Database API token")
@@ -1410,8 +1410,8 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
             {"X": {**ABC, "cut": "a b"}, "Y": {**ABC, "cut": "b c"}},
             {},
             {
-                "X": "+ cut to routes a, b",
-                "Y": "+ cut to routes b, c; 1 repeated trips of X left out [X] (1)",
+                "X": "+ cut to 2 of 3 routes",
+                "Y": "+ cut to 2 of 3 routes; 1 repeated trips of X left out [X] (1)",
             },
         ),
         ({"F": IN_C, "C": {**C, "renewed": True}}, {}, {"C": "+", "F": KEPT}),
@@ -1420,8 +1420,8 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
             {"F": IN_C, "C": {**AB, "cut": "a"}},
             {},
             {
-                "C": "+ cut to routes a",
-                "F": "+ kept: container C cropped to selected routes",
+                "C": "+ cut to 1 of 2 routes",
+                "F": f"+ {WHOLE}; kept: container C cropped to selected routes",
             },
         ),
         (
@@ -1433,15 +1433,15 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
             {"P": {**AB, "cut": "a"}, "C": AB, "F": IN_C},
             {},
             {
-                "P": "+ cut to routes a",
-                "C": "+ 1 repeated trips of P left out [P] (1)",
-                "F": SKIP_C,
+                "P": "+ cut to 1 of 2 routes",
+                "C": f"+ {WHOLE}; 1 repeated trips of P left out [P] (1)",
+                "F": f"{SKIP_C} -> P C",
             },
         ),
         (
             {"C": AB, "P": {**AB, "cut": "a"}, "F": IN_C},
             {},
-            {"C": "+", "P": "- same content as C [C]", "F": SKIP_C},
+            {"C": f"+ {WHOLE}", "P": "- same content as C [C]", "F": f"{SKIP_C} -> C"},
         ),
         (
             {"A": NEW, "B": OLD},
@@ -1496,12 +1496,12 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
         (
             {"V": {**NEW, "hours": (9,)}, "C": OLD, "F": IN_C},
             ON_DAY,
-            {"V": "+", "C": "+", "F": SKIP_C},
+            {"V": "+", "C": "+", "F": f"{SKIP_C} -> C"},
         ),
         (
             {"V": {**NEW, "hours": (9,)}, "E": OLD, "C": OLD, "F": IN_C},
             ON_DAY,
-            {"V": "+", "E": "+", "C": "- same content as E [E]", "F": SKIP_C},
+            {"V": "+", "E": "+", "C": "- same content as E [E]", "F": f"{SKIP_C} -> E"},
         ),
         (
             {
@@ -1586,7 +1586,11 @@ def test_fetch_delivers_one_copy_per_service(
     tmp_path, monkeypatch, feeds, options, expected
 ):
     result, downloads = _fetch_networks(tmp_path, monkeypatch, feeds, **options)
-    assert {e["feed_id"]: _seen(e) for e in result.selection} == expected
+    seen = {e["feed_id"]: _seen(e) for e in result.selection}
+    # A feed left out as contained, then the delivered feeds carrying it.
+    for feed_id, carriers in result.contained.items():
+        seen[feed_id] += f" -> {' '.join(carriers)}"
+    assert seen == expected
     if options.get("duplicate_trips") == "keep":
         # Nothing is compared, so no feed counts repeats.
         assert {e["duplicate_trips"] for e in result.selection} == {None}
@@ -2004,7 +2008,7 @@ def test_containment_from_the_cache_follows_the_proofs_of_the_snapshot(
         result = fetch(cache_dir=cache_dir, **options)
         return [(e["feed_id"], e["decision"], e["note"]) for e in result.selection]
 
-    kept = "kept: containment not proven current"
+    kept = "kept: containment in f-b not proven current"
     assert decisions() == [("f-a", "delivered", kept), ("f-b", "delivered", None)]
     # f-a's version as a probe under this snapshot would have proven it.
     cache = FeedCache(cache_dir)
@@ -2042,7 +2046,7 @@ def test_a_container_read_from_the_hosted_copy_proves_nothing(tmp_path, monkeypa
     first = fetch(cache_dir=cache_dir, **options)
     online[0] = False
     again = fetch(cache_dir=cache_dir, **options)
-    kept = "kept: containment not proven current"
+    kept = "kept: containment in f-b not proven current"
     for result in (first, again):
         notes = {e["feed_id"]: (e["decision"], e["note"]) for e in result.selection}
         assert notes["f-a"] == ("delivered", kept)
@@ -2670,9 +2674,9 @@ def test_fetch_place_fetches_the_osm_extract_last_for_the_served_parts(
     assert must_cover == shapely.multipoints([(24.931, 60.169), (24.941, 60.171)])
     assert result.osm_pbf == fake_pbf
     assert result.osm_area.equals(_buffered(served, 1600))
-    *_, note = result.selection
-    assert note["feed_id"] is None and note["decision"] is None
-    assert note["note"].startswith("OSM area: 1 of 2 parts (")
+    (entry,) = result.selection
+    assert entry["decision"] == "delivered"
+    assert result.osm_note.startswith("OSM area: 1 of 2 parts (")
 
 
 # route -> (agency, stop, trip, route_type); a1 carries local+regional.
@@ -2859,7 +2863,7 @@ def test_fetch_place_crops_bundles_to_the_selected_routes(
     assert ("unexpected_enum_value" in codes) == (not repair)
     (selection,) = result.selections
     assert selection["feed_id"] == "f-a"
-    assert result.selection[0]["note"] == "cut to routes r-local, r-reg"
+    assert result.selection[0]["note"] == "cut to 2 of 4 routes"
     assert selection["selector_state"] == "complete"
     assert selection["trusted"] is True and selection["reason"] is None
     assert selection["kept"] == ["r-local", "r-reg"]
@@ -3017,6 +3021,7 @@ def test_fetch_place_stale_selector_follows_on_untrusted_selector(
     }
     (sel,) = whole.selections
     assert sel["trusted"] is False and sel["reason"] == "stale" and sel["kept"] is None
+    assert whole.selection[0]["note"] == "delivered whole: selector out of date"
 
     # auto + exclude: the exclusion is a hard constraint, so the feed is skipped.
     _stub_pbf_and_atlas(monkeypatch, tmp_path, payload)
@@ -3099,7 +3104,7 @@ def test_a_cached_version_lacking_a_selected_route_is_passed_over(
     options = dict(place="Q1757", index=index, crop=False, osm=False, tiers=["local"])
     result = fetch(cache_dir=tmp_path / "cache", **options)
     (entry,) = result.selection
-    assert (entry["cache"], entry["note"]) == ("reused", "cut to routes r-local")
+    assert (entry["cache"], entry["note"]) == ("reused", "cut to 1 of 4 routes")
     origin = result.reports[0]["summary"]["provenance"]
     assert origin["sha256"] == hashlib.sha256(carrying).hexdigest()
 
@@ -3148,12 +3153,12 @@ _EXTRACT_FAILURE = "https://download.example/extract.osm.pbf: HTTP 404 Not Found
 
 
 @pytest.mark.parametrize(
-    "osm, notes",
-    [(False, []), (True, [f"OSM extract not fetched: {_EXTRACT_FAILURE}"])],
+    "osm, note",
+    [(False, None), (True, f"OSM extract not fetched: {_EXTRACT_FAILURE}")],
     ids=["osm-off", "download-failed"],
 )
 def test_fetch_aoi_without_an_extract_keeps_the_feeds(
-    pipeline_env, monkeypatch, osm, notes
+    pipeline_env, monkeypatch, osm, note
 ):
     tmp_path, _ = pipeline_env
 
@@ -3172,12 +3177,9 @@ def test_fetch_aoi_without_an_extract_keeps_the_feeds(
         )
     assert (result.osm_pbf, result.osm_area) == (None, None)
     assert len(result.feeds) == 1  # the GTFS side is unaffected
-    # The note entry comes after the feed's.
-    assert [(e["feed_id"], e["note"]) for e in result.selection[1:]] == [
-        (None, note) for note in notes
-    ]
+    assert (len(result.selection), result.osm_note) == (1, note)
     warned = [str(w.message) for w in caught if "OSM" in str(w.message)]
-    assert warned == [f"{note}; osm_pbf is None" for note in notes]
+    assert warned == ([] if note is None else [f"{note}; osm_pbf is None"])
 
 
 def test_fetch_place_without_osm_skips_the_extract(tmp_path, monkeypatch):

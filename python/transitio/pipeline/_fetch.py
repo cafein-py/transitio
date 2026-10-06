@@ -61,33 +61,36 @@ class FetchResult:
     reports: list
     repairs: list
     skipped: list
+    # How each feed's route selector was checked and applied on the place
+    # path (keys as fetch's Returns lists them); empty without tiers,
+    # exclude or on_unknown="exclude".
     selections: list = dataclasses.field(default_factory=list)
     provenance: dict = None
     # The index snapshot the feeds were discovered from; None for the AOI path,
     # which discovers by bounding box and has no snapshot.
     snapshot: str = None
-    # {feed id: [ids of delivered feeds containing it]} over the delivered
-    # feeds, from the index's contained_in (schema 10), a container that lost
-    # repeated trips standing with the feeds holding them; empty otherwise.
+    # {feed id: [ids of the delivered feeds carrying it]} for each feed left
+    # out as contained, in selection order; empty otherwise.
     contained: dict = dataclasses.field(default_factory=dict)
     # One entry per candidate feed, in candidate order, with its decision;
-    # ``skipped`` lists the same skips. Entries with feed_id None note, after
-    # the candidates, the feeds an empty default view hides, and last the
-    # place parts the OSM extract leaves out and the delivered stops outside
-    # its area, or why it was not fetched.
+    # ``skipped`` lists the same skips.
     selection: list = dataclasses.field(default_factory=list)
     # The WGS84 area the OSM extract was fetched for; None without one. A
     # failed extract download leaves it and osm_pbf None. On the place path,
     # its parts farther than 1.6 km from every delivered stop may lack OSM data.
     osm_area: object = None
+    # The feeds an empty default view hides and the tiers that fetch them.
+    view_note: str | None = None
+    # The place parts the OSM extract leaves out and the delivered stops
+    # outside its area, or why it was not fetched.
+    osm_note: str | None = None
 
     def __iter__(self):  # convenient (pbf, feeds) unpacking
         return iter((self.osm_pbf, self.feeds))
 
     def selection_table(self):
         """The selection record as a ``pandas.DataFrame``, one row per
-        candidate feed, then the default-view and OSM note rows when there
-        are any."""
+        candidate feed."""
         import pandas as pd
 
         return pd.DataFrame(self.selection, columns=list(_SELECTION_FIELDS))
@@ -723,7 +726,7 @@ def _containers(feed, entries, carriers, cropped, current):
     """``(proven, notes)``: a candidate's containers carried whole and
     proven unchanged before download, and why each other decided one drops
     nothing."""
-    proven, notes = [], []
+    proven, unproven, notes = [], [], []
     for container in feed.contained_in:
         if container == feed.feed_id or container not in entries:
             continue
@@ -731,15 +734,20 @@ def _containers(feed, entries, carriers, cropped, current):
         if decision is None:
             continue
         if container in carriers:
-            if current.get(container):
-                proven.append(container)
-            else:
-                notes.append("kept: containment not proven current")
+            (proven if current.get(container) else unproven).append(container)
         elif container in cropped:
             notes.append(f"kept: container {container} cropped to selected routes")
         else:
             notes.append(f"kept: container {container} skipped")
+    if unproven:
+        notes.append(_unproven(unproven))
     return proven, notes
+
+
+def _unproven(containers):
+    """The note on a feed kept because its containment in ``containers`` is
+    not proven current."""
+    return f"kept: containment in {', '.join(containers)} not proven current"
 
 
 def _containers_first(feeds):
@@ -1725,19 +1733,24 @@ def fetch(
     ``"whole"`` always delivers it whole; ``"drop"`` always skips it;
     ``"error"`` raises :class:`~transitio.exceptions.StaleSelectorError`.
     A schema-10 index records the larger feeds whose stops and routes contain
-    a feed's, and ``FetchResult.contained`` reports the delivered pairs, a
-    container that lost repeated trips (below) with the feeds holding them. With
-    ``contained="drop"`` (default) containers are processed first, and a
-    contained feed is left out before download (``"contained in <id>"``)
+    a feed's (``IndexedFeed.contained_in``). With ``contained="drop"``
+    (default) containers are processed first, and a contained feed is left
+    out before download (``"contained in <id>"``)
     when a container was delivered whole (not cut to a route selection) or
     skipped as the same content as a feed delivered whole, and conditional
     ``HEAD`` probes (as for ``expired``) prove both archives unchanged since
     indexed: the container's, sent before its download, and the contained
     feed's. A container downloaded as a catalogued dataset proves nothing.
     Otherwise the feed is processed as usual and its ``note`` says why:
-    ``"kept: containment not proven current"``, ``"kept: container <id>
-    skipped"`` or ``"kept: container <id> cropped to selected routes"``.
-    ``contained="keep"`` leaves no feed out for containment.
+    ``"kept: containment in <ids> not proven current"``, ``"kept: container
+    <id> skipped"`` or ``"kept: container <id> cropped to selected routes"``.
+    ``FetchResult.contained`` maps each feed left out as contained to the
+    delivered feeds that carry it, in selection order: its containers, each
+    one skipped as the same content as a feed delivered whole standing for
+    that feed, and, with a container that lost repeated trips (below), the
+    feeds holding them; a feed with no such feed delivered is not listed.
+    ``contained="keep"`` leaves no feed out for containment, and
+    ``contained`` is empty.
 
     Resolves and crops the OSM extract, discovers the GTFS feeds (overlapping
     the AOI, or the place's indexed feeds), downloads each feed, spatially
@@ -1975,8 +1988,8 @@ def fetch(
         ``to_cafein`` builds without a walking network. A failed extract
         download does not abort the call: the feeds are still delivered,
         ``osm_pbf`` and ``osm_area`` are None, a ``UserWarning`` says so and
-        the last selection entry notes ``"OSM extract not fetched:
-        <error>"``; ``to_cafein`` then builds without a walking network, as
+        ``osm_note`` holds ``"OSM extract not fetched: <error>"``;
+        ``to_cafein`` then builds without a walking network, as
         with ``osm=False``. Other errors, such as ``ExtractNotFoundError``
         when no extract covers the area, still raise.
     directory : str or pathlib.Path, optional
@@ -2013,8 +2026,8 @@ def fetch(
         ``osm_pbf``, validated ``feeds`` (paths), merged ``reports`` and
         repair ``repairs`` (fix logs, empty without ``repair=True``) per
         kept feed, ``skipped`` (feed id, reason) pairs, the ``selection``
-        record and, on the place path, the ``contained`` pairs among the
-        delivered feeds. Reports merge the local validation of the delivered
+        record and, on the place path, ``selections`` and ``contained``
+        (above). Reports merge the local validation of the delivered
         feed with the hosted report of the published dataset, so after
         cropping or repair the hosted side describes the pre-transform
         original. A report's ``summary["droppedRows"]`` lists the rows the
@@ -2023,10 +2036,15 @@ def fetch(
         ``selection`` has one entry per candidate feed, in
         candidate order: ``feed_id``, ``name``, ``decision``
         (``"delivered"`` or ``"skipped"``), ``reason`` (why it was skipped),
-        ``note`` (about a delivered feed: the routes it was cut to, why a
-        contained feed was kept, a similar feed, ``"from the Mobility
-        Database hosted copy"`` after a failed download, an
-        ``agency_timezone`` not equivalent to the zone of most of its stops,
+        ``note`` (about a delivered feed: first ``"cut to <n> of <m>
+        routes"`` for one cut to a route selection (``"cut to <n> selected
+        routes"`` when its routes.txt was not read), or ``"delivered whole:
+        selector out of date"`` or ``"delivered whole: selector
+        unavailable"`` for one whose selector was not trusted, as
+        ``selections`` details; then why a contained feed was kept, a
+        similar feed, ``"from the Mobility Database hosted copy"`` after a
+        failed download, an ``agency_timezone`` not equivalent to the zone
+        of most of its stops,
         e.g. ``"agency_timezone America/New_York; stops in
         Pacific/Honolulu"``, a placeholder calendar, which a left-out
         version keeps, rows the crop left out, e.g. ``"dropped 1860
@@ -2037,7 +2055,7 @@ def fetch(
         the area path), ``feed_window`` (the computed window of a validated
         download, delivered or not; None otherwise or when unknown),
         ``same_as`` (earlier deliveries of the same archive) and
-        ``contained_in`` (the containers a containment skip names),
+        ``contained_in`` (the index's containers a containment skip names),
         ``version_of`` (for a left-out version, ``{"feed_id", "route_overlap",
         "stop_overlap"}`` against the highest-ranked kept version it pairs
         with, for an undated feed the highest-ranked dated one starting after
@@ -2063,21 +2081,32 @@ def fetch(
         without an extract or when its stops.txt cannot be read) and
         ``path`` (the delivered feed).
         Windows are ISO dates.
+        ``selections``, with ``tiers``, ``exclude`` or
+        ``on_unknown="exclude"``, has one entry per feed whose route
+        selector was checked, in the order decided: ``feed_id``,
+        ``selector_state`` (``"complete"``, ``"whole_feed"`` or
+        ``"unavailable"``), ``trusted``, ``reason`` (why it was not trusted:
+        ``"stale"``, ``"unavailable"`` or ``"route_absent"``; None when
+        trusted), ``kept`` and ``dropped`` (the feed's routes the selector
+        kept and removed, sorted; None when the feed was not cut, ``dropped``
+        ``[]`` for a whole-feed selector, or when its routes.txt was not
+        read), ``declared_as`` (the curator predicate of a complete selector
+        made from one, else None) and ``selected_by`` (per matched edge
+        ``{"tier", "selector_state", "route_ids"}``).
         When ``place`` is fetched without ``tiers`` and its default view
         (:meth:`~transitio.index.Place.feeds`) holds none of the place's
-        feeds, an entry with ``feed_id`` None after the candidates names
-        them and the tiers that fetch them, and a ``UserWarning`` repeats
-        it, e.g. ``"default view (region: secondary, tertiary) holds none of
-        the place's 2 feeds: f-a (primary), f-b (primary); tiers=['local']
-        fetches them"``.
+        feeds, ``view_note`` names them and the tiers that fetch them, and a
+        ``UserWarning`` repeats it, e.g. ``"default view (region: secondary,
+        tertiary) holds none of the place's 2 feeds: f-a (primary), f-b
+        (primary); tiers=['local'] fetches them"``.
         When the OSM extract leaves out parts of the place, or delivered
-        stops lie outside its area, a last entry with ``feed_id`` None
-        notes them, e.g. ``"OSM area: 1 of 47 parts (1783 of 2188 km²);
-        4970 of 10026 located stops outside it"``, the stops summed over
-        the delivered feeds, with ``"(stops.txt of 1 feed not read)"``
-        added for feeds not counted; when its download failed, the last entry
-        notes that instead, e.g. ``"OSM extract not fetched: Could not
-        download any of the 1 extracts that contain the area:
+        stops lie outside its area, ``osm_note`` notes them, e.g. ``"OSM
+        area: 1 of 47 parts (1783 of 2188 km²); 4970 of 10026 located stops
+        outside it"``, the stops summed over the delivered feeds, with
+        ``"(stops.txt of 1 feed not read)"`` added for feeds not counted;
+        when its download failed, it notes that instead, e.g. ``"OSM
+        extract not fetched: Could not download any of the 1 extracts that
+        contain the area:
         https://download.bbbike.org/osm/bbbike/Basel/Basel.osm.pbf (timed
         out)"``. ``FetchResult.selection_table()`` returns
         the record as a DataFrame. ``osm_area`` is the WGS84 geometry the OSM
@@ -2364,8 +2393,6 @@ def fetch(
         coords = {path: _stop_coords(path) for path in feeds}
         counts = _count_outside(record, geometry, coords)
         osm_note = _osm_note(geometry, geometry, *counts)
-    if osm_note is not None:
-        record.append({**_entry(None, None), "note": osm_note})
     return FetchResult(
         osm_pbf=osm_pbf,
         feeds=feeds,
@@ -2374,6 +2401,7 @@ def fetch(
         skipped=_skipped(record),
         selection=record,
         osm_area=None if osm_pbf is None else geometry,
+        osm_note=osm_note,
     )
 
 
@@ -2497,8 +2525,8 @@ def _osm_stops(area, coords):
 
 
 def _hidden_note(place, hidden):
-    """The selection-record note on a place whose default view holds none of
-    its ``hidden`` feeds: the view's categories, the feeds (at most five
+    """The ``view_note`` on a place whose default view holds none of its
+    ``hidden`` feeds: the view's categories, the feeds (at most five
     named) and the tiers that fetch them, local, regional and national when
     only unknown edges remain."""
     from transitio.index.feeds import CATEGORY_ORDER, _default_categories
@@ -2545,7 +2573,7 @@ def _count_outside(record, area, coords):
 
 
 def _osm_note(geometry, parts, outside=0, total=0, unread=0):
-    """The selection-record note on the OSM area: the parts of ``geometry``
+    """The ``osm_note`` on the OSM area: the parts of ``geometry``
     that ``parts`` leaves out, and the ``outside`` of ``total`` located
     stops outside the area with the ``unread`` feeds whose stops.txt was not
     read; None when no part is left out and neither count is non-zero."""
@@ -2708,8 +2736,7 @@ def _fetch_place(
         # through on_untrusted_selector rather than filtering silently.
         # on_unknown="exclude" is itself an edge filter, so this activates
         # even without an explicit tiers/exclude query.
-        routes = None
-        selection = None
+        routes = selection = applied = None
         if tiers is not None or exclude is not None or on_unknown != "include":
             sel = feed.selector
             selected_by = [
@@ -2750,6 +2777,8 @@ def _fetch_place(
                     return "skipped"
                 # action == "whole": deliver unfiltered (routes stays None),
                 # the selection recording why it was not filtered.
+                state = "unavailable" if reason == "unavailable" else "out of date"
+                applied = f"delivered whole: selector {state}"
             elif sel.state == "complete":
                 routes = set(sel.route_ids)
                 selection = {
@@ -2836,11 +2865,14 @@ def _fetch_place(
             decision="delivered", feed_window=window, path=path, same_as=same_as
         )
         if routes is not None:
-            notes.insert(0, "cut to routes " + ", ".join(sorted(routes)))
+            if present is None:
+                applied = f"cut to {len(routes)} selected routes"
+            else:
+                applied = f"cut to {len(present & routes)} of {len(present)} routes"
             cropped.add(feed.feed_id)
         else:
             carriers[feed.feed_id] = feed.feed_id
-        notes += [_timezone_note(path, budget), _dropped_note(report)]
+        notes = [applied, *notes, _timezone_note(path, budget), _dropped_note(report)]
         for text in dict.fromkeys(filter(None, notes)):
             _note(entry, text)
         reports.append(report)
@@ -2867,15 +2899,15 @@ def _fetch_place(
                 _skip(entry, "only unknown-tier edges")
     for feed in offered:
         entry_for(feed)
+    view_note = None
     if tiers is None and not offered:
         # An empty default view may hide feeds a tier query would fetch.
         hidden = place_obj.feeds(
             exclude=exclude, on_unknown=on_unknown, categories=None
         )
         if hidden:
-            note = _hidden_note(place_obj, hidden)
-            record.append({**_entry(None, None), "note": note})
-            warnings.warn(note, UserWarning, stacklevel=3)
+            view_note = _hidden_note(place_obj, hidden)
+            warnings.warn(view_note, UserWarning, stacklevel=3)
 
     cache = _feed_cache(cache_dir, directory)
     snapshot = provenance["snapshot"]
@@ -2950,7 +2982,7 @@ def _fetch_place(
             notes = list(notes)
             inside = proven if snapshot in version.index_proofs else ()
             if proven and not inside:
-                notes.append("kept: containment not proven current")
+                notes.append(_unproven(proven))
             if first["fetched_from"] == "mdb_latest" and (
                 first["download_errors"] or keyless
             ):
@@ -3054,7 +3086,7 @@ def _fetch_place(
                     _skip(entry, f"contained in {proven[0]}", contained_in=proven)
                     protected.update(carriers[c] for c in proven)
                     continue
-                notes.append("kept: containment not proven current")
+                notes.append(_unproven(proven))
             # The hosted validation report only describes the dataset's own
             # bytes, so it is attached only when the dataset supplied them.
             path = fetched_from = url = None
@@ -3155,21 +3187,20 @@ def _fetch_place(
     delivered_ids, feeds, reports, repairs = (
         [column[n] for n in rows] for column in (delivered_ids, feeds, reports, repairs)
     )
-    # A container that lost repeated trips is carried with the feeds holding them.
-    pairs = {
-        feed.feed_id: sorted(
-            {c for one in feed.contained_in for c in (one, *lost.get(one, ()))}
-            & set(delivered_ids) - {feed.feed_id}
-        )
-        for feed in kept
-        if feed.feed_id in delivered_ids
-    }
+    # A feed left out as contained is carried by its containers' carriers,
+    # and those that lost repeated trips by the feeds holding them too.
+    position = {entry["feed_id"]: n for n, entry in enumerate(record)}
+    pairs = {}
+    for entry in record:
+        held = {carriers[c] for c in entry["contained_in"]}
+        held |= {f for c in held for f in lost.get(c, ())}
+        pairs[entry["feed_id"]] = sorted(held & set(delivered_ids), key=position.get)
 
-    osm_pbf = osm_area = None
+    osm_pbf = osm_area = osm_note = None
     if osm:
         parts, coords = _osm_parts(geometry, feeds)
         osm_area = _buffered(parts, _OSM_BUFFER_M)
-        osm_pbf, note = _osm_extract(
+        osm_pbf, osm_note = _osm_extract(
             parts,
             buffer_m=_OSM_BUFFER_M,
             must_cover=_osm_stops(osm_area, coords),
@@ -3180,9 +3211,7 @@ def _fetch_place(
             osm_area = None
         else:
             counts = _count_outside(record, osm_area, coords)
-            note = _osm_note(geometry, parts, *counts)
-        if note is not None:
-            record.append({**_entry(None, None), "note": note})
+            osm_note = _osm_note(geometry, parts, *counts)
 
     return FetchResult(
         osm_pbf=osm_pbf,
@@ -3196,4 +3225,6 @@ def _fetch_place(
         contained={feed_id: ids for feed_id, ids in pairs.items() if ids},
         selection=record,
         osm_area=osm_area,
+        view_note=view_note,
+        osm_note=osm_note,
     )

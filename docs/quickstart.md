@@ -176,8 +176,8 @@ cafein may then find no walking network near such a stop and give it no
 footpaths. A journey that starts and ends in the area is routed as before;
 only a walking transfer at such a stop can be lost. The `stops_outside_osm` column of
 `result.selection_table()` counts each delivered feed's located stops, those
-with usable coordinates, outside `osm_area`, and the last row of the record
-sums them. The count is geometric and can differ from the number cafein
+with usable coordinates, outside `osm_area`, and `result.osm_note` sums
+them. The count is geometric and can differ from the number cafein
 reports without footpaths, either way: the extract spans the bounding box
 of the area and cafein snaps a stop up to 1.6 km away, while a stop inside
 the area can still lie far from any street or path.
@@ -382,9 +382,9 @@ metro's primary and secondary feeds (its local and regional service), a
 region's secondary and tertiary ones, a country's tertiary ones. A region or
 country of at most 1,000 km², such as Monaco or San Juan, is town-sized and
 keeps its primary, secondary and tertiary feeds. When `fetch(place=...)`
-without tiers finds the default view empty while the place has feeds, an
-entry of the selection record names them and the `tiers` that fetch them,
-and a warning repeats it. `exclude` drops named tiers and
+without tiers finds the default view empty while the place has feeds,
+`result.view_note` names them and the `tiers` that fetch them, and a
+warning repeats it. `exclude` drops named tiers and
 `requires=["shapes.txt"]` keeps only feeds carrying those files.
 `feed.realtime` lists the GTFS-realtime companions tied to a static feed;
 the companions the index could not tie to one are in
