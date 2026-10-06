@@ -34,6 +34,7 @@ box in WGS84. The pipeline:
 ```python
 result.osm_pbf     # pathlib.Path of the cropped .osm.pbf
 result.feeds       # list of GTFS zip paths
+result.paths       # {feed id: path}, in the order of result.feeds
 result.reports     # per-feed merged validation reports (dicts)
 result.repairs     # per-feed repair fix logs (empty without repair=True)
 result.skipped     # [(feed id, reason), ...]
@@ -213,8 +214,25 @@ snapshot in use. For a feed that needs an account, credentials for its
 provider count alike whichever key they hold, and a call without them uses
 only copies fetched without them.
 
-With `directory=` the delivered feeds are copied there; without it they are
-the files in the cache, read-only on Linux and macOS.
+With `directory=` the delivered feeds are copied there, each named by its
+feed id: `f-nvbw~ding.zip` beside its provenance sidecar
+`f-nvbw~ding.provenance.json`. An id that is not a safe file name, such as
+`f-u2f-pražskáintegrovanádoprava`, becomes its ASCII form, `+` and the id's
+SHA-256: `f-u2f-prazskaintegrovanadoprava+<sha256>.zip`. A later call that
+delivers the same feed into the same directory replaces its files, and one
+that leaves the feed out for repeating other feeds' trips removes its file;
+give calls that run at the same time, or whose results you want to keep
+side by side, a directory each. Without `directory=` the delivered
+feeds are the files in the cache, read-only on Linux and macOS. Either way
+`result.paths` maps each delivered feed's id to its file:
+
+```python
+result = transitio.fetch(place="Helsinki", when="2026-09-01", directory="feeds")
+for feed_id, path in result.paths.items():
+    print(feed_id, path.name)
+```
+
+`transitio.cache` lists what the cache holds and clears it:
 
 ```python
 import datetime

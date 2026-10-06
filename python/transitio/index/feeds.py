@@ -90,10 +90,14 @@ class ServiceLevel:
 
     ``stops`` are distinct scheduled stops inside the place, ``routes`` the
     routes with a scheduled stop there, and ``departures_per_day`` the
-    scheduled stop-events at those stops per average calendar day — ``None``
-    when nothing could be measured: the feed's timetable was not read (a
-    feed that legitimately skipped ``stop_times``, or a declared-only
-    placement), or it carried no usable calendar to weight the events by.
+    scheduled stop-events at those stops per day, averaged over the period
+    the feed's timetable covers: from the first to the last date running at
+    least a quarter of its busiest day's trips, the quieter days inside that
+    period included, not the calendar's whole extent. It is ``None`` when
+    nothing could be measured: the feed's timetable was not read (a feed
+    that legitimately skipped ``stop_times``, or a declared-only placement),
+    or it carried no usable calendar to weight the events by. Snapshots
+    built before this rule average over the calendar's whole extent.
     """
 
     def __init__(self, record):
@@ -519,7 +523,10 @@ class IndexedFeed:
     @property
     def relevance(self):
         """The pair's relevance score (identical on every edge of the pair),
-        or None on an index without relevance."""
+        or None on an index without relevance. The score grows with the
+        feed's share of the place's service; a feed whose service had ended
+        more than 30 days before it was crawled (stale when indexed) counts
+        in no feed's share of the place and has a share of 0."""
         scores = [e.relevance for e in self.edges.values() if e.relevance is not None]
         return max(scores) if scores else None
 

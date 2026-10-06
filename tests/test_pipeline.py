@@ -122,9 +122,7 @@ def test_fetch_end_to_end(pipeline_env):
     # Every stop lies in the area, so there is no OSM note.
     (entry,) = result.selection
     assert entry["stops_outside_osm"] == 0 and result.osm_note is None
-    assert len(result.feeds) == 1
-    assert "-cropped" in result.feeds[0].name
-    assert result.feeds[0].suffix == ".zip"
+    assert result.paths == {"mdb-10": tmp_path / "mdb-10.zip"}
     (report,) = result.reports
     assert report["summary"]["counts"]["errors"] == 0
     assert result.skipped == []
@@ -184,7 +182,8 @@ def test_an_area_fetch_keeps_each_feeds_download_apart(pipeline_env, monkeypatch
     agencies = {zipfile.ZipFile(p).read("agency.txt") for p in result.feeds}
     assert len(agencies) == 2
     # The repeat downloads no feed: each is its one cached version, acquired
-    # once; the directory holds only the crops.
+    # once; the directory holds only the crops, the repeat's replacing the
+    # first call's.
     assert [e["cache"] for e in first.selection + result.selection] == (
         ["downloaded"] * 2 + ["reused"] * 2
     )
@@ -194,7 +193,7 @@ def test_an_area_fetch_keeps_each_feeds_download_apart(pipeline_env, monkeypatch
         sidecar = json.loads(path.with_suffix(".provenance.json").read_text())
         assert len(sidecar["cache"]["sources"]) == 1
     assert sorted((tmp_path / "out").rglob("*.zip")) == sorted(result.feeds)
-    assert all("-cropped" in p.name for p in result.feeds)
+    assert sorted(p.name for p in result.feeds) == ["mdb-10.zip", "mdb-11.zip"]
     if os.name != "nt":
         crops = (tmp_path / "cache").rglob("*-cropped*.zip")
         assert not any(os.access(path, os.W_OK) for path in crops)
@@ -2407,6 +2406,27 @@ def test_fetch_place_skips_a_feed_whose_provenance_sidecar_is_unreadable(
     assert result.feeds == []
 
 
+@pytest.mark.parametrize(
+    "feed_id, name",
+    [
+        ("f-nvbw~ding", "f-nvbw~ding"),
+        # A plain id spelling another id's ASCII form keeps a name of its own.
+        ("f-abc", "f-abc"),
+        ("F-ABC", "f-abc+{sha}"),
+        ("f-u2f-pražskáintegrovanádoprava", "f-u2f-prazskaintegrovanadoprava+{sha}"),
+        ("f-あおい交通", "f+{sha}"),
+        ("con", "con+{sha}"),
+        # 120 characters, cut to 80 and stripped of the "-" the cut ends on.
+        ("f-" + "a" * 77 + "-" + "b" * 40, "f-" + "a" * 77 + "+{sha}"),
+    ],
+)
+def test_delivered_name(feed_id, name):
+    from transitio.pipeline._fetch import _delivered_name
+
+    sha = hashlib.sha256(feed_id.encode("utf-8")).hexdigest()
+    assert _delivered_name(feed_id) == name.format(sha=sha)
+
+
 def test_a_place_fetch_keeps_its_download_as_a_cached_version(tmp_path, monkeypatch):
     index = _place_index(
         tmp_path, {"atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}}}
@@ -2429,19 +2449,20 @@ def test_a_place_fetch_keeps_its_download_as_a_cached_version(tmp_path, monkeypa
     ] * 2
     assert not list(cache.rglob(".staging"))
     # The directory holds the delivered copy; reports describe the first download.
-    assert [p.name for p in out.rglob("*.zip")] == [version.name]
+    assert [p.name for p in out.rglob("*.zip")] == ["f-a.zip"]
     origin = [r["summary"]["provenance"] for r in first.reports + second.reports]
     assert origin[0] == origin[1]
     assert origin[0]["retrieved_at"] == sources[0]["retrieved_at"]
     with pytest.raises(ValueError, match="outside the download cache"):
         fetch(cache_dir=cache, **{**options, "directory": cache / "gtfs" / "out"})
     if os.name != "nt":
-        # A feed folder in the directory linking into the cache is refused.
+        # A link at a delivered name, into the cache, is replaced.
         linked = tmp_path / "linked"
         linked.mkdir()
-        (linked / version.parent.name).symlink_to(version.parent)
+        (linked / "f-a.zip").symlink_to(version)
         result = fetch(cache_dir=cache, **{**options, "directory": linked})
-        assert result.skipped[0][1].endswith(" is a symlink")
+        assert result.feeds == [linked / "f-a.zip"]
+        assert not result.feeds[0].is_symlink()
         assert version.read_bytes() == _gtfs_payload()
 
 
@@ -2528,8 +2549,8 @@ def test_fetch_place_dataset_selection_failure_falls_back(tmp_path, monkeypatch)
 
 
 def test_fetch_place_output_names_differ_by_geometry(tmp_path, monkeypatch):
-    # The same place id with different geometry must not share an output name,
-    # or one fetch would overwrite the other's differently-cropped feed.
+    # The same place id with different geometry must not share a stored
+    # output, or one fetch would read back the other's differently-cropped feed.
     import shapely
 
     import transitio
@@ -2538,13 +2559,12 @@ def test_fetch_place_output_names_differ_by_geometry(tmp_path, monkeypatch):
         tmp_path, {"atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}}}
     )
     _stub_pbf_and_atlas(monkeypatch, tmp_path, _gtfs_payload())
-    out = tmp_path / "out"
     place_obj = transitio.place("Q1757", index=index)
-    first = fetch(place=place_obj, directory=out)
+    first = fetch(place=place_obj)
     # Still around the fixture's stops, so the crop keeps its trip.
     place_obj._record["geometry"] = shapely.box(24.92, 60.16, 24.95, 60.18)
-    second = fetch(place=place_obj, directory=out)
-    assert first.feeds[0].name != second.feeds[0].name
+    second = fetch(place=place_obj)
+    assert first.feeds[0] != second.feeds[0]
 
 
 # A two-part place: the first part holds the GTFS fixture's stops.
@@ -2910,11 +2930,10 @@ def test_fetch_place_output_names_differ_by_selected_routes(tmp_path, monkeypatc
         ),
     )
     _stub_pbf_and_atlas(monkeypatch, tmp_path, payload)
-    out = tmp_path / "out"
-    a = fetch(place="Q1757", index=index, directory=out, crop=False, tiers=["local"])
-    b = fetch(place="Q1757", index=index, directory=out, crop=False, tiers=["regional"])
-    # Different tier selections must not overwrite each other's cropped feed.
-    assert a.feeds[0].name != b.feeds[0].name
+    a = fetch(place="Q1757", index=index, crop=False, tiers=["local"])
+    b = fetch(place="Q1757", index=index, crop=False, tiers=["regional"])
+    # Different tier selections must not share a stored cropped feed.
+    assert a.feeds[0] != b.feeds[0]
 
 
 def test_fetch_place_on_unknown_governs_bundle_routes(tmp_path, monkeypatch):

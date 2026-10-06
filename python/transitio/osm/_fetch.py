@@ -128,9 +128,15 @@ def _fmt_coord(value):
     return f"{value:.5f}".rstrip("0").rstrip(".")
 
 
+def _slug(text):
+    """``text`` lowercased, each run of characters other than ASCII letters
+    and digits made one ``-``, with no ``-`` at either end."""
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
 def _crop_filename(aoi, geometry, must_cover=None):
     if isinstance(aoi, str) and must_cover is None:
-        slug = re.sub(r"[^a-z0-9]+", "-", aoi.lower()).strip("-") or "place"
+        slug = _slug(aoi) or "place"
         # Distinct place names can normalize to one slug (non-ASCII names
         # especially); the digest keeps their cache entries apart.
         digest = hashlib.sha256(aoi.encode("utf-8")).hexdigest()[:8]

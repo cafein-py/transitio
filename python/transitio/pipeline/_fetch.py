@@ -10,6 +10,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import shutil
 import tempfile
 import warnings
@@ -30,6 +31,14 @@ _STOP_DECIMALS = 3
 
 # Metres the place path grows the OSM area by: cafein's default snap distance.
 _OSM_BUFFER_M = 1600
+
+# Feed ids a delivered feed is named by as they are: lowercase ASCII, at
+# most 100 characters, and none of the device names Windows reserves.
+_PLAIN_NAME = re.compile(r"[a-z0-9][a-z0-9_~-]*")
+_DEVICE_NAMES = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + [f"{port}{n}" for port in ("com", "lpt") for n in range(1, 10)]
+)
 
 # The fields of a selection-record entry, in selection_table's column order.
 _SELECTION_FIELDS = (
@@ -87,6 +96,17 @@ class FetchResult:
 
     def __iter__(self):  # convenient (pbf, feeds) unpacking
         return iter((self.osm_pbf, self.feeds))
+
+    @property
+    def paths(self):
+        """``{feed id: path}`` of the delivered feeds, in the order of
+        ``feeds``, so ``list(result.paths.values()) == result.feeds``."""
+        ids = {
+            entry["path"]: entry["feed_id"]
+            for entry in self.selection
+            if entry["decision"] == "delivered"
+        }
+        return {ids[path]: path for path in self.feeds}
 
     def selection_table(self):
         """The selection record as a ``pandas.DataFrame``, one row per
@@ -1585,16 +1605,31 @@ def _feed_cache(cache_dir, directory):
     return cache
 
 
+def _delivered_name(feed_id):
+    """The name, without extension, ``feed_id``'s feed is delivered under:
+    the id itself when it is a plain name, else its ASCII form cut to 80
+    characters, ``+`` and the id's SHA-256. No plain name holds a ``+``."""
+    from transitio.catalog._cache import _feed_dir
+    from transitio.index.places import _normalize
+    from transitio.osm._fetch import _slug
+
+    plain = _PLAIN_NAME.fullmatch(feed_id) and len(feed_id) <= 100
+    if plain and feed_id not in _DEVICE_NAMES:
+        return feed_id
+    slug = _slug(_normalize(feed_id))[:80].rstrip("-")
+    return f"{slug}+{_feed_dir(feed_id).removeprefix('id-')}"
+
+
 def _deliver(path, directory, provenance):
     """``path``, a feed made from a cached version, as delivered: copied into
-    ``directory`` beside a sidecar of its ``provenance`` when given, in its
-    feed's digest-named folder."""
-    from transitio.catalog._cache import _copy, _directory, _feed_dir
+    ``directory``, when given, as ``<name>.zip`` beside a sidecar of its
+    ``provenance``, ``<name>`` being its feed's :func:`_delivered_name`. A
+    file or link at either name is replaced."""
+    from transitio.catalog._cache import _copy
 
     if directory:
-        folder = pathlib.Path(directory) / _feed_dir(provenance["feed_id"])
-        _directory(folder)
-        path = _copy(path, folder / path.name, provenance)
+        name = _delivered_name(provenance["feed_id"])
+        path = _copy(path, pathlib.Path(directory) / f"{name}.zip", provenance)
     return path
 
 
@@ -1993,15 +2028,25 @@ def fetch(
         with ``osm=False``. Other errors, such as ``ExtractNotFoundError``
         when no extract covers the area, still raise.
     directory : str or pathlib.Path, optional
-        Where the delivered feeds are copied, each in its feed's
-        digest-named folder beside its provenance sidecar: the cropped,
+        Where the delivered feeds are copied, each as ``<name>.zip`` beside
+        its provenance sidecar ``<name>.provenance.json``: the cropped,
         route-filtered, repaired or deduplicated feed, or the cached version
         when none of those ran; a feed cut of repeated trips is written over
-        its copy there. A feed skipped or left out leaves nothing there.
-        Without it the delivered feeds are the files in the cache, an
-        untransformed one the read-only cached version itself. The OSM
-        extract goes here too. It must lie outside the download cache
-        (``ValueError``).
+        its copy there. The name is the feed id when it is lowercase ASCII
+        letters, digits, ``_``, ``~`` and ``-``, starting with a letter or
+        digit, at most 100 characters and not a Windows device name
+        (``con``, ``nul``, ``com1`` and the like); otherwise it is the id's
+        ASCII form cut to 80 characters, ``+`` and the id's SHA-256, e.g.
+        ``f-u2f-prazskaintegrovanadoprava+<sha256>`` for
+        ``f-u2f-pražskáintegrovanádoprava``. A later call delivering the
+        same feed into the same directory replaces its files, and one that
+        delivers it and then leaves it out for repeating other feeds' trips
+        removes its archive; a feed skipped before delivery leaves a file an
+        earlier call delivered for it in place. Calls running at the same
+        time need directories of their own. Without it the delivered feeds
+        are the files in the cache, an untransformed one the read-only
+        cached version itself. The OSM extract goes here too. It must lie
+        outside the download cache (``ValueError``).
     refresh_token, cache_dir, country_code
         Passed to the catalog and OSM layers; downloads are cached under
         ``cache_dir``, by default the platform cache.
@@ -2025,11 +2070,12 @@ def fetch(
     FetchResult
         ``osm_pbf``, validated ``feeds`` (paths), merged ``reports`` and
         repair ``repairs`` (fix logs, empty without ``repair=True``) per
-        kept feed, ``skipped`` (feed id, reason) pairs, the ``selection``
-        record and, on the place path, ``selections`` and ``contained``
-        (above). Reports merge the local validation of the delivered
-        feed with the hosted report of the published dataset, so after
-        cropping or repair the hosted side describes the pre-transform
+        kept feed, ``paths`` (``{feed id: path}`` of the same feeds, in the
+        order of ``feeds``), ``skipped`` (feed id, reason) pairs, the
+        ``selection`` record and, on the place path, ``selections`` and
+        ``contained`` (above). Reports merge the local validation of the
+        delivered feed with the hosted report of the published dataset, so
+        after cropping or repair the hosted side describes the pre-transform
         original. A report's ``summary["droppedRows"]`` lists the rows the
         crop left out (the ``dropped_rows`` of
         :func:`~transitio.gtfs.crop_feed`), None for a feed not cropped.

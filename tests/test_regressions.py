@@ -2283,7 +2283,8 @@ def test_feeds_nested_in_one_archive_are_read_from_it_once(
         place="Q1757", index=index, directory=out, crop=False, osm=False, expired="keep"
     )
     assert requests == [("GET", "/outer.zip")]
-    assert all(path.name.startswith("id-") for path in out.glob("*"))
+    # The directory holds the feeds' own files, not the archive.
+    assert {path.name.split(".")[0] for path in out.glob("*")} <= set(urls)
     if status == 404:
         reason = f"download failed: atlas: {outer}: HTTP 404 Not Found"
         assert sorted(result.skipped) == [("f-1", reason), ("f-2", reason)]
@@ -2501,3 +2502,52 @@ def test_selector_fingerprints_read_members_as_large_as_the_build():
     from transitio.index import fingerprint
 
     assert fingerprint._MAX_MEMBER_BYTES == 8 * 1024**3
+
+
+def test_delivered_feeds_are_named_by_feed_id(tmp_path, monkeypatch):
+    # Feeds delivered into a directory each sat in an id-<sha256> folder, so
+    # the feeds of a Munich fetch could be told apart only by their sidecars.
+    import hashlib
+    import json
+    import pathlib
+
+    import transitio.index as transitio_index
+    from index_fixture import HULL, covered_feed, edge, write_index
+    from transitio.pipeline import fetch
+
+    ids = ["f-u281z9-mvv", "f-nvbw~ding", "f-u2f-pražskáintegrovanádoprava"]
+    feeds = [
+        {
+            **covered_feed(feed_id, coverage_source="crawl"),
+            "coverage": HULL,
+            "atlas": {"urls": {"static_current": f"https://feeds.example/{n}.zip"}},
+        }
+        for n, feed_id in enumerate(ids)
+    ]
+    edges = [edge("Q1757", feed_id, tier="local") for feed_id in ids]
+    index = transitio_index.read_index(
+        write_index(tmp_path / "index", feeds=feeds, edges=edges)
+    )
+
+    def download(self, feed, directory=None):
+        # Each feed's trips run hours apart from the others', so none repeats.
+        n = ids.index(feed.feed_id)
+        times = FEED["stop_times.txt"].replace("08:", f"1{n}:").replace("09:", f"2{n}:")
+        tables = {**FEED, "stop_times.txt": times}
+        return write_zip(pathlib.Path(directory) / "latest.zip", tables)
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas._fetch_static", download)
+    out = tmp_path / "out"
+    result = fetch(
+        place="Q1757", index=index, directory=out, crop=False, osm=False, expired="keep"
+    )
+    sha = hashlib.sha256(ids[2].encode("utf-8")).hexdigest()
+    names = [*ids[:2], f"f-u2f-prazskaintegrovanadoprava+{sha}"]
+    assert result.paths == {i: out / f"{name}.zip" for i, name in zip(ids, names)}
+    assert list(result.paths.values()) == result.feeds
+    for feed_id, path in result.paths.items():
+        sidecar = json.loads(path.with_suffix(".provenance.json").read_text())
+        assert sidecar["feed_id"] == feed_id
+    files = [name + end for name in names for end in (".zip", ".provenance.json")]
+    assert sorted(path.name for path in out.iterdir()) == sorted(files)
