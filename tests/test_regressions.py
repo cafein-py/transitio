@@ -1783,6 +1783,23 @@ def test_copies_of_a_headway_network_are_merged_once(tmp_path):
     assert report["duplicate_trips"]["dropped"] == 1
 
 
+def test_copies_of_a_trip_coded_as_bus_and_local_bus_are_merged_once(tmp_path):
+    # Munich's city operator codes its buses 704 (local bus) where the
+    # regional feed codes them 3, so a merge kept both copies of each trip.
+    from transitio.edit import FeedEditor
+    from transitio.gtfs import merge_feeds
+
+    local = {**MIDLAND, "routes.txt": MIDLAND["routes.txt"].replace(",3\n", ",704\n")}
+    feeds = [
+        write_zip(tmp_path / f"{n}.zip", files)
+        for n, files in enumerate((MIDLAND, local))
+    ]
+    report = merge_feeds(feeds, tmp_path / "merged.zip", check=False)
+    merged = FeedEditor(tmp_path / "merged.zip").tables
+    assert list(merged["trips.txt"]["trip_id"]) == ["f1:t1"]
+    assert report["duplicate_trips"]["dropped"] == 1
+
+
 def _near_feed(moved, stop_times, extra):
     """A feed of trip ``g`` on route X36 and headway trip ``h`` on route
     506 over stops a to e, ``moved`` degrees north, and ``extra`` stops."""

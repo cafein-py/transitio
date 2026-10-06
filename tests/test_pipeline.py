@@ -439,14 +439,14 @@ def test_feed_modes_read_stripped_values_and_uneven_rows(tmp_path):
 
 
 def test_mode_type_extended_blocks():
-    from transitio.pipeline._fetch import _MODE_TYPES
+    from transitio.gtfs._schedule import MODE_TYPES
 
-    assert 300 in _MODE_TYPES["rail"]
-    assert 100 in _MODE_TYPES["rail"]
-    assert {400, 500, 600, 12} <= _MODE_TYPES["subway"]
-    assert {200, 700, 800, 11} <= _MODE_TYPES["bus"]
-    assert {900, 906, 5} <= _MODE_TYPES["tram"]
-    assert {1000, 1200} <= _MODE_TYPES["ferry"]
+    assert 300 in MODE_TYPES["rail"]
+    assert 100 in MODE_TYPES["rail"]
+    assert {400, 500, 600, 12} <= MODE_TYPES["subway"]
+    assert {200, 700, 800, 11} <= MODE_TYPES["bus"]
+    assert {900, 906, 5} <= MODE_TYPES["tram"]
+    assert {1000, 1200} <= MODE_TYPES["ferry"]
 
 
 def test_rank_prefers_official_active_specific():
@@ -770,6 +770,8 @@ def test_fetch_aoi_rejects_place_only_arguments():
         fetch(place="X", contained="maybe")
     with pytest.raises(ValueError, match="'skip' or 'keep'"):
         fetch(place="X", expired="maybe")
+    with pytest.raises(ValueError, match="'drop', 'exact' or 'keep'"):
+        fetch(place="X", duplicate_trips="maybe")
     with pytest.raises(ValueError, match="disagree"):
         fetch(place="X", when="2026-06-01", reference_date="20260602")
 
@@ -1387,6 +1389,12 @@ C, F = {"agency": "C"}, {"agency": "F"}
 AB, ABC = {**C, "routes": ("a", "b")}, {**C, "routes": ("a", "b", "c")}
 IN_C = {**F, "in": "C", "hours": (9,)}
 ADDS = f"+ similar to A but adds service on {DAY}"
+ON_DAY = {"when": DAY}
+# A trip half a minute after the 09:00 trip, which it nearly repeats.
+NEAR_NINE = {
+    "trips.txt": "r1,wk,x\n",
+    "stop_times.txt": "x,09:00:30,09:00:30,s2,1\nx,09:10:30,09:10:30,s3,2\n",
+}
 # A network on a placeholder calendar, and the note it gets.
 HELD = {"start": "20000101", "end": "20990101"}
 HELD_NOTE = "placeholder calendar 2000-01-01 to 2099-01-01"
@@ -1395,22 +1403,22 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
 
 @pytest.mark.filterwarnings("ignore:no Mobility Database API token")
 @pytest.mark.parametrize(
-    "feeds, when, expected",
+    "feeds, options, expected",
     [
-        ({"X": F, "Y": F}, None, {"X": "+", "Y": "- same content as X [X]"}),
+        ({"X": F, "Y": F}, {}, {"X": "+", "Y": "- same content as X [X]"}),
         (
             {"X": {**ABC, "cut": "a b"}, "Y": {**ABC, "cut": "b c"}},
-            None,
+            {},
             {
                 "X": "+ cut to routes a, b",
-                "Y": "+ cut to routes b, c; 1 repeated trips of X left out [X]",
+                "Y": "+ cut to routes b, c; 1 repeated trips of X left out [X] (1)",
             },
         ),
-        ({"F": IN_C, "C": {**C, "renewed": True}}, None, {"C": "+", "F": KEPT}),
-        ({"F": {**IN_C, "renewed": True}, "C": C}, None, {"C": "+", "F": KEPT}),
+        ({"F": IN_C, "C": {**C, "renewed": True}}, {}, {"C": "+", "F": KEPT}),
+        ({"F": {**IN_C, "renewed": True}, "C": C}, {}, {"C": "+", "F": KEPT}),
         (
             {"F": IN_C, "C": {**AB, "cut": "a"}},
-            None,
+            {},
             {
                 "C": "+ cut to routes a",
                 "F": "+ kept: container C cropped to selected routes",
@@ -1418,62 +1426,62 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
         ),
         (
             {"F": IN_C, "C": {**C, "ended": True}},
-            None,
+            {},
             {"C": f"- {R_ENDED}{SAME}", "F": "+ kept: container C skipped"},
         ),
         (
             {"P": {**AB, "cut": "a"}, "C": AB, "F": IN_C},
-            None,
+            {},
             {
                 "P": "+ cut to routes a",
-                "C": "+ 1 repeated trips of P left out [P]",
+                "C": "+ 1 repeated trips of P left out [P] (1)",
                 "F": SKIP_C,
             },
         ),
         (
             {"C": AB, "P": {**AB, "cut": "a"}, "F": IN_C},
-            None,
+            {},
             {"C": "+", "P": "- same content as C [C]", "F": SKIP_C},
         ),
         (
             {"A": NEW, "B": OLD},
-            DAY,
+            ON_DAY,
             {"A": "+", "B": "- another version of A [A 1.0 1.0]"},
         ),
         (
             {"A": NEW, "B": {**OLD, "agency": "HSL Oy."}},
-            DAY,
+            ON_DAY,
             {"A": "+", "B": "- another version of A [A 1.0 1.0]"},
         ),
         (
             {"A": NEW, "B": {**OLD, "agency": ""}},
-            DAY,
+            ON_DAY,
             {"A": "+", "B": "- another version of A [A 1.0 1.0]"},
         ),
         (
             {"A": NEW, "B": {**OLD, "hours": (8, 9)}},
-            DAY,
-            {"A": "+", "B": f"{ADDS}; 1 repeated trips of A left out"},
+            ON_DAY,
+            {"A": "+", "B": f"{ADDS}; 1 repeated trips of A left out (1)"},
         ),
-        ({"A": NEW, "B": {**OLD, "hours": (9,)}}, DAY, {"A": "+", "B": ADDS}),
+        ({"A": NEW, "B": {**OLD, "hours": (9,)}}, ON_DAY, {"A": "+", "B": ADDS}),
         (
             {"A": {**NEW, "headway": 600}, "B": {**OLD, "headway": 600}},
-            DAY,
+            ON_DAY,
             {"A": "+", "B": "- another version of A [A 1.0 1.0]"},
         ),
         (
             {"A": {**NEW, "headway": 600}, "B": {**OLD, "headway": 300}},
-            DAY,
+            ON_DAY,
             {"A": "+", "B": ADDS},
         ),
         (
             {"A": {**NEW, "hours": (8, 9)}, "B": OLD, "C": {**OLDER, "hours": (10,)}},
-            DAY,
+            ON_DAY,
             {"A": "+", "B": "- another version of A [A 1.0 1.0]", "C": ADDS},
         ),
         (
             {"C": {**OLDER, "hours": (10,)}, "B": OLD, "A": {**NEW, "hours": (8, 9)}},
-            DAY,
+            ON_DAY,
             {"A": "+", "B": "- another version of A [A 1.0 1.0]", "C": ADDS},
         ),
         (
@@ -1482,17 +1490,17 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
                 "B": {**OLD, "stops": range(1, 11)},
                 "C": {**OLDER, "stops": range(2, 12), "hours": (9,)},
             },
-            DAY,
+            ON_DAY,
             {"A": "+", "B": "- another version of A [A 1.0 0.818]", "C": "+"},
         ),
         (
             {"V": {**NEW, "hours": (9,)}, "C": OLD, "F": IN_C},
-            DAY,
+            ON_DAY,
             {"V": "+", "C": "+", "F": SKIP_C},
         ),
         (
             {"V": {**NEW, "hours": (9,)}, "E": OLD, "C": OLD, "F": IN_C},
-            DAY,
+            ON_DAY,
             {"V": "+", "E": "+", "C": "- same content as E [E]", "F": SKIP_C},
         ),
         (
@@ -1500,17 +1508,17 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
                 "A": {**NEW, "stops": range(8)},
                 "B": {**OLD, "stops": range(1, 9), "hours": (9,)},
             },
-            DAY,
+            ON_DAY,
             {"A": "+", "B": "+"},
         ),
         (
             {"A": NEW, "B": {**OLD, "transfers": True}},
-            DAY,
+            ON_DAY,
             {"A": "+", "B": "+ similar to A; kept, has transfers or pathways"},
         ),
         (
             {"A": {"start": "20260701"}, "B": OLD},
-            None,
+            {},
             {
                 "A": "+ similar to B; kept, no study day",
                 "B": "+ similar to A; kept, no study day",
@@ -1518,7 +1526,7 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
         ),
         (
             {"A": {**NEW, "end": "20991231"}, "B": OLD},
-            DAY,
+            ON_DAY,
             {
                 "A": "+ placeholder calendar 2026-06-01 to 2099-12-31",
                 "B": "- another version of A [A 1.0 1.0]",
@@ -1529,28 +1537,34 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
                 "A": {**NEW, "stops": range(8)},
                 "B": {**HELD, "stops": range(1, 9), "hours": (9,)},
             },
-            DAY,
+            ON_DAY,
             {"A": "+", "B": f"+ {HELD_NOTE}"},
         ),
         (
             {"A": HELD, "B": {**HELD, "routes": ("x",)}},
-            DAY,
+            ON_DAY,
             {"A": f"+ {HELD_NOTE}", "B": f"+ {HELD_NOTE}"},
         ),
-        ({"X": F, "Y": C}, None, {"X": "+", "Y": "- every trip repeats a trip of X"}),
+        ({"X": F, "Y": C}, {}, {"X": "+", "Y": "- every trip repeats a trip of X (1)"}),
         (
             {"A": NEW, "B": {**OLD, **F}},
-            DAY,
-            {"A": "+", "B": f"- every trip on {DAY} repeats a trip of A"},
+            ON_DAY,
+            {"A": "+", "B": f"- every trip on {DAY} repeats a trip of A (1)"},
         ),
-        ({"A": NEW, "B": {**OLD, **F}}, None, {"A": "+", "B": "+"}),
+        ({"A": NEW, "B": {**OLD, **F}}, {}, {"A": "+", "B": "+"}),
         (
             {"A": NEW, "B": {**NEW, **F, "zone": "America/New_York"}},
-            DAY,
+            ON_DAY,
             {
                 "A": "+",
                 "B": "+ agency_timezone America/New_York; stops in Europe/Helsinki",
             },
+        ),
+        ({"X": F, "Y": C}, {"duplicate_trips": "keep"}, {"X": "+", "Y": "+"}),
+        (
+            {"A": {**C, "hours": (8, 9)}, "B": {**F, "extra": NEAR_NINE}},
+            {"duplicate_trips": "exact"},
+            {"A": "+", "B": "+ 1 repeated trips of A left out (1)"},
         ),
     ],
     ids=(
@@ -1565,14 +1579,17 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
         "version-transfers versions-no-study-day placeholder-starting-later "
         "placeholder-under-stop-threshold placeholders-other-routes "
         "repeats-other-agency repeats-on-the-day repeats-not-every-date "
-        "repeats-other-time-zone"
+        "repeats-other-time-zone repeats-kept repeats-exact"
     ).split(),
 )
 def test_fetch_delivers_one_copy_per_service(
-    tmp_path, monkeypatch, feeds, when, expected
+    tmp_path, monkeypatch, feeds, options, expected
 ):
-    result, downloads = _fetch_networks(tmp_path, monkeypatch, feeds, when=when)
+    result, downloads = _fetch_networks(tmp_path, monkeypatch, feeds, **options)
     assert {e["feed_id"]: _seen(e) for e in result.selection} == expected
+    if options.get("duplicate_trips") == "keep":
+        # Nothing is compared, so no feed counts repeats.
+        assert {e["duplicate_trips"] for e in result.selection} == {None}
     # A feed left out before download is never downloaded; every other is.
     early = ("contained in", "unchanged since indexed")
     assert sorted(downloads) == sorted(
@@ -1636,13 +1653,14 @@ def _fetch_networks(tmp_path, monkeypatch, feeds, **options):
 
 
 def _seen(entry):
-    """An entry as ``"+ <note> [<links>]"``, or ``"- <reason> ..."`` when
-    skipped."""
+    """An entry as ``"+ <note> [<links>] (<n>)"``, or ``"- <reason> ..."``
+    when skipped, ``<n>`` the trips left out as repeats, when any."""
     links = entry["same_as"] + entry["contained_in"]
     links = links + [*(entry["version_of"] or {}).values()]
     links = links and f"[{' '.join(map(str, links))}]"
     head = f"- {entry['reason']}" if entry["reason"] else "+"
-    return " ".join(filter(None, (head, entry["note"], links)))
+    count = entry["duplicate_trips"] and f"({entry['duplicate_trips']})"
+    return " ".join(filter(None, (head, entry["note"], links, count)))
 
 
 # The function each fault patches, and the calls it fails.
@@ -1716,7 +1734,7 @@ KEPT_TRIPS = "+ repeated trips kept: disk full"
             {
                 "A": "+",
                 "B": "- serves ['tram'] after repeated trips were left out, "
-                "not ['bus']",
+                "not ['bus'] (1)",
             },
             None,
         ),
@@ -1724,7 +1742,7 @@ KEPT_TRIPS = "+ repeated trips kept: disk full"
             {**F, "extra": UNREAD},
             {"when": DAY},
             None,
-            {"A": "+", "B": "+ 1 repeated trips of A left out"},
+            {"A": "+", "B": "+ 1 repeated trips of A left out (1)"},
             1,
         ),
         # Left with no calendar, the feed is delivered as it was.
@@ -1843,7 +1861,7 @@ def test_the_deduplicating_crop_is_reported(tmp_path, monkeypatch):
     feeds = {"A": C, "B": {**TWO, "extra": dangling}}
     for call in ("cold", "warm"):
         result, _ = _fetch_networks(tmp_path / call, monkeypatch, feeds)
-        assert result.selection[1]["note"] == "1 repeated trips of A left out"
+        assert _seen(result.selection[1]) == "+ 1 repeated trips of A left out (1)"
         assert _dropped_note(result.reports[1]) == (
             "dropped 1 stop_times.txt rows whose stop_id is not in stops.txt"
         )

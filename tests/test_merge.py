@@ -639,6 +639,8 @@ def _repeats(trips, rows=(), continuous=""):
     builder.add_route("r2", 3, "2", agency_id="a")
     builder.add_route("r3", 3, "1", agency_id="a", continuous_pickup="0")
     builder.add_route("r4", 3, "1", agency_id="b")
+    builder.add_route("r704", 704, "1", agency_id="a")
+    builder.add_route("r900", 900, "1", agency_id="a")
     for service in sorted({trip.get("service", "jan") for trip in trips}):
         builder.add_service(service, "daily", *SERVICES[service])
     for trip in trips:
@@ -673,6 +675,8 @@ def _repeats(trips, rows=(), continuous=""):
         ({"stops": ("s5", "s2")}, "equal"),
         ({"route": "r3"}, "differs"),
         ({"route": "r4"}, "equal"),
+        ({"route": "r704"}, "equal"),
+        ({"route": "r900"}, "differs"),
         ({"shape_id": "sa"}, "equal"),
         ({"trip_headsign": "Centre"}, "equal"),
         ({"stops": ("s9", "s2")}, "absent"),
@@ -697,7 +701,8 @@ def _repeats(trips, rows=(), continuous=""):
     ],
     ids=(
         "identical other-time other-pickup other-route-key moved-stop "
-        "moved-within-rounding route-continuous-pickup other-agency other-shape "
+        "moved-within-rounding route-continuous-pickup other-agency "
+        "extended-bus-type tram-type other-shape "
         "other-headsign unknown-stop repeated-sequence unknown-route "
         "listed-twice padded-sequence headway-shifted other-headway "
         "headway-vs-timetabled unreadable-frequency unreadable-first-departure"

@@ -15,19 +15,6 @@ import tempfile
 import warnings
 import zipfile
 
-# Coarse mode names over GTFS route types, including the extended blocks:
-# railway 100s and suburban railway 300s are rail; urban railway 400s,
-# metro 500s, underground 600s and monorail join subway; coach 200s,
-# bus 700s and trolleybus 800s join bus; tram 900s; water 1000s and
-# ferry 1200s are ferry. Aerial, funicular, taxi and air map to no mode.
-_MODE_TYPES = {
-    "tram": {0, 5} | set(range(900, 1000)),
-    "subway": {1, 12} | set(range(400, 700)),
-    "rail": {2} | set(range(100, 200)) | set(range(300, 400)),
-    "bus": {3, 11} | set(range(200, 300)) | set(range(700, 900)),
-    "ferry": {4} | set(range(1000, 1100)) | set(range(1200, 1300)),
-}
-
 # Decompressed budget for the pre-validation routes.txt peek; any real
 # routes.txt is far smaller, and validation applies the full budgets later.
 _MODES_BYTE_CAP = 64 * 1024 * 1024
@@ -56,6 +43,7 @@ _SELECTION_FIELDS = (
     "same_as",
     "contained_in",
     "version_of",
+    "duplicate_trips",
     "fetched_from",
     "download_errors",
     "cache",
@@ -155,6 +143,7 @@ def _feed_modes(path):
     import pandas as pd
 
     from transitio.edit._editor import _normalise_table
+    from transitio.gtfs._schedule import MODE_TYPES
 
     try:
         with zipfile.ZipFile(path) as archive:
@@ -178,7 +167,7 @@ def _feed_modes(path):
         types = {int(value) for value in set(values) if value.lstrip("-").isdigit()}
     except (OSError, KeyError, ValueError, zipfile.BadZipFile):
         return None
-    return {mode for mode, accepted in _MODE_TYPES.items() if types & accepted}
+    return {mode for mode, accepted in MODE_TYPES.items() if types & accepted}
 
 
 def _bbox_area(feed):
@@ -828,7 +817,7 @@ def _service(path, day=None, max_total_bytes=None):
         tables = _read_tables(path, names, max_total_bytes)
         if tables is None:
             return None
-        keys = route_keys(tables)[["agency", "name", "type"]]
+        keys = route_keys(tables)[["agency", "name", "mode"]]
         agency = tables.get("agency.txt", pd.DataFrame())
         named = (_column(agency, "agency_name").str.strip() != "").any()
         ids = _column(tables.get("routes.txt", pd.DataFrame()), "agency_id").str.strip()
@@ -838,7 +827,7 @@ def _service(path, day=None, max_total_bytes=None):
         # Stops and stations need coordinates; other location types may lack them.
         kind = stops.get("location_type", pd.Series("", index=stops.index))
         located = points[kind.str.strip().isin(("", "0", "1"))]
-        parts = keys[["name", "type"]] if unnamed else keys
+        parts = keys[["name", "mode"]] if unnamed else keys
         if (parts == "").any(axis=None) or located.isna().any(axis=None):
             return None
         points = points.round(_STOP_DECIMALS).add(0.0).dropna()
@@ -943,7 +932,7 @@ def _settle_versions(record, services, protected, day):
     ids = sorted(services, key=rank)
     for feed_id in filter(undated, ids):
         _note(entries[feed_id], undated(feed_id))
-    # A pair with an unnamed agency compares routes by name and type only.
+    # A pair with an unnamed agency compares routes by name and mode only.
     lines = {
         feed_id: {key[1:] for key in services[feed_id]["routes"]} for feed_id in ids
     }
@@ -1036,9 +1025,11 @@ def _drop_repeats(cache, record, processed, feeds, reports, directory, **options
     written over its delivered archive in ``directory``, and its report in
     ``reports``. A withdrawn feed's entry is skipped and its archive in
     ``directory`` removed. A failed replacement or removal keeps the feed as
-    delivered, noted. ``options`` are ``budgets``, ``modes`` and ``day``,
-    the study day or None. Returns ``{feed id: [ids]}``: for each feed cut
-    or withdrawn, the feeds holding the trips it repeated.
+    delivered, noted. Each compared entry gets its ``duplicate_trips``
+    count. ``options`` are ``budgets``, ``modes``, ``day``, the study day or
+    None, and ``duplicate_trips``, ``"keep"`` comparing nothing. Returns
+    ``{feed id: [ids]}``: for each feed cut or withdrawn, the feeds holding
+    the trips it repeated.
     """
     from transitio import _http
 
@@ -1051,13 +1042,13 @@ def _drop_repeats(cache, record, processed, feeds, reports, directory, **options
         ),
         key=lambda n: position[processed[n].entry["feed_id"]],
     )
-    if len(order) < 2:
+    if len(order) < 2 or options["duplicate_trips"] == "keep":
         return {}
     items = [processed[n] for n in order]
     day, modes = options["day"], options["modes"]
     run = _request_key(
         made=[(item.entry["feed_id"], item.key) for item in items],
-        duplicate_trips="drop",
+        duplicate_trips=options["duplicate_trips"],
         day=None if day is None else day.isoformat(),
         modes=None if modes is None else sorted(modes),
     )
@@ -1066,6 +1057,8 @@ def _drop_repeats(cache, record, processed, feeds, reports, directory, **options
     lost = {}
     for n, item, (outcome, made) in zip(order, items, found):
         entry = item.entry
+        # None when not compared, else 0 until trips are left out below.
+        entry["duplicate_trips"] = outcome["dropped"] and 0
         if outcome["skip"] is None and made is None:
             if outcome["note"] is not None:
                 _note(entry, outcome["note"])
@@ -1084,6 +1077,7 @@ def _drop_repeats(cache, record, processed, feeds, reports, directory, **options
         except Exception as error:  # noqa: B902 — the feed stays as delivered
             _note(entry, f"repeated trips kept: {error}")
             continue
+        entry["duplicate_trips"] = outcome["dropped"]
         lost[entry["feed_id"]] = outcome["of"]
         if outcome["skip"] is not None:
             _skip(entry, outcome["skip"], path=None, feed_window=outcome["window"])
@@ -1115,9 +1109,10 @@ def _stored_repeats(items, keys):
     return found
 
 
-def _repeats(cache, items, keys, budgets, modes, day):
+def _repeats(cache, items, keys, budgets, modes, day, duplicate_trips):
     """Per feed of ``items``, in priority order, ``(outcome, made)``: the
-    trips left out as repeats of the trips kept from the feeds before it
+    trips left out as repeats, with ``duplicate_trips="drop"`` also near
+    repeats, of the trips kept from the feeds before it
     (:func:`~transitio.gtfs._duplicates.repeated_trips`), the feeds holding
     them, and a skip reason, or a note and the service window with
     ``made``, the deduplicated output (:func:`_without_repeats`). Once every
@@ -1150,7 +1145,7 @@ def _repeats(cache, items, keys, budgets, modes, day):
             read = None
         tables.append(read or {})
     ids = [item.entry["feed_id"] for item in items]
-    found, failed = [], set()
+    found, failed, near = [], set(), duplicate_trips == "drop"
 
     try:
         # The deduplicated outputs wait here until every feed is decided.
@@ -1166,7 +1161,7 @@ def _repeats(cache, items, keys, budgets, modes, day):
                     located = [_stop_zone(read) for read in tables]
                     for n in _timezone_outliers(tables, located=located):
                         tables[n] = {}
-                matched = repeated_trips(tables, day=day)
+                matched = repeated_trips(tables, near=near, day=day)
             except Exception as error:  # noqa: B902 — every feed keeps its trips
                 return unchanged(error)
             for n in range(len(found), len(items)):
@@ -1701,6 +1696,7 @@ def fetch(
     index=None,
     credentials=None,
     modes=None,
+    duplicate_trips="drop",
     expired="skip",
     repair=False,
     crop=True,
@@ -1810,13 +1806,13 @@ def fetch(
     earlier feed.
 
     On the place path, delivered feeds whose route keys (agency name, route
-    short else long name, type) and stops (coordinates at 3 decimals) share
+    short else long name, mode) and stops (coordinates at 3 decimals) share
     0.9 and 0.8 or more are versions, ranked by later start, more trips,
     then candidate order. Agency names compare casefolded, without
     diacritics, punctuation or a trailing legal form (``Ltd``, ``Oy``,
     ``S.A.`` and the like). A feed with at most one agency row, none named,
     whose routes name at most one ``agency_id`` is unnamed, and its pairs
-    compare routes by name and type only. With ``when``, one is left out as
+    compare routes by name and mode only. With ``when``, one is left out as
     ``"another version of <id>"`` when a kept version pairs with it and kept
     versions run, by trip signature (which leaves out the agency), every
     trip it runs on the day, a headway trip matching one with the same
@@ -1835,23 +1831,27 @@ def fetch(
     whose routes, stops or, with ``when``, calendars cannot be read, or with
     a blank agency name that is not unnamed, is never a version.
 
-    The delivered feeds do not repeat each other's trips. A trip that a
-    feed earlier in the selection record also runs is left out of the later
-    feed: on the place path the record follows the place's view
-    (:meth:`~transitio.index.Place.feeds`: category, then relevance, then
-    id), on the area path the order above. Trips compare as
-    :func:`~transitio.gtfs.merge_feeds` compares them: route name and type,
-    stops and times, nearly (within 50 m and 3 minutes), pickup and
-    drop-off, and frequencies, whatever the agency. With ``when`` the trips
-    running that day are compared, each earlier trip covering one later
-    trip; without it a trip is left out only when it is covered on every
-    date it runs, which reads the whole calendar and, on a large network,
-    takes longer and more memory than a study day. A trip whose services
-    cannot be read or are not declared, that cannot be signed or that
-    transfers.txt names is never left out. A feed declaring a time zone not
-    equivalent to the others' (as ``merge_feeds(timezones="skip")``
-    decides), over ``max_total_bytes`` or unreadable is not compared. A feed
-    that loses trips is delivered cropped without them
+    With ``duplicate_trips="drop"`` (default) the delivered feeds do not
+    repeat each other's trips. A trip that a feed earlier in the selection
+    record also runs is left out of the later feed: on the place path the
+    record follows the place's view (:meth:`~transitio.index.Place.feeds`:
+    category, then relevance, then id), on the area path the order above.
+    Trips compare as :func:`~transitio.gtfs.merge_feeds` compares them:
+    route name and mode (the route type's basic mode, as ``modes`` names
+    them, else the type itself, so local bus 704 equals bus 3), stops and
+    times, nearly (within 50 m and 3 minutes; with ``"exact"`` only
+    exactly), pickup and drop-off, and frequencies, whatever the agency.
+    ``"keep"`` compares nothing and delivers every feed with all its trips.
+    With ``when`` the trips running that day are compared, each earlier
+    trip covering one later trip; without it a trip is left out only when
+    it is covered on every date it runs, which reads the whole calendar
+    and, on a large network, takes longer and more memory than a study day.
+    A trip whose services cannot be read or are not declared, that cannot
+    be signed or that transfers.txt names is never left out. A feed
+    declaring a time zone not equivalent to the others' (as
+    ``merge_feeds(timezones="skip")`` decides), over ``max_total_bytes`` or
+    unreadable is not compared. A feed that loses trips is delivered
+    cropped without them
     (:func:`~transitio.gtfs.crop_feed`'s ``exclude_trips``), so the stops,
     shapes, calendars, routes, transfers and pathways that only those trips
     used go too; with ``crop=False`` and no route selection this is the
@@ -1869,8 +1869,8 @@ def fetch(
     lacking a file GTFS requires keeps the feed's trips, noted ``"repeated
     trips kept: <error>"``. What was found is stored with
     each feed's cached version, keyed by the delivered feeds and their
-    outputs, the day and ``modes``, and a later call comparing the same
-    reads it back.
+    outputs, ``duplicate_trips``, the day and ``modes``, and a later call
+    comparing the same reads it back.
 
     Parameters
     ----------
@@ -1929,6 +1929,11 @@ def fetch(
         ``rail``, ``bus``, ``ferry`` — decided from the delivered
         (post-crop) feed's routes.txt, since the catalog carries no mode
         metadata. Unknown mode names raise ``ValueError``.
+    duplicate_trips : {"drop", "exact", "keep"}, default "drop"
+        Whether to leave out of the delivered feeds the trips that repeat,
+        or nearly repeat (``"drop"``), a trip of an earlier delivered feed,
+        as above: ``"exact"`` leaves out exact repeats only, and ``"keep"``
+        compares nothing. Another value raises ``ValueError``.
     expired : {"skip", "keep"}, default "skip"
         With ``"skip"``, on the place path, an indexed feed whose index
         service window misses the day (ends before it, or starts after the
@@ -2036,7 +2041,13 @@ def fetch(
         ``version_of`` (for a left-out version, ``{"feed_id", "route_overlap",
         "stop_overlap"}`` against the highest-ranked kept version it pairs
         with, for an undated feed the highest-ranked dated one starting after
-        its placeholder start when one does), ``fetched_from`` (where the
+        its placeholder start when one does), ``duplicate_trips`` (the
+        number of trips left out as repeats of an earlier delivered feed's:
+        0 for a compared feed that lost none, the first included; None for
+        a feed not compared: with ``duplicate_trips="keep"`` or fewer than
+        two feeds delivered, one in another time zone, unreadable or over
+        ``max_total_bytes``, and a feed decided before the comparison),
+        ``fetched_from`` (where the
         download came from: ``"mdb_dataset"`` a catalogued dataset,
         ``"producer"`` the feed's own URL, its ``download_url`` or one from
         the Mobility Database or Transitland Atlas, ``"mdb_latest"`` the
@@ -2109,16 +2120,20 @@ def fetch(
         raise ValueError(
             "on_untrusted_selector= must be 'auto', 'whole', 'drop' or 'error'"
         )
+    if duplicate_trips not in ("drop", "exact", "keep"):
+        raise ValueError("duplicate_trips= must be 'drop', 'exact' or 'keep'")
 
     if modes is not None:
+        from transitio.gtfs._schedule import MODE_TYPES
+
         if isinstance(modes, str):
             modes = [modes]
         modes = {str(mode).lower() for mode in modes}
-        unknown = modes - set(_MODE_TYPES)
+        unknown = modes - set(MODE_TYPES)
         if unknown:
             raise ValueError(
                 f"unknown modes {sorted(unknown)}; "
-                f"valid modes are {sorted(_MODE_TYPES)}"
+                f"valid modes are {sorted(MODE_TYPES)}"
             )
 
     # The day the date rules test: the study day, else today. A downloaded
@@ -2148,6 +2163,7 @@ def fetch(
             window_day=window_day,
             expired=expired,
             modes=modes,
+            duplicate_trips=duplicate_trips,
             repair=repair,
             crop=crop,
             osm=osm,
@@ -2336,6 +2352,7 @@ def fetch(
             )
 
     repeats = dict(budgets=budgets, modes=modes, day=day if study else None)
+    repeats["duplicate_trips"] = duplicate_trips
     _drop_repeats(cache, record, processed, feeds, reports, directory, **repeats)
     rows = [
         n for n, item in enumerate(processed) if item.entry["decision"] == "delivered"
@@ -2582,6 +2599,7 @@ def _fetch_place(
     window_day,
     expired,
     modes,
+    duplicate_trips,
     repair,
     crop,
     osm,
@@ -3124,6 +3142,7 @@ def _fetch_place(
             continue
         entries[feed_id]["path"] = feeds[n]
     repeats = dict(budgets=budgets, modes=modes, day=day if study else None)
+    repeats["duplicate_trips"] = duplicate_trips
     lost = _drop_repeats(cache, record, processed, feeds, reports, directory, **repeats)
     for feed_id, (access, _) in decided.items():
         entry = entries[feed_id]

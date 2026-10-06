@@ -250,14 +250,16 @@ def merge_tables(
         are reported as dropped (``locations.geojson`` is refused).
     duplicate_trips : {"drop", "exact", "keep"}, default "drop"
         ``"exact"`` leaves out each input's trips that repeat trips kept
-        from the inputs before it: same route name and type, stops, times
-        and pickup and drop-off behaviour, a frequency-based trip's times
+        from the inputs before it: same route name and mode (bus, tram,
+        subway, rail or ferry, an extended route type such as 704, local
+        bus, counting as its basic type; any other type as itself), stops,
+        times and pickup and drop-off behaviour, a frequency-based trip's times
         counted from its first departure and with the same frequencies.txt
         rows (see :func:`~transitio.gtfs._schedule.trip_signatures`). The
         agency, headsigns, short names, ``shape_id`` and shape geometry,
         ``timepoint`` and ``shape_dist_traveled`` may differ; the earlier
         trip's are kept. ``"drop"`` also leaves out a trip with no such
-        repeat that nearly repeats kept trips: same route name and type and
+        repeat that nearly repeats kept trips: same route name and mode and
         frequencies.txt rows, its stops within 50 m and 3 minutes of theirs
         in order, a minute apart on average, at most two stops and a fifth
         of them unmatched, the same pickup and drop-off behaviour but for
