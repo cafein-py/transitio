@@ -2428,3 +2428,12 @@ def test_stops_beyond_the_osm_area_are_counted(tmp_path, monkeypatch, osm):
         None,
         "OSM area: 1 of 3 located stops outside it",
     )
+
+
+def test_selector_fingerprints_read_members_as_large_as_the_build():
+    # The build fingerprints members of a whole download up to 8 GiB; with a
+    # smaller ceiling here, every selector of a national aggregate whose
+    # stop_times.txt runs to several GiB is stale and the feed is delivered whole.
+    from transitio.index import fingerprint
+
+    assert fingerprint._MAX_MEMBER_BYTES == 8 * 1024**3

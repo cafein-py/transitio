@@ -48,6 +48,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   use, and a key-protected feed without usable credentials uses only copies
   fetched without them.
 
+### Fixed
+
+- `fetch` checks a feed's selector against a download whose members are
+  up to 8 GiB, as large as the index build reads. A member over 2 GiB made
+  every selector of the feed out of date, so a national aggregate whose
+  stop_times.txt is that large was delivered uncut even when its selector
+  matched the download.
+
 ## 0.19.1 — 2026-10-02
 
 ### Changed
