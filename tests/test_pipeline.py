@@ -122,9 +122,11 @@ def _zip(tables, compression=zipfile.ZIP_DEFLATED):
     import io as _io
 
     buffer = _io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", compression=compression) as archive:
+    with zipfile.ZipFile(buffer, "w") as archive:
         for name, content in tables.items():
-            archive.writestr(name, content)
+            # A fixed time, so the same tables always give the same bytes.
+            member = zipfile.ZipInfo(name, (2026, 1, 1, 0, 0, 0))
+            archive.writestr(member, content, compress_type=compression)
     return buffer.getvalue()
 
 
@@ -1808,13 +1810,7 @@ def _place_index(tmp_path, feed):
 
 
 def _gtfs_payload():
-    import io as _io
-
-    buffer = _io.BytesIO()
-    with zipfile.ZipFile(buffer, "w") as archive:
-        for name, content in GTFS.items():
-            archive.writestr(name, content)
-    return buffer.getvalue()
+    return _zip(GTFS, zipfile.ZIP_STORED)
 
 
 def _stub_pbf_and_atlas(monkeypatch, tmp_path, payload):
