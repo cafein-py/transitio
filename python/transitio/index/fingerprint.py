@@ -147,14 +147,16 @@ class _MemberTooLarge(Exception):
     """A member is over the build's per-member ceiling."""
 
 
-# Ceiling on one member's uncompressed size, mirroring the crawl's member
-# ceiling: a member the build would have refused to extract has no fingerprint
-# to recompute against, so at fetch time it is a miss, not an unbounded read.
-# The ceiling matches the build deliberately -- a tighter fetch-time budget
-# would mark a large but legitimate feed the build accepted as stale -- and the
-# accumulation here is the same the build's extraction and the Rust crop of the
-# very same download already do, so it adds no exposure beyond the existing path.
-_MAX_MEMBER_BYTES = 2 * 1024 * 1024 * 1024
+# Ceiling on one member's uncompressed size, mirroring the crawl's ceiling for
+# members of a whole download (8 GiB): a member the build would have refused
+# to extract has no fingerprint to recompute against, so at fetch time it is a
+# miss, not an unbounded read. The ceiling matches the build deliberately -- a
+# tighter fetch-time budget would mark a large but legitimate feed the build
+# accepted as stale, such as a national aggregate whose stop_times.txt runs to
+# several GiB -- and the accumulation here is the same the build's extraction
+# and the Rust crop of the very same download already do, so it adds no
+# exposure beyond the existing path.
+_MAX_MEMBER_BYTES = 8 * 1024 * 1024 * 1024
 
 
 @contextlib.contextmanager

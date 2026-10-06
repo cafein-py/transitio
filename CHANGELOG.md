@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- `fetch` checks a feed's selector against a download whose members are
+  up to 8 GiB, as large as the index build reads. A member over 2 GiB made
+  every selector of the feed out of date, so a national aggregate whose
+  stop_times.txt is that large was delivered uncut even when its selector
+  matched the download.
+
 ## 0.19.1 — 2026-10-02
 
 ### Changed
