@@ -1844,6 +1844,61 @@ def test_near_repeats_of_a_trip_are_merged_once(tmp_path):
     assert counts["dropped"] == counts["near_matches"] == counts["unaligned_stops"] == 2
 
 
+def test_delivered_feeds_do_not_repeat_each_others_trips(tmp_path, monkeypatch):
+    # In Munich the city operator's feed repeated most trips of the regional
+    # feed under its own agency name, a minute and some metres off, and
+    # fetch delivered both copies to be routed together.
+    import httpx
+
+    import transitio.index as transitio_index
+    from index_fixture import HULL, covered_feed, edge, write_index
+    from transitio.catalog import TransitlandAtlas
+    from transitio.pipeline import fetch
+
+    agency = MIDLAND["agency.txt"].replace("Midland Bluebird", "First Glasgow")
+    operator = {
+        **MIDLAND,
+        "agency.txt": agency,
+        # 20 m north of the regional feed's stops.
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\n"
+        "a,A,55.86018,-4.25\nb,B,55.87018,-4.26\n",
+        "trips.txt": MIDLAND["trips.txt"] + "x36,wk,t2\n",
+        "stop_times.txt": "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "t1,08:01:00,08:01:00,a,1\nt1,08:11:00,08:11:00,b,2\n"
+        "t2,10:00:00,10:00:00,a,1\nt2,10:10:00,10:10:00,b,2\n",
+    }
+    payloads = {
+        feed_id: write_zip(tmp_path / f"{feed_id}.zip", files).read_bytes()
+        for feed_id, files in (("f-a", MIDLAND), ("f-b", operator))
+    }
+    feeds = [
+        {
+            **covered_feed(feed_id, coverage_source="crawl"),
+            "coverage": HULL,
+            "atlas": {"urls": {"static_current": f"https://feeds.example/{feed_id}"}},
+        }
+        for feed_id in payloads
+    ]
+    edges = [edge("Q1757", f["feed_id"], tier="local") for f in feeds]
+    index = transitio_index.read_index(
+        write_index(tmp_path / "index", feeds=feeds, edges=edges)
+    )
+
+    def handler(request):
+        return httpx.Response(200, content=payloads[request.url.path.strip("/")])
+
+    class Served(TransitlandAtlas):
+        def __init__(self, **kwargs):
+            super().__init__(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas", Served)
+    result = fetch(place="Q1757", index=index, crop=False, osm=False, expired="keep")
+    trips = [read_entry(path, "trips.txt").decode().split() for path in result.feeds]
+    assert [rows[1:] for rows in trips] == [["x36,wk,t1"], ["x36,wk,t2"]]
+    assert result.selection[1]["note"] == "1 repeated trips of f-a left out"
+
+
 def test_a_placeholder_calendar_is_an_older_version_of_the_dated_network(tmp_path):
     # A snapshot on a 2025 to 2099 calendar passed every date check, and as
     # its route names had drifted it never paired with the dated network

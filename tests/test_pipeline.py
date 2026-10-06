@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import pathlib
 import urllib.parse
 import warnings
 import zipfile
@@ -44,6 +45,13 @@ HKL = {
     **GTFS,
     "agency.txt": GTFS["agency.txt"].replace("HSL", "HKL"),
     "stop_times.txt": GTFS["stop_times.txt"].replace("08:", "09:"),
+}
+# HKL also running GTFS's trip, its own trip as t2.
+PARTIAL = {
+    **HKL,
+    "trips.txt": GTFS["trips.txt"] + "r1,wk,t2\n",
+    "stop_times.txt": GTFS["stop_times.txt"]
+    + HKL["stop_times.txt"].split("\n", 1)[1].replace("t1", "t2"),
 }
 
 CSV_BODY = (
@@ -808,11 +816,14 @@ def _partitioned_index(
 def test_a_kept_contained_feed_is_reported(tmp_path, monkeypatch):
     import pathlib
 
-    ids = ("f-a", "f-b")
+    ids = ("f-a", "f-b", "f-c")
     index = _partitioned_index(
-        tmp_path, monkeypatch, dict.fromkeys(ids, {}), contained={"f-a": ["f-b"]}
+        tmp_path, monkeypatch, dict.fromkeys(ids, {}), contained={"f-c": ["f-b"]}
     )
-    payloads = {"f-a": _zip(GTFS), "f-b": _zip(HKL)}
+    # f-b repeats f-a's trip, so f-a carries part of f-c's container.
+    later = {"stop_times.txt": GTFS["stop_times.txt"].replace("08:", "10:")}
+    other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "VR"), **later}
+    payloads = {"f-a": _zip(GTFS), "f-b": _zip(PARTIAL), "f-c": _zip(other)}
     fetched = []
 
     def fake_download(self, feed, directory=None):
@@ -841,8 +852,8 @@ def test_a_kept_contained_feed_is_reported(tmp_path, monkeypatch):
     decisions = [
         (e["feed_id"], e["decision"], e["contained_in"]) for e in result.selection
     ]
-    assert sorted(fetched) == list(ids) and len(result.feeds) == 2
-    assert result.contained == {"f-a": ["f-b"]}
+    assert sorted(fetched) == list(ids) and len(result.feeds) == 3
+    assert result.contained == {"f-c": ["f-a", "f-b"]}
     assert decisions == [(i, "delivered", []) for i in ids]
 
 
@@ -1314,26 +1325,37 @@ def _network(agency="HSL", start="20260101", stops=None, hours=(8,), **options):
     """GTFS of ``agency`` whose ``routes`` each run a trip from s2 to s3 at
     each of ``hours``, daily from ``start`` to ``end`` (through 2026 unless
     given), among stops s<i> (s0 to s9 unless ``stops`` names them); with a
-    ``headway``, each trip repeats that often for an hour."""
+    ``headway``, each trip repeats that often for an hour. ``types`` maps
+    routes to a type other than bus, ``zone`` is the agency's time zone and
+    ``extra`` adds rows by file."""
     stops = range(10) if stops is None else stops
+    types, zone = options.get("types", {}), options.get("zone", "Europe/Helsinki")
     trips = [(r, h) for r in options.get("routes", ("r1",)) for h in hours]
     times = (
         "{0}{1},{1:02}:00:00,{1:02}:00:00,s2,1\n{0}{1},{1:02}:10:00,{1:02}:10:00,s3,2"
     )
     tables = {
         **_calendar(start, options.get("end", "20261231")),
-        "agency.txt": GTFS["agency.txt"].replace("HSL", agency),
+        "agency.txt": GTFS["agency.txt"]
+        .replace("HSL", agency)
+        .replace("Europe/Helsinki", zone),
         "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\n"
         + "".join(f"s{i},S{i},{60 + i / 100:.2f},24.9\n" for i in stops),
         "routes.txt": "route_id,agency_id,route_short_name,route_type\n"
-        + "".join(f"{r},hsl,{r},3\n" for r in options.get("routes", ("r1",))),
+        + "".join(
+            f"{r},hsl,{r},{types.get(r, 3)}\n" for r in options.get("routes", ("r1",))
+        ),
         "trips.txt": "route_id,service_id,trip_id\n"
         + "".join(f"{r},wk,{r}{h}\n" for r, h in trips),
         "stop_times.txt": GTFS["stop_times.txt"].split("\n")[0]
         + "".join("\n" + times.format(r, h) for r, h in trips),
     }
     if options.get("transfers"):
-        tables["transfers.txt"] = "from_stop_id,to_stop_id,transfer_type\ns2,s3,0\n"
+        # Naming the first trip, which is then never compared as a repeat.
+        tables["transfers.txt"] = (
+            "from_stop_id,to_stop_id,from_trip_id,to_trip_id,transfer_type\n"
+            "s2,s3,{0}{1},{0}{1},0\n".format(*trips[0])
+        )
     if options.get("headway"):
         tables["frequencies.txt"] = (
             "trip_id,start_time,end_time,headway_secs\n"
@@ -1342,6 +1364,8 @@ def _network(agency="HSL", start="20260101", stops=None, hours=(8,), **options):
                 for r, h in trips
             )
         )
+    for name, rows in options.get("extra", {}).items():
+        tables[name] = tables[name].rstrip("\n") + "\n" + rows
     return _zip(tables)
 
 
@@ -1367,7 +1391,10 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
         (
             {"X": {**ABC, "cut": "a b"}, "Y": {**ABC, "cut": "b c"}},
             None,
-            {"X": "+ cut to routes a, b", "Y": "+ cut to routes b, c [X]"},
+            {
+                "X": "+ cut to routes a, b",
+                "Y": "+ cut to routes b, c; 1 repeated trips of X left out [X]",
+            },
         ),
         ({"F": IN_C, "C": {**C, "renewed": True}}, None, {"C": "+", "F": KEPT}),
         ({"F": {**IN_C, "renewed": True}, "C": C}, None, {"C": "+", "F": KEPT}),
@@ -1387,7 +1414,11 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
         (
             {"P": {**AB, "cut": "a"}, "C": AB, "F": IN_C},
             None,
-            {"P": "+ cut to routes a", "C": "+ [P]", "F": SKIP_C},
+            {
+                "P": "+ cut to routes a",
+                "C": "+ 1 repeated trips of P left out [P]",
+                "F": SKIP_C,
+            },
         ),
         (
             {"C": AB, "P": {**AB, "cut": "a"}, "F": IN_C},
@@ -1409,7 +1440,11 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
             DAY,
             {"A": "+", "B": "- another version of A [A 1.0 1.0]"},
         ),
-        ({"A": NEW, "B": {**OLD, "hours": (8, 9)}}, DAY, {"A": "+", "B": ADDS}),
+        (
+            {"A": NEW, "B": {**OLD, "hours": (8, 9)}},
+            DAY,
+            {"A": "+", "B": f"{ADDS}; 1 repeated trips of A left out"},
+        ),
         ({"A": NEW, "B": {**OLD, "hours": (9,)}}, DAY, {"A": "+", "B": ADDS}),
         (
             {"A": {**NEW, "headway": 600}, "B": {**OLD, "headway": 600}},
@@ -1492,6 +1527,21 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
             DAY,
             {"A": f"+ {HELD_NOTE}", "B": f"+ {HELD_NOTE}"},
         ),
+        ({"X": F, "Y": C}, None, {"X": "+", "Y": "- every trip repeats a trip of X"}),
+        (
+            {"A": NEW, "B": {**OLD, **F}},
+            DAY,
+            {"A": "+", "B": f"- every trip on {DAY} repeats a trip of A"},
+        ),
+        ({"A": NEW, "B": {**OLD, **F}}, None, {"A": "+", "B": "+"}),
+        (
+            {"A": NEW, "B": {**NEW, **F, "zone": "America/New_York"}},
+            DAY,
+            {
+                "A": "+",
+                "B": "+ agency_timezone America/New_York; stops in Europe/Helsinki",
+            },
+        ),
     ],
     ids=(
         "identical identical-overlapping-routes container-renewed "
@@ -1503,7 +1553,9 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
         "version-chain version-protected-container "
         "version-same-content-container version-under-stop-threshold "
         "version-transfers versions-no-study-day placeholder-starting-later "
-        "placeholder-under-stop-threshold placeholders-other-routes"
+        "placeholder-under-stop-threshold placeholders-other-routes "
+        "repeats-other-agency repeats-on-the-day repeats-not-every-date "
+        "repeats-other-time-zone"
     ).split(),
 )
 def test_fetch_delivers_one_copy_per_service(
@@ -1581,6 +1633,227 @@ def _seen(entry):
     links = links and f"[{' '.join(map(str, links))}]"
     head = f"- {entry['reason']}" if entry["reason"] else "+"
     return " ".join(filter(None, (head, entry["note"], links)))
+
+
+# The function each fault patches, and the calls it fails.
+FAULTS = {
+    "deliver": (
+        "transitio.pipeline._fetch._deliver",
+        lambda *a: a[2]["feed_id"] == "A",
+    ),
+    "crop": ("transitio.gtfs.crop_feed", lambda *a, **o: "exclude_trips" in o),
+    "replace": (
+        "transitio._http.replacing",
+        lambda p: p.suffix == ".zip" and p.exists(),
+    ),
+    "unlink": ("os.unlink", lambda p, **_: "out" in pathlib.Path(p).parts),
+    "report": (
+        "transitio.pipeline._fetch._report",
+        lambda made, *a: made["path"].name.endswith("-deduplicated.zip"),
+    ),
+    # The comparison alone reads transfers.txt without a study day.
+    "read": (
+        "transitio.pipeline._fetch._read_tables",
+        lambda p, n, *a: "transfers.txt" in n,
+    ),
+    # Only the staging of the deduplicated outputs keeps no cleanup error.
+    "staging": (
+        "tempfile.TemporaryDirectory",
+        lambda **o: "ignore_cleanup_errors" in o,
+    ),
+}
+# A repeat of C's 08:00 trip and a trip of its own; a trip on a service
+# whose calendar cannot be read, and one on a service no calendar declares.
+TWO = {**F, "hours": (8, 9)}
+X_TIMES = "x,09:00:00,09:00:00,s2,1\nx,09:10:00,09:10:00,s3,2\n"
+UNREAD = {
+    "trips.txt": "r1,bad,x\n",
+    "stop_times.txt": X_TIMES,
+    "calendar.txt": "bad,1,1,1,1,1,1,1,20260101,2026-12-31\n",
+}
+UNDECLARED = {"trips.txt": "r1,none,x\n", "stop_times.txt": X_TIMES}
+# A trip whose first stop is missing, which the crop leaves out.
+UNUSABLE = {"trips.txt": "r1,wk,x\n", "stop_times.txt": X_TIMES.replace("s2", "s99")}
+KEPT_TRIPS = "+ repeated trips kept: disk full"
+
+
+@pytest.mark.filterwarnings("ignore:no Mobility Database API token")
+@pytest.mark.parametrize(
+    "second, options, fault, expected, trips",
+    [
+        (F, {}, "deliver", {"A": "- processing failed: disk full", "B": "+"}, 1),
+        (TWO, {}, "crop", {"A": "+", "B": KEPT_TRIPS}, 2),
+        (TWO, {}, "replace", {"A": "+", "B": KEPT_TRIPS}, 2),
+        (F, {}, "unlink", {"A": "+", "B": KEPT_TRIPS}, 1),
+        (TWO, {}, "report", {"A": "+", "B": KEPT_TRIPS}, 2),
+        (TWO, {}, "staging", {"A": KEPT_TRIPS, "B": KEPT_TRIPS}, 2),
+        (TWO, {}, "read", {"A": KEPT_TRIPS, "B": KEPT_TRIPS}, 2),
+        (
+            {**TWO, "extra": UNUSABLE},
+            {},
+            None,
+            {
+                "A": "+",
+                "B": "+ repeated trips kept: the crop would also leave out 1 trips "
+                "that repeat no other feed's",
+            },
+            3,
+        ),
+        (
+            {**F, "routes": ("r1", "t"), "types": {"t": 0}},
+            {"modes": "bus"},
+            None,
+            {
+                "A": "+",
+                "B": "- serves ['tram'] after repeated trips were left out, "
+                "not ['bus']",
+            },
+            None,
+        ),
+        (
+            {**F, "extra": UNREAD},
+            {"when": DAY},
+            None,
+            {"A": "+", "B": "+ 1 repeated trips of A left out"},
+            1,
+        ),
+        # Left with no calendar, the feed is delivered as it was.
+        (
+            {**F, "extra": UNDECLARED},
+            {"when": DAY},
+            None,
+            {
+                "A": "+",
+                "B": "+ repeated trips kept: the feed left would be missing "
+                "calendar.txt and calendar_dates.txt",
+            },
+            2,
+        ),
+    ],
+    ids=(
+        "covering-feed-undelivered crop replace unlink report staging read "
+        "unusable-trip modes unread-service undeclared-service"
+    ).split(),
+)
+def test_a_feed_keeps_the_trips_no_delivered_feed_repeats(
+    tmp_path, monkeypatch, second, options, fault, expected, trips
+):
+    import importlib
+
+    if fault is not None:
+        target, failing = FAULTS[fault]
+        module, name = target.rsplit(".", 1)
+        real = getattr(importlib.import_module(module), name)
+
+        def faulty(*args, **kwargs):
+            if failing(*args, **kwargs):
+                raise OSError("disk full")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(target, faulty)
+    feeds = {"A": C, "B": second}
+    result, _ = _fetch_networks(tmp_path, monkeypatch, feeds, **options)
+    assert {e["feed_id"]: _seen(e) for e in result.selection} == expected
+    (path,) = [e["path"] for e in result.selection if e["feed_id"] == "B"]
+    assert (path and len(_feed_tables(path)["trips.txt"])) == trips
+
+
+@pytest.mark.filterwarnings("ignore:no Mobility Database API token")
+def test_a_failed_rematch_keeps_every_feed_as_delivered(tmp_path, monkeypatch):
+    # The matching after B's withdrawal for its modes fails once.
+    calls = _counted_matching(monkeypatch, failing=2)
+    two_modes = {"agency": "G", "routes": ("r1", "t"), "types": {"t": 0}}
+    feeds = {"A": C, "K": TWO, "B": two_modes, "D": {"agency": "H", "hours": (10,)}}
+    options = {"modes": "bus"}
+    options["cache_dir"] = tmp_path / "cache"
+    result, _ = _fetch_networks(tmp_path / "first", monkeypatch, feeds, **options)
+    kept = "+ repeated trips kept: matching failed"
+    assert {e["feed_id"]: _seen(e) for e in result.selection} == dict.fromkeys(
+        feeds, kept
+    )
+    assert not list(options["cache_dir"].rglob("outputs/*-deduplicated.zip"))
+    # Nothing was stored, so the next call matches again.
+    result, _ = _fetch_networks(tmp_path / "again", monkeypatch, feeds, **options)
+    assert len(calls) == 4
+    assert result.selection[1]["note"] == "1 repeated trips of A left out"
+
+
+@pytest.mark.filterwarnings("ignore:no Mobility Database API token")
+@pytest.mark.parametrize(
+    "second, fault, note, trips",
+    [
+        (TWO, "removed", "its cached version was removed", 2),
+        (F, "unlisted", "disk full", 1),
+    ],
+    ids=["removed", "unlisted"],
+)
+def test_a_version_gone_before_storing_keeps_its_trips(
+    tmp_path, monkeypatch, second, fault, note, trips
+):
+    from transitio.catalog._cache import FeedCache
+    from transitio.pipeline import _fetch
+
+    real = _fetch._store_found
+
+    def gone(cache, items, *args):
+        if fault == "removed":
+            # A concurrent clear removes B's version once compared.
+            cache.delete(items[1].version)
+        else:
+            # Listing B's versions fails once, as B is to be withdrawn.
+            listed = cache.versions
+            failed = []
+
+            def versions(feed_id):
+                if feed_id == "B" and not failed:
+                    failed.append(feed_id)
+                    raise OSError("disk full")
+                return listed(feed_id)
+
+            monkeypatch.setattr(cache, "versions", versions)
+        return real(cache, items, *args)
+
+    monkeypatch.setattr(_fetch, "_store_found", gone)
+    cache_dir = tmp_path / "cache"
+    feeds = {"A": C, "B": second}
+    result, _ = _fetch_networks(tmp_path, monkeypatch, feeds, cache_dir=cache_dir)
+    assert _seen(result.selection[1]) == f"+ repeated trips kept: {note}"
+    assert len(_feed_tables(result.feeds[1])["trips.txt"]) == trips
+    assert not list(cache_dir.rglob("*-deduplicated.zip"))
+    if fault == "removed":
+        assert FeedCache(cache_dir).versions("B") == []
+
+
+@pytest.mark.filterwarnings("ignore:no Mobility Database API token")
+def test_the_deduplicating_crop_is_reported(tmp_path, monkeypatch):
+    from transitio.pipeline._fetch import _dropped_note
+
+    # Without crop=, it is B's first crop, which leaves out a dangling row.
+    dangling = {"stop_times.txt": "r19,09:20:00,09:20:00,s99,3\n"}
+    feeds = {"A": C, "B": {**TWO, "extra": dangling}}
+    for call in ("cold", "warm"):
+        result, _ = _fetch_networks(tmp_path / call, monkeypatch, feeds)
+        assert result.selection[1]["note"] == "1 repeated trips of A left out"
+        assert _dropped_note(result.reports[1]) == (
+            "dropped 1 stop_times.txt rows whose stop_id is not in stops.txt"
+        )
+
+
+def _counted_matching(monkeypatch, failing=None):
+    """The calls made from now on to the trip matching, by number; the one
+    numbered ``failing`` raises."""
+    import transitio.gtfs._duplicates as duplicates
+
+    real, calls = duplicates.repeated_trips, []
+
+    def matched(*args, **kwargs):
+        calls.append(len(calls) + 1)
+        if calls[-1] == failing:
+            raise ValueError("matching failed")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(duplicates, "repeated_trips", matched)
+    return calls
 
 
 def _timeless(reports):

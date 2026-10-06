@@ -10,6 +10,7 @@ import io
 import json
 import os
 import pathlib
+import shutil
 import tempfile
 import warnings
 import zipfile
@@ -78,7 +79,8 @@ class FetchResult:
     # which discovers by bounding box and has no snapshot.
     snapshot: str = None
     # {feed id: [ids of delivered feeds containing it]} over the delivered
-    # feeds, from the index's contained_in (schema 10); empty otherwise.
+    # feeds, from the index's contained_in (schema 10), a container that lost
+    # repeated trips standing with the feeds holding them; empty otherwise.
     contained: dict = dataclasses.field(default_factory=dict)
     # One entry per candidate feed, in candidate order, with its decision;
     # ``skipped`` lists the same skips. Entries with feed_id None note, after
@@ -1024,6 +1026,252 @@ class _Processed:
     hosted: dict
 
 
+def _drop_repeats(cache, record, processed, feeds, reports, directory, **options):
+    """Leave out of the delivered feeds the trips that repeat a trip kept
+    from a feed before them in ``record``, as :func:`fetch` describes.
+
+    ``processed`` holds a :class:`_Processed` for each path of ``feeds``
+    and report of ``reports``; those whose entry is delivered are compared.
+    A feed cut of repeated trips gets its deduplicated output in ``feeds``,
+    written over its delivered archive in ``directory``, and its report in
+    ``reports``. A withdrawn feed's entry is skipped and its archive in
+    ``directory`` removed. A failed replacement or removal keeps the feed as
+    delivered, noted. ``options`` are ``budgets``, ``modes`` and ``day``,
+    the study day or None. Returns ``{feed id: [ids]}``: for each feed cut
+    or withdrawn, the feeds holding the trips it repeated.
+    """
+    from transitio import _http
+
+    position = {entry["feed_id"]: n for n, entry in enumerate(record)}
+    order = sorted(
+        (
+            n
+            for n, item in enumerate(processed)
+            if item.entry["decision"] == "delivered"
+        ),
+        key=lambda n: position[processed[n].entry["feed_id"]],
+    )
+    if len(order) < 2:
+        return {}
+    items = [processed[n] for n in order]
+    day, modes = options["day"], options["modes"]
+    run = _request_key(
+        made=[(item.entry["feed_id"], item.key) for item in items],
+        duplicate_trips="drop",
+        day=None if day is None else day.isoformat(),
+        modes=None if modes is None else sorted(modes),
+    )
+    keys = [_request_key(run=run, made=item.key) for item in items]
+    found = _repeats(cache, items, keys, **options)
+    lost = {}
+    for n, item, (outcome, made) in zip(order, items, found):
+        entry = item.entry
+        if outcome["skip"] is None and made is None:
+            if outcome["note"] is not None:
+                _note(entry, outcome["note"])
+            continue
+        try:
+            # The report first, so a failure leaves the delivered feed whole.
+            report = None if made is None else _report(made, item.hosted, item.origin)
+            if outcome["skip"] is not None and directory:
+                os.unlink(feeds[n])
+                with contextlib.suppress(OSError):
+                    os.unlink(feeds[n].with_suffix(".provenance.json"))
+            elif made is not None and directory:
+                with open(made["path"], "rb") as source:
+                    with _http.replacing(feeds[n]) as handle:
+                        shutil.copyfileobj(source, handle)
+        except Exception as error:  # noqa: B902 — the feed stays as delivered
+            _note(entry, f"repeated trips kept: {error}")
+            continue
+        lost[entry["feed_id"]] = outcome["of"]
+        if outcome["skip"] is not None:
+            _skip(entry, outcome["skip"], path=None, feed_window=outcome["window"])
+            continue
+        if not directory:
+            feeds[n] = made["path"]
+        reports[n] = report
+        entry.update(path=feeds[n], feed_window=outcome["window"])
+        _note(entry, outcome["note"])
+    return lost
+
+
+def _repeats(cache, items, keys, budgets, modes, day):
+    """Per feed of ``items``, in priority order, ``(outcome, made)``: the
+    trips left out as repeats of the trips kept from the feeds before it
+    (:func:`~transitio.gtfs._duplicates.repeated_trips`), the feeds holding
+    them, and a skip reason, or a note and the service window with
+    ``made``, the deduplicated output (:func:`_without_repeats`), stored
+    under its key of ``keys`` once every feed is decided
+    (:func:`_store_found`). A feed declaring another time zone than the
+    rest (as ``merge_feeds(timezones="skip")`` sets apart), over
+    ``max_total_bytes`` or unreadable is not compared. A feed left with
+    none of ``modes`` is withdrawn and the matching runs again without it.
+    A failure keeps a feed's trips, with a note; a failed matching, or a
+    feed's file that cannot be opened, keeps every feed's and stores
+    nothing."""
+    from transitio.gtfs._duplicates import repeated_trips
+    from transitio.gtfs._merge import _stop_zone, _timezone_outliers, _timezones
+
+    def unchanged(error):
+        kept = {"dropped": None, "of": [], "skip": None, "window": None}
+        return [({**kept, "note": f"repeated trips kept: {error}"}, None)] * len(items)
+
+    names = {"agency.txt", "stops.txt", "routes.txt", "trips.txt", "stop_times.txt"}
+    names |= {"calendar.txt", "calendar_dates.txt", "frequencies.txt", "transfers.txt"}
+    tables = []
+    for item in items:
+        try:
+            read = _read_tables(
+                item.made["path"], names, budgets.get("max_total_bytes")
+            )
+        except OSError as error:  # gone or unreachable: every feed keeps its trips
+            return unchanged(error)
+        except Exception:  # noqa: B902 — an unreadable feed is not compared
+            read = None
+        tables.append(read or {})
+    ids = [item.entry["feed_id"] for item in items]
+    found = []
+
+    try:
+        # The deduplicated outputs wait here until every feed is decided.
+        staging = tempfile.TemporaryDirectory(
+            dir=cache.root, ignore_cleanup_errors=True
+        )
+    except Exception as error:  # noqa: B902 — every feed keeps its trips
+        return unchanged(error)
+    with staging as scratch:
+        while len(found) < len(items):
+            try:
+                if not found and len(set().union(*map(_timezones, tables))) > 1:
+                    located = [_stop_zone(read) for read in tables]
+                    for n in _timezone_outliers(tables, located=located):
+                        tables[n] = {}
+                matched = repeated_trips(tables, day=day)
+            except Exception as error:  # noqa: B902 — every feed keeps its trips
+                return unchanged(error)
+            for n in range(len(found), len(items)):
+                trips, earlier, scope = matched[n]
+                outcome = {"dropped": 0 if tables[n] else None, "skip": None}
+                outcome.update(of=[ids[p] for p in earlier], note=None, window=None)
+                made, again = None, False
+                try:
+                    if trips:
+                        output = pathlib.Path(scratch) / f"{n}.zip"
+                        made = _without_repeats(items[n].made, output, trips, budgets)
+                        again = _decide(
+                            outcome, made, tables[n], trips, scope, modes, day
+                        )
+                except Exception as error:  # noqa: B902 — the feed keeps its trips
+                    note = f"repeated trips kept: {error}"
+                    outcome, made = {**outcome, "skip": None, "note": note}, None
+                found.append((outcome, None if outcome["skip"] else made))
+                if again:
+                    tables[n] = {}
+                    break
+        return _store_found(cache, items, keys, found)
+
+
+def _store_found(cache, items, keys, found):
+    """``found``, what :func:`_repeats` decided of ``items``, once stored:
+    a cut feed's deduplicated output moved to
+    ``outputs/<key>-deduplicated.zip`` beside its version, its key of
+    ``keys``, and stored (:func:`_store_output`). A cut feed whose output
+    cannot be stored keeps its trips, noted. Nothing is stored for a
+    version the cache no longer lists, and its feed, cut or withdrawn,
+    keeps its trips, noted."""
+    from transitio.catalog._cache import _directory
+
+    stored = []
+    for n, (item, key, (outcome, made)) in enumerate(zip(items, keys, found)):
+        feed_id, listed = item.entry["feed_id"], True
+        try:
+            with cache.lock(feed_id):
+                versions = cache.versions(feed_id)
+                listed = item.version.sha256 in {v.sha256 for v in versions}
+                if listed and made is not None:
+                    folder = item.version.path.parent / "outputs"
+                    _directory(folder)
+                    made = {**made, "path": folder / f"{key}-deduplicated.zip"}
+                    os.replace(found[n][1]["path"], made["path"])
+                    _store_output(cache, item.version, key, made)
+        except Exception as error:  # noqa: B902 — the feed keeps its trips
+            if made is not None or outcome["skip"] is not None:
+                note = f"repeated trips kept: {error}"
+                outcome, made = {**outcome, "skip": None, "note": note}, None
+        if not listed and (made is not None or outcome["skip"] is not None):
+            note = "repeated trips kept: its cached version was removed"
+            outcome, made = {**outcome, "skip": None, "note": note}, None
+        stored.append((outcome, made))
+    return stored
+
+
+def _decide(outcome, made, tables, trips, scope, modes, day):
+    """Record in ``outcome`` what ``made``, the deduplicated output of the
+    feed read as ``tables`` without the repeated ``trips``, leaves: the
+    number of its trips left out and its service window, and a skip reason
+    when it lost every trip in ``scope`` or, with ``modes``, every requested
+    mode, else the note. Returns whether it lost the modes. Raises
+    ``ValueError`` when the crop left out other trips too or the output
+    lacks a file GTFS requires."""
+    left = _read_tables(made["path"], {"trips.txt"})["trips.txt"]
+    gone = set(tables["trips.txt"]["trip_id"]) - set(left["trip_id"])
+    if gone - trips:
+        others = len(gone - trips)
+        raise ValueError(
+            f"the crop would also leave out {others} trips that repeat no "
+            "other feed's"
+        )
+    window = _window(*_service_window(made["validation"]))
+    outcome.update(dropped=len(gone), window=window)
+    listed = ", ".join(outcome["of"])
+    served = None if modes is None else _feed_modes(made["path"])
+    if scope <= gone:
+        on = "" if day is None else f" on {day.isoformat()}"
+        outcome["skip"] = f"every trip{on} repeats a trip of {listed}"
+        return False
+    missing = _missing_files(made["validation"])
+    if missing is not None:
+        raise ValueError(f"the feed left would be {missing}")
+    if modes is not None and served is None:
+        raise ValueError("could not read routes.txt for mode filtering")
+    if modes is not None and not served & modes:
+        outcome["skip"] = (
+            f"serves {sorted(served)} after repeated trips were left out, "
+            f"not {sorted(modes)}"
+        )
+        return True
+    outcome["note"] = f"{len(gone)} repeated trips of {listed} left out"
+    return False
+
+
+def _without_repeats(made, output, trips, budgets):
+    """What processing ``made`` becomes without the trips ``trips``: its
+    output cropped with :func:`~transitio.gtfs.crop_feed`'s
+    ``exclude_trips`` to ``output``, read-only, and validated, the crop's
+    source notices and dropped rows added to those ``made`` holds. A failed
+    step removes the output."""
+    from transitio.gtfs import crop_feed
+    from transitio.validate import validate_feed
+
+    try:
+        cropped = crop_feed(
+            made["path"], output, exclude_trips=sorted(trips), **budgets
+        )
+        made = {
+            **made,
+            "path": _read_only(output),
+            "source_notices": made["source_notices"] + cropped["source_notices"],
+            "dropped": (made["dropped"] or []) + cropped["dropped_rows"],
+        }
+        made["validation"] = validate_feed(output, **budgets)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(output)
+        raise
+    return made
+
+
 class _Archives:
     """The archives a call reads feeds from by URL fragment, each downloaded
     into ``directory`` once, keyed by its URL without the fragment; a failed
@@ -1447,7 +1695,8 @@ def fetch(
     ``"whole"`` always delivers it whole; ``"drop"`` always skips it;
     ``"error"`` raises :class:`~transitio.exceptions.StaleSelectorError`.
     A schema-10 index records the larger feeds whose stops and routes contain
-    a feed's, and ``FetchResult.contained`` reports the delivered pairs. With
+    a feed's, and ``FetchResult.contained`` reports the delivered pairs, a
+    container that lost repeated trips (below) with the feeds holding them. With
     ``contained="drop"`` (default) containers are processed first, and a
     contained feed is left out before download (``"contained in <id>"``)
     when a container was delivered whole (not cut to a route selection) or
@@ -1551,6 +1800,40 @@ def fetch(
     Without ``when`` none is left out; similar feeds are noted. A feed
     whose routes, stops or, with ``when``, calendars cannot be read, or with
     a blank agency name that is not unnamed, is never a version.
+
+    The delivered feeds do not repeat each other's trips. A trip that a
+    feed earlier in the selection record also runs is left out of the later
+    feed: on the place path the record follows the place's view
+    (:meth:`~transitio.index.Place.feeds`: category, then relevance, then
+    id), on the area path the order above. Trips compare as
+    :func:`~transitio.gtfs.merge_feeds` compares them: route name and type,
+    stops and times, nearly (within 50 m and 3 minutes), pickup and
+    drop-off, and frequencies, whatever the agency. With ``when`` the trips
+    running that day are compared, each earlier trip covering one later
+    trip; without it a trip is left out only when it is covered on every
+    date it runs, which reads the whole calendar and, on a large network,
+    takes longer and more memory than a study day. A trip whose services
+    cannot be read or are not declared, that cannot be signed or that
+    transfers.txt names is never left out. A feed declaring a time zone not
+    equivalent to the others' (as ``merge_feeds(timezones="skip")``
+    decides), over ``max_total_bytes`` or unreadable is not compared. A feed
+    that loses trips is delivered cropped without them
+    (:func:`~transitio.gtfs.crop_feed`'s ``exclude_trips``), so the stops,
+    shapes, calendars, routes, transfers and pathways that only those trips
+    used go too; with ``crop=False`` and no route selection this is the
+    feed's first crop. Delivered feeds are separate feeds, so no transfer
+    or pathway links them. The cut feed is validated again, its report
+    (listing also the rows this crop left out) and ``feed_window`` come
+    from it, and its note says ``"<n> repeated trips of <ids> left out"``.
+    A feed whose every trip in scope repeats is skipped as ``"every trip
+    repeats a trip of <ids>"`` (with ``when``, ``"every trip on <day>
+    repeats a trip of <ids>"``), and with ``modes`` a feed left without a
+    requested mode as ``"serves [...] after repeated trips were left out,
+    not [...]"``, the later feeds then compared again without it; the
+    ``feed_window`` of either is that of what it kept. A step that fails,
+    a crop that would also leave out trips repeating nothing, or a cut feed
+    lacking a file GTFS requires keeps the feed's trips, noted ``"repeated
+    trips kept: <error>"``.
 
     Parameters
     ----------
@@ -1657,11 +1940,13 @@ def fetch(
     directory : str or pathlib.Path, optional
         Where the delivered feeds are copied, each in its feed's
         digest-named folder beside its provenance sidecar: the cropped,
-        route-filtered or repaired feed, or the cached version when none of
-        those ran. A feed skipped or left out leaves nothing there. Without
-        it the delivered feeds are the files in the cache, an untransformed
-        one the read-only cached version itself. The OSM extract goes here
-        too. It must lie outside the download cache (``ValueError``).
+        route-filtered, repaired or deduplicated feed, or the cached version
+        when none of those ran; a feed cut of repeated trips is written over
+        its copy there. A feed skipped or left out leaves nothing there.
+        Without it the delivered feeds are the files in the cache, an
+        untransformed one the read-only cached version itself. The OSM
+        extract goes here too. It must lie outside the download cache
+        (``ValueError``).
     refresh_token, cache_dir, country_code
         Passed to the catalog and OSM layers; downloads are cached under
         ``cache_dir``, by default the platform cache.
@@ -1704,8 +1989,8 @@ def fetch(
         Pacific/Honolulu"``, a placeholder calendar, which a left-out
         version keeps, rows the crop left out, e.g. ``"dropped 1860
         stop_times.txt rows whose stop_id is not in stops.txt"`` or
-        ``"dropped 8 exact duplicate trips.txt rows"``; several join with
-        ``"; "``),
+        ``"dropped 8 exact duplicate trips.txt rows"``, the repeated trips
+        left out or kept; several join with ``"; "``),
         ``index_window`` (the index's ``[start, end]``; None undated or on
         the area path), ``feed_window`` (the computed window of a validated
         download, delivered or not; None otherwise or when unknown),
@@ -2013,6 +2298,8 @@ def fetch(
                 _hosted(db, cache, version, dataset_id),
             )
 
+    repeats = dict(budgets=budgets, modes=modes, day=day if study else None)
+    _drop_repeats(cache, record, processed, feeds, reports, directory, **repeats)
     rows = [
         n for n, item in enumerate(processed) if item.entry["decision"] == "delivered"
     ]
@@ -2279,8 +2566,9 @@ def _fetch_place(
     without credentials it is read from the hosted copy alone, or skipped
     when it has none, and its texts in the record are masked
     (:meth:`_Access.redact`). The versions among the delivered feeds are
-    settled after the feed loop, and the OSM extract comes last, for the
-    parts the remaining feeds serve."""
+    settled after the feed loop, then their repeated trips left out
+    (:func:`_drop_repeats`), and the OSM extract comes last, for the parts
+    the remaining feeds serve."""
     from transitio import __version__
     from transitio.catalog import Feed, MobilityDatabase, TransitlandAtlas
     from transitio.catalog._client import _dataset_entry
@@ -2798,6 +3086,8 @@ def _fetch_place(
             removed.add(feed_id)
             continue
         entries[feed_id]["path"] = feeds[n]
+    repeats = dict(budgets=budgets, modes=modes, day=day if study else None)
+    lost = _drop_repeats(cache, record, processed, feeds, reports, directory, **repeats)
     for feed_id, (access, _) in decided.items():
         entry = entries[feed_id]
         for key in ("reason", "note", "download_errors"):
@@ -2809,8 +3099,12 @@ def _fetch_place(
     delivered_ids, feeds, reports, repairs = (
         [column[n] for n in rows] for column in (delivered_ids, feeds, reports, repairs)
     )
+    # A container that lost repeated trips is carried with the feeds holding them.
     pairs = {
-        feed.feed_id: sorted(set(feed.contained_in) & set(delivered_ids))
+        feed.feed_id: sorted(
+            {c for one in feed.contained_in for c in (one, *lost.get(one, ()))}
+            & set(delivered_ids) - {feed.feed_id}
+        )
         for feed in kept
         if feed.feed_id in delivered_ids
     }

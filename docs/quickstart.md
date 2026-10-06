@@ -26,7 +26,9 @@ box in WGS84. The pipeline:
 3. downloads each feed, crops it to the area (its polygon, else its bounding
    box), repairs it when asked, and validates it with the canonical notice
    codes,
-4. returns the artefact paths together with per-feed merged reports and a
+4. leaves out of each delivered feed the trips an earlier delivered feed
+   also runs,
+5. returns the artefact paths together with per-feed merged reports and a
    `(feed id, reason)` record for everything it skipped.
 
 ```python
@@ -92,6 +94,24 @@ gives a reason such as `"protected feed: credentials missing for
 trafiklab"`, followed by the feed's `access_instructions()`: who issues
 the credentials and where to register. When a download with credentials
 fails, the hosted copy is read without them.
+
+Feeds often publish the same trips: a city operator's buses also appear in
+the regional and national feeds, under another agency name and with times a
+minute apart. `fetch` delivers each such trip once. The feed earlier in the
+selection record keeps it, for a place the order of `place.feeds()` (by
+category, then relevance), and the later feed is delivered without it,
+noted `"<n> repeated trips of <feed ids> left out"`. Trips are compared as
+`merge_feeds` compares them: the same route name and type, and the same
+stops and times, or nearly (within 50 m and 3 minutes). With `when`, the
+trips of that day are compared. Without it, a trip is left out only when the
+earlier feeds run it on every date it runs, which reads every feed's whole
+calendar: for the nine feeds of the Munich metro area the comparison took
+about 50 seconds, against about 15 seconds for one day, and memory peaked at
+8 GB against 5 to 6 GB. A feed is left out only when every trip in scope,
+with `when` that day's, repeats a trip of an earlier feed; a trip the
+comparison cannot read, such as one whose calendar cannot be read, keeps its
+feed. The delivered feeds are separate feeds, so no transfer or pathway
+links two of them.
 
 `merge_feeds` writes one feed from the cropped ones. With `check=False` it
 keeps the file when the validator reports ERROR notices; the returned

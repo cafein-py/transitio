@@ -56,7 +56,7 @@ from transitio.exceptions import DownloadError
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _SIDECAR = ".provenance.json"
 # The steps whose output ``fetch`` stores, as ``<key>-<step>.zip``.
-_OUTPUT_STEPS = ("cropped", "repaired")
+_OUTPUT_STEPS = ("cropped", "repaired", "deduplicated")
 
 
 def _feed_dir(feed_id):
