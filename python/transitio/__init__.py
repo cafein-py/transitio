@@ -14,6 +14,7 @@ __all__ = [
     "TransitlandAtlas",
     "exceptions",
     "build_feed",
+    "cache",
     "compare_feed_history",
     "compare_feeds",
     "credentials",
@@ -87,6 +88,7 @@ def __getattr__(name):
 
         return getattr(index, name)
     if name in (
+        "cache",
         "credentials",
         "edit",
         "exceptions",

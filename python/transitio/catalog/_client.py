@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime
-import json
 import os
 import re
 import time
@@ -13,6 +12,7 @@ from pathlib import Path
 import platformdirs
 
 from transitio import _http
+from transitio.catalog._cache import FeedCache, _write_provenance
 from transitio.catalog._csv import fetch_catalog_csv, search_csv
 from transitio.catalog._models import Dataset, Feed, as_date
 from transitio.exceptions import DownloadError, MissingTokenError
@@ -51,15 +51,16 @@ def _bounds(aoi):
     return values
 
 
-def _write_provenance(path, data):
-    """Write a provenance sidecar atomically and without following a symlink
-    at the target: a partial write cannot leave truncated JSON beside the
-    artefact it describes, and a symlink cannot redirect the write elsewhere.
-    Portable -- the fresh unique temp name needs no ``O_NOFOLLOW``, and
-    ``os.replace`` swaps it in without following a symlink at the target."""
-    body = json.dumps(data, indent=2).encode("utf-8")
-    with _http.replacing(path) as handle:
-        handle.write(body)
+def _dataset_entry(dataset):
+    """A dataset's entry in a cached version's ``datasets`` map."""
+    return {
+        "hash": dataset.hash,
+        "validation_report_url": dataset.validation_report_url,
+        "service_date_range": [
+            str(dataset.service_start) if dataset.service_start else None,
+            str(dataset.service_end) if dataset.service_end else None,
+        ],
+    }
 
 
 def _download_recorded(http, url, path, record, **options):
@@ -358,43 +359,133 @@ class MobilityDatabase:
         when = as_date(when)
         return [d for d in self.datasets(feed, limit=None) if d.covers(when)]
 
-    def download(self, dataset, directory=None):
+    def download(self, dataset, directory=None, use_cache=True):
         """Download a dataset zip with checksum verification and caching.
 
-        A cached copy whose SHA-256 matches the catalogued hash is reused
-        without a network request. A ``<dataset id>.provenance.json`` sidecar
-        records feed and dataset IDs, source URL, checksum and retrieval
-        timestamp for reproducibility.
+        A dataset is a fixed version, so a cached copy holding it (its bytes
+        matching the catalogued hash, when the catalogue gives one) is reused
+        without a network request; ``use_cache=False`` downloads it again.
+        Identical bytes catalogued as several datasets are stored once.
 
         Parameters
         ----------
         dataset : Dataset
         directory : str or pathlib.Path, optional
-            Target directory; defaults to the transitio cache.
+            When given, a writable copy is written to
+            ``<directory>/<dataset id>.zip`` beside a ``.provenance.json``
+            sidecar recording feed and dataset IDs, source URL, checksum,
+            service dates and retrieval time, and its path is returned.
+            Otherwise the read-only cached file is returned; its sidecar
+            describes the first dataset stored with these bytes.
+        use_cache : bool, default True
+            Reuse a cached copy of the dataset.
 
         Returns
         -------
         pathlib.Path
-            Path of the downloaded zip.
+            Path of the zip.
 
         Raises
         ------
         DownloadError
             When the dataset has no hosted URL, its download fails (dropped
-            connections and transient HTTP errors are retried first), or its
-            checksum does not match.
+            connections and transient HTTP errors are retried first), its
+            checksum does not match, or it is not a zip archive.
         """
         if not dataset.hosted_url:
             raise DownloadError(f"dataset {dataset.id} has no hosted download url")
-        target_dir = (
-            Path(directory)
-            if directory
-            else self._cache_dir / "gtfs" / _safe_id(dataset.feed_id)
-        )
-        target_dir.mkdir(parents=True, exist_ok=True)
-        path = target_dir / f"{_safe_id(dataset.id)}.zip"
-        if path.exists() and dataset.hash and _http.sha256_file(path) == dataset.hash:
-            return path
+        _safe_id(dataset.id)
+        cache = FeedCache(self._cache_dir)
+
+        def holds(version):
+            return dataset.id in version.datasets and (
+                not dataset.hash or version.sha256 == dataset.hash
+            )
+
+        with cache.lock(dataset.feed_id):
+            version = cache.newest(dataset.feed_id, holds) if use_cache else None
+            if version is None:
+                # The catalog token is never sent to download hosts.
+                version = cache.download(
+                    self._http,
+                    dataset.hosted_url,
+                    dataset.feed_id,
+                    {"feed_id": dataset.feed_id},
+                    "mdb_dataset",
+                    expected=dataset.hash,
+                    dataset={dataset.id: _dataset_entry(dataset)},
+                )
+            else:
+                cache.touch(version)
+            if directory:
+                target = Path(directory) / f"{dataset.id}.zip"
+                return cache.deliver(version, target, version.provenance(dataset.id))
+        return version.path
+
+    def download_latest(self, feed, directory=None, use_cache=True):
+        """Download the latest hosted dataset zip of a feed.
+
+        Works without an API token: the URL comes from the catalogue entry.
+        The newest cached copy of the feed is reused without a network
+        request; ``use_cache=False`` downloads the latest dataset again and,
+        once that succeeds, replaces the cached copies. No upstream checksum
+        is available, and the provenance sidecar records the computed SHA-256
+        only. With a token, :meth:`dataset_for` plus :meth:`download` give
+        checksum-verified, version-pinned downloads instead.
+
+        Parameters
+        ----------
+        feed : Feed
+        directory : str or pathlib.Path, optional
+            When given, a writable copy is written to
+            ``<directory>/latest.zip`` beside a ``.provenance.json`` sidecar,
+            and its path is returned. Otherwise the read-only cached file is
+            returned.
+        use_cache : bool, default True
+            Reuse the newest cached copy.
+
+        Returns
+        -------
+        pathlib.Path
+            Path of the zip.
+
+        Raises
+        ------
+        DownloadError
+            When the feed has no hosted URL, or its download fails (dropped
+            connections and transient HTTP errors are retried first) or is
+            not a zip archive; a failed download leaves the cache unchanged.
+        """
+        if not feed.latest_dataset_url:
+            raise DownloadError(f"feed {feed.id} has no hosted latest-dataset url")
+        cache = FeedCache(self._cache_dir)
+        with cache.lock(feed.id):
+            version = None
+            if use_cache:
+                # Only a copy obtained as the latest dataset stands for it.
+                version = cache.newest(feed.id, lambda v: v.acquired_as("mdb_latest"))
+            if version is None:
+                version = cache.download(
+                    self._http,
+                    feed.latest_dataset_url,
+                    feed.id,
+                    {"feed_id": feed.id},
+                    "mdb_latest",
+                    replace=not use_cache,
+                )
+            else:
+                cache.touch(version)
+            if directory:
+                return cache.deliver(version, Path(directory) / "latest.zip")
+        return version.path
+
+    def _fetch_dataset(self, dataset, directory):
+        """Download a dataset into ``directory`` beside its provenance
+        sidecar, checksum-verified and without the cache; ``fetch`` stages
+        its downloads so."""
+        if not dataset.hosted_url:
+            raise DownloadError(f"dataset {dataset.id} has no hosted download url")
+        path = Path(directory) / f"{_safe_id(dataset.id)}.zip"
         # The catalog token is never sent to download hosts.
         digest = _http.download(self._http, dataset.hosted_url, path)
         if dataset.hash and digest != dataset.hash:
@@ -408,50 +499,19 @@ class MobilityDatabase:
             "dataset_id": dataset.id,
             "source_url": dataset.hosted_url,
             "sha256": digest,
-            "service_date_range": [
-                str(dataset.service_start) if dataset.service_start else None,
-                str(dataset.service_end) if dataset.service_end else None,
-            ],
+            "service_date_range": _dataset_entry(dataset)["service_date_range"],
             "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         _write_provenance(path.with_suffix(".provenance.json"), provenance)
         return path
 
-    def download_latest(self, feed, directory=None):
-        """Download the latest hosted dataset zip of a feed.
-
-        Works without an API token: the URL comes from the catalogue entry.
-        The latest dataset is a moving target, so the file is re-downloaded
-        on every call; no upstream checksum is available, and the provenance
-        sidecar records the computed SHA-256 only. With a token,
-        :meth:`dataset_for` plus :meth:`download` give checksum-verified,
-        version-pinned downloads instead.
-
-        Parameters
-        ----------
-        feed : Feed
-        directory : str or pathlib.Path, optional
-            Target directory; defaults to the transitio cache.
-
-        Returns
-        -------
-        pathlib.Path
-            Path of the downloaded zip.
-
-        Raises
-        ------
-        DownloadError
-            When the feed has no hosted URL or its download fails (dropped
-            connections and transient HTTP errors are retried first).
-        """
+    def _fetch_latest(self, feed, directory):
+        """Download a feed's latest hosted dataset into ``directory`` beside
+        its provenance sidecar, without the cache; ``fetch`` stages its
+        downloads so."""
         if not feed.latest_dataset_url:
             raise DownloadError(f"feed {feed.id} has no hosted latest-dataset url")
-        target_dir = (
-            Path(directory)
-            if directory
-            else self._cache_dir / "gtfs" / _safe_id(feed.id)
-        )
-        path = target_dir / "latest.zip"
+        path = Path(directory) / "latest.zip"
         return _download_recorded(
             self._http, feed.latest_dataset_url, path, {"feed_id": feed.id}
         )
