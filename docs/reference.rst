@@ -108,8 +108,25 @@ directory.
 
 .. currentmodule:: transitio
 
+The download cache
+------------------
+
+Every downloaded feed is kept as a version in the cache and reused while it
+serves the request (see :func:`~transitio.fetch`); these list and remove what
+the cache holds.
+
+.. currentmodule:: transitio.cache
+
+.. autosummary::
+   :toctree: api/
+
+   info
+   clear
+
 The feed catalogs
 -----------------
+
+.. currentmodule:: transitio
 
 .. autosummary::
    :toctree: api/

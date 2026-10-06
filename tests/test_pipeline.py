@@ -1,5 +1,6 @@
 import base64
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -107,7 +108,7 @@ def test_fetch_end_to_end(pipeline_env):
     (entry,) = result.selection
     assert entry["stops_outside_osm"] == 0
     assert len(result.feeds) == 1
-    assert "-cropped-" in result.feeds[0].name
+    assert "-cropped" in result.feeds[0].name
     assert result.feeds[0].suffix == ".zip"
     (report,) = result.reports
     assert report["summary"]["counts"]["errors"] == 0
@@ -121,15 +122,17 @@ def _zip(tables, compression=zipfile.ZIP_DEFLATED):
     import io as _io
 
     buffer = _io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", compression=compression) as archive:
+    with zipfile.ZipFile(buffer, "w") as archive:
         for name, content in tables.items():
-            archive.writestr(name, content)
+            # A fixed time, so the same tables always give the same bytes.
+            member = zipfile.ZipInfo(name, (2026, 1, 1, 0, 0, 0))
+            archive.writestr(member, content, compress_type=compression)
     return buffer.getvalue()
 
 
-def _area_fetch(monkeypatch, tmp_path, second):
+def _area_fetch(monkeypatch, tmp_path, second, **options):
     """An area fetch over two hosted feeds, mdb-10 serving ``GTFS`` and mdb-11
-    the zip bytes ``second``."""
+    the zip bytes ``second``; ``options`` go to :func:`fetch`."""
     from transitio.catalog._client import MobilityDatabase
 
     payloads = {"/mdb-10/latest.zip": _zip(GTFS), "/mdb-11/latest.zip": second}
@@ -145,7 +148,6 @@ def _area_fetch(monkeypatch, tmp_path, second):
 
     def patched(refresh_token=None, **kwargs):
         kwargs["transport"] = httpx.MockTransport(handler)
-        kwargs["cache_dir"] = tmp_path / "cache"
         return MobilityDatabase(refresh_token, **kwargs)
 
     monkeypatch.setattr("transitio.catalog.MobilityDatabase", patched)
@@ -153,17 +155,104 @@ def _area_fetch(monkeypatch, tmp_path, second):
         return fetch(
             (24.6, 60.1, 25.2, 60.4),
             directory=tmp_path / "out",
+            cache_dir=tmp_path / "cache",
             reference_date="20260601",
+            **options,
         )
 
 
 def test_an_area_fetch_keeps_each_feeds_download_apart(pipeline_env, monkeypatch):
     tmp_path, _ = pipeline_env
     other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "HKL")}
+    first = _area_fetch(monkeypatch, tmp_path, _zip(other))
     result = _area_fetch(monkeypatch, tmp_path, _zip(other))
     assert len(set(result.feeds)) == 2
     agencies = {zipfile.ZipFile(p).read("agency.txt") for p in result.feeds}
     assert len(agencies) == 2
+    # The repeat downloads no feed: each is its one cached version, acquired
+    # once; the directory holds only the crops.
+    assert [e["cache"] for e in first.selection + result.selection] == (
+        ["downloaded"] * 2 + ["reused"] * 2
+    )
+    cached = list((tmp_path / "cache").glob("gtfs/id-*/*.zip"))
+    assert len(cached) == len({p.parent for p in cached}) == 2
+    for path in cached:
+        sidecar = json.loads(path.with_suffix(".provenance.json").read_text())
+        assert len(sidecar["cache"]["sources"]) == 1
+    assert sorted((tmp_path / "out").rglob("*.zip")) == sorted(result.feeds)
+    assert all("-cropped" in p.name for p in result.feeds)
+    if os.name != "nt":
+        crops = (tmp_path / "cache").rglob("*-cropped*.zip")
+        assert not any(os.access(path, os.W_OK) for path in crops)
+
+    # A refresh served a page instead of mdb-11's archive falls back to it.
+    page = b"<html>maintenance</html>"
+    refreshed = _area_fetch(monkeypatch, tmp_path, page, use_cache=False)
+    assert sorted(e["cache"] for e in refreshed.selection) == ["fallback", "refreshed"]
+    assert len(refreshed.feeds) == 2
+
+
+def test_a_repeated_fetch_reuses_what_processing_made(pipeline_env, monkeypatch):
+    import transitio.gtfs
+    import transitio.validate
+
+    tmp_path, _ = pipeline_env
+    calls = []
+    for module, name in (
+        (transitio.gtfs, "crop_feed"),
+        (transitio.validate, "validate_feed"),
+    ):
+        real = getattr(module, name)
+
+        def counted(*args, _real=real, _name=name, **options):
+            calls.append(_name)
+            return _real(*args, **options)
+
+        monkeypatch.setattr(module, name, counted)
+    other = _zip({**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "HKL")})
+    first = _area_fetch(monkeypatch, tmp_path, other)
+    assert sorted(calls) == ["crop_feed"] * 2 + ["validate_feed"] * 2
+    # A delivered copy is the caller's; the stored output serves the repeat.
+    first.feeds[0].write_bytes(b"")
+    again = _area_fetch(monkeypatch, tmp_path, other)
+    assert len(calls) == 4
+    assert _timeless(first.reports) == _timeless(again.reports)
+    assert first.repairs == again.repairs
+    # A stored output that changed is made again.
+    output, *_ = sorted((tmp_path / "cache").rglob("outputs/*-cropped.zip"))
+    output.chmod(0o644)
+    output.write_bytes(b"changed")
+    _area_fetch(monkeypatch, tmp_path, other)
+    assert sorted(calls[4:]) == ["crop_feed", "validate_feed"]
+    # A version deleted for an unreadable sidecar leaves no outputs behind.
+    from transitio.catalog._cache import FeedCache
+
+    cache, folder = FeedCache(tmp_path / "cache"), output.parent.parent
+    (feed_id,) = [f for f in ("mdb-10", "mdb-11") if cache.folder(f) == folder]
+    (sidecar,) = folder.glob("*.provenance.json")
+    sidecar.write_text("{")
+    assert cache.versions(feed_id) == []
+    assert list((folder / "outputs").iterdir()) == []
+
+
+def test_outputs_are_keyed_by_the_exact_area_and_the_budgets():
+    from types import SimpleNamespace
+
+    from shapely.geometry import Polygon, box
+
+    from transitio.pipeline._fetch import _output_key
+
+    version = SimpleNamespace(sha256="0" * 64)
+    square, notched = box(0, 0, 1, 1), Polygon(
+        [(0, 0), (1, 0), (1, 1), (0.5, 0.5), (0, 1)]
+    )
+
+    def key(area, crop=True, **budgets):
+        return _output_key(version, area, None, crop, False, budgets)
+
+    assert key(square) != key(notched)  # the same bounds
+    assert key(square) != key(square, max_notices_per_file=5)
+    assert key(square, crop=False) == key(notched, crop=False)
 
 
 def test_an_area_fetch_delivers_the_same_content_once(pipeline_env, monkeypatch):
@@ -180,6 +269,17 @@ def test_an_area_fetch_delivers_the_same_content_once(pipeline_env, monkeypatch)
     assert first["index_window"] is None and first["name"] in {"HSL", "HKL"}
     # A feed skipped after its download still records where it came from.
     assert [e["fetched_from"] for e in result.selection] == ["mdb_latest"] * 2
+
+
+def test_an_area_fetch_reports_a_page_that_is_no_zip_as_a_failed_download(
+    pipeline_env, monkeypatch
+):
+    tmp_path, _ = pipeline_env
+    result = _area_fetch(monkeypatch, tmp_path, b"<html>maintenance</html>")
+    (entry,) = [e for e in result.selection if e["decision"] == "skipped"]
+    assert entry["reason"] == f"download failed: {entry['download_errors']}"
+    assert entry["download_errors"].endswith("not a zip archive")
+    assert entry["fetched_from"] is None and len(result.feeds) == 1
 
 
 OTHER_TRIPS = {**GTFS, "trips.txt": "route_id,service_id,trip_id\nr1,wk,t2\n"}
@@ -549,12 +649,12 @@ def test_download_indexed_tries_the_producer_then_the_hosted_copy(
         return path
 
     db = SimpleNamespace(
-        download_latest=lambda proxy, directory: serve(
+        _fetch_latest=lambda proxy, directory: serve(
             proxy.latest_dataset_url, directory
         )
     )
     atlas = SimpleNamespace(
-        download=lambda record, directory: serve(record.static_url, directory)
+        _fetch_static=lambda record, directory: serve(record.static_url, directory)
     )
     if source is None:
         with pytest.raises(DownloadError) as caught:
@@ -562,11 +662,14 @@ def test_download_indexed_tries_the_producer_then_the_hosted_copy(
         expected = "; ".join(failures) or "feed f-a has no downloadable url"
         assert str(caught.value) == expected
     else:
-        path, fetched_from, seen = _download_indexed(feed, db, atlas, tmp_path, None)
-        assert (zipfile.is_zipfile(path), fetched_from, seen) == (
+        path, fetched_from, seen, url = _download_indexed(
+            feed, db, atlas, tmp_path, None
+        )
+        assert (zipfile.is_zipfile(path), fetched_from, seen, url) == (
             True,
             source,
             failures,
+            calls[-1],
         )
     assert called == calls
 
@@ -607,7 +710,9 @@ def test_fetch_place_selects_downloads_and_processes(tmp_path, monkeypatch):
 
     fake_pbf = tmp_path / "aoi.osm.pbf"
     fake_pbf.write_bytes(b"\x00fake")
-    monkeypatch.setattr("transitio.catalog.TransitlandAtlas.download", fake_download)
+    monkeypatch.setattr(
+        "transitio.catalog.TransitlandAtlas._fetch_static", fake_download
+    )
     monkeypatch.setattr("transitio.osm.fetch_pbf", lambda *a, **k: fake_pbf)
     monkeypatch.setattr("transitio.osm._fetch.fetch_pbf", lambda *a, **k: fake_pbf)
 
@@ -619,7 +724,7 @@ def test_fetch_place_selects_downloads_and_processes(tmp_path, monkeypatch):
         reference_date="20260601",
     )
     assert result.osm_pbf == fake_pbf
-    assert [p.name for p in result.feeds] == ["latest.zip"]
+    assert len(result.feeds) == 1
     ((feed_id, reason),) = result.skipped
     assert reason == f"same content as {({'f-a', 'f-b'} - {feed_id}).pop()}"
     assert result.selections == []
@@ -715,7 +820,9 @@ def test_a_kept_contained_feed_is_reported(tmp_path, monkeypatch):
 
     fake_pbf = tmp_path / "aoi.osm.pbf"
     fake_pbf.write_bytes(b"\x00fake")
-    monkeypatch.setattr("transitio.catalog.TransitlandAtlas.download", fake_download)
+    monkeypatch.setattr(
+        "transitio.catalog.TransitlandAtlas._fetch_static", fake_download
+    )
     monkeypatch.setattr("transitio.osm.fetch_pbf", lambda *a, **k: fake_pbf)
     monkeypatch.setattr("transitio.osm._fetch.fetch_pbf", lambda *a, **k: fake_pbf)
     result = fetch(
@@ -1151,6 +1258,7 @@ def test_schema_11_downloads(
             credentials=credentials,
             when=DAY,
             directory=tmp_path / "out",
+            cache_dir=tmp_path / "cache",
             crop=False,
             osm=False,
         )
@@ -1444,6 +1552,245 @@ def test_fetch_delivers_one_copy_per_service(
     )
     paths = [e["path"] for e in result.selection if e["decision"] == "delivered"]
     assert sorted(result.feeds) == sorted(paths) and len(result.reports) == len(paths)
+    # A feed skipped or left out as a version leaves nothing in the directory.
+    assert sorted((tmp_path / "out").rglob("*.zip")) == sorted(paths)
+
+
+def _timeless(reports):
+    """``reports`` without the time each was generated."""
+    return [
+        {**r, "summary": {k: v for k, v in r["summary"].items() if k != "generatedAt"}}
+        for r in reports
+    ]
+
+
+@pytest.mark.filterwarnings("ignore:no Mobility Database API token")
+def test_a_cached_version_serves_the_study_days_it_covers(tmp_path, monkeypatch):
+    from transitio.catalog import TransitlandAtlas
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    # The index saw the feed ended, so a download is preceded by a probe.
+    index = _partitioned_index(tmp_path, monkeypatch, {"f-a": ENDED_ETAG})
+    spring = _zip(_calendar("20260101", "20260501"))
+    weekdays = _zip(_calendar("20260101", "20261231", "1111100"))
+    sha = {body: hashlib.sha256(body).hexdigest() for body in (spring, weekdays)}
+    served, requests = {}, []
+
+    def handler(request):
+        requests.append(request.method)
+        if served["body"] is None:
+            raise httpx.ConnectError("offline", request=request)
+        return httpx.Response(200, content=served["body"])
+
+    class Served(TransitlandAtlas):
+        def __init__(self, **kwargs):
+            super().__init__(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas", Served)
+    options = dict(place="Q1757", index=index, crop=False, osm=False)
+    options["cache_dir"] = tmp_path / "cache"
+
+    def run(when, body, **extra):
+        served["body"], before = body, len(requests)
+        result = fetch(when=when, **options, **extra)
+        (entry,) = result.selection
+        report = result.reports[0]["summary"]["provenance"]["sha256"]
+        return result, [entry["cache"], report, requests[before:]]
+
+    first, seen = run("2026-03-02", spring)
+    assert seen == ["downloaded", sha[spring], ["HEAD", "GET"]]
+    # Offline, the day is served from the cache with neither download nor probe.
+    again, seen = run("2026-03-02", None)
+    assert seen == ["reused", sha[spring], []]
+    columns = ("cache", "download_errors")
+    tables = [
+        [{k: v for k, v in e.items() if k not in columns} for e in r.selection]
+        for r in (first, again)
+    ]
+    assert tables[0] == tables[1]
+    assert _timeless(first.reports) == _timeless(again.reports)
+    # A day the version misses downloads another and keeps it.
+    assert run("2026-06-01", weekdays)[1] == [
+        "downloaded",
+        sha[weekdays],
+        ["HEAD", "GET"],
+    ]
+    # The first day keeps its version though the newer one serves it too; a
+    # new Sunday passes over the newer one, which runs no Sunday service.
+    assert run("2026-03-02", None)[1] == ["reused", sha[spring], []]
+    assert run("2026-03-08", None)[1] == ["reused", sha[spring], []]
+    # A refresh whose every attempt fails falls back, deleting nothing.
+    with pytest.warns(UserWarning, match="f-a: refresh failed"):
+        _, seen = run("2026-06-01", b"<html>maintenance</html>", use_cache=False)
+    assert seen == ["fallback", sha[weekdays], ["HEAD", "GET"]]
+    assert len(list((tmp_path / "cache" / "gtfs").glob("id-*/*.zip"))) == 2
+
+
+@pytest.mark.filterwarnings("ignore:no Mobility Database API token")
+def test_containment_from_the_cache_follows_the_proofs_of_the_snapshot(
+    tmp_path, monkeypatch
+):
+    from transitio.catalog import TransitlandAtlas
+    from transitio.catalog._cache import FeedCache
+    from transitio.pipeline._fetch import _prove
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    columns = {"f-a": ETAG, "f-b": ETAG}
+    index = _partitioned_index(tmp_path, monkeypatch, columns, {"f-a": ["f-b"]})
+    other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "HKL")}
+    payloads = {"f-a": _zip(GTFS), "f-b": _zip(other)}
+    online, requests = [True], []
+
+    def handler(request):
+        feed_id = request.url.path.strip("/")
+        requests.append((request.method, feed_id))
+        if not online[0]:
+            raise httpx.ConnectError("offline", request=request)
+        if request.method == "HEAD":
+            # The container is unchanged since indexed, f-a is not.
+            return httpx.Response(304 if feed_id == "f-b" else 200)
+        return httpx.Response(200, content=payloads[feed_id])
+
+    class Served(TransitlandAtlas):
+        def __init__(self, **kwargs):
+            super().__init__(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas", Served)
+    cache_dir = tmp_path / "cache"
+    options = dict(place="Q1757", index=index, crop=False, osm=False)
+
+    def decisions():
+        result = fetch(cache_dir=cache_dir, **options)
+        return [(e["feed_id"], e["decision"], e["note"]) for e in result.selection]
+
+    kept = "kept: containment not proven current"
+    assert decisions() == [("f-a", "delivered", kept), ("f-b", "delivered", None)]
+    # f-a's version as a probe under this snapshot would have proven it.
+    cache = FeedCache(cache_dir)
+    (version,) = cache.versions("f-a")
+    _prove(cache, version, index.snapshot_id, "https://feeds.example/f-a")
+    online[0], before = False, len(requests)
+    assert decisions() == [("f-a", "skipped", None), ("f-b", "delivered", None)]
+    # Under another snapshot neither version is proven, so f-a stays.
+    index.snapshot["snapshot_id"] = "another"
+    assert decisions() == [("f-a", "delivered", kept), ("f-b", "delivered", None)]
+    assert requests[before:] == []
+
+
+def test_a_container_read_from_the_hosted_copy_proves_nothing(tmp_path, monkeypatch):
+    from transitio.catalog._cache import FeedCache
+
+    hosted = "https://files.example.com/f-b/latest.zip"
+    columns = {"f-a": ETAG, "f-b": {**ETAG, "mdb": {"urls": {"latest": hosted}}}}
+    index = _partitioned_index(tmp_path, monkeypatch, columns, {"f-a": ["f-b"]})
+    other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "HKL")}
+    payloads = {"/f-a": _zip(GTFS), "/f-b/latest.zip": _zip(other)}
+    online = [True]
+
+    def handler(request):
+        if not online[0]:
+            raise httpx.ConnectError("offline", request=request)
+        if request.method == "HEAD":
+            return httpx.Response(304)  # both unchanged since indexed
+        if request.url.path in payloads:
+            return httpx.Response(200, content=payloads[request.url.path])
+        return httpx.Response(404)  # the container's producer URL
+
+    _serve(monkeypatch, handler)
+    cache_dir = tmp_path / "cache"
+    options = dict(place="Q1757", index=index, crop=False, osm=False)
+    first = fetch(cache_dir=cache_dir, **options)
+    online[0] = False
+    again = fetch(cache_dir=cache_dir, **options)
+    kept = "kept: containment not proven current"
+    for result in (first, again):
+        notes = {e["feed_id"]: (e["decision"], e["note"]) for e in result.selection}
+        assert notes["f-a"] == ("delivered", kept)
+        assert notes["f-b"][1].startswith("from the Mobility Database hosted copy")
+    # The probe proved the producer's archive, not the hosted copy read.
+    (version,) = FeedCache(cache_dir).versions("f-b")
+    assert version.index_proofs == {}
+    columns = ("cache", "download_errors")
+    tables = [
+        [{k: v for k, v in e.items() if k not in columns} for e in r.selection]
+        for r in (first, again)
+    ]
+    assert tables[0] == tables[1]
+    assert _timeless(first.reports) == _timeless(again.reports)
+
+
+@pytest.mark.filterwarnings("ignore:no Mobility Database API token")
+def test_a_cached_producer_copy_is_used_only_with_credentials(tmp_path, monkeypatch):
+    mdb = {"urls": {"latest": HOSTED}}
+    feeds = {"f-a": {"mdb": mdb, **_protected(KEY)}}
+    index = _partitioned_index(tmp_path, monkeypatch, feeds, providers=PROVIDERS)
+    payload = _zip(_calendar("20260101", "20261231"))
+    requests = []
+
+    def handler(request):
+        requests.append(str(request.url.copy_with(query=None)))
+        return httpx.Response(200, content=payload)
+
+    _serve(monkeypatch, handler)
+    options = dict(place="Q1757", index=index, crop=False, osm=False, when=DAY)
+    options["cache_dir"] = tmp_path / "cache"
+    results = []
+    for env in ({"P_KEY__KEY": SECRET}, {}, {"P_KEY__KEY": SECRET}):
+        _credentials_env(monkeypatch, tmp_path, env)
+        (entry,) = fetch(**options).selection
+        results.append((entry["fetched_from"], entry["cache"]))
+    # Without the key the producer copy is passed over for the hosted copy.
+    assert results == [
+        ("producer", "downloaded"),
+        ("mdb_latest", "downloaded"),
+        ("producer", "reused"),
+    ]
+    assert requests == [API, HOSTED]
+
+
+def test_a_cached_dataset_is_reported_alike_without_the_catalogue(
+    tmp_path, monkeypatch
+):
+    from transitio.catalog._models import Dataset
+
+    index = _place_index(
+        tmp_path, {"mdb": {"mdb_id": "mdb-9", "urls": {"latest": "u"}}}
+    )
+    payload = _gtfs_payload()
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, payload)
+    newest = Dataset.from_api(
+        {
+            "id": "mdb-9-newest",
+            "feed_id": "mdb-9",
+            "hosted_url": "https://x/z.zip",
+            "validation_report": {"url_json": "https://x/r.json"},
+        }
+    )
+    hosted = {"summary": {"validatorVersion": "6.0.0"}, "notices": []}
+
+    def dataset_download(self, dataset, directory):
+        path = directory / f"{dataset.id}.zip"
+        path.write_bytes(payload)
+        return path
+
+    def unreachable(*args, **kwargs):
+        raise RuntimeError("catalogue unreachable")
+
+    catalogue = "transitio.catalog.MobilityDatabase"
+    monkeypatch.setattr(f"{catalogue}.datasets", lambda self, feed: [newest])
+    monkeypatch.setattr(f"{catalogue}.validation_report", lambda self, d: hosted)
+    monkeypatch.setattr(f"{catalogue}._fetch_dataset", dataset_download)
+    options = dict(place="Q1757", index=index, crop=False, refresh_token="tok")
+    first = fetch(**options)
+    for name in ("datasets", "validation_report", "_fetch_dataset"):
+        monkeypatch.setattr(f"{catalogue}.{name}", unreachable)
+    again = fetch(**options)
+    assert [e["cache"] for e in first.selection + again.selection] == [
+        "downloaded",
+        "reused",
+    ]
+    assert _timeless(first.reports) == _timeless(again.reports)
+    assert again.reports[0]["summary"]["provenance"]["dataset_id"] == "mdb-9-newest"
 
 
 def test_fetch_place_rejects_country_code():
@@ -1463,13 +1810,7 @@ def _place_index(tmp_path, feed):
 
 
 def _gtfs_payload():
-    import io as _io
-
-    buffer = _io.BytesIO()
-    with zipfile.ZipFile(buffer, "w") as archive:
-        for name, content in GTFS.items():
-            archive.writestr(name, content)
-    return buffer.getvalue()
+    return _zip(GTFS, zipfile.ZIP_STORED)
 
 
 def _stub_pbf_and_atlas(monkeypatch, tmp_path, payload):
@@ -1484,7 +1825,9 @@ def _stub_pbf_and_atlas(monkeypatch, tmp_path, payload):
 
     fake_pbf = tmp_path / "aoi.osm.pbf"
     fake_pbf.write_bytes(b"\x00fake")
-    monkeypatch.setattr("transitio.catalog.TransitlandAtlas.download", fake_download)
+    monkeypatch.setattr(
+        "transitio.catalog.TransitlandAtlas._fetch_static", fake_download
+    )
     monkeypatch.setattr("transitio.osm.fetch_pbf", lambda *a, **k: fake_pbf)
     monkeypatch.setattr("transitio.osm._fetch.fetch_pbf", lambda *a, **k: fake_pbf)
     return fake_pbf
@@ -1504,7 +1847,7 @@ def test_fetch_place_when_without_token_warns(tmp_path, monkeypatch):
             crop=False,
             when="2026-06-01",
         )
-    assert [p.name for p in result.feeds] == ["latest.zip"]
+    assert [e["fetched_from"] for e in result.selection] == ["producer"]
 
 
 def test_fetch_place_with_token_selects_the_covering_dataset(tmp_path, monkeypatch):
@@ -1533,7 +1876,7 @@ def test_fetch_place_with_token_selects_the_covering_dataset(tmp_path, monkeypat
         return path
 
     monkeypatch.setattr(
-        "transitio.catalog.MobilityDatabase.download", fake_dataset_download
+        "transitio.catalog.MobilityDatabase._fetch_dataset", fake_dataset_download
     )
     result = fetch(
         place="Q1757",
@@ -1543,7 +1886,7 @@ def test_fetch_place_with_token_selects_the_covering_dataset(tmp_path, monkeypat
         when="2026-06-01",
         refresh_token="tok",
     )
-    assert [p.name for p in result.feeds] == ["mdb-9-2026.zip"]
+    assert result.reports[0]["summary"]["provenance"]["dataset_id"] == "mdb-9-2026"
 
 
 def test_fetch_place_records_index_provenance(tmp_path, monkeypatch):
@@ -1644,8 +1987,13 @@ def test_a_delivered_feed_notes_an_agency_timezone_its_stops_disagree_with(
     assert note.endswith(f"agency_timezone {NEW_YORK}; stops in Europe/Helsinki")
 
 
+@pytest.mark.parametrize(
+    "served, error",
+    [(None, "dataset download boom"), (b"<html></html>", "not a zip archive")],
+    ids=["raises", "no-zip"],
+)
 def test_fetch_place_falls_back_to_atlas_when_the_dataset_download_fails(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, served, error
 ):
     from transitio.catalog._models import Dataset
 
@@ -1666,9 +2014,13 @@ def test_fetch_place_falls_back_to_atlas_when_the_dataset_download_fails(
     )
 
     def failing(self, dataset, directory=None):
-        raise RuntimeError("dataset download boom")
+        if served is None:
+            raise RuntimeError("dataset download boom")
+        path = directory / f"{dataset.id}.zip"
+        path.write_bytes(served)
+        return path
 
-    monkeypatch.setattr("transitio.catalog.MobilityDatabase.download", failing)
+    monkeypatch.setattr("transitio.catalog.MobilityDatabase._fetch_dataset", failing)
     result = fetch(
         place="Q1757",
         index=index,
@@ -1677,13 +2029,13 @@ def test_fetch_place_falls_back_to_atlas_when_the_dataset_download_fails(
         when="2026-06-01",
         refresh_token="tok",
     )
-    # The dataset download failed, so the Atlas fallback delivered latest.zip.
-    assert [p.name for p in result.feeds] == ["latest.zip"]
+    # The dataset download failed, so the Atlas fallback delivered the feed.
+    assert len(result.feeds) == 1
     assert result.skipped == []
     (entry,) = result.selection
     assert (entry["fetched_from"], entry["download_errors"]) == (
         "producer",
-        "mdb dataset: dataset download boom",
+        f"mdb dataset: {error}",
     )
 
 
@@ -1694,14 +2046,59 @@ def test_fetch_place_skips_a_feed_whose_provenance_sidecar_is_unreadable(
         tmp_path, {"atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}}}
     )
     _stub_pbf_and_atlas(monkeypatch, tmp_path, _gtfs_payload())
+    from transitio.catalog import TransitlandAtlas
+
+    stub = TransitlandAtlas._fetch_static
+
+    def truncated(self, feed, directory):
+        path = stub(self, feed, directory)
+        path.with_suffix(".provenance.json").write_text("{")
+        return path
+
+    monkeypatch.setattr(TransitlandAtlas, "_fetch_static", truncated)
     out = tmp_path / "out"
-    out.mkdir()
-    # The stub writes no sidecar, so this truncated one stays beside the zip.
-    (out / "latest.provenance.json").write_text("{")
     result = fetch(place="Q1757", index=index, directory=out, crop=False, osm=False)
     ((feed_id, reason),) = result.skipped
     assert feed_id == "f-a" and reason.startswith("processing failed: ")
     assert result.feeds == []
+
+
+def test_a_place_fetch_keeps_its_download_as_a_cached_version(tmp_path, monkeypatch):
+    index = _place_index(
+        tmp_path, {"atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}}}
+    )
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, _gtfs_payload())
+    out, cache = tmp_path / "out", tmp_path / "cache"
+    options = dict(place="Q1757", index=index, directory=out, crop=False, osm=False)
+    first = fetch(cache_dir=cache, **options)
+    second = fetch(cache_dir=cache, use_cache=False, **options)
+    assert [e["cache"] for e in first.selection + second.selection] == [
+        "downloaded",
+        "refreshed",
+    ]
+    # Identical downloads keep one version and record each acquisition.
+    (version,) = (cache / "gtfs").glob("id-*/*.zip")
+    sidecar = json.loads(version.with_suffix(".provenance.json").read_text())
+    sources = sidecar["cache"]["sources"]
+    assert [(s["fetched_from"], s["index_snapshot"]) for s in sources] == [
+        ("producer", index.snapshot_id)
+    ] * 2
+    assert not list(cache.rglob(".staging"))
+    # The directory holds the delivered copy; reports describe the first download.
+    assert [p.name for p in out.rglob("*.zip")] == [version.name]
+    origin = [r["summary"]["provenance"] for r in first.reports + second.reports]
+    assert origin[0] == origin[1]
+    assert origin[0]["retrieved_at"] == sources[0]["retrieved_at"]
+    with pytest.raises(ValueError, match="outside the download cache"):
+        fetch(cache_dir=cache, **{**options, "directory": cache / "gtfs" / "out"})
+    if os.name != "nt":
+        # A feed folder in the directory linking into the cache is refused.
+        linked = tmp_path / "linked"
+        linked.mkdir()
+        (linked / version.parent.name).symlink_to(version.parent)
+        result = fetch(cache_dir=cache, **{**options, "directory": linked})
+        assert result.skipped[0][1].endswith(" is a symlink")
+        assert version.read_bytes() == _gtfs_payload()
 
 
 def test_fetch_place_from_a_bound_index_uses_its_snapshot(tmp_path, monkeypatch):
@@ -1714,7 +2111,7 @@ def test_fetch_place_from_a_bound_index_uses_its_snapshot(tmp_path, monkeypatch)
     place_obj = transitio.place("Q1757", index=index)
     result = fetch(place=place_obj, directory=tmp_path / "out", crop=False)
     assert result.provenance["snapshot"] == index.snapshot_id
-    assert [p.name for p in result.feeds] == ["latest.zip"]
+    assert len(result.feeds) == 1
 
 
 def test_fetch_place_with_token_and_no_date_uses_the_newest_dataset(
@@ -1747,7 +2144,9 @@ def test_fetch_place_with_token_and_no_date_uses_the_newest_dataset(
         path.write_bytes(payload)
         return path
 
-    monkeypatch.setattr("transitio.catalog.MobilityDatabase.download", dataset_download)
+    monkeypatch.setattr(
+        "transitio.catalog.MobilityDatabase._fetch_dataset", dataset_download
+    )
     result = fetch(
         place="Q1757",
         index=index,
@@ -1755,7 +2154,7 @@ def test_fetch_place_with_token_and_no_date_uses_the_newest_dataset(
         crop=False,
         refresh_token="tok",
     )
-    assert [p.name for p in result.feeds] == ["mdb-9-newest.zip"]
+    assert result.reports[0]["summary"]["provenance"]["dataset_id"] == "mdb-9-newest"
 
 
 def test_fetch_place_dataset_selection_failure_falls_back(tmp_path, monkeypatch):
@@ -1780,7 +2179,7 @@ def test_fetch_place_dataset_selection_failure_falls_back(tmp_path, monkeypatch)
         refresh_token="tok",
     )
     # The catalogue lookup failed, but the Atlas url still delivered the feed.
-    assert [p.name for p in result.feeds] == ["latest.zip"]
+    assert len(result.feeds) == 1
     assert result.skipped == []
 
 
@@ -1906,7 +2305,7 @@ def test_fetch_place_fetches_the_osm_extract_last_for_the_served_parts(
         tmp_path, {"atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}}}
     )
     fake_pbf = _stub_pbf_and_atlas(monkeypatch, tmp_path, _gtfs_payload())
-    download = transitio.catalog.TransitlandAtlas.download
+    download = transitio.catalog.TransitlandAtlas._fetch_static
     events = []
 
     def recorded_download(self, feed, directory=None):
@@ -1918,7 +2317,7 @@ def test_fetch_place_fetches_the_osm_extract_last_for_the_served_parts(
         return fake_pbf
 
     monkeypatch.setattr(
-        "transitio.catalog.TransitlandAtlas.download", recorded_download
+        "transitio.catalog.TransitlandAtlas._fetch_static", recorded_download
     )
     monkeypatch.setattr("transitio.osm.fetch_pbf", recorded_fetch_pbf)
     served = shapely.box(*_SERVED)
@@ -2081,18 +2480,20 @@ def test_fetch_place_crops_bundles_to_the_selected_routes(
             return real_repair(path, output, **options)
 
         monkeypatch.setattr(repair_module, "repair_feed", recording_repair)
-    result = fetch(
-        place="Q1757",
-        index=index,
-        directory=tmp_path / "out",
-        crop=False,
-        repair=repair,
-        tiers=["local", "regional"],
-        exclude=["national"],
-    )
-    # the repair, when asked for, receives the cropped feed
+    options = dict(place="Q1757", index=index, directory=tmp_path / "out")
+    options.update(crop=False, repair=repair, tiers=["local", "regional"])
+    result = fetch(exclude=["national"], **options)
+    # A repeat reads back what was made, the repair's fixes included.
+    again = fetch(exclude=["national"], **options)
+    assert len(repaired_inputs) == repair and again.repairs == result.repairs
+    assert _timeless(again.reports) == _timeless(result.reports)
+    # the repair, when asked for, receives the cropped feed, kept read-only
     assert bool(repaired_inputs) == repair
-    assert all("-cropped-" in path for path in repaired_inputs)
+    assert all("-cropped" in path for path in repaired_inputs)
+    if os.name != "nt":
+        assert not any(os.access(path, os.W_OK) for path in repaired_inputs)
+    # Only the delivered feed reaches the directory, not the crop it repaired.
+    assert list((tmp_path / "out").rglob("*.zip")) == result.feeds
     # The delivered feed keeps only the selected tiers' routes, and the crop
     # cascade drops the entities only the removed routes referenced.
     tables = _feed_tables(result.feeds[0])
@@ -2302,6 +2703,66 @@ def test_fetch_place_stale_selector_follows_on_untrusted_selector(
             on_untrusted_selector="error",
         )
 
+    # Offline, with only the stale cached version, the policy decides on it.
+    def offline(self, feed, directory):
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas._fetch_static", offline)
+    options = dict(place="Q1757", index=index, crop=False, tiers=["local"])
+    cached = fetch(**options)
+    assert [e["cache"] for e in cached.selection] == ["reused"] and cached.feeds
+    assert fetch(exclude=["national"], **options).feeds == []
+    with pytest.raises(StaleSelectorError):
+        fetch(on_untrusted_selector="error", **options)
+    with pytest.warns(UserWarning, match="f-a: refresh failed"):
+        refreshed = fetch(use_cache=False, **options)
+    assert [e["cache"] for e in refreshed.selection] == ["fallback"]
+
+
+def test_a_cached_version_lacking_a_selected_route_is_passed_over(
+    tmp_path, monkeypatch
+):
+    import itertools
+
+    from index_fixture import edge as _edge
+    from transitio.catalog import _cache
+    from transitio.pipeline import _fetch
+
+    service = {"stops": 1, "routes": 1, "departures_per_day": 1.0}
+    selected = {
+        **_edge("Q1757", "f-a", tier="local", service=service),
+        "selector_state": "complete",
+        "selector": {"route_id": ["r-local"]},
+        "needs_review": False,
+    }
+    index = _selector_index(tmp_path, [selected])
+
+    def present(path, feed, sel):
+        # Fingerprints match; the routes are those the version carries.
+        return True, None, {r["route_id"] for r in _feed_tables(path)["routes.txt"]}
+
+    def offline(self, feed, directory):
+        raise RuntimeError("offline")
+
+    clock = itertools.count()
+    monkeypatch.setattr(_cache, "_now", lambda: f"2026-10-05T00:00:{next(clock):02d}")
+    monkeypatch.setattr(_fetch, "_selector_trusted", present)
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas._fetch_static", offline)
+    carrying, lacking = _multi_route_gtfs(), _multi_route_gtfs(_ROUTE_SPECS[1:])
+    cache = _cache.FeedCache(tmp_path / "cache")
+    for payload in (carrying, lacking):  # the version lacking the route is newer
+        with cache.lock("f-a"), cache.staging("f-a") as staging:
+            (staging / "feed.zip").write_bytes(payload)
+            _fetch._add_version(
+                cache, "f-a", staging / "feed.zip", "u", "producer", None
+            )
+    options = dict(place="Q1757", index=index, crop=False, osm=False, tiers=["local"])
+    result = fetch(cache_dir=tmp_path / "cache", **options)
+    (entry,) = result.selection
+    assert (entry["cache"], entry["note"]) == ("reused", "cut to routes r-local")
+    origin = result.reports[0]["summary"]["provenance"]
+    assert origin["sha256"] == hashlib.sha256(carrying).hexdigest()
+
 
 @pytest.mark.parametrize(
     ("policy", "exclude", "on_unknown", "expected"),
@@ -2412,7 +2873,9 @@ def test_fetch_place_without_osm_skips_the_extract(tmp_path, monkeypatch):
     def forbidden(*a, **k):
         raise AssertionError("fetch_pbf called despite osm=False")
 
-    monkeypatch.setattr("transitio.catalog.TransitlandAtlas.download", fake_download)
+    monkeypatch.setattr(
+        "transitio.catalog.TransitlandAtlas._fetch_static", fake_download
+    )
     monkeypatch.setattr("transitio.osm.fetch_pbf", forbidden)
     monkeypatch.setattr("transitio.osm._fetch.fetch_pbf", forbidden)
 
@@ -2425,7 +2888,7 @@ def test_fetch_place_without_osm_skips_the_extract(tmp_path, monkeypatch):
         reference_date="20260601",
     )
     assert result.osm_pbf is None
-    assert [p.name for p in result.feeds] == ["latest.zip"]
+    assert len(result.feeds) == 1
 
 
 def test_to_pyrosm_without_an_extract_is_refused(tmp_path):

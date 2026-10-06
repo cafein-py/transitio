@@ -1899,7 +1899,8 @@ def test_http_clients_identify_themselves_as_transitio(client, tmp_path):
 
     def handler(request):
         sent.append(request)
-        return httpx.Response(200, content=b"PK\x03\x04")
+        # The smallest valid zip: an empty archive's end record.
+        return httpx.Response(200, content=b"PK\x05\x06" + bytes(18))
 
     transport = httpx.MockTransport(handler)
     if client == "mdb":
@@ -2210,7 +2211,7 @@ def test_feeds_nested_in_one_archive_are_read_from_it_once(
         place="Q1757", index=index, directory=out, crop=False, osm=False, expired="keep"
     )
     assert requests == [("GET", "/outer.zip")]
-    assert all(path.name.startswith("id-") for path in out.iterdir())
+    assert all(path.name.startswith("id-") for path in out.glob("*"))
     if status == 404:
         reason = f"download failed: atlas: {outer}: HTTP 404 Not Found"
         assert sorted(result.skipped) == [("f-1", reason), ("f-2", reason)]
@@ -2273,7 +2274,7 @@ def test_a_failed_extract_download_keeps_the_fetched_feeds(
         raise error
 
     monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
-    monkeypatch.setattr("transitio.catalog.TransitlandAtlas.download", download)
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas._fetch_static", download)
     monkeypatch.setattr("transitio.osm.fetch_pbf", fetch_pbf)
     options = dict(
         place="Q1757",
@@ -2358,7 +2359,7 @@ def test_an_empty_default_view_is_not_fetched_silently(
         return write_zip(pathlib.Path(directory) / "latest.zip", FEED)
 
     monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
-    monkeypatch.setattr("transitio.catalog.TransitlandAtlas.download", download)
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas._fetch_static", download)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         result = fetch(
@@ -2413,7 +2414,7 @@ def test_stops_beyond_the_osm_area_are_counted(tmp_path, monkeypatch, osm):
         return write_zip(pathlib.Path(directory) / "latest.zip", tables)
 
     monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
-    monkeypatch.setattr("transitio.catalog.TransitlandAtlas.download", download)
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas._fetch_static", download)
     monkeypatch.setattr("transitio.osm.fetch_pbf", lambda *a, **k: tmp_path / "a.pbf")
     result = fetch(place="c", index=index, directory=tmp_path / "out", osm=osm)
     entry, *notes = result.selection
