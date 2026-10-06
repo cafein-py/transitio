@@ -14,7 +14,10 @@ cache's records under ``cache``:
 - ``served``: the requests of ``fetch`` the version served, by key, each with
   the dataset it was read as;
 - ``index_proofs``: the index snapshots under which a probe proved the bytes
-  to be the archive the index crawled, each with the URL probed.
+  to be the archive the index crawled, each with the URL probed;
+- ``outputs``: what ``fetch`` made of the version, by key, each the name and
+  SHA-256 of its file in the feed's ``outputs`` folder, beside the results
+  stored as ``<key>.json``.
 
 A delivered copy's sidecar describes the first acquisition. A version is
 published only after its download completed and the file is a readable zip;
@@ -101,7 +104,25 @@ def _well_formed(sidecar, feed_id, digest):
         )
         and isinstance(cache.get("served", {}), dict)
         and isinstance(cache.get("index_proofs", {}), dict)
+        and isinstance(cache.get("outputs", {}), dict)
+        and all(_output_record(k, r) for k, r in cache.get("outputs", {}).items())
     )
+
+
+def _output_record(key, record):
+    """Whether ``record`` describes an output under ``key`` as ``fetch``
+    stores one: no file (the version itself) or the step's file named by the
+    key, with their SHA-256 digests."""
+    if not (_DIGEST.fullmatch(key) and isinstance(record, dict)):
+        return False
+    file, digest = record.get("file"), record.get("sha256")
+    if file is None:
+        named = digest is None
+    else:
+        named = file in (f"{key}-cropped.zip", f"{key}-repaired.zip")
+        named = named and isinstance(digest, str) and bool(_DIGEST.fullmatch(digest))
+    results = record.get("results_sha256")
+    return named and isinstance(results, str) and bool(_DIGEST.fullmatch(results))
 
 
 def _directory(path):
@@ -231,7 +252,22 @@ class FeedCache:
                 continue
             found.append(Version(path, sidecar))
         found.sort(key=lambda v: (v.retrieved_at, v.sha256), reverse=True)
+        self._sweep(folder, found)
         return found
+
+    def _sweep(self, folder, versions):
+        """Remove the outputs no version in ``versions`` lists, such as those
+        of a version deleted for an unreadable sidecar."""
+        outputs = folder / "outputs"
+        if outputs.is_symlink() or not outputs.is_dir():
+            return
+        listed = set()
+        for version in versions:
+            for key, record in version.sidecar["cache"].get("outputs", {}).items():
+                listed.update((f"{key}.json", record.get("file")))
+        for path in outputs.iterdir():
+            if path.name not in listed:
+                _unlink(path)
 
     def newest(self, feed_id, accept=None):
         """The newest version whose bytes still match their digest and that
@@ -379,7 +415,16 @@ class FeedCache:
         self.update(version, change)
 
     def delete(self, version):
-        """Remove a version's archive and sidecar."""
+        """Remove a version's archive, sidecar and the outputs made of it."""
+        outputs = version.path.parent / "outputs"
+        records = version.sidecar.get("cache", {}).get("outputs", {})
+        for key, record in records.items() if not outputs.is_symlink() else ():
+            # Only names the cache gives its outputs, whatever the sidecar says.
+            if not _DIGEST.fullmatch(key):
+                continue
+            if record.get("file") in (f"{key}-cropped.zip", f"{key}-repaired.zip"):
+                _unlink(outputs / record["file"])
+            _unlink(outputs / f"{key}.json")
         _unlink(version.path)
         _unlink(version.path.with_suffix(_SIDECAR))
 

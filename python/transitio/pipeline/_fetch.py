@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime
 import hashlib
@@ -348,7 +349,7 @@ def _process_feed(
     path,
     *,
     geometry,
-    tag,
+    tag=None,
     repair,
     crop,
     modes,
@@ -358,6 +359,7 @@ def _process_feed(
     budgets,
     routes=None,
     provenance=None,
+    outputs=None,
 ):
     """Crop, repair, mode-filter, validate and report one downloaded feed,
     writing what it makes beside it; the report carries ``provenance``.
@@ -366,6 +368,12 @@ def _process_feed(
     day. The computed service window is tested against ``day`` (None tests
     nothing): with a ``study`` day it must cover the day and the validation
     report must not prove the day idle; otherwise it must not end before it.
+
+    With ``outputs``, ``(cache, version)`` of the cached version at ``path``,
+    what the crop, repair and validation make is stored with the version
+    (:func:`_store_output`) and a later call making the same reads it back
+    instead (:func:`_stored_output`); the mode filter, the day checks and the
+    report run again on every call.
 
     Returns ``(path, report, fixes, present_routes, window)``; ``present_routes``
     is the set of ``route_id`` values in the downloaded feed as it enters the
@@ -377,44 +385,43 @@ def _process_feed(
     cropped. Raises :class:`_SkipFeed` when the feed drops out. Shared by the
     AOI and the place paths.
     """
-    from transitio.gtfs import crop_feed
-    from transitio.repair import repair_feed
     from transitio.report import build_report
     from transitio.validate import validate_feed
 
-    present_routes = None
-    source_notices = []
-    dropped = None
-    if crop or routes is not None:
-        cropped = path.with_name(f"{path.stem}-cropped-{tag}.zip")
-        report = crop_feed(
-            path, cropped, aoi=geometry if crop else None, routes=routes, **budgets
+    made = None
+    if outputs is not None:
+        cache, version = outputs
+        key = _output_key(version, geometry, routes, crop, repair, budgets)
+        made = _stored_output(version, key)
+    if made is None:
+        if outputs is None:
+            folder, stem = path.parent, f"{path.stem}-{tag}"
+        else:
+            folder, stem = version.path.parent / "outputs", key
+        made = _transform(
+            path,
+            folder,
+            stem,
+            geometry=geometry,
+            repair=repair,
+            crop=crop,
+            budgets=budgets,
+            routes=routes,
         )
-        if routes is not None:
-            # From the crop's own scan of this feed, so the drop audit and the
-            # crop describe the same bytes (no second read to race). ``None``
-            # (no routes.txt) stays undetermined, not empty.
-            source = report.get("source_routes")
-            present_routes = None if source is None else set(source)
-        # The crop writes trimmed tables; the source's whitespace is
-        # reported with the feed.
-        source_notices = report["source_notices"]
-        dropped = report["dropped_rows"]
-        path = _read_only(cropped)
-    # The crop comes first, so the repair works on the area's feed rather
-    # than on the whole source.
-    fixes = []
-    if repair:
-        repaired = path.with_name(f"{path.stem}-repaired-{tag}.zip")
-        fixes = repair_feed(path, repaired, **budgets)["fixes"]
-        path = _read_only(repaired)
+        if outputs is not None:
+            _store_output(cache, version, key, made)
+    path = made["path"]
     if modes is not None:
         served = _feed_modes(path)
         if served is None:
             raise _SkipFeed("could not read routes.txt for mode filtering")
         if not served & modes:
             raise _SkipFeed(f"serves {sorted(served)}, not {sorted(modes)}")
-    validation = validate_feed(path, **budgets)
+    if "validation" not in made:
+        made["validation"] = validate_feed(path, **budgets)
+        if outputs is not None:
+            _store_output(cache, version, key, made)
+    validation = made["validation"]
     start = end = None
     if validation["service_window"]:
         start, end = (
@@ -431,10 +438,165 @@ def _process_feed(
             reason = f"no service on {day.isoformat()}"
         if reason is not None:
             raise _SkipFeed(reason, window)
-    validation["notices"].extend(source_notices)
+    validation["notices"].extend(made["source_notices"])
     report = build_report(validation, hosted=hosted, provenance=provenance)
-    report["summary"]["droppedRows"] = dropped
-    return path, report, fixes, present_routes, window
+    report["summary"]["droppedRows"] = made["dropped"]
+    return path, report, made["fixes"], made["present_routes"], window
+
+
+def _transform(path, folder, stem, **steps):
+    """The crop and the repair :func:`_process_feed` asks of the feed at
+    ``path``, each output ``<stem>-<step>.zip`` in ``folder``: a dict of the
+    feed made (``path``, read-only), the routes it had as it entered the
+    route crop, the notices of the source the crop trimmed, the rows the crop
+    dropped and the repair's fixes. A failed step removes the outputs the
+    call wrote."""
+    made = {"present_routes": None, "source_notices": [], "dropped": None}
+    written = []
+    try:
+        return _transformed(path, folder, stem, made, written, **steps)
+    except BaseException:
+        # A step that failed leaves none of the call's outputs behind.
+        for output in written:
+            with contextlib.suppress(OSError):
+                os.unlink(output)
+        raise
+
+
+def _transformed(
+    path, folder, stem, made, written, *, geometry, repair, crop, budgets, routes
+):
+    """The steps of :func:`_transform`, each output added to ``written``."""
+    from transitio.catalog._cache import _directory
+    from transitio.gtfs import crop_feed
+    from transitio.repair import repair_feed
+
+    if crop or routes is not None:
+        _directory(folder)
+        cropped = folder / f"{stem}-cropped.zip"
+        written.append(cropped)
+        report = crop_feed(
+            path, cropped, aoi=geometry if crop else None, routes=routes, **budgets
+        )
+        if routes is not None:
+            # From the crop's own scan of this feed, so the drop audit and the
+            # crop describe the same bytes (no second read to race). ``None``
+            # (no routes.txt) stays undetermined, not empty.
+            source = report.get("source_routes")
+            made["present_routes"] = None if source is None else set(source)
+        # The crop writes trimmed tables; the source's whitespace is
+        # reported with the feed.
+        made["source_notices"] = report["source_notices"]
+        made["dropped"] = report["dropped_rows"]
+        path = _read_only(cropped)
+    # The crop comes first, so the repair works on the area's feed rather
+    # than on the whole source.
+    made["fixes"] = []
+    if repair:
+        _directory(folder)
+        repaired = folder / f"{stem}-repaired.zip"
+        written.append(repaired)
+        made["fixes"] = repair_feed(path, repaired, **budgets)["fixes"]
+        path = _read_only(repaired)
+    made["path"] = path
+    return made
+
+
+def _output_key(version, geometry, routes, crop, repair, budgets):
+    """The SHA-256 naming what processing makes of ``version``: canonical
+    JSON of the transitio release, the version's SHA-256, the exact area
+    (when cropped to it), the routes, the crop and repair flags and the
+    budgets, the reference date among them."""
+    from transitio import __version__
+
+    return _request_key(
+        transitio=__version__,
+        version=version.sha256,
+        area=hashlib.sha256(geometry.wkb).hexdigest() if crop else None,
+        routes=None if routes is None else sorted(routes),
+        crop=crop,
+        repair=repair,
+        budgets=budgets,
+    )
+
+
+def _stored_output(version, key):
+    """What :func:`_transform` and the validation made of ``version`` under
+    ``key``, as stored with it; None when nothing is stored, or when the
+    output no longer matches its SHA-256 or its results cannot be read."""
+    from transitio import _http
+    from transitio.catalog._cache import _regular
+
+    record = version.sidecar["cache"].get("outputs", {}).get(key)
+    if record is None:
+        return None
+    folder = version.path.parent / "outputs"
+    results = folder / f"{key}.json"
+    try:
+        if folder.is_symlink() or record["file"] not in (
+            None,
+            f"{key}-cropped.zip",
+            f"{key}-repaired.zip",
+        ):
+            return None
+        path = version.path if record["file"] is None else folder / record["file"]
+        if not (_regular(results) and _regular(path)):
+            return None
+        if _http.sha256_file(results) != record["results_sha256"]:
+            return None
+        if record["file"] is not None and _http.sha256_file(path) != record["sha256"]:
+            return None
+        made = json.loads(results.read_text())
+        routes = made["present_routes"]
+        shapes = [
+            (routes, (list, type(None))),
+            (made["source_notices"], list),
+            (made["dropped"], (list, type(None))),
+            (made["fixes"], list),
+            (made.get("validation", {}), dict),
+        ]
+        if not all(isinstance(value, kind) for value, kind in shapes):
+            return None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    made.update(path=path, present_routes=None if routes is None else set(routes))
+    return made
+
+
+def _store_output(cache, version, key, made):
+    """Store with ``version`` what processing ``made`` of it under ``key``,
+    the validation once it ran: the results beside the output in the
+    version's ``outputs`` folder, and the output's name and SHA-256 in its
+    sidecar."""
+    from transitio import _http
+    from transitio.catalog._cache import _directory, _write_provenance
+
+    folder = version.path.parent / "outputs"
+    _directory(folder)
+    path = made["path"]
+    record = {"file": None, "sha256": None}
+    if path != version.path:
+        record.update(file=path.name, sha256=_http.sha256_file(path))
+        # Only the last step's output is kept.
+        intermediate = folder / f"{key}-cropped.zip"
+        if intermediate != path and intermediate.exists():
+            intermediate.unlink()
+    routes = made["present_routes"]
+    results = {
+        "present_routes": None if routes is None else sorted(routes),
+        "source_notices": made["source_notices"],
+        "dropped": made["dropped"],
+        "fixes": made["fixes"],
+    }
+    if "validation" in made:
+        results["validation"] = made["validation"]
+    _write_provenance(folder / f"{key}.json", results)
+    record["results_sha256"] = _http.sha256_file(folder / f"{key}.json")
+
+    def change(sidecar):
+        sidecar["cache"].setdefault("outputs", {})[key] = record
+
+    cache.update(version, change)
 
 
 def _read_only(path):
@@ -1310,7 +1472,13 @@ def fetch(
     use, so a reused dataset is reported as when downloaded. The area path
     reuses its feeds' versions alike, though the Mobility Database is still
     searched for the feeds; a dataset is selected only for a feed no cached
-    version serves. Every overlapping feed is processed, in a
+    version serves. What the crop, repair and validation make of a cached
+    version is stored with it, keyed by the transitio release, the exact
+    area when cropped to it, the routes, ``crop``, ``repair`` and the
+    budgets, and a later call
+    making the same reads it back; the mode filter, the day checks and the
+    report run again on every call, and deleting a version deletes what was
+    made of it. Every overlapping feed is processed, in a
     deterministic order with official feeds first; one broken feed never
     aborts the others — it lands in ``skipped`` with its reason. A feed
     lacking a file GTFS requires is skipped, with or without ``when`` and
@@ -1636,19 +1804,6 @@ def fetch(
 
     geometry = _as_geometry(aoi)
 
-    # Transformed outputs carry a parameter digest so calls for different
-    # AOIs or reference dates never overwrite each other's artefacts.
-    tag = hashlib.sha256(
-        json.dumps(
-            {
-                "bounds": [round(v, 6) for v in geometry.bounds],
-                "reference_date": budgets.get("reference_date"),
-                "crop": crop,
-            },
-            sort_keys=True,
-        ).encode()
-    ).hexdigest()[:16]
-
     cache = _feed_cache(cache_dir, directory)
     osm_pbf = osm_note = None
     if osm:
@@ -1699,8 +1854,8 @@ def fetch(
                 path, report, fixes, _, window = _process_feed(
                     path,
                     provenance=origin,
+                    outputs=(cache, version),
                     geometry=geometry,
-                    tag=tag,
                     repair=repair,
                     crop=crop,
                     modes=modes,
@@ -2114,19 +2269,6 @@ def _fetch_place(
         raise ValueError(f"place {place_obj.id} has no geometry to fetch for")
     study = when is not None
 
-    tag = hashlib.sha256(
-        json.dumps(
-            {
-                "place": place_obj.id,
-                "snapshot": provenance["snapshot"],
-                "bounds": [round(v, 6) for v in geometry.bounds],
-                "reference_date": budgets.get("reference_date"),
-                "crop": crop,
-            },
-            sort_keys=True,
-        ).encode()
-    ).hexdigest()[:16]
-
     offered = place_obj.feeds(tiers=tiers, exclude=exclude, on_unknown=on_unknown)
     kept = _containers_first(offered) if contained == "drop" else offered
     # Credentials are checked and resolved before any download.
@@ -2255,22 +2397,13 @@ def _fetch_place(
             if selection is not None:
                 selections.append(selection)
             return "skipped"
-        # A per-feed tag folds in the selected routes so the same feed
-        # fetched under different tiers never overwrites an earlier output.
-        feed_tag = tag
-        if routes is not None:
-            feed_tag = hashlib.sha256(
-                json.dumps(
-                    {"tag": tag, "routes": sorted(routes)}, sort_keys=True
-                ).encode()
-            ).hexdigest()[:16]
         origin = _report_provenance(version, dataset_id)
         try:
             path, report, fixes, present, window = _process_feed(
                 path,
                 provenance=origin,
+                outputs=(cache, version),
                 geometry=geometry,
-                tag=feed_tag,
                 repair=repair,
                 crop=crop,
                 modes=modes,

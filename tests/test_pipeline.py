@@ -108,7 +108,7 @@ def test_fetch_end_to_end(pipeline_env):
     (entry,) = result.selection
     assert entry["stops_outside_osm"] == 0
     assert len(result.feeds) == 1
-    assert "-cropped-" in result.feeds[0].name
+    assert "-cropped" in result.feeds[0].name
     assert result.feeds[0].suffix == ".zip"
     (report,) = result.reports
     assert report["summary"]["counts"]["errors"] == 0
@@ -178,9 +178,9 @@ def test_an_area_fetch_keeps_each_feeds_download_apart(pipeline_env, monkeypatch
         sidecar = json.loads(path.with_suffix(".provenance.json").read_text())
         assert len(sidecar["cache"]["sources"]) == 1
     assert sorted((tmp_path / "out").rglob("*.zip")) == sorted(result.feeds)
-    assert all("-cropped-" in p.name for p in result.feeds)
+    assert all("-cropped" in p.name for p in result.feeds)
     if os.name != "nt":
-        crops = (tmp_path / "cache").rglob("*-cropped-*.zip")
+        crops = (tmp_path / "cache").rglob("*-cropped*.zip")
         assert not any(os.access(path, os.W_OK) for path in crops)
 
     # A refresh served a page instead of mdb-11's archive falls back to it.
@@ -188,6 +188,69 @@ def test_an_area_fetch_keeps_each_feeds_download_apart(pipeline_env, monkeypatch
     refreshed = _area_fetch(monkeypatch, tmp_path, page, use_cache=False)
     assert sorted(e["cache"] for e in refreshed.selection) == ["fallback", "refreshed"]
     assert len(refreshed.feeds) == 2
+
+
+def test_a_repeated_fetch_reuses_what_processing_made(pipeline_env, monkeypatch):
+    import transitio.gtfs
+    import transitio.validate
+
+    tmp_path, _ = pipeline_env
+    calls = []
+    for module, name in (
+        (transitio.gtfs, "crop_feed"),
+        (transitio.validate, "validate_feed"),
+    ):
+        real = getattr(module, name)
+
+        def counted(*args, _real=real, _name=name, **options):
+            calls.append(_name)
+            return _real(*args, **options)
+
+        monkeypatch.setattr(module, name, counted)
+    other = _zip({**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "HKL")})
+    first = _area_fetch(monkeypatch, tmp_path, other)
+    assert sorted(calls) == ["crop_feed"] * 2 + ["validate_feed"] * 2
+    # A delivered copy is the caller's; the stored output serves the repeat.
+    first.feeds[0].write_bytes(b"")
+    again = _area_fetch(monkeypatch, tmp_path, other)
+    assert len(calls) == 4
+    assert _timeless(first.reports) == _timeless(again.reports)
+    assert first.repairs == again.repairs
+    # A stored output that changed is made again.
+    output, *_ = sorted((tmp_path / "cache").rglob("outputs/*-cropped.zip"))
+    output.chmod(0o644)
+    output.write_bytes(b"changed")
+    _area_fetch(monkeypatch, tmp_path, other)
+    assert sorted(calls[4:]) == ["crop_feed", "validate_feed"]
+    # A version deleted for an unreadable sidecar leaves no outputs behind.
+    from transitio.catalog._cache import FeedCache
+
+    cache, folder = FeedCache(tmp_path / "cache"), output.parent.parent
+    (feed_id,) = [f for f in ("mdb-10", "mdb-11") if cache.folder(f) == folder]
+    (sidecar,) = folder.glob("*.provenance.json")
+    sidecar.write_text("{")
+    assert cache.versions(feed_id) == []
+    assert list((folder / "outputs").iterdir()) == []
+
+
+def test_outputs_are_keyed_by_the_exact_area_and_the_budgets():
+    from types import SimpleNamespace
+
+    from shapely.geometry import Polygon, box
+
+    from transitio.pipeline._fetch import _output_key
+
+    version = SimpleNamespace(sha256="0" * 64)
+    square, notched = box(0, 0, 1, 1), Polygon(
+        [(0, 0), (1, 0), (1, 1), (0.5, 0.5), (0, 1)]
+    )
+
+    def key(area, crop=True, **budgets):
+        return _output_key(version, area, None, crop, False, budgets)
+
+    assert key(square) != key(notched)  # the same bounds
+    assert key(square) != key(square, max_notices_per_file=5)
+    assert key(square, crop=False) == key(notched, crop=False)
 
 
 def test_an_area_fetch_delivers_the_same_content_once(pipeline_env, monkeypatch):
@@ -2421,18 +2484,16 @@ def test_fetch_place_crops_bundles_to_the_selected_routes(
             return real_repair(path, output, **options)
 
         monkeypatch.setattr(repair_module, "repair_feed", recording_repair)
-    result = fetch(
-        place="Q1757",
-        index=index,
-        directory=tmp_path / "out",
-        crop=False,
-        repair=repair,
-        tiers=["local", "regional"],
-        exclude=["national"],
-    )
+    options = dict(place="Q1757", index=index, directory=tmp_path / "out")
+    options.update(crop=False, repair=repair, tiers=["local", "regional"])
+    result = fetch(exclude=["national"], **options)
+    # A repeat reads back what was made, the repair's fixes included.
+    again = fetch(exclude=["national"], **options)
+    assert len(repaired_inputs) == repair and again.repairs == result.repairs
+    assert _timeless(again.reports) == _timeless(result.reports)
     # the repair, when asked for, receives the cropped feed, kept read-only
     assert bool(repaired_inputs) == repair
-    assert all("-cropped-" in path for path in repaired_inputs)
+    assert all("-cropped" in path for path in repaired_inputs)
     if os.name != "nt":
         assert not any(os.access(path, os.W_OK) for path in repaired_inputs)
     # Only the delivered feed reaches the directory, not the crop it repaired.
