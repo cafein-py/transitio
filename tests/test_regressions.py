@@ -1783,6 +1783,23 @@ def test_copies_of_a_headway_network_are_merged_once(tmp_path):
     assert report["duplicate_trips"]["dropped"] == 1
 
 
+def test_copies_of_a_trip_coded_as_bus_and_local_bus_are_merged_once(tmp_path):
+    # Munich's city operator codes its buses 704 (local bus) where the
+    # regional feed codes them 3, so a merge kept both copies of each trip.
+    from transitio.edit import FeedEditor
+    from transitio.gtfs import merge_feeds
+
+    local = {**MIDLAND, "routes.txt": MIDLAND["routes.txt"].replace(",3\n", ",704\n")}
+    feeds = [
+        write_zip(tmp_path / f"{n}.zip", files)
+        for n, files in enumerate((MIDLAND, local))
+    ]
+    report = merge_feeds(feeds, tmp_path / "merged.zip", check=False)
+    merged = FeedEditor(tmp_path / "merged.zip").tables
+    assert list(merged["trips.txt"]["trip_id"]) == ["f1:t1"]
+    assert report["duplicate_trips"]["dropped"] == 1
+
+
 def _near_feed(moved, stop_times, extra):
     """A feed of trip ``g`` on route X36 and headway trip ``h`` on route
     506 over stops a to e, ``moved`` degrees north, and ``extra`` stops."""
@@ -1842,6 +1859,61 @@ def test_near_repeats_of_a_trip_are_merged_once(tmp_path):
     assert sorted(merged["trips.txt"]["trip_id"]) == ["f1:g", "f1:h"]
     counts = report["duplicate_trips"]
     assert counts["dropped"] == counts["near_matches"] == counts["unaligned_stops"] == 2
+
+
+def test_delivered_feeds_do_not_repeat_each_others_trips(tmp_path, monkeypatch):
+    # In Munich the city operator's feed repeated most trips of the regional
+    # feed under its own agency name, a minute and some metres off, and
+    # fetch delivered both copies to be routed together.
+    import httpx
+
+    import transitio.index as transitio_index
+    from index_fixture import HULL, covered_feed, edge, write_index
+    from transitio.catalog import TransitlandAtlas
+    from transitio.pipeline import fetch
+
+    agency = MIDLAND["agency.txt"].replace("Midland Bluebird", "First Glasgow")
+    operator = {
+        **MIDLAND,
+        "agency.txt": agency,
+        # 20 m north of the regional feed's stops.
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\n"
+        "a,A,55.86018,-4.25\nb,B,55.87018,-4.26\n",
+        "trips.txt": MIDLAND["trips.txt"] + "x36,wk,t2\n",
+        "stop_times.txt": "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "t1,08:01:00,08:01:00,a,1\nt1,08:11:00,08:11:00,b,2\n"
+        "t2,10:00:00,10:00:00,a,1\nt2,10:10:00,10:10:00,b,2\n",
+    }
+    payloads = {
+        feed_id: write_zip(tmp_path / f"{feed_id}.zip", files).read_bytes()
+        for feed_id, files in (("f-a", MIDLAND), ("f-b", operator))
+    }
+    feeds = [
+        {
+            **covered_feed(feed_id, coverage_source="crawl"),
+            "coverage": HULL,
+            "atlas": {"urls": {"static_current": f"https://feeds.example/{feed_id}"}},
+        }
+        for feed_id in payloads
+    ]
+    edges = [edge("Q1757", f["feed_id"], tier="local") for f in feeds]
+    index = transitio_index.read_index(
+        write_index(tmp_path / "index", feeds=feeds, edges=edges)
+    )
+
+    def handler(request):
+        return httpx.Response(200, content=payloads[request.url.path.strip("/")])
+
+    class Served(TransitlandAtlas):
+        def __init__(self, **kwargs):
+            super().__init__(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas", Served)
+    result = fetch(place="Q1757", index=index, crop=False, osm=False, expired="keep")
+    trips = [read_entry(path, "trips.txt").decode().split() for path in result.feeds]
+    assert [rows[1:] for rows in trips] == [["x36,wk,t1"], ["x36,wk,t2"]]
+    assert result.selection[1]["note"] == "1 repeated trips of f-a left out"
 
 
 def test_a_placeholder_calendar_is_an_older_version_of_the_dated_network(tmp_path):
@@ -2211,7 +2283,8 @@ def test_feeds_nested_in_one_archive_are_read_from_it_once(
         place="Q1757", index=index, directory=out, crop=False, osm=False, expired="keep"
     )
     assert requests == [("GET", "/outer.zip")]
-    assert all(path.name.startswith("id-") for path in out.glob("*"))
+    # The directory holds the feeds' own files, not the archive.
+    assert {path.name.split(".")[0] for path in out.glob("*")} <= set(urls)
     if status == 404:
         reason = f"download failed: atlas: {outer}: HTTP 404 Not Found"
         assert sorted(result.skipped) == [("f-1", reason), ("f-2", reason)]
@@ -2290,15 +2363,11 @@ def test_a_failed_extract_download_keeps_the_fetched_feeds(
         return
     with pytest.warns(UserWarning, match="OSM extract not fetched"):
         result = fetch(**options)
-    delivered, last = result.selection
+    (delivered,) = result.selection
     assert delivered["decision"] == "delivered"
     assert result.feeds == [delivered["path"]]
     assert (result.osm_pbf, result.osm_area) == (None, None)
-    assert (last["feed_id"], last["decision"], last["note"]) == (
-        None,
-        None,
-        f"OSM extract not fetched: {_EXTRACT_TIMEOUT}",
-    )
+    assert result.osm_note == f"OSM extract not fetched: {_EXTRACT_TIMEOUT}"
 
 
 _HIDDEN_NOTE = (
@@ -2371,9 +2440,7 @@ def test_an_empty_default_view_is_not_fetched_silently(
         assert (warned, calls, entry["decision"]) == ([], ["f-bus"], "delivered")
         return
     assert (warned, calls, result.feeds) == ([note], [], [])
-    assert [(e["feed_id"], e["decision"], e["note"]) for e in result.selection] == [
-        (None, None, note)
-    ]
+    assert (result.selection, result.view_note) == ([], note)
 
 
 @pytest.mark.parametrize("osm", [True, False])
@@ -2417,15 +2484,13 @@ def test_stops_beyond_the_osm_area_are_counted(tmp_path, monkeypatch, osm):
     monkeypatch.setattr("transitio.catalog.TransitlandAtlas._fetch_static", download)
     monkeypatch.setattr("transitio.osm.fetch_pbf", lambda *a, **k: tmp_path / "a.pbf")
     result = fetch(place="c", index=index, directory=tmp_path / "out", osm=osm)
-    entry, *notes = result.selection
+    (entry,) = result.selection
     assert entry["decision"] == "delivered"
     if not osm:
-        assert (entry["stops_outside_osm"], notes) == (None, [])
+        assert (entry["stops_outside_osm"], result.osm_note) == (None, None)
         return
-    (last,) = notes
-    assert (entry["stops_outside_osm"], last["feed_id"], last["note"]) == (
+    assert (entry["stops_outside_osm"], result.osm_note) == (
         1,
-        None,
         "OSM area: 1 of 3 located stops outside it",
     )
 
@@ -2437,3 +2502,52 @@ def test_selector_fingerprints_read_members_as_large_as_the_build():
     from transitio.index import fingerprint
 
     assert fingerprint._MAX_MEMBER_BYTES == 8 * 1024**3
+
+
+def test_delivered_feeds_are_named_by_feed_id(tmp_path, monkeypatch):
+    # Feeds delivered into a directory each sat in an id-<sha256> folder, so
+    # the feeds of a Munich fetch could be told apart only by their sidecars.
+    import hashlib
+    import json
+    import pathlib
+
+    import transitio.index as transitio_index
+    from index_fixture import HULL, covered_feed, edge, write_index
+    from transitio.pipeline import fetch
+
+    ids = ["f-u281z9-mvv", "f-nvbw~ding", "f-u2f-pražskáintegrovanádoprava"]
+    feeds = [
+        {
+            **covered_feed(feed_id, coverage_source="crawl"),
+            "coverage": HULL,
+            "atlas": {"urls": {"static_current": f"https://feeds.example/{n}.zip"}},
+        }
+        for n, feed_id in enumerate(ids)
+    ]
+    edges = [edge("Q1757", feed_id, tier="local") for feed_id in ids]
+    index = transitio_index.read_index(
+        write_index(tmp_path / "index", feeds=feeds, edges=edges)
+    )
+
+    def download(self, feed, directory=None):
+        # Each feed's trips run hours apart from the others', so none repeats.
+        n = ids.index(feed.feed_id)
+        times = FEED["stop_times.txt"].replace("08:", f"1{n}:").replace("09:", f"2{n}:")
+        tables = {**FEED, "stop_times.txt": times}
+        return write_zip(pathlib.Path(directory) / "latest.zip", tables)
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas._fetch_static", download)
+    out = tmp_path / "out"
+    result = fetch(
+        place="Q1757", index=index, directory=out, crop=False, osm=False, expired="keep"
+    )
+    sha = hashlib.sha256(ids[2].encode("utf-8")).hexdigest()
+    names = [*ids[:2], f"f-u2f-prazskaintegrovanadoprava+{sha}"]
+    assert result.paths == {i: out / f"{name}.zip" for i, name in zip(ids, names)}
+    assert list(result.paths.values()) == result.feeds
+    for feed_id, path in result.paths.items():
+        sidecar = json.loads(path.with_suffix(".provenance.json").read_text())
+        assert sidecar["feed_id"] == feed_id
+    files = [name + end for name in names for end in (".zip", ".provenance.json")]
+    assert sorted(path.name for path in out.iterdir()) == sorted(files)

@@ -32,6 +32,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Identical archives of several feeds are stored once, as hard links to one
   blob; on Windows, and where a link cannot be made, each feed keeps its own
   copy.
+- `fetch` leaves out of each delivered feed the trips that a feed earlier in
+  the selection record also runs (for a place, in the order of
+  `place.feeds()`). Trips compare as `merge_feeds` compares them: the same
+  route name and mode, stops and times, nearly (within 50 m and 3 minutes),
+  pickup and drop-off behaviour, and frequencies, whatever the agency. With
+  `when` the trips of that day are compared; without it, a trip is left out
+  only when it is covered on every date it runs. A feed whose every trip in
+  scope repeats is skipped, as is one left without a requested mode under
+  `modes`; a trip that cannot be compared, such as one whose calendar cannot
+  be read, is never left out, and a feed in another time zone, unreadable or
+  over `max_total_bytes` is not compared. The results are stored with the
+  cached versions.
+- `duplicate_trips="drop"` (the default), `"exact"` or `"keep"` on `fetch`,
+  and a `duplicate_trips` column in the selection table counting the trips
+  left out of each feed (None for a feed not compared).
+- `crop_feed(..., exclude_trips=...)` leaves out the named trips and what
+  only they used.
+- `FetchResult.paths`, `{feed id: path}` of the delivered feeds in the order
+  of `FetchResult.feeds`.
 
 ### Changed
 
@@ -47,6 +66,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `contained="drop"` only by a probe recorded under the index snapshot in
   use, and a key-protected feed without usable credentials uses only copies
   fetched without them.
+- Trips and routes compare route types by basic mode (bus, tram, subway,
+  rail or ferry), in `fetch`'s repeated trips and versions and in
+  `merge_feeds`, so an extended type such as 704 (local bus) matches 3
+  (bus).
+- The selection record holds one entry per candidate feed. The notes it
+  held in entries without a feed move to `FetchResult.osm_note` and
+  `FetchResult.view_note`.
+- A feed cut to a route selection is noted `"cut to <n> of <m> routes"`;
+  the routes stay listed in `selections`, which is now documented. A feed
+  delivered whole because its selector cannot be trusted is noted
+  `"delivered whole: selector out of date"` or `"delivered whole: selector
+  unavailable"`.
+- `FetchResult.contained` maps each feed left out as contained to the
+  delivered feeds carrying it, and the note `"kept: containment in <ids>
+  not proven current"` names the containers.
+- `fetch(directory=...)` names each delivered feed by its feed id,
+  `<feed id>.zip` beside `<feed id>.provenance.json`, flat in the
+  directory; an id that is not a safe file name becomes its ASCII form, `+`
+  and its SHA-256. A later call delivering the same feed into the same
+  directory replaces its files. The `id-<sha256>` folders earlier versions
+  left in a directory are not removed.
+- `ServiceLevel.departures_per_day`, `IndexedFeed.relevance` and
+  `Place.service` are documented as the index now computes them: departures
+  are averaged over the period a feed's timetable covers, a feed stale when
+  indexed counts in no feed's share of the place nor in the place's sums,
+  and a merged index sums the place over every build's feeds.
 
 ### Fixed
 

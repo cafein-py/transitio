@@ -10,22 +10,11 @@ import io
 import json
 import os
 import pathlib
+import re
+import shutil
 import tempfile
 import warnings
 import zipfile
-
-# Coarse mode names over GTFS route types, including the extended blocks:
-# railway 100s and suburban railway 300s are rail; urban railway 400s,
-# metro 500s, underground 600s and monorail join subway; coach 200s,
-# bus 700s and trolleybus 800s join bus; tram 900s; water 1000s and
-# ferry 1200s are ferry. Aerial, funicular, taxi and air map to no mode.
-_MODE_TYPES = {
-    "tram": {0, 5} | set(range(900, 1000)),
-    "subway": {1, 12} | set(range(400, 700)),
-    "rail": {2} | set(range(100, 200)) | set(range(300, 400)),
-    "bus": {3, 11} | set(range(200, 300)) | set(range(700, 900)),
-    "ferry": {4} | set(range(1000, 1100)) | set(range(1200, 1300)),
-}
 
 # Decompressed budget for the pre-validation routes.txt peek; any real
 # routes.txt is far smaller, and validation applies the full budgets later.
@@ -43,6 +32,14 @@ _STOP_DECIMALS = 3
 # Metres the place path grows the OSM area by: cafein's default snap distance.
 _OSM_BUFFER_M = 1600
 
+# Feed ids a delivered feed is named by as they are: lowercase ASCII, at
+# most 100 characters, and none of the device names Windows reserves.
+_PLAIN_NAME = re.compile(r"[a-z0-9][a-z0-9_~-]*")
+_DEVICE_NAMES = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + [f"{port}{n}" for port in ("com", "lpt") for n in range(1, 10)]
+)
+
 # The fields of a selection-record entry, in selection_table's column order.
 _SELECTION_FIELDS = (
     "feed_id",
@@ -55,6 +52,7 @@ _SELECTION_FIELDS = (
     "same_as",
     "contained_in",
     "version_of",
+    "duplicate_trips",
     "fetched_from",
     "download_errors",
     "cache",
@@ -72,32 +70,47 @@ class FetchResult:
     reports: list
     repairs: list
     skipped: list
+    # How each feed's route selector was checked and applied on the place
+    # path (keys as fetch's Returns lists them); empty without tiers,
+    # exclude or on_unknown="exclude".
     selections: list = dataclasses.field(default_factory=list)
     provenance: dict = None
     # The index snapshot the feeds were discovered from; None for the AOI path,
     # which discovers by bounding box and has no snapshot.
     snapshot: str = None
-    # {feed id: [ids of delivered feeds containing it]} over the delivered
-    # feeds, from the index's contained_in (schema 10); empty otherwise.
+    # {feed id: [ids of the delivered feeds carrying it]} for each feed left
+    # out as contained, in selection order; empty otherwise.
     contained: dict = dataclasses.field(default_factory=dict)
     # One entry per candidate feed, in candidate order, with its decision;
-    # ``skipped`` lists the same skips. Entries with feed_id None note, after
-    # the candidates, the feeds an empty default view hides, and last the
-    # place parts the OSM extract leaves out and the delivered stops outside
-    # its area, or why it was not fetched.
+    # ``skipped`` lists the same skips.
     selection: list = dataclasses.field(default_factory=list)
     # The WGS84 area the OSM extract was fetched for; None without one. A
     # failed extract download leaves it and osm_pbf None. On the place path,
     # its parts farther than 1.6 km from every delivered stop may lack OSM data.
     osm_area: object = None
+    # The feeds an empty default view hides and the tiers that fetch them.
+    view_note: str | None = None
+    # The place parts the OSM extract leaves out and the delivered stops
+    # outside its area, or why it was not fetched.
+    osm_note: str | None = None
 
     def __iter__(self):  # convenient (pbf, feeds) unpacking
         return iter((self.osm_pbf, self.feeds))
 
+    @property
+    def paths(self):
+        """``{feed id: path}`` of the delivered feeds, in the order of
+        ``feeds``, so ``list(result.paths.values()) == result.feeds``."""
+        ids = {
+            entry["path"]: entry["feed_id"]
+            for entry in self.selection
+            if entry["decision"] == "delivered"
+        }
+        return {ids[path]: path for path in self.feeds}
+
     def selection_table(self):
         """The selection record as a ``pandas.DataFrame``, one row per
-        candidate feed, then the default-view and OSM note rows when there
-        are any."""
+        candidate feed."""
         import pandas as pd
 
         return pd.DataFrame(self.selection, columns=list(_SELECTION_FIELDS))
@@ -153,6 +166,7 @@ def _feed_modes(path):
     import pandas as pd
 
     from transitio.edit._editor import _normalise_table
+    from transitio.gtfs._schedule import MODE_TYPES
 
     try:
         with zipfile.ZipFile(path) as archive:
@@ -176,7 +190,7 @@ def _feed_modes(path):
         types = {int(value) for value in set(values) if value.lstrip("-").isdigit()}
     except (OSError, KeyError, ValueError, zipfile.BadZipFile):
         return None
-    return {mode for mode, accepted in _MODE_TYPES.items() if types & accepted}
+    return {mode for mode, accepted in MODE_TYPES.items() if types & accepted}
 
 
 def _bbox_area(feed):
@@ -225,6 +239,17 @@ def _window(start, end):
     if start is None and end is None:
         return None
     return [None if day is None else day.isoformat() for day in (start, end)]
+
+
+def _service_window(validation):
+    """The first and last dates of a validation report's computed service
+    window, None for both when unknown."""
+    if not validation["service_window"]:
+        return None, None
+    return tuple(
+        datetime.datetime.strptime(value, "%Y%m%d").date()
+        for value in validation["service_window"]
+    )
 
 
 def _misses(start, end, day, study):
@@ -375,20 +400,20 @@ def _process_feed(
     instead (:func:`_stored_output`); the mode filter, the day checks and the
     report run again on every call.
 
-    Returns ``(path, report, fixes, present_routes, window)``; ``present_routes``
-    is the set of ``route_id`` values in the downloaded feed as it enters the
-    route crop, or ``None`` when a ``routes`` filter is not applied or that
-    feed's routes.txt cannot be read — so a caller records an *undetermined*
-    drop rather than a false empty one — and ``window`` the computed service
-    window as ISO dates, None when unknown. The report's summary carries the
-    crop's ``dropped_rows`` as ``droppedRows``, None when the feed was not
-    cropped. Raises :class:`_SkipFeed` when the feed drops out. Shared by the
-    AOI and the place paths.
+    Returns ``(path, report, made, key, window)``: ``made`` what
+    :func:`_transform` and the validation made, its ``present_routes`` the
+    set of ``route_id`` values in the downloaded feed as it enters the route
+    crop, or ``None`` when a ``routes`` filter is not applied or that feed's
+    routes.txt cannot be read — so a caller records an *undetermined* drop
+    rather than a false empty one — ``key`` the output key (None without
+    ``outputs``) and ``window`` the computed service window as ISO dates,
+    None when unknown. The report is :func:`_report`'s. Raises
+    :class:`_SkipFeed` when the feed drops out. Shared by the AOI and the
+    place paths.
     """
-    from transitio.report import build_report
     from transitio.validate import validate_feed
 
-    made = None
+    made = key = None
     if outputs is not None:
         cache, version = outputs
         key = _output_key(version, geometry, routes, crop, repair, budgets)
@@ -422,12 +447,7 @@ def _process_feed(
         if outputs is not None:
             _store_output(cache, version, key, made)
     validation = made["validation"]
-    start = end = None
-    if validation["service_window"]:
-        start, end = (
-            datetime.datetime.strptime(value, "%Y%m%d").date()
-            for value in validation["service_window"]
-        )
+    start, end = _service_window(validation)
     window = _window(start, end)
     missing = _missing_files(validation)
     if missing is not None:
@@ -438,10 +458,25 @@ def _process_feed(
             reason = f"no service on {day.isoformat()}"
         if reason is not None:
             raise _SkipFeed(reason, window)
-    validation["notices"].extend(made["source_notices"])
+    return path, _report(made, hosted, provenance), made, key, window
+
+
+def _report(made, hosted, provenance):
+    """The report on the feed that processing ``made``: its validation, with the
+    notices of the source the crop trimmed, merged with the ``hosted``
+    report and carrying ``provenance``; its summary holds the crop's
+    ``dropped_rows`` as ``droppedRows``, None when the feed was not
+    cropped."""
+    from transitio.report import build_report
+
+    validation = made["validation"]
+    validation = {
+        **validation,
+        "notices": validation["notices"] + made["source_notices"],
+    }
     report = build_report(validation, hosted=hosted, provenance=provenance)
     report["summary"]["droppedRows"] = made["dropped"]
-    return path, report, made["fixes"], made["present_routes"], window
+    return report
 
 
 def _transform(path, folder, stem, **steps):
@@ -525,7 +560,7 @@ def _stored_output(version, key):
     ``key``, as stored with it; None when nothing is stored, or when the
     output no longer matches its SHA-256 or its results cannot be read."""
     from transitio import _http
-    from transitio.catalog._cache import _regular
+    from transitio.catalog._cache import _OUTPUT_STEPS, _regular
 
     record = version.sidecar["cache"].get("outputs", {}).get(key)
     if record is None:
@@ -533,11 +568,8 @@ def _stored_output(version, key):
     folder = version.path.parent / "outputs"
     results = folder / f"{key}.json"
     try:
-        if folder.is_symlink() or record["file"] not in (
-            None,
-            f"{key}-cropped.zip",
-            f"{key}-repaired.zip",
-        ):
+        names = [f"{key}-{step}.zip" for step in _OUTPUT_STEPS]
+        if folder.is_symlink() or record["file"] not in (None, *names):
             return None
         path = version.path if record["file"] is None else folder / record["file"]
         if not (_regular(results) and _regular(path)):
@@ -714,7 +746,7 @@ def _containers(feed, entries, carriers, cropped, current):
     """``(proven, notes)``: a candidate's containers carried whole and
     proven unchanged before download, and why each other decided one drops
     nothing."""
-    proven, notes = [], []
+    proven, unproven, notes = [], [], []
     for container in feed.contained_in:
         if container == feed.feed_id or container not in entries:
             continue
@@ -722,15 +754,20 @@ def _containers(feed, entries, carriers, cropped, current):
         if decision is None:
             continue
         if container in carriers:
-            if current.get(container):
-                proven.append(container)
-            else:
-                notes.append("kept: containment not proven current")
+            (proven if current.get(container) else unproven).append(container)
         elif container in cropped:
             notes.append(f"kept: container {container} cropped to selected routes")
         else:
             notes.append(f"kept: container {container} skipped")
+    if unproven:
+        notes.append(_unproven(unproven))
     return proven, notes
+
+
+def _unproven(containers):
+    """The note on a feed kept because its containment in ``containers`` is
+    not proven current."""
+    return f"kept: containment in {', '.join(containers)} not proven current"
 
 
 def _containers_first(feeds):
@@ -808,7 +845,7 @@ def _service(path, day=None, max_total_bytes=None):
         tables = _read_tables(path, names, max_total_bytes)
         if tables is None:
             return None
-        keys = route_keys(tables)[["agency", "name", "type"]]
+        keys = route_keys(tables)[["agency", "name", "mode"]]
         agency = tables.get("agency.txt", pd.DataFrame())
         named = (_column(agency, "agency_name").str.strip() != "").any()
         ids = _column(tables.get("routes.txt", pd.DataFrame()), "agency_id").str.strip()
@@ -818,7 +855,7 @@ def _service(path, day=None, max_total_bytes=None):
         # Stops and stations need coordinates; other location types may lack them.
         kind = stops.get("location_type", pd.Series("", index=stops.index))
         located = points[kind.str.strip().isin(("", "0", "1"))]
-        parts = keys[["name", "type"]] if unnamed else keys
+        parts = keys[["name", "mode"]] if unnamed else keys
         if (parts == "").any(axis=None) or located.isna().any(axis=None):
             return None
         points = points.round(_STOP_DECIMALS).add(0.0).dropna()
@@ -923,7 +960,7 @@ def _settle_versions(record, services, protected, day):
     ids = sorted(services, key=rank)
     for feed_id in filter(undated, ids):
         _note(entries[feed_id], undated(feed_id))
-    # A pair with an unnamed agency compares routes by name and type only.
+    # A pair with an unnamed agency compares routes by name and mode only.
     lines = {
         feed_id: {key[1:] for key in services[feed_id]["routes"]} for feed_id in ids
     }
@@ -988,6 +1025,308 @@ def _settle_versions(record, services, protected, day):
             note = undated(member)
             _skip(entries[member], reason, note=note, path=None, version_of=version)
     return removed
+
+
+@dataclasses.dataclass
+class _Processed:
+    """A feed processed for delivery: its selection-record ``entry``, its
+    cached ``version`` and the ``(request key, dataset id)`` it serves, what
+    processing ``made`` of it under the output ``key``, and its report's
+    ``origin`` and ``hosted`` report."""
+
+    entry: dict
+    version: object
+    served: tuple
+    made: dict
+    key: str
+    origin: dict
+    hosted: dict
+
+
+def _drop_repeats(cache, record, processed, feeds, reports, directory, **options):
+    """Leave out of the delivered feeds the trips that repeat a trip kept
+    from a feed before them in ``record``, as :func:`fetch` describes.
+
+    ``processed`` holds a :class:`_Processed` for each path of ``feeds``
+    and report of ``reports``; those whose entry is delivered are compared.
+    A feed cut of repeated trips gets its deduplicated output in ``feeds``,
+    written over its delivered archive in ``directory``, and its report in
+    ``reports``. A withdrawn feed's entry is skipped and its archive in
+    ``directory`` removed. A failed replacement or removal keeps the feed as
+    delivered, noted. Each compared entry gets its ``duplicate_trips``
+    count. ``options`` are ``budgets``, ``modes``, ``day``, the study day or
+    None, and ``duplicate_trips``, ``"keep"`` comparing nothing. Returns
+    ``{feed id: [ids]}``: for each feed cut or withdrawn, the feeds holding
+    the trips it repeated.
+    """
+    from transitio import _http
+
+    position = {entry["feed_id"]: n for n, entry in enumerate(record)}
+    order = sorted(
+        (
+            n
+            for n, item in enumerate(processed)
+            if item.entry["decision"] == "delivered"
+        ),
+        key=lambda n: position[processed[n].entry["feed_id"]],
+    )
+    if len(order) < 2 or options["duplicate_trips"] == "keep":
+        return {}
+    items = [processed[n] for n in order]
+    day, modes = options["day"], options["modes"]
+    run = _request_key(
+        made=[(item.entry["feed_id"], item.key) for item in items],
+        duplicate_trips=options["duplicate_trips"],
+        day=None if day is None else day.isoformat(),
+        modes=None if modes is None else sorted(modes),
+    )
+    keys = [_request_key(run=run, made=item.key) for item in items]
+    found = _stored_repeats(items, keys) or _repeats(cache, items, keys, **options)
+    lost = {}
+    for n, item, (outcome, made) in zip(order, items, found):
+        entry = item.entry
+        # None when not compared, else 0 until trips are left out below.
+        entry["duplicate_trips"] = outcome["dropped"] and 0
+        if outcome["skip"] is None and made is None:
+            if outcome["note"] is not None:
+                _note(entry, outcome["note"])
+            continue
+        try:
+            # The report first, so a failure leaves the delivered feed whole.
+            report = None if made is None else _report(made, item.hosted, item.origin)
+            if outcome["skip"] is not None and directory:
+                os.unlink(feeds[n])
+                with contextlib.suppress(OSError):
+                    os.unlink(feeds[n].with_suffix(".provenance.json"))
+            elif made is not None and directory:
+                with open(made["path"], "rb") as source:
+                    with _http.replacing(feeds[n]) as handle:
+                        shutil.copyfileobj(source, handle)
+        except Exception as error:  # noqa: B902 — the feed stays as delivered
+            _note(entry, f"repeated trips kept: {error}")
+            continue
+        entry["duplicate_trips"] = outcome["dropped"]
+        lost[entry["feed_id"]] = outcome["of"]
+        if outcome["skip"] is not None:
+            _skip(entry, outcome["skip"], path=None, feed_window=outcome["window"])
+            continue
+        if not directory:
+            feeds[n] = made["path"]
+        reports[n] = report
+        entry.update(path=feeds[n], feed_window=outcome["window"])
+        _note(entry, outcome["note"])
+    return lost
+
+
+def _stored_repeats(items, keys):
+    """What :func:`_repeats` stored of ``items`` under ``keys``, None unless
+    every feed has its outcome and every cut feed its deduplicated output."""
+    from transitio.catalog._cache import _repeats_record
+
+    found = []
+    for item, key in zip(items, keys):
+        outcome = item.version.sidecar["cache"].get("repeats", {}).get(key)
+        if not _repeats_record(key, outcome):
+            return None
+        made = None
+        if outcome["skip"] is None and outcome["dropped"]:
+            made = _stored_output(item.version, key)
+            if made is None or "validation" not in made:
+                return None
+        found.append((outcome, made))
+    return found
+
+
+def _repeats(cache, items, keys, budgets, modes, day, duplicate_trips):
+    """Per feed of ``items``, in priority order, ``(outcome, made)``: the
+    trips left out as repeats, with ``duplicate_trips="drop"`` also near
+    repeats, of the trips kept from the feeds before it
+    (:func:`~transitio.gtfs._duplicates.repeated_trips`), the feeds holding
+    them, and a skip reason, or a note and the service window with
+    ``made``, the deduplicated output (:func:`_without_repeats`). Once every
+    feed is decided, each outcome is stored under its key of ``keys``
+    (:func:`_store_found`). A feed declaring another time zone than the
+    rest (as ``merge_feeds(timezones="skip")`` sets apart), over
+    ``max_total_bytes`` or unreadable is not compared. A feed left with
+    none of ``modes`` is withdrawn and the matching runs again without it.
+    A failure keeps a feed's trips, with a note, and is not stored; a failed
+    matching, or a feed's file that cannot be opened, keeps every feed's
+    and stores nothing."""
+    from transitio.gtfs._duplicates import repeated_trips
+    from transitio.gtfs._merge import _stop_zone, _timezone_outliers, _timezones
+
+    def unchanged(error):
+        kept = {"dropped": None, "of": [], "skip": None, "window": None}
+        return [({**kept, "note": f"repeated trips kept: {error}"}, None)] * len(items)
+
+    names = {"agency.txt", "stops.txt", "routes.txt", "trips.txt", "stop_times.txt"}
+    names |= {"calendar.txt", "calendar_dates.txt", "frequencies.txt", "transfers.txt"}
+    tables = []
+    for item in items:
+        try:
+            read = _read_tables(
+                item.made["path"], names, budgets.get("max_total_bytes")
+            )
+        except OSError as error:  # gone or unreachable: every feed keeps its trips
+            return unchanged(error)
+        except Exception:  # noqa: B902 — an unreadable feed is not compared
+            read = None
+        tables.append(read or {})
+    ids = [item.entry["feed_id"] for item in items]
+    found, failed, near = [], set(), duplicate_trips == "drop"
+
+    try:
+        # The deduplicated outputs wait here until every feed is decided.
+        staging = tempfile.TemporaryDirectory(
+            dir=cache.root, ignore_cleanup_errors=True
+        )
+    except Exception as error:  # noqa: B902 — every feed keeps its trips
+        return unchanged(error)
+    with staging as scratch:
+        while len(found) < len(items):
+            try:
+                if not found and len(set().union(*map(_timezones, tables))) > 1:
+                    located = [_stop_zone(read) for read in tables]
+                    for n in _timezone_outliers(tables, located=located):
+                        tables[n] = {}
+                matched = repeated_trips(tables, near=near, day=day)
+            except Exception as error:  # noqa: B902 — every feed keeps its trips
+                return unchanged(error)
+            for n in range(len(found), len(items)):
+                trips, earlier, scope = matched[n]
+                outcome = {"dropped": 0 if tables[n] else None, "skip": None}
+                outcome.update(of=[ids[p] for p in earlier], note=None, window=None)
+                made, again = None, False
+                try:
+                    if trips:
+                        output = pathlib.Path(scratch) / f"{n}.zip"
+                        made = _without_repeats(items[n].made, output, trips, budgets)
+                        again = _decide(
+                            outcome, made, tables[n], trips, scope, modes, day
+                        )
+                except Exception as error:  # noqa: B902 — the feed keeps its trips
+                    note = f"repeated trips kept: {error}"
+                    outcome, made = {**outcome, "skip": None, "note": note}, None
+                    failed.add(n)
+                found.append((outcome, None if outcome["skip"] else made))
+                if again:
+                    tables[n] = {}
+                    break
+        return _store_found(cache, items, keys, found, failed)
+
+
+def _store_found(cache, items, keys, found, failed):
+    """``found``, what :func:`_repeats` decided of ``items``, once stored:
+    a cut feed's deduplicated output moved to
+    ``outputs/<key>-deduplicated.zip`` beside its version and stored
+    (:func:`_store_output`), and each outcome but those at the positions
+    ``failed`` stored with the version under its key of ``keys``. A cut feed
+    whose output cannot be stored keeps its trips, noted; an outcome not
+    stored is found again by a later call. Nothing is stored for a version
+    the cache no longer lists, and its feed, cut or withdrawn, keeps its
+    trips, noted."""
+    from transitio.catalog._cache import _directory
+
+    stored = []
+    for n, (item, key, (outcome, made)) in enumerate(zip(items, keys, found)):
+        feed_id, listed = item.entry["feed_id"], True
+        try:
+            with cache.lock(feed_id):
+                versions = cache.versions(feed_id)
+                listed = item.version.sha256 in {v.sha256 for v in versions}
+                if listed and made is not None:
+                    folder = item.version.path.parent / "outputs"
+                    _directory(folder)
+                    made = {**made, "path": folder / f"{key}-deduplicated.zip"}
+                    os.replace(found[n][1]["path"], made["path"])
+                    _store_output(cache, item.version, key, made)
+                if listed and n not in failed:
+                    _store_repeats(cache, item.version, key, outcome)
+        except Exception as error:  # noqa: B902 — not stored, found again later
+            if made is not None or outcome["skip"] is not None:
+                note = f"repeated trips kept: {error}"
+                outcome, made = {**outcome, "skip": None, "note": note}, None
+        if not listed and (made is not None or outcome["skip"] is not None):
+            note = "repeated trips kept: its cached version was removed"
+            outcome, made = {**outcome, "skip": None, "note": note}, None
+        stored.append((outcome, made))
+    return stored
+
+
+def _decide(outcome, made, tables, trips, scope, modes, day):
+    """Record in ``outcome`` what ``made``, the deduplicated output of the
+    feed read as ``tables`` without the repeated ``trips``, leaves: the
+    number of its trips left out and its service window, and a skip reason
+    when it lost every trip in ``scope`` or, with ``modes``, every requested
+    mode, else the note. Returns whether it lost the modes. Raises
+    ``ValueError`` when the crop left out other trips too or the output
+    lacks a file GTFS requires."""
+    left = _read_tables(made["path"], {"trips.txt"})["trips.txt"]
+    gone = set(tables["trips.txt"]["trip_id"]) - set(left["trip_id"])
+    if gone - trips:
+        others = len(gone - trips)
+        raise ValueError(
+            f"the crop would also leave out {others} trips that repeat no "
+            "other feed's"
+        )
+    window = _window(*_service_window(made["validation"]))
+    outcome.update(dropped=len(gone), window=window)
+    listed = ", ".join(outcome["of"])
+    served = None if modes is None else _feed_modes(made["path"])
+    if scope <= gone:
+        on = "" if day is None else f" on {day.isoformat()}"
+        outcome["skip"] = f"every trip{on} repeats a trip of {listed}"
+        return False
+    missing = _missing_files(made["validation"])
+    if missing is not None:
+        raise ValueError(f"the feed left would be {missing}")
+    if modes is not None and served is None:
+        raise ValueError("could not read routes.txt for mode filtering")
+    if modes is not None and not served & modes:
+        outcome["skip"] = (
+            f"serves {sorted(served)} after repeated trips were left out, "
+            f"not {sorted(modes)}"
+        )
+        return True
+    outcome["note"] = f"{len(gone)} repeated trips of {listed} left out"
+    return False
+
+
+def _without_repeats(made, output, trips, budgets):
+    """What processing ``made`` becomes without the trips ``trips``: its
+    output cropped with :func:`~transitio.gtfs.crop_feed`'s
+    ``exclude_trips`` to ``output``, read-only, and validated, the crop's
+    source notices and dropped rows added to those ``made`` holds. A failed
+    step removes the output."""
+    from transitio.gtfs import crop_feed
+    from transitio.validate import validate_feed
+
+    try:
+        cropped = crop_feed(
+            made["path"], output, exclude_trips=sorted(trips), **budgets
+        )
+        made = {
+            **made,
+            "path": _read_only(output),
+            "source_notices": made["source_notices"] + cropped["source_notices"],
+            "dropped": (made["dropped"] or []) + cropped["dropped_rows"],
+        }
+        made["validation"] = validate_feed(output, **budgets)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(output)
+        raise
+    return made
+
+
+def _store_repeats(cache, version, key, outcome):
+    """Store with ``version`` what :func:`_repeats` decided of it under
+    ``key``."""
+
+    def change(sidecar):
+        sidecar["cache"].setdefault("repeats", {})[key] = outcome
+
+    cache.update(version, change)
 
 
 class _Archives:
@@ -1266,16 +1605,31 @@ def _feed_cache(cache_dir, directory):
     return cache
 
 
+def _delivered_name(feed_id):
+    """The name, without extension, ``feed_id``'s feed is delivered under:
+    the id itself when it is a plain name, else its ASCII form cut to 80
+    characters, ``+`` and the id's SHA-256. No plain name holds a ``+``."""
+    from transitio.catalog._cache import _feed_dir
+    from transitio.index.places import _normalize
+    from transitio.osm._fetch import _slug
+
+    plain = _PLAIN_NAME.fullmatch(feed_id) and len(feed_id) <= 100
+    if plain and feed_id not in _DEVICE_NAMES:
+        return feed_id
+    slug = _slug(_normalize(feed_id))[:80].rstrip("-")
+    return f"{slug}+{_feed_dir(feed_id).removeprefix('id-')}"
+
+
 def _deliver(path, directory, provenance):
     """``path``, a feed made from a cached version, as delivered: copied into
-    ``directory`` beside a sidecar of its ``provenance`` when given, in its
-    feed's digest-named folder."""
-    from transitio.catalog._cache import _copy, _directory, _feed_dir
+    ``directory``, when given, as ``<name>.zip`` beside a sidecar of its
+    ``provenance``, ``<name>`` being its feed's :func:`_delivered_name`. A
+    file or link at either name is replaced."""
+    from transitio.catalog._cache import _copy
 
     if directory:
-        folder = pathlib.Path(directory) / _feed_dir(provenance["feed_id"])
-        _directory(folder)
-        path = _copy(path, folder / path.name, provenance)
+        name = _delivered_name(provenance["feed_id"])
+        path = _copy(path, pathlib.Path(directory) / f"{name}.zip", provenance)
     return path
 
 
@@ -1385,6 +1739,7 @@ def fetch(
     index=None,
     credentials=None,
     modes=None,
+    duplicate_trips="drop",
     expired="skip",
     repair=False,
     crop=True,
@@ -1413,18 +1768,24 @@ def fetch(
     ``"whole"`` always delivers it whole; ``"drop"`` always skips it;
     ``"error"`` raises :class:`~transitio.exceptions.StaleSelectorError`.
     A schema-10 index records the larger feeds whose stops and routes contain
-    a feed's, and ``FetchResult.contained`` reports the delivered pairs. With
-    ``contained="drop"`` (default) containers are processed first, and a
-    contained feed is left out before download (``"contained in <id>"``)
+    a feed's (``IndexedFeed.contained_in``). With ``contained="drop"``
+    (default) containers are processed first, and a contained feed is left
+    out before download (``"contained in <id>"``)
     when a container was delivered whole (not cut to a route selection) or
     skipped as the same content as a feed delivered whole, and conditional
     ``HEAD`` probes (as for ``expired``) prove both archives unchanged since
     indexed: the container's, sent before its download, and the contained
     feed's. A container downloaded as a catalogued dataset proves nothing.
     Otherwise the feed is processed as usual and its ``note`` says why:
-    ``"kept: containment not proven current"``, ``"kept: container <id>
-    skipped"`` or ``"kept: container <id> cropped to selected routes"``.
-    ``contained="keep"`` leaves no feed out for containment.
+    ``"kept: containment in <ids> not proven current"``, ``"kept: container
+    <id> skipped"`` or ``"kept: container <id> cropped to selected routes"``.
+    ``FetchResult.contained`` maps each feed left out as contained to the
+    delivered feeds that carry it, in selection order: its containers, each
+    one skipped as the same content as a feed delivered whole standing for
+    that feed, and, with a container that lost repeated trips (below), the
+    feeds holding them; a feed with no such feed delivered is not listed.
+    ``contained="keep"`` leaves no feed out for containment, and
+    ``contained`` is empty.
 
     Resolves and crops the OSM extract, discovers the GTFS feeds (overlapping
     the AOI, or the place's indexed feeds), downloads each feed, spatially
@@ -1493,13 +1854,13 @@ def fetch(
     earlier feed.
 
     On the place path, delivered feeds whose route keys (agency name, route
-    short else long name, type) and stops (coordinates at 3 decimals) share
+    short else long name, mode) and stops (coordinates at 3 decimals) share
     0.9 and 0.8 or more are versions, ranked by later start, more trips,
     then candidate order. Agency names compare casefolded, without
     diacritics, punctuation or a trailing legal form (``Ltd``, ``Oy``,
     ``S.A.`` and the like). A feed with at most one agency row, none named,
     whose routes name at most one ``agency_id`` is unnamed, and its pairs
-    compare routes by name and type only. With ``when``, one is left out as
+    compare routes by name and mode only. With ``when``, one is left out as
     ``"another version of <id>"`` when a kept version pairs with it and kept
     versions run, by trip signature (which leaves out the agency), every
     trip it runs on the day, a headway trip matching one with the same
@@ -1517,6 +1878,47 @@ def fetch(
     Without ``when`` none is left out; similar feeds are noted. A feed
     whose routes, stops or, with ``when``, calendars cannot be read, or with
     a blank agency name that is not unnamed, is never a version.
+
+    With ``duplicate_trips="drop"`` (default) the delivered feeds do not
+    repeat each other's trips. A trip that a feed earlier in the selection
+    record also runs is left out of the later feed: on the place path the
+    record follows the place's view (:meth:`~transitio.index.Place.feeds`:
+    category, then relevance, then id), on the area path the order above.
+    Trips compare as :func:`~transitio.gtfs.merge_feeds` compares them:
+    route name and mode (the route type's basic mode, as ``modes`` names
+    them, else the type itself, so local bus 704 equals bus 3), stops and
+    times, nearly (within 50 m and 3 minutes; with ``"exact"`` only
+    exactly), pickup and drop-off, and frequencies, whatever the agency.
+    ``"keep"`` compares nothing and delivers every feed with all its trips.
+    With ``when`` the trips running that day are compared, each earlier
+    trip covering one later trip; without it a trip is left out only when
+    it is covered on every date it runs, which reads the whole calendar
+    and, on a large network, takes longer and more memory than a study day.
+    A trip whose services cannot be read or are not declared, that cannot
+    be signed or that transfers.txt names is never left out. A feed
+    declaring a time zone not equivalent to the others' (as
+    ``merge_feeds(timezones="skip")`` decides), over ``max_total_bytes`` or
+    unreadable is not compared. A feed that loses trips is delivered
+    cropped without them
+    (:func:`~transitio.gtfs.crop_feed`'s ``exclude_trips``), so the stops,
+    shapes, calendars, routes, transfers and pathways that only those trips
+    used go too; with ``crop=False`` and no route selection this is the
+    feed's first crop. Delivered feeds are separate feeds, so no transfer
+    or pathway links them. The cut feed is validated again, its report
+    (listing also the rows this crop left out) and ``feed_window`` come
+    from it, and its note says ``"<n> repeated trips of <ids> left out"``.
+    A feed whose every trip in scope repeats is skipped as ``"every trip
+    repeats a trip of <ids>"`` (with ``when``, ``"every trip on <day>
+    repeats a trip of <ids>"``), and with ``modes`` a feed left without a
+    requested mode as ``"serves [...] after repeated trips were left out,
+    not [...]"``, the later feeds then compared again without it; the
+    ``feed_window`` of either is that of what it kept. A step that fails,
+    a crop that would also leave out trips repeating nothing, or a cut feed
+    lacking a file GTFS requires keeps the feed's trips, noted ``"repeated
+    trips kept: <error>"``. What was found is stored with
+    each feed's cached version, keyed by the delivered feeds and their
+    outputs, ``duplicate_trips``, the day and ``modes``, and a later call
+    comparing the same reads it back.
 
     Parameters
     ----------
@@ -1575,6 +1977,11 @@ def fetch(
         ``rail``, ``bus``, ``ferry`` — decided from the delivered
         (post-crop) feed's routes.txt, since the catalog carries no mode
         metadata. Unknown mode names raise ``ValueError``.
+    duplicate_trips : {"drop", "exact", "keep"}, default "drop"
+        Whether to leave out of the delivered feeds the trips that repeat,
+        or nearly repeat (``"drop"``), a trip of an earlier delivered feed,
+        as above: ``"exact"`` leaves out exact repeats only, and ``"keep"``
+        compares nothing. Another value raises ``ValueError``.
     expired : {"skip", "keep"}, default "skip"
         With ``"skip"``, on the place path, an indexed feed whose index
         service window misses the day (ends before it, or starts after the
@@ -1616,18 +2023,30 @@ def fetch(
         ``to_cafein`` builds without a walking network. A failed extract
         download does not abort the call: the feeds are still delivered,
         ``osm_pbf`` and ``osm_area`` are None, a ``UserWarning`` says so and
-        the last selection entry notes ``"OSM extract not fetched:
-        <error>"``; ``to_cafein`` then builds without a walking network, as
+        ``osm_note`` holds ``"OSM extract not fetched: <error>"``;
+        ``to_cafein`` then builds without a walking network, as
         with ``osm=False``. Other errors, such as ``ExtractNotFoundError``
         when no extract covers the area, still raise.
     directory : str or pathlib.Path, optional
-        Where the delivered feeds are copied, each in its feed's
-        digest-named folder beside its provenance sidecar: the cropped,
-        route-filtered or repaired feed, or the cached version when none of
-        those ran. A feed skipped or left out leaves nothing there. Without
-        it the delivered feeds are the files in the cache, an untransformed
-        one the read-only cached version itself. The OSM extract goes here
-        too. It must lie outside the download cache (``ValueError``).
+        Where the delivered feeds are copied, each as ``<name>.zip`` beside
+        its provenance sidecar ``<name>.provenance.json``: the cropped,
+        route-filtered, repaired or deduplicated feed, or the cached version
+        when none of those ran; a feed cut of repeated trips is written over
+        its copy there. The name is the feed id when it is lowercase ASCII
+        letters, digits, ``_``, ``~`` and ``-``, starting with a letter or
+        digit, at most 100 characters and not a Windows device name
+        (``con``, ``nul``, ``com1`` and the like); otherwise it is the id's
+        ASCII form cut to 80 characters, ``+`` and the id's SHA-256, e.g.
+        ``f-u2f-prazskaintegrovanadoprava+<sha256>`` for
+        ``f-u2f-pražskáintegrovanádoprava``. A later call delivering the
+        same feed into the same directory replaces its files, and one that
+        delivers it and then leaves it out for repeating other feeds' trips
+        removes its archive; a feed skipped before delivery leaves a file an
+        earlier call delivered for it in place. Calls running at the same
+        time need directories of their own. Without it the delivered feeds
+        are the files in the cache, an untransformed one the read-only
+        cached version itself. The OSM extract goes here too. It must lie
+        outside the download cache (``ValueError``).
     refresh_token, cache_dir, country_code
         Passed to the catalog and OSM layers; downloads are cached under
         ``cache_dir``, by default the platform cache.
@@ -1651,36 +2070,48 @@ def fetch(
     FetchResult
         ``osm_pbf``, validated ``feeds`` (paths), merged ``reports`` and
         repair ``repairs`` (fix logs, empty without ``repair=True``) per
-        kept feed, ``skipped`` (feed id, reason) pairs, the ``selection``
-        record and, on the place path, the ``contained`` pairs among the
-        delivered feeds. Reports merge the local validation of the delivered
-        feed with the hosted report of the published dataset, so after
-        cropping or repair the hosted side describes the pre-transform
+        kept feed, ``paths`` (``{feed id: path}`` of the same feeds, in the
+        order of ``feeds``), ``skipped`` (feed id, reason) pairs, the
+        ``selection`` record and, on the place path, ``selections`` and
+        ``contained`` (above). Reports merge the local validation of the
+        delivered feed with the hosted report of the published dataset, so
+        after cropping or repair the hosted side describes the pre-transform
         original. A report's ``summary["droppedRows"]`` lists the rows the
         crop left out (the ``dropped_rows`` of
         :func:`~transitio.gtfs.crop_feed`), None for a feed not cropped.
         ``selection`` has one entry per candidate feed, in
         candidate order: ``feed_id``, ``name``, ``decision``
         (``"delivered"`` or ``"skipped"``), ``reason`` (why it was skipped),
-        ``note`` (about a delivered feed: the routes it was cut to, why a
-        contained feed was kept, a similar feed, ``"from the Mobility
-        Database hosted copy"`` after a failed download, an
-        ``agency_timezone`` not equivalent to the zone of most of its stops,
+        ``note`` (about a delivered feed: first ``"cut to <n> of <m>
+        routes"`` for one cut to a route selection (``"cut to <n> selected
+        routes"`` when its routes.txt was not read), or ``"delivered whole:
+        selector out of date"`` or ``"delivered whole: selector
+        unavailable"`` for one whose selector was not trusted, as
+        ``selections`` details; then why a contained feed was kept, a
+        similar feed, ``"from the Mobility Database hosted copy"`` after a
+        failed download, an ``agency_timezone`` not equivalent to the zone
+        of most of its stops,
         e.g. ``"agency_timezone America/New_York; stops in
         Pacific/Honolulu"``, a placeholder calendar, which a left-out
         version keeps, rows the crop left out, e.g. ``"dropped 1860
         stop_times.txt rows whose stop_id is not in stops.txt"`` or
-        ``"dropped 8 exact duplicate trips.txt rows"``; several join with
-        ``"; "``),
+        ``"dropped 8 exact duplicate trips.txt rows"``, the repeated trips
+        left out or kept; several join with ``"; "``),
         ``index_window`` (the index's ``[start, end]``; None undated or on
         the area path), ``feed_window`` (the computed window of a validated
         download, delivered or not; None otherwise or when unknown),
         ``same_as`` (earlier deliveries of the same archive) and
-        ``contained_in`` (the containers a containment skip names),
+        ``contained_in`` (the index's containers a containment skip names),
         ``version_of`` (for a left-out version, ``{"feed_id", "route_overlap",
         "stop_overlap"}`` against the highest-ranked kept version it pairs
         with, for an undated feed the highest-ranked dated one starting after
-        its placeholder start when one does), ``fetched_from`` (where the
+        its placeholder start when one does), ``duplicate_trips`` (the
+        number of trips left out as repeats of an earlier delivered feed's:
+        0 for a compared feed that lost none, the first included; None for
+        a feed not compared: with ``duplicate_trips="keep"`` or fewer than
+        two feeds delivered, one in another time zone, unreadable or over
+        ``max_total_bytes``, and a feed decided before the comparison),
+        ``fetched_from`` (where the
         download came from: ``"mdb_dataset"`` a catalogued dataset,
         ``"producer"`` the feed's own URL, its ``download_url`` or one from
         the Mobility Database or Transitland Atlas, ``"mdb_latest"`` the
@@ -1696,21 +2127,32 @@ def fetch(
         without an extract or when its stops.txt cannot be read) and
         ``path`` (the delivered feed).
         Windows are ISO dates.
+        ``selections``, with ``tiers``, ``exclude`` or
+        ``on_unknown="exclude"``, has one entry per feed whose route
+        selector was checked, in the order decided: ``feed_id``,
+        ``selector_state`` (``"complete"``, ``"whole_feed"`` or
+        ``"unavailable"``), ``trusted``, ``reason`` (why it was not trusted:
+        ``"stale"``, ``"unavailable"`` or ``"route_absent"``; None when
+        trusted), ``kept`` and ``dropped`` (the feed's routes the selector
+        kept and removed, sorted; None when the feed was not cut, ``dropped``
+        ``[]`` for a whole-feed selector, or when its routes.txt was not
+        read), ``declared_as`` (the curator predicate of a complete selector
+        made from one, else None) and ``selected_by`` (per matched edge
+        ``{"tier", "selector_state", "route_ids"}``).
         When ``place`` is fetched without ``tiers`` and its default view
         (:meth:`~transitio.index.Place.feeds`) holds none of the place's
-        feeds, an entry with ``feed_id`` None after the candidates names
-        them and the tiers that fetch them, and a ``UserWarning`` repeats
-        it, e.g. ``"default view (region: secondary, tertiary) holds none of
-        the place's 2 feeds: f-a (primary), f-b (primary); tiers=['local']
-        fetches them"``.
+        feeds, ``view_note`` names them and the tiers that fetch them, and a
+        ``UserWarning`` repeats it, e.g. ``"default view (region: secondary,
+        tertiary) holds none of the place's 2 feeds: f-a (primary), f-b
+        (primary); tiers=['local'] fetches them"``.
         When the OSM extract leaves out parts of the place, or delivered
-        stops lie outside its area, a last entry with ``feed_id`` None
-        notes them, e.g. ``"OSM area: 1 of 47 parts (1783 of 2188 km²);
-        4970 of 10026 located stops outside it"``, the stops summed over
-        the delivered feeds, with ``"(stops.txt of 1 feed not read)"``
-        added for feeds not counted; when its download failed, the last entry
-        notes that instead, e.g. ``"OSM extract not fetched: Could not
-        download any of the 1 extracts that contain the area:
+        stops lie outside its area, ``osm_note`` notes them, e.g. ``"OSM
+        area: 1 of 47 parts (1783 of 2188 km²); 4970 of 10026 located stops
+        outside it"``, the stops summed over the delivered feeds, with
+        ``"(stops.txt of 1 feed not read)"`` added for feeds not counted;
+        when its download failed, it notes that instead, e.g. ``"OSM
+        extract not fetched: Could not download any of the 1 extracts that
+        contain the area:
         https://download.bbbike.org/osm/bbbike/Basel/Basel.osm.pbf (timed
         out)"``. ``FetchResult.selection_table()`` returns
         the record as a DataFrame. ``osm_area`` is the WGS84 geometry the OSM
@@ -1753,16 +2195,20 @@ def fetch(
         raise ValueError(
             "on_untrusted_selector= must be 'auto', 'whole', 'drop' or 'error'"
         )
+    if duplicate_trips not in ("drop", "exact", "keep"):
+        raise ValueError("duplicate_trips= must be 'drop', 'exact' or 'keep'")
 
     if modes is not None:
+        from transitio.gtfs._schedule import MODE_TYPES
+
         if isinstance(modes, str):
             modes = [modes]
         modes = {str(mode).lower() for mode in modes}
-        unknown = modes - set(_MODE_TYPES)
+        unknown = modes - set(MODE_TYPES)
         if unknown:
             raise ValueError(
                 f"unknown modes {sorted(unknown)}; "
-                f"valid modes are {sorted(_MODE_TYPES)}"
+                f"valid modes are {sorted(MODE_TYPES)}"
             )
 
     # The day the date rules test: the study day, else today. A downloaded
@@ -1792,6 +2238,7 @@ def fetch(
             window_day=window_day,
             expired=expired,
             modes=modes,
+            duplicate_trips=duplicate_trips,
             repair=repair,
             crop=crop,
             osm=osm,
@@ -1813,7 +2260,7 @@ def fetch(
 
     from transitio.catalog._client import _dataset_entry
 
-    feeds, reports, repairs, record = [], [], [], []
+    feeds, reports, repairs, record, processed = [], [], [], [], []
     delivered = _Delivered()
     # Everything but the version that decides whether one serves.
     key = _request_key(
@@ -1851,7 +2298,7 @@ def fetch(
                 # Modes are read from the delivered feed, after cropping, so an
                 # aggregate serving buses only outside the AOI does not pass a
                 # bus filter.
-                path, report, fixes, _, window = _process_feed(
+                path, report, made, made_key, window = _process_feed(
                     path,
                     provenance=origin,
                     outputs=(cache, version),
@@ -1884,8 +2331,11 @@ def fetch(
                 if note is not None:
                     _note(entry, note)
             reports.append(report)
-            repairs.append(fixes)
+            repairs.append(made["fixes"])
             feeds.append(path)
+            served = (key, dataset_id)
+            item = _Processed(entry, version, served, made, made_key, origin, hosted)
+            processed.append(item)
             delivered.add(feed.id, version.path)
             return "delivered"
 
@@ -1976,12 +2426,19 @@ def fetch(
                 _hosted(db, cache, version, dataset_id),
             )
 
+    repeats = dict(budgets=budgets, modes=modes, day=day if study else None)
+    repeats["duplicate_trips"] = duplicate_trips
+    _drop_repeats(cache, record, processed, feeds, reports, directory, **repeats)
+    rows = [
+        n for n, item in enumerate(processed) if item.entry["decision"] == "delivered"
+    ]
+    feeds, reports, repairs = (
+        [column[n] for n in rows] for column in (feeds, reports, repairs)
+    )
     if osm_pbf is not None:
         coords = {path: _stop_coords(path) for path in feeds}
         counts = _count_outside(record, geometry, coords)
         osm_note = _osm_note(geometry, geometry, *counts)
-    if osm_note is not None:
-        record.append({**_entry(None, None), "note": osm_note})
     return FetchResult(
         osm_pbf=osm_pbf,
         feeds=feeds,
@@ -1990,6 +2447,7 @@ def fetch(
         skipped=_skipped(record),
         selection=record,
         osm_area=None if osm_pbf is None else geometry,
+        osm_note=osm_note,
     )
 
 
@@ -2113,8 +2571,8 @@ def _osm_stops(area, coords):
 
 
 def _hidden_note(place, hidden):
-    """The selection-record note on a place whose default view holds none of
-    its ``hidden`` feeds: the view's categories, the feeds (at most five
+    """The ``view_note`` on a place whose default view holds none of its
+    ``hidden`` feeds: the view's categories, the feeds (at most five
     named) and the tiers that fetch them, local, regional and national when
     only unknown edges remain."""
     from transitio.index.feeds import CATEGORY_ORDER, _default_categories
@@ -2161,7 +2619,7 @@ def _count_outside(record, area, coords):
 
 
 def _osm_note(geometry, parts, outside=0, total=0, unread=0):
-    """The selection-record note on the OSM area: the parts of ``geometry``
+    """The ``osm_note`` on the OSM area: the parts of ``geometry``
     that ``parts`` leaves out, and the ``outside`` of ``total`` located
     stops outside the area with the ``unread`` feeds whose stops.txt was not
     read; None when no part is left out and neither count is non-zero."""
@@ -2215,6 +2673,7 @@ def _fetch_place(
     window_day,
     expired,
     modes,
+    duplicate_trips,
     repair,
     crop,
     osm,
@@ -2236,8 +2695,9 @@ def _fetch_place(
     without credentials it is read from the hosted copy alone, or skipped
     when it has none, and its texts in the record are masked
     (:meth:`_Access.redact`). The versions among the delivered feeds are
-    settled after the feed loop, and the OSM extract comes last, for the
-    parts the remaining feeds serve."""
+    settled after the feed loop, then their repeated trips left out
+    (:func:`_drop_repeats`), and the OSM extract comes last, for the parts
+    the remaining feeds serve."""
     from transitio import __version__
     from transitio.catalog import Feed, MobilityDatabase, TransitlandAtlas
     from transitio.catalog._client import _dataset_entry
@@ -2283,7 +2743,7 @@ def _fetch_place(
     }
     feeds, reports, repairs, selections, record = [], [], [], [], []
     delivered = _Delivered()
-    delivered_ids, used = [], []
+    delivered_ids, processed = [], []
     entries = {}
     # Containment state: the feeds carried by a feed delivered whole (itself,
     # or the feed whose content it repeats), those delivered cut to routes,
@@ -2322,8 +2782,7 @@ def _fetch_place(
         # through on_untrusted_selector rather than filtering silently.
         # on_unknown="exclude" is itself an edge filter, so this activates
         # even without an explicit tiers/exclude query.
-        routes = None
-        selection = None
+        routes = selection = applied = None
         if tiers is not None or exclude is not None or on_unknown != "include":
             sel = feed.selector
             selected_by = [
@@ -2364,6 +2823,8 @@ def _fetch_place(
                     return "skipped"
                 # action == "whole": deliver unfiltered (routes stays None),
                 # the selection recording why it was not filtered.
+                state = "unavailable" if reason == "unavailable" else "out of date"
+                applied = f"delivered whole: selector {state}"
             elif sel.state == "complete":
                 routes = set(sel.route_ids)
                 selection = {
@@ -2399,7 +2860,7 @@ def _fetch_place(
             return "skipped"
         origin = _report_provenance(version, dataset_id)
         try:
-            path, report, fixes, present, window = _process_feed(
+            path, report, made, made_key, window = _process_feed(
                 path,
                 provenance=origin,
                 outputs=(cache, version),
@@ -2442,6 +2903,7 @@ def _fetch_place(
         # not here. Both are None (undetermined) when routes.txt could
         # not be read. Only a trusted complete selector was cropped
         # (``routes`` is set).
+        present = made["present_routes"]
         if selection is not None and routes is not None:
             selection["kept"] = None if present is None else sorted(present & routes)
             selection["dropped"] = None if present is None else sorted(present - routes)
@@ -2449,19 +2911,24 @@ def _fetch_place(
             decision="delivered", feed_window=window, path=path, same_as=same_as
         )
         if routes is not None:
-            notes.insert(0, "cut to routes " + ", ".join(sorted(routes)))
+            if present is None:
+                applied = f"cut to {len(routes)} selected routes"
+            else:
+                applied = f"cut to {len(present & routes)} of {len(present)} routes"
             cropped.add(feed.feed_id)
         else:
             carriers[feed.feed_id] = feed.feed_id
-        notes += [_timezone_note(path, budget), _dropped_note(report)]
+        notes = [applied, *notes, _timezone_note(path, budget), _dropped_note(report)]
         for text in dict.fromkeys(filter(None, notes)):
             _note(entry, text)
         reports.append(report)
-        repairs.append(fixes)
+        repairs.append(made["fixes"])
         feeds.append(path)
         delivered.add(feed.feed_id, version.path, routes)
         delivered_ids.append(feed.feed_id)
-        used.append((version, origin, key, dataset_id))
+        served = (key, dataset_id)
+        item = _Processed(entry, version, served, made, made_key, origin, hosted)
+        processed.append(item)
         if selection is not None:
             selections.append(selection)
         service = _service(path, day if study else None, budget)
@@ -2478,15 +2945,15 @@ def _fetch_place(
                 _skip(entry, "only unknown-tier edges")
     for feed in offered:
         entry_for(feed)
+    view_note = None
     if tiers is None and not offered:
         # An empty default view may hide feeds a tier query would fetch.
         hidden = place_obj.feeds(
             exclude=exclude, on_unknown=on_unknown, categories=None
         )
         if hidden:
-            note = _hidden_note(place_obj, hidden)
-            record.append({**_entry(None, None), "note": note})
-            warnings.warn(note, UserWarning, stacklevel=3)
+            view_note = _hidden_note(place_obj, hidden)
+            warnings.warn(view_note, UserWarning, stacklevel=3)
 
     cache = _feed_cache(cache_dir, directory)
     snapshot = provenance["snapshot"]
@@ -2561,7 +3028,7 @@ def _fetch_place(
             notes = list(notes)
             inside = proven if snapshot in version.index_proofs else ()
             if proven and not inside:
-                notes.append("kept: containment not proven current")
+                notes.append(_unproven(proven))
             if first["fetched_from"] == "mdb_latest" and (
                 first["download_errors"] or keyless
             ):
@@ -2665,7 +3132,7 @@ def _fetch_place(
                     _skip(entry, f"contained in {proven[0]}", contained_in=proven)
                     protected.update(carriers[c] for c in proven)
                     continue
-                notes.append("kept: containment not proven current")
+                notes.append(_unproven(proven))
             # The hosted validation report only describes the dataset's own
             # bytes, so it is attached only when the dataset supplied them.
             path = fetched_from = url = None
@@ -2740,40 +3207,46 @@ def _fetch_place(
 
     removed = _settle_versions(record, services, protected, day if study else None)
     # A feed is delivered once the versions are settled and it stays.
-    for n, (feed_id, (version, origin, key, context)) in enumerate(
-        zip(delivered_ids, used)
-    ):
+    for n, (feed_id, item) in enumerate(zip(delivered_ids, processed)):
         if feed_id in removed:
             continue
         try:
             with cache.lock(feed_id):
-                feeds[n] = _deliver(feeds[n], directory, origin)
-                cache.touch(version, served=(key, context))
+                feeds[n] = _deliver(feeds[n], directory, item.origin)
+                cache.touch(item.version, served=item.served)
         except Exception as error:  # noqa: B902 — isolate per-feed failures
             _skip(entries[feed_id], f"processing failed: {error}", path=None)
             removed.add(feed_id)
             continue
         entries[feed_id]["path"] = feeds[n]
+    repeats = dict(budgets=budgets, modes=modes, day=day if study else None)
+    repeats["duplicate_trips"] = duplicate_trips
+    lost = _drop_repeats(cache, record, processed, feeds, reports, directory, **repeats)
     for feed_id, (access, _) in decided.items():
         entry = entries[feed_id]
         for key in ("reason", "note", "download_errors"):
             if access is not None and entry[key] is not None:
                 entry[key] = access.redact(entry[key])
-    rows = [n for n, feed_id in enumerate(delivered_ids) if feed_id not in removed]
+    rows = [
+        n for n, item in enumerate(processed) if item.entry["decision"] == "delivered"
+    ]
     delivered_ids, feeds, reports, repairs = (
         [column[n] for n in rows] for column in (delivered_ids, feeds, reports, repairs)
     )
-    pairs = {
-        feed.feed_id: sorted(set(feed.contained_in) & set(delivered_ids))
-        for feed in kept
-        if feed.feed_id in delivered_ids
-    }
+    # A feed left out as contained is carried by its containers' carriers,
+    # and those that lost repeated trips by the feeds holding them too.
+    position = {entry["feed_id"]: n for n, entry in enumerate(record)}
+    pairs = {}
+    for entry in record:
+        held = {carriers[c] for c in entry["contained_in"]}
+        held |= {f for c in held for f in lost.get(c, ())}
+        pairs[entry["feed_id"]] = sorted(held & set(delivered_ids), key=position.get)
 
-    osm_pbf = osm_area = None
+    osm_pbf = osm_area = osm_note = None
     if osm:
         parts, coords = _osm_parts(geometry, feeds)
         osm_area = _buffered(parts, _OSM_BUFFER_M)
-        osm_pbf, note = _osm_extract(
+        osm_pbf, osm_note = _osm_extract(
             parts,
             buffer_m=_OSM_BUFFER_M,
             must_cover=_osm_stops(osm_area, coords),
@@ -2784,9 +3257,7 @@ def _fetch_place(
             osm_area = None
         else:
             counts = _count_outside(record, osm_area, coords)
-            note = _osm_note(geometry, parts, *counts)
-        if note is not None:
-            record.append({**_entry(None, None), "note": note})
+            osm_note = _osm_note(geometry, parts, *counts)
 
     return FetchResult(
         osm_pbf=osm_pbf,
@@ -2800,4 +3271,6 @@ def _fetch_place(
         contained={feed_id: ids for feed_id, ids in pairs.items() if ids},
         selection=record,
         osm_area=osm_area,
+        view_note=view_note,
+        osm_note=osm_note,
     )

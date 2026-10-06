@@ -634,9 +634,11 @@ def test_a_moving_target_is_served_from_the_cache_until_a_refresh(
         assert not list(tmp_path.rglob("*.part"))
 
 
-def _damage_sidecar(path, **fields):
+def _damage_sidecar(path, records=(), **fields):
     sidecar = path.with_suffix(".provenance.json")
-    sidecar.write_text(json.dumps(dict(json.loads(sidecar.read_text()), **fields)))
+    data = dict(json.loads(sidecar.read_text()), **fields)
+    data["cache"].update(records)
+    sidecar.write_text(json.dumps(data))
 
 
 def _damage_archive(path):
@@ -662,6 +664,10 @@ def _link_outside(path):
         _damage_archive,
         lambda path: _damage_sidecar(path, sha256="0" * 64),
         lambda path: _damage_sidecar(path, cache={"sources": [{}], "datasets": {}}),
+        # A repeats record lacking its skip, note and window.
+        lambda path: _damage_sidecar(
+            path, records={"repeats": {"0" * 64: {"dropped": 1, "of": []}}}
+        ),
         _squat,
         lambda path: _squat(path.with_suffix(".provenance.json")),
         pytest.param(
@@ -677,6 +683,7 @@ def _link_outside(path):
         "archive",
         "digest",
         "records",
+        "repeats-record",
         "archive-directory",
         "sidecar-directory",
         "linked-archive",

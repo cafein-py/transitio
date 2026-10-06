@@ -31,6 +31,18 @@ MAX_EXPANDED_DAYS = 50_000_000
 #: placeholder rather than a timetable period, as the validator's
 #: ``calendar_span_truncated`` notice counts it.
 PLACEHOLDER_DAYS = 4000
+#: Basic modes over GTFS route types, including the extended blocks:
+#: railway 100s and suburban railway 300s are rail; urban railway 400s,
+#: metro 500s, underground 600s and monorail join subway; coach 200s,
+#: bus 700s and trolleybus 800s join bus; tram 900s; water 1000s and
+#: ferry 1200s are ferry. Aerial, funicular, taxi and air map to no mode.
+MODE_TYPES = {
+    "tram": {0, 5} | set(range(900, 1000)),
+    "subway": {1, 12} | set(range(400, 700)),
+    "rail": {2} | set(range(100, 200)) | set(range(300, 400)),
+    "bus": {3, 11} | set(range(200, 300)) | set(range(700, 900)),
+    "ferry": {4} | set(range(1000, 1100)) | set(range(1200, 1300)),
+}
 # A trip signature joins two 64-bit hashes taken under these keys.
 _HASH_KEYS = ("transitio-trip-1", "transitio-trip-2")
 # Legal-form words an agency key drops from the end of a name.
@@ -104,16 +116,17 @@ def placeholder_rows(tables):
     return rows[end - start >= np.timedelta64(PLACEHOLDER_DAYS, "D")]
 
 
-def service_dates(tables):
+def service_dates(tables, within=None):
     """The dates each service runs, from calendar.txt and calendar_dates.txt.
 
     Returns ``(dates, unexpanded)``: the ``(service_id, date)`` rows, and
     the ids of the services left out because a date, weekday flag,
     exception type or column of theirs cannot be read, a calendar row of
     theirs spans more than :data:`MAX_SERVICE_DAYS` days, or its days are
-    past :data:`MAX_EXPANDED_DAYS`.
+    past :data:`MAX_EXPANDED_DAYS`. ``within``, a ``(first, last)`` pair of
+    dates, keeps the days between them.
     """
-    dates, unexpanded = _service_days(tables)
+    dates, unexpanded = _service_days(tables, within)
     return dates[~dates["service_id"].isin(unexpanded)], unexpanded
 
 
@@ -257,9 +270,10 @@ def agency_keys(names):
 def route_keys(tables):
     """Each route's key, indexed by ``route_id`` (the first row of each id
     kept): ``agency``, its agency name as :func:`agency_keys` compares it;
-    ``name``, its short name, else long name, casefolded; ``type``, its
-    route type; and its ``continuous_pickup`` and ``continuous_drop_off``,
-    blank when unset."""
+    ``name``, its short name, else long name, casefolded; ``mode``, its
+    route type's basic mode (:data:`MODE_TYPES`), else the route type; and
+    its ``continuous_pickup`` and ``continuous_drop_off``, blank when
+    unset."""
     agency, routes = (
         tables.get(name, pd.DataFrame()) for name in ("agency.txt", "routes.txt")
     )
@@ -270,11 +284,13 @@ def route_keys(tables):
         # A single-agency feed may leave a route's agency_id blank.
         agency_names = agency_names.mask(route_agency.str.strip() == "", names.iloc[0])
     short = _stripped(routes, "route_short_name")
+    types = _stripped(routes, "route_type")
+    modes = {str(t): mode for mode, accepted in MODE_TYPES.items() for t in accepted}
     keys = pd.DataFrame(
         {
             "agency": agency_names.fillna(""),
             "name": short.mask(short == "", _stripped(routes, "route_long_name")),
-            "type": _stripped(routes, "route_type"),
+            "mode": types.map(modes).fillna(types),
             "continuous_pickup": _stripped(routes, "continuous_pickup"),
             "continuous_drop_off": _stripped(routes, "continuous_drop_off"),
         }
@@ -287,7 +303,7 @@ def trip_signatures(tables, with_stops=False):
     """The signature of each trip in a feed's tables.
 
     A signature is 128 bits, written as 32 hex digits, over the trip's route
-    short name, else long name, casefolded, and route type, its
+    short name, else long name, casefolded, and mode (:func:`route_keys`), its
     ``wheelchair_accessible`` and ``bikes_allowed`` (blank as 0), and per
     stop, in ``stop_sequence`` order: the stop's coordinates rounded to 5
     decimals, arrival and departure times with single-digit hours padded,
@@ -318,7 +334,7 @@ def trip_signatures(tables, with_stops=False):
     neither can be read), ``pickup`` and ``drop_off`` (blank as 0),
     ``continuous`` (whether an effective ``continuous_pickup`` or
     ``continuous_drop_off`` is not 1), and per trip ``route`` (a hash of
-    its route's name and type and whether it is frequency-based), ``runs``
+    its route's name and mode and whether it is frequency-based), ``runs``
     (a hash of its frequencies.txt rows, 0 for a timetabled trip), and
     ``wheelchair`` and ``bikes`` (blank as 0).
     """
@@ -423,7 +439,7 @@ def trip_signatures(tables, with_stops=False):
         return pd.Series(values, index=signed_ids).reindex(trips.index).to_numpy()
 
     route = keys.reindex(_column(trips, "route_id").to_numpy())
-    whole = route[["name", "type"]].set_axis(trips.index)
+    whole = route[["name", "mode"]].set_axis(trips.index)
     whole = whole.assign(
         wheelchair=_stripped(trips, "wheelchair_accessible", "0"),
         bikes=_stripped(trips, "bikes_allowed", "0"),
@@ -478,7 +494,7 @@ def trip_signatures(tables, with_stops=False):
             "drop_off": rows["drop_off"].to_numpy()[at],
             "continuous": stopping.any(axis=1).to_numpy()[at],
             # Hashed under the last key, as are the frequency rows.
-            "route": _digest(whole[["name", "type", "headway"]], key)[placed],
+            "route": _digest(whole[["name", "mode", "headway"]], key)[placed],
             "runs": runs[trip],
             "wheelchair": whole["wheelchair"].to_numpy()[placed],
             "bikes": whole["bikes"].to_numpy()[placed],

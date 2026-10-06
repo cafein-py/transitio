@@ -299,6 +299,9 @@ class Place:
     def service(self):
         """The place's transit service level, summed over the feeds serving
         it: ``feeds``, ``stops``, ``routes`` and ``departures_per_day``.
+        The sums leave out feeds stale when indexed
+        (:attr:`~transitio.index.IndexedFeed.relevance`), and in a merged
+        index they are summed over every build's feeds.
 
         The numbers describe how much service the index knows about in the
         place — a capital's thousands of daily stop-events against a small

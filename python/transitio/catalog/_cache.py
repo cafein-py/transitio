@@ -17,7 +17,10 @@ cache's records under ``cache``:
   to be the archive the index crawled, each with the URL probed;
 - ``outputs``: what ``fetch`` made of the version, by key, each the name and
   SHA-256 of its file in the feed's ``outputs`` folder, beside the results
-  stored as ``<key>.json``.
+  stored as ``<key>.json``;
+- ``repeats``: what ``fetch`` found of the version's trips repeating those of
+  the feeds delivered before it, by key: the trips left out, the feeds they
+  repeat, the skip reason, the note and the service window.
 
 A delivered copy's sidecar describes the first acquisition. A version is
 published only after its download completed and the file is a readable zip;
@@ -55,6 +58,8 @@ from transitio.exceptions import DownloadError
 
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _SIDECAR = ".provenance.json"
+# The steps whose output ``fetch`` stores, as ``<key>-<step>.zip``.
+_OUTPUT_STEPS = ("cropped", "repaired", "deduplicated")
 
 
 def _feed_dir(feed_id):
@@ -113,6 +118,8 @@ def _well_formed(sidecar, feed_id, digest):
         and isinstance(cache.get("index_proofs", {}), dict)
         and isinstance(cache.get("outputs", {}), dict)
         and all(_output_record(k, r) for k, r in cache.get("outputs", {}).items())
+        and isinstance(cache.get("repeats", {}), dict)
+        and all(_repeats_record(k, r) for k, r in cache.get("repeats", {}).items())
     )
 
 
@@ -126,10 +133,32 @@ def _output_record(key, record):
     if file is None:
         named = digest is None
     else:
-        named = file in (f"{key}-cropped.zip", f"{key}-repaired.zip")
+        named = file in [f"{key}-{step}.zip" for step in _OUTPUT_STEPS]
         named = named and isinstance(digest, str) and bool(_DIGEST.fullmatch(digest))
     results = record.get("results_sha256")
     return named and isinstance(results, str) and bool(_DIGEST.fullmatch(results))
+
+
+def _repeats_record(key, record):
+    """Whether ``record`` holds what ``fetch`` found of a version's repeated
+    trips under ``key``: the count left out (None: not compared), the ids
+    of the feeds they repeat, the skip reason and note, and the service
+    window."""
+    fields = ("dropped", "of", "skip", "note", "window")
+    if not (_DIGEST.fullmatch(key) and isinstance(record, dict)):
+        return False
+    if not all(field in record for field in fields):
+        return False
+    dropped, ids, window = record["dropped"], record["of"], record["window"]
+    if window is not None and not (isinstance(window, list) and len(window) == 2):
+        return False
+    texts = [record["skip"], record["note"], *(window or ())]
+    return (
+        (dropped is None or type(dropped) is int and dropped >= 0)
+        and isinstance(ids, list)
+        and all(isinstance(i, str) for i in ids)
+        and all(text is None or isinstance(text, str) for text in texts)
+    )
 
 
 def _directory(path):
@@ -579,7 +608,7 @@ class FeedCache:
             # Only names the cache gives its outputs, whatever the sidecar says.
             if not _DIGEST.fullmatch(key):
                 continue
-            if record.get("file") in (f"{key}-cropped.zip", f"{key}-repaired.zip"):
+            if record.get("file") in [f"{key}-{step}.zip" for step in _OUTPUT_STEPS]:
                 _unlink(outputs / record["file"])
             _unlink(outputs / f"{key}.json")
         _unlink(version.path.with_suffix(_SIDECAR))

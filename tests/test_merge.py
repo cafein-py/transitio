@@ -639,6 +639,8 @@ def _repeats(trips, rows=(), continuous=""):
     builder.add_route("r2", 3, "2", agency_id="a")
     builder.add_route("r3", 3, "1", agency_id="a", continuous_pickup="0")
     builder.add_route("r4", 3, "1", agency_id="b")
+    builder.add_route("r704", 704, "1", agency_id="a")
+    builder.add_route("r900", 900, "1", agency_id="a")
     for service in sorted({trip.get("service", "jan") for trip in trips}):
         builder.add_service(service, "daily", *SERVICES[service])
     for trip in trips:
@@ -673,6 +675,8 @@ def _repeats(trips, rows=(), continuous=""):
         ({"stops": ("s5", "s2")}, "equal"),
         ({"route": "r3"}, "differs"),
         ({"route": "r4"}, "equal"),
+        ({"route": "r704"}, "equal"),
+        ({"route": "r900"}, "differs"),
         ({"shape_id": "sa"}, "equal"),
         ({"trip_headsign": "Centre"}, "equal"),
         ({"stops": ("s9", "s2")}, "absent"),
@@ -697,7 +701,8 @@ def _repeats(trips, rows=(), continuous=""):
     ],
     ids=(
         "identical other-time other-pickup other-route-key moved-stop "
-        "moved-within-rounding route-continuous-pickup other-agency other-shape "
+        "moved-within-rounding route-continuous-pickup other-agency "
+        "extended-bus-type tram-type other-shape "
         "other-headsign unknown-stop repeated-sequence unknown-route "
         "listed-twice padded-sequence headway-shifted other-headway "
         "headway-vs-timetabled unreadable-frequency unreadable-first-departure"
@@ -1035,6 +1040,26 @@ def test_duplicate_trips(tmp_path, inputs, dropped, expected):
         "near_matches": expected.get("near", 0),
         "unaligned_stops": expected.get("unaligned", 0),
     }
+
+
+def test_repeated_trips_on_a_day():
+    from transitio.gtfs._duplicates import repeated_trips
+
+    # The second input runs t1 a minute later from stops 20 m from the first
+    # input's, and t2 an hour later; t9 names a service no calendar declares.
+    moved = [
+        (
+            "stops.txt",
+            dict(stop_id=f"m{n}", stop_name="m", stop_lat=lat, stop_lon="24.9"),
+        )
+        for n, lat in ((1, "60.10018"), (2, "60.11018"))
+    ]
+    undeclared = ("trips.txt", dict(route_id="r1", service_id="none", trip_id="t9"))
+    later = {"stops": ("m1", "m2"), "times": ("08:01:00", "08:11:00")}
+    second = _repeats(_trips(later, {"times": LATER}), rows=[*moved, undeclared])
+    tables = [_repeats(ONE).tables, second.tables]
+    found = repeated_trips(tables, day=datetime.date(2026, 1, 14))
+    assert found == [(set(), [], {"t1"}), ({"t1"}, [0], {"t1", "t2", "t9"})]
 
 
 def test_rows_of_dropped_trips_go():

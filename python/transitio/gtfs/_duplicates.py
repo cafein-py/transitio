@@ -52,19 +52,79 @@ def _named_trips(tables, name, *columns):
     return set().union(*(set(value[value.str.strip() != ""]) for value in values))
 
 
-def _find_duplicates(table_sets, near):
+def repeated_trips(table_sets, near=True, day=None):
+    """Per input, ``(trip ids, earlier, in scope)``: the ids of the trips
+    that repeat, or with ``near`` nearly repeat, trips kept from the inputs
+    before it, as :func:`~transitio.gtfs.merge_tables` leaves them out; the
+    positions of the inputs whose trips they repeat, sorted; and the ids of
+    its trips in scope, which a trip that cannot be compared stays among.
+
+    ``table_sets`` are the inputs' unprefixed tables; an empty one is not
+    compared. With a ``day``, a date, the trips in scope are those running
+    that day and those whose services cannot be read or are not declared,
+    and each earlier trip covers one later trip on it; without one, every
+    trip is in scope.
+    """
+    from transitio.gtfs._merge import _prefix_feed
+
+    within = None if day is None else (day, day)
+    present = [position for position, tables in enumerate(table_sets) if tables]
+    prefixed, scope = [], [set() for _ in table_sets]
+    for position in present:
+        tables = table_sets[position]
+        if within is not None:
+            tables = _running(tables, within)
+        trips = tables.get("trips.txt")
+        if trips is not None and "trip_id" in trips.columns:
+            scope[position] = set(trips["trip_id"])
+        prefixed.append(_prefix_feed(tables, f"f{position}", set()))
+    if len(prefixed) < 2:
+        return [(set(), [], ids) for ids in scope]
+    dropped, exact, aligned, _ = _find_duplicates(prefixed, near, within)
+    pairs = set(exact) | set(zip(aligned["later"], aligned["earlier"]))
+    found = [(set(), set()) for _ in table_sets]
+    for position, gone in zip(present, dropped):
+        found[position][0].update(trip.split(":", 1)[1] for trip in gone)
+    for later, earlier in pairs:
+        found[int(later.split(":", 1)[0][1:])][1].add(int(earlier.split(":", 1)[0][1:]))
+    return [(gone, sorted(of), ids) for (gone, of), ids in zip(found, scope)]
+
+
+def _running(tables, within):
+    """``tables`` with only the trips running ``within``, a ``(first, last)``
+    pair of dates, or whose services cannot be read or neither calendar file
+    declares, and their stop times and frequencies."""
+    trips = tables.get("trips.txt")
+    if trips is None or "service_id" not in trips.columns:
+        return tables
+    dates, unexpanded = service_dates(tables, within)
+    declared = _named_trips(tables, "calendar.txt", "service_id")
+    declared |= _named_trips(tables, "calendar_dates.txt", "service_id")
+    service = trips["service_id"]
+    readable = service.isin(declared) & ~service.isin(unexpanded)
+    trips = trips[service.isin(dates["service_id"]) | ~readable]
+    out = {**tables, "trips.txt": trips}
+    for name in ("stop_times.txt", "frequencies.txt"):
+        table = tables.get(name)
+        if table is not None and "trip_id" in table.columns:
+            out[name] = table[table["trip_id"].isin(trips["trip_id"])]
+    return out
+
+
+def _find_duplicates(table_sets, near, within=None):
     """``(dropped, matched, aligned, unexpanded)``: each input's dropped
     trip ids, the ``(dropped trip, earlier trip)`` pairs matched exactly,
     with ``near`` the stops of the pairs matched near (see
     :func:`~transitio.gtfs._near.near_matches`), and the number of services
-    not expanded."""
+    not expanded. ``within``, a ``(first, last)`` pair of dates, counts
+    only the days between them."""
     signed, dates, stops = [], [], []
     unexpanded = 0
     for position, tables in enumerate(table_sets):
         trips = trip_signatures(tables, with_stops=near)
         if near:
             trips, rows = trips
-        service_days, left_out = service_dates(tables)
+        service_days, left_out = service_dates(tables, within)
         unexpanded += len(left_out)
         never = _named_trips(tables, "transfers.txt", "from_trip_id", "to_trip_id")
         compared = ~trips["service_id"].isin(left_out) & ~trips["trip_id"].isin(never)

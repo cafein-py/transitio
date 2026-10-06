@@ -26,12 +26,15 @@ box in WGS84. The pipeline:
 3. downloads each feed, crops it to the area (its polygon, else its bounding
    box), repairs it when asked, and validates it with the canonical notice
    codes,
-4. returns the artefact paths together with per-feed merged reports and a
+4. leaves out of each delivered feed the trips an earlier delivered feed
+   also runs,
+5. returns the artefact paths together with per-feed merged reports and a
    `(feed id, reason)` record for everything it skipped.
 
 ```python
 result.osm_pbf     # pathlib.Path of the cropped .osm.pbf
 result.feeds       # list of GTFS zip paths
+result.paths       # {feed id: path}, in the order of result.feeds
 result.reports     # per-feed merged validation reports (dicts)
 result.repairs     # per-feed repair fix logs (empty without repair=True)
 result.skipped     # [(feed id, reason), ...]
@@ -93,6 +96,28 @@ trafiklab"`, followed by the feed's `access_instructions()`: who issues
 the credentials and where to register. When a download with credentials
 fails, the hosted copy is read without them.
 
+Feeds often publish the same trips: a city operator's buses also appear in
+the regional and national feeds, under another agency name and with times a
+minute apart. `fetch` delivers each such trip once. The feed earlier in the
+selection record keeps it, for a place the order of `place.feeds()` (by
+category, then relevance), and the later feed is delivered without it,
+noted `"<n> repeated trips of <feed ids> left out"`; the `duplicate_trips`
+column of `result.selection_table()` counts them. Trips are compared as
+`merge_feeds` compares them: the same route name and mode (bus, tram,
+subway, rail or ferry, so a local bus coded 704 matches a bus coded 3), and
+the same stops and times, or nearly (within 50 m and 3 minutes). With
+`when`, the trips of that day are compared. Without it, a trip is left out
+only when the earlier feeds run it on every date it runs, which reads every
+feed's whole calendar: for the nine feeds of the Munich metro area the
+comparison took about 50 seconds, against about 15 seconds for one day, and
+memory peaked at 8 GB against 5 to 6 GB. A feed is left out only when every
+trip in scope, with `when` that day's, repeats a trip of an earlier feed; a
+trip the comparison cannot read, such as one whose calendar cannot be read,
+keeps its feed. The delivered feeds are separate feeds, so no transfer or
+pathway links two of them. `duplicate_trips="exact"` leaves out exact
+repeats only, and `duplicate_trips="keep"` compares nothing, so every feed
+keeps all its trips.
+
 `merge_feeds` writes one feed from the cropped ones. With `check=False` it
 keeps the file when the validator reports ERROR notices; the returned
 report lists them.
@@ -152,8 +177,8 @@ cafein may then find no walking network near such a stop and give it no
 footpaths. A journey that starts and ends in the area is routed as before;
 only a walking transfer at such a stop can be lost. The `stops_outside_osm` column of
 `result.selection_table()` counts each delivered feed's located stops, those
-with usable coordinates, outside `osm_area`, and the last row of the record
-sums them. The count is geometric and can differ from the number cafein
+with usable coordinates, outside `osm_area`, and `result.osm_note` sums
+them. The count is geometric and can differ from the number cafein
 reports without footpaths, either way: the extract spans the bounding box
 of the area and cafein snaps a stop up to 1.6 km away, while a stop inside
 the area can still lie far from any street or path.
@@ -168,7 +193,8 @@ offline too, and a repeated request uses the version it used before, so a
 repeated run delivers the same feeds and reports. A day no cached version
 serves downloads the feed and keeps the older versions. The crops, repairs
 and validation results made from a version are kept with it and read back
-by a call that makes the same.
+by a call that makes the same, as are the trips found repeating those of the
+other feeds the call delivers.
 
 ```python
 transitio.fetch(place="Helsinki", when="2026-09-01")   # downloads
@@ -188,8 +214,25 @@ snapshot in use. For a feed that needs an account, credentials for its
 provider count alike whichever key they hold, and a call without them uses
 only copies fetched without them.
 
-With `directory=` the delivered feeds are copied there; without it they are
-the files in the cache, read-only on Linux and macOS.
+With `directory=` the delivered feeds are copied there, each named by its
+feed id: `f-nvbw~ding.zip` beside its provenance sidecar
+`f-nvbw~ding.provenance.json`. An id that is not a safe file name, such as
+`f-u2f-pražskáintegrovanádoprava`, becomes its ASCII form, `+` and the id's
+SHA-256: `f-u2f-prazskaintegrovanadoprava+<sha256>.zip`. A later call that
+delivers the same feed into the same directory replaces its files, and one
+that leaves the feed out for repeating other feeds' trips removes its file;
+give calls that run at the same time, or whose results you want to keep
+side by side, a directory each. Without `directory=` the delivered
+feeds are the files in the cache, read-only on Linux and macOS. Either way
+`result.paths` maps each delivered feed's id to its file:
+
+```python
+result = transitio.fetch(place="Helsinki", when="2026-09-01", directory="feeds")
+for feed_id, path in result.paths.items():
+    print(feed_id, path.name)
+```
+
+`transitio.cache` lists what the cache holds and clears it:
 
 ```python
 import datetime
@@ -357,9 +400,9 @@ metro's primary and secondary feeds (its local and regional service), a
 region's secondary and tertiary ones, a country's tertiary ones. A region or
 country of at most 1,000 km², such as Monaco or San Juan, is town-sized and
 keeps its primary, secondary and tertiary feeds. When `fetch(place=...)`
-without tiers finds the default view empty while the place has feeds, an
-entry of the selection record names them and the `tiers` that fetch them,
-and a warning repeats it. `exclude` drops named tiers and
+without tiers finds the default view empty while the place has feeds,
+`result.view_note` names them and the `tiers` that fetch them, and a
+warning repeats it. `exclude` drops named tiers and
 `requires=["shapes.txt"]` keeps only feeds carrying those files.
 `feed.realtime` lists the GTFS-realtime companions tied to a static feed;
 the companions the index could not tie to one are in

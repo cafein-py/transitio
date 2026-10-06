@@ -28,7 +28,7 @@ def near_matches(earlier, later, keep=None):
 
     Both are the stop rows :func:`~transitio.gtfs._schedule.trip_signatures`
     returns ``with_stops``. A later trip of ``n`` stops nearly repeats an
-    earlier trip when their routes' name and type are equal, as are their
+    earlier trip when their routes' name and mode are equal, as are their
     frequencies.txt rows (a timetabled trip never nearly repeats a
     frequency-based one); its stops align in order with the earlier trip's,
     each aligned pair within :data:`NEAR_METRES` metres (equirectangular)
