@@ -39,6 +39,13 @@ GTFS = {
     ),
 }
 
+# Another agency's copy of GTFS, its trip an hour later.
+HKL = {
+    **GTFS,
+    "agency.txt": GTFS["agency.txt"].replace("HSL", "HKL"),
+    "stop_times.txt": GTFS["stop_times.txt"].replace("08:", "09:"),
+}
+
 CSV_BODY = (
     "id,data_type,status,is_official,provider,"
     "location.country_code,location.subdivision_name,location.municipality,"
@@ -163,9 +170,8 @@ def _area_fetch(monkeypatch, tmp_path, second, **options):
 
 def test_an_area_fetch_keeps_each_feeds_download_apart(pipeline_env, monkeypatch):
     tmp_path, _ = pipeline_env
-    other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "HKL")}
-    first = _area_fetch(monkeypatch, tmp_path, _zip(other))
-    result = _area_fetch(monkeypatch, tmp_path, _zip(other))
+    first = _area_fetch(monkeypatch, tmp_path, _zip(HKL))
+    result = _area_fetch(monkeypatch, tmp_path, _zip(HKL))
     assert len(set(result.feeds)) == 2
     agencies = {zipfile.ZipFile(p).read("agency.txt") for p in result.feeds}
     assert len(agencies) == 2
@@ -209,7 +215,7 @@ def test_a_repeated_fetch_reuses_what_processing_made(pipeline_env, monkeypatch)
             return _real(*args, **options)
 
         monkeypatch.setattr(module, name, counted)
-    other = _zip({**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "HKL")})
+    other = _zip(HKL)
     first = _area_fetch(monkeypatch, tmp_path, other)
     assert sorted(calls) == ["crop_feed"] * 2 + ["validate_feed"] * 2
     # A delivered copy is the caller's; the stored output serves the repeat.
@@ -806,8 +812,7 @@ def test_a_kept_contained_feed_is_reported(tmp_path, monkeypatch):
     index = _partitioned_index(
         tmp_path, monkeypatch, dict.fromkeys(ids, {}), contained={"f-a": ["f-b"]}
     )
-    other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "HKL")}
-    payloads = {"f-a": _zip(GTFS), "f-b": _zip(other)}
+    payloads = {"f-a": _zip(GTFS), "f-b": _zip(HKL)}
     fetched = []
 
     def fake_download(self, feed, directory=None):
@@ -1346,7 +1351,8 @@ def _network(agency="HSL", start="20260101", stops=None, hours=(8,), **options):
 NEW, OLD, OLDER = ({"start": f"2026{month}01"} for month in ("06", "05", "04"))
 C, F = {"agency": "C"}, {"agency": "F"}
 AB, ABC = {**C, "routes": ("a", "b")}, {**C, "routes": ("a", "b", "c")}
-IN_C, ADDS = {**F, "in": "C"}, f"+ similar to A but adds service on {DAY}"
+IN_C = {**F, "in": "C", "hours": (9,)}
+ADDS = f"+ similar to A but adds service on {DAY}"
 # A network on a placeholder calendar, and the note it gets.
 HELD = {"start": "20000101", "end": "20990101"}
 HELD_NOTE = "placeholder calendar 2000-01-01 to 2099-01-01"
@@ -1416,12 +1422,12 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
             {"A": "+", "B": ADDS},
         ),
         (
-            {"A": {**NEW, "hours": (8, 9)}, "B": OLD, "C": {**OLDER, "hours": (8, 10)}},
+            {"A": {**NEW, "hours": (8, 9)}, "B": OLD, "C": {**OLDER, "hours": (10,)}},
             DAY,
             {"A": "+", "B": "- another version of A [A 1.0 1.0]", "C": ADDS},
         ),
         (
-            {"C": {**OLDER, "hours": (8, 10)}, "B": OLD, "A": {**NEW, "hours": (8, 9)}},
+            {"C": {**OLDER, "hours": (10,)}, "B": OLD, "A": {**NEW, "hours": (8, 9)}},
             DAY,
             {"A": "+", "B": "- another version of A [A 1.0 1.0]", "C": ADDS},
         ),
@@ -1429,19 +1435,26 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
             {
                 "A": NEW,
                 "B": {**OLD, "stops": range(1, 11)},
-                "C": {**OLDER, "stops": range(2, 12)},
+                "C": {**OLDER, "stops": range(2, 12), "hours": (9,)},
             },
             DAY,
             {"A": "+", "B": "- another version of A [A 1.0 0.818]", "C": "+"},
         ),
-        ({"V": NEW, "C": OLD, "F": IN_C}, DAY, {"V": "+", "C": "+", "F": SKIP_C}),
         (
-            {"V": NEW, "E": OLD, "C": OLD, "F": IN_C},
+            {"V": {**NEW, "hours": (9,)}, "C": OLD, "F": IN_C},
+            DAY,
+            {"V": "+", "C": "+", "F": SKIP_C},
+        ),
+        (
+            {"V": {**NEW, "hours": (9,)}, "E": OLD, "C": OLD, "F": IN_C},
             DAY,
             {"V": "+", "E": "+", "C": "- same content as E [E]", "F": SKIP_C},
         ),
         (
-            {"A": {**NEW, "stops": range(8)}, "B": {**OLD, "stops": range(1, 9)}},
+            {
+                "A": {**NEW, "stops": range(8)},
+                "B": {**OLD, "stops": range(1, 9), "hours": (9,)},
+            },
             DAY,
             {"A": "+", "B": "+"},
         ),
@@ -1467,7 +1480,10 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
             },
         ),
         (
-            {"A": {**NEW, "stops": range(8)}, "B": {**HELD, "stops": range(1, 9)}},
+            {
+                "A": {**NEW, "stops": range(8)},
+                "B": {**HELD, "stops": range(1, 9), "hours": (9,)},
+            },
             DAY,
             {"A": "+", "B": f"+ {HELD_NOTE}"},
         ),
@@ -1493,7 +1509,26 @@ KEPT, SKIP_C = "+ kept: containment not proven current", "- contained in C [C]"
 def test_fetch_delivers_one_copy_per_service(
     tmp_path, monkeypatch, feeds, when, expected
 ):
-    from transitio.catalog import TransitlandAtlas
+    result, downloads = _fetch_networks(tmp_path, monkeypatch, feeds, when=when)
+    assert {e["feed_id"]: _seen(e) for e in result.selection} == expected
+    # A feed left out before download is never downloaded; every other is.
+    early = ("contained in", "unchanged since indexed")
+    assert sorted(downloads) == sorted(
+        e["feed_id"]
+        for e in result.selection
+        if not any(w in (e["reason"] or "") for w in early)
+    )
+    paths = [e["path"] for e in result.selection if e["decision"] == "delivered"]
+    assert sorted(result.feeds) == sorted(paths) and len(result.reports) == len(paths)
+    # A feed skipped or left out as a version leaves nothing in the directory.
+    assert sorted((tmp_path / "out").rglob("*.zip")) == sorted(paths)
+
+
+def _fetch_networks(tmp_path, monkeypatch, feeds, **options):
+    """``(result, downloaded)``: a fetch of Q1757 into ``tmp_path / "out"``
+    over ``feeds``, ``{feed id: spec}`` in record order (the specs above),
+    with ``options``, and the ids of the feeds downloaded."""
+    from transitio.catalog._atlas import TransitlandAtlas
 
     monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
     payloads, columns, edges, contained, renewed = {}, {}, {}, {}, set()
@@ -1532,28 +1567,20 @@ def test_fetch_delivers_one_copy_per_service(
         directory=tmp_path / "out",
         crop=False,
         osm=False,
-        when=when,
         tiers=["local"] if edges else None,
+        **options,
     )
+    return result, downloads
 
-    def seen(e):
-        links = e["same_as"] + e["contained_in"] + [*(e["version_of"] or {}).values()]
-        links = links and f"[{' '.join(map(str, links))}]"
-        head = f"- {e['reason']}" if e["reason"] else "+"
-        return " ".join(filter(None, (head, e["note"], links)))
 
-    assert {e["feed_id"]: seen(e) for e in result.selection} == expected
-    # A feed left out before download is never downloaded; every other is.
-    early = ("contained in", "unchanged since indexed")
-    assert sorted(downloads) == sorted(
-        e["feed_id"]
-        for e in result.selection
-        if not any(w in (e["reason"] or "") for w in early)
-    )
-    paths = [e["path"] for e in result.selection if e["decision"] == "delivered"]
-    assert sorted(result.feeds) == sorted(paths) and len(result.reports) == len(paths)
-    # A feed skipped or left out as a version leaves nothing in the directory.
-    assert sorted((tmp_path / "out").rglob("*.zip")) == sorted(paths)
+def _seen(entry):
+    """An entry as ``"+ <note> [<links>]"``, or ``"- <reason> ..."`` when
+    skipped."""
+    links = entry["same_as"] + entry["contained_in"]
+    links = links + [*(entry["version_of"] or {}).values()]
+    links = links and f"[{' '.join(map(str, links))}]"
+    head = f"- {entry['reason']}" if entry["reason"] else "+"
+    return " ".join(filter(None, (head, entry["note"], links)))
 
 
 def _timeless(reports):
@@ -1637,8 +1664,7 @@ def test_containment_from_the_cache_follows_the_proofs_of_the_snapshot(
     monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
     columns = {"f-a": ETAG, "f-b": ETAG}
     index = _partitioned_index(tmp_path, monkeypatch, columns, {"f-a": ["f-b"]})
-    other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "HKL")}
-    payloads = {"f-a": _zip(GTFS), "f-b": _zip(other)}
+    payloads = {"f-a": _zip(GTFS), "f-b": _zip(HKL)}
     online, requests = [True], []
 
     def handler(request):
@@ -1683,8 +1709,7 @@ def test_a_container_read_from_the_hosted_copy_proves_nothing(tmp_path, monkeypa
     hosted = "https://files.example.com/f-b/latest.zip"
     columns = {"f-a": ETAG, "f-b": {**ETAG, "mdb": {"urls": {"latest": hosted}}}}
     index = _partitioned_index(tmp_path, monkeypatch, columns, {"f-a": ["f-b"]})
-    other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "HKL")}
-    payloads = {"/f-a": _zip(GTFS), "/f-b/latest.zip": _zip(other)}
+    payloads = {"/f-a": _zip(GTFS), "/f-b/latest.zip": _zip(HKL)}
     online = [True]
 
     def handler(request):

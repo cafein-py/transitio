@@ -55,6 +55,8 @@ from transitio.exceptions import DownloadError
 
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _SIDECAR = ".provenance.json"
+# The steps whose output ``fetch`` stores, as ``<key>-<step>.zip``.
+_OUTPUT_STEPS = ("cropped", "repaired")
 
 
 def _feed_dir(feed_id):
@@ -126,7 +128,7 @@ def _output_record(key, record):
     if file is None:
         named = digest is None
     else:
-        named = file in (f"{key}-cropped.zip", f"{key}-repaired.zip")
+        named = file in [f"{key}-{step}.zip" for step in _OUTPUT_STEPS]
         named = named and isinstance(digest, str) and bool(_DIGEST.fullmatch(digest))
     results = record.get("results_sha256")
     return named and isinstance(results, str) and bool(_DIGEST.fullmatch(results))
@@ -579,7 +581,7 @@ class FeedCache:
             # Only names the cache gives its outputs, whatever the sidecar says.
             if not _DIGEST.fullmatch(key):
                 continue
-            if record.get("file") in (f"{key}-cropped.zip", f"{key}-repaired.zip"):
+            if record.get("file") in [f"{key}-{step}.zip" for step in _OUTPUT_STEPS]:
                 _unlink(outputs / record["file"])
             _unlink(outputs / f"{key}.json")
         _unlink(version.path.with_suffix(_SIDECAR))

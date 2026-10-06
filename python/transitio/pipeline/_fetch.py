@@ -227,6 +227,17 @@ def _window(start, end):
     return [None if day is None else day.isoformat() for day in (start, end)]
 
 
+def _service_window(validation):
+    """The first and last dates of a validation report's computed service
+    window, None for both when unknown."""
+    if not validation["service_window"]:
+        return None, None
+    return tuple(
+        datetime.datetime.strptime(value, "%Y%m%d").date()
+        for value in validation["service_window"]
+    )
+
+
 def _misses(start, end, day, study):
     """Why a service window from ``start`` to ``end`` misses ``day``, or None.
 
@@ -375,20 +386,20 @@ def _process_feed(
     instead (:func:`_stored_output`); the mode filter, the day checks and the
     report run again on every call.
 
-    Returns ``(path, report, fixes, present_routes, window)``; ``present_routes``
-    is the set of ``route_id`` values in the downloaded feed as it enters the
-    route crop, or ``None`` when a ``routes`` filter is not applied or that
-    feed's routes.txt cannot be read — so a caller records an *undetermined*
-    drop rather than a false empty one — and ``window`` the computed service
-    window as ISO dates, None when unknown. The report's summary carries the
-    crop's ``dropped_rows`` as ``droppedRows``, None when the feed was not
-    cropped. Raises :class:`_SkipFeed` when the feed drops out. Shared by the
-    AOI and the place paths.
+    Returns ``(path, report, made, key, window)``: ``made`` what
+    :func:`_transform` and the validation made, its ``present_routes`` the
+    set of ``route_id`` values in the downloaded feed as it enters the route
+    crop, or ``None`` when a ``routes`` filter is not applied or that feed's
+    routes.txt cannot be read — so a caller records an *undetermined* drop
+    rather than a false empty one — ``key`` the output key (None without
+    ``outputs``) and ``window`` the computed service window as ISO dates,
+    None when unknown. The report is :func:`_report`'s. Raises
+    :class:`_SkipFeed` when the feed drops out. Shared by the AOI and the
+    place paths.
     """
-    from transitio.report import build_report
     from transitio.validate import validate_feed
 
-    made = None
+    made = key = None
     if outputs is not None:
         cache, version = outputs
         key = _output_key(version, geometry, routes, crop, repair, budgets)
@@ -422,12 +433,7 @@ def _process_feed(
         if outputs is not None:
             _store_output(cache, version, key, made)
     validation = made["validation"]
-    start = end = None
-    if validation["service_window"]:
-        start, end = (
-            datetime.datetime.strptime(value, "%Y%m%d").date()
-            for value in validation["service_window"]
-        )
+    start, end = _service_window(validation)
     window = _window(start, end)
     missing = _missing_files(validation)
     if missing is not None:
@@ -438,10 +444,25 @@ def _process_feed(
             reason = f"no service on {day.isoformat()}"
         if reason is not None:
             raise _SkipFeed(reason, window)
-    validation["notices"].extend(made["source_notices"])
+    return path, _report(made, hosted, provenance), made, key, window
+
+
+def _report(made, hosted, provenance):
+    """The report on the feed that processing ``made``: its validation, with the
+    notices of the source the crop trimmed, merged with the ``hosted``
+    report and carrying ``provenance``; its summary holds the crop's
+    ``dropped_rows`` as ``droppedRows``, None when the feed was not
+    cropped."""
+    from transitio.report import build_report
+
+    validation = made["validation"]
+    validation = {
+        **validation,
+        "notices": validation["notices"] + made["source_notices"],
+    }
     report = build_report(validation, hosted=hosted, provenance=provenance)
     report["summary"]["droppedRows"] = made["dropped"]
-    return path, report, made["fixes"], made["present_routes"], window
+    return report
 
 
 def _transform(path, folder, stem, **steps):
@@ -525,7 +546,7 @@ def _stored_output(version, key):
     ``key``, as stored with it; None when nothing is stored, or when the
     output no longer matches its SHA-256 or its results cannot be read."""
     from transitio import _http
-    from transitio.catalog._cache import _regular
+    from transitio.catalog._cache import _OUTPUT_STEPS, _regular
 
     record = version.sidecar["cache"].get("outputs", {}).get(key)
     if record is None:
@@ -533,11 +554,8 @@ def _stored_output(version, key):
     folder = version.path.parent / "outputs"
     results = folder / f"{key}.json"
     try:
-        if folder.is_symlink() or record["file"] not in (
-            None,
-            f"{key}-cropped.zip",
-            f"{key}-repaired.zip",
-        ):
+        names = [f"{key}-{step}.zip" for step in _OUTPUT_STEPS]
+        if folder.is_symlink() or record["file"] not in (None, *names):
             return None
         path = version.path if record["file"] is None else folder / record["file"]
         if not (_regular(results) and _regular(path)):
@@ -988,6 +1006,22 @@ def _settle_versions(record, services, protected, day):
             note = undated(member)
             _skip(entries[member], reason, note=note, path=None, version_of=version)
     return removed
+
+
+@dataclasses.dataclass
+class _Processed:
+    """A feed processed for delivery: its selection-record ``entry``, its
+    cached ``version`` and the ``(request key, dataset id)`` it serves, what
+    processing ``made`` of it under the output ``key``, and its report's
+    ``origin`` and ``hosted`` report."""
+
+    entry: dict
+    version: object
+    served: tuple
+    made: dict
+    key: str
+    origin: dict
+    hosted: dict
 
 
 class _Archives:
@@ -1813,7 +1847,7 @@ def fetch(
 
     from transitio.catalog._client import _dataset_entry
 
-    feeds, reports, repairs, record = [], [], [], []
+    feeds, reports, repairs, record, processed = [], [], [], [], []
     delivered = _Delivered()
     # Everything but the version that decides whether one serves.
     key = _request_key(
@@ -1851,7 +1885,7 @@ def fetch(
                 # Modes are read from the delivered feed, after cropping, so an
                 # aggregate serving buses only outside the AOI does not pass a
                 # bus filter.
-                path, report, fixes, _, window = _process_feed(
+                path, report, made, made_key, window = _process_feed(
                     path,
                     provenance=origin,
                     outputs=(cache, version),
@@ -1884,8 +1918,11 @@ def fetch(
                 if note is not None:
                     _note(entry, note)
             reports.append(report)
-            repairs.append(fixes)
+            repairs.append(made["fixes"])
             feeds.append(path)
+            served = (key, dataset_id)
+            item = _Processed(entry, version, served, made, made_key, origin, hosted)
+            processed.append(item)
             delivered.add(feed.id, version.path)
             return "delivered"
 
@@ -1976,6 +2013,12 @@ def fetch(
                 _hosted(db, cache, version, dataset_id),
             )
 
+    rows = [
+        n for n, item in enumerate(processed) if item.entry["decision"] == "delivered"
+    ]
+    feeds, reports, repairs = (
+        [column[n] for n in rows] for column in (feeds, reports, repairs)
+    )
     if osm_pbf is not None:
         coords = {path: _stop_coords(path) for path in feeds}
         counts = _count_outside(record, geometry, coords)
@@ -2283,7 +2326,7 @@ def _fetch_place(
     }
     feeds, reports, repairs, selections, record = [], [], [], [], []
     delivered = _Delivered()
-    delivered_ids, used = [], []
+    delivered_ids, processed = [], []
     entries = {}
     # Containment state: the feeds carried by a feed delivered whole (itself,
     # or the feed whose content it repeats), those delivered cut to routes,
@@ -2399,7 +2442,7 @@ def _fetch_place(
             return "skipped"
         origin = _report_provenance(version, dataset_id)
         try:
-            path, report, fixes, present, window = _process_feed(
+            path, report, made, made_key, window = _process_feed(
                 path,
                 provenance=origin,
                 outputs=(cache, version),
@@ -2442,6 +2485,7 @@ def _fetch_place(
         # not here. Both are None (undetermined) when routes.txt could
         # not be read. Only a trusted complete selector was cropped
         # (``routes`` is set).
+        present = made["present_routes"]
         if selection is not None and routes is not None:
             selection["kept"] = None if present is None else sorted(present & routes)
             selection["dropped"] = None if present is None else sorted(present - routes)
@@ -2457,11 +2501,13 @@ def _fetch_place(
         for text in dict.fromkeys(filter(None, notes)):
             _note(entry, text)
         reports.append(report)
-        repairs.append(fixes)
+        repairs.append(made["fixes"])
         feeds.append(path)
         delivered.add(feed.feed_id, version.path, routes)
         delivered_ids.append(feed.feed_id)
-        used.append((version, origin, key, dataset_id))
+        served = (key, dataset_id)
+        item = _Processed(entry, version, served, made, made_key, origin, hosted)
+        processed.append(item)
         if selection is not None:
             selections.append(selection)
         service = _service(path, day if study else None, budget)
@@ -2740,15 +2786,13 @@ def _fetch_place(
 
     removed = _settle_versions(record, services, protected, day if study else None)
     # A feed is delivered once the versions are settled and it stays.
-    for n, (feed_id, (version, origin, key, context)) in enumerate(
-        zip(delivered_ids, used)
-    ):
+    for n, (feed_id, item) in enumerate(zip(delivered_ids, processed)):
         if feed_id in removed:
             continue
         try:
             with cache.lock(feed_id):
-                feeds[n] = _deliver(feeds[n], directory, origin)
-                cache.touch(version, served=(key, context))
+                feeds[n] = _deliver(feeds[n], directory, item.origin)
+                cache.touch(item.version, served=item.served)
         except Exception as error:  # noqa: B902 — isolate per-feed failures
             _skip(entries[feed_id], f"processing failed: {error}", path=None)
             removed.add(feed_id)
@@ -2759,7 +2803,9 @@ def _fetch_place(
         for key in ("reason", "note", "download_errors"):
             if access is not None and entry[key] is not None:
                 entry[key] = access.redact(entry[key])
-    rows = [n for n, feed_id in enumerate(delivered_ids) if feed_id not in removed]
+    rows = [
+        n for n, item in enumerate(processed) if item.entry["decision"] == "delivered"
+    ]
     delivered_ids, feeds, reports, repairs = (
         [column[n] for n in rows] for column in (delivered_ids, feeds, reports, repairs)
     )
