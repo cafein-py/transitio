@@ -208,6 +208,7 @@ def test_an_area_fetch_keeps_each_feeds_download_apart(pipeline_env, monkeypatch
 
 def test_a_repeated_fetch_reuses_what_processing_made(pipeline_env, monkeypatch):
     import transitio.gtfs
+    import transitio.gtfs._duplicates
     import transitio.validate
 
     tmp_path, _ = pipeline_env
@@ -215,6 +216,7 @@ def test_a_repeated_fetch_reuses_what_processing_made(pipeline_env, monkeypatch)
     for module, name in (
         (transitio.gtfs, "crop_feed"),
         (transitio.validate, "validate_feed"),
+        (transitio.gtfs._duplicates, "repeated_trips"),
     ):
         real = getattr(module, name)
 
@@ -223,21 +225,29 @@ def test_a_repeated_fetch_reuses_what_processing_made(pipeline_env, monkeypatch)
             return _real(*args, **options)
 
         monkeypatch.setattr(module, name, counted)
-    other = _zip(HKL)
+    other = _zip(PARTIAL)
     first = _area_fetch(monkeypatch, tmp_path, other)
-    assert sorted(calls) == ["crop_feed"] * 2 + ["validate_feed"] * 2
-    # A delivered copy is the caller's; the stored output serves the repeat.
+    made = ["crop_feed"] * 3 + ["repeated_trips"] + ["validate_feed"] * 3
+    assert sorted(calls) == made
+    assert [e["note"] for e in first.selection] == [
+        None,
+        "1 repeated trips of mdb-10 left out",
+    ]
+    assert [t["trip_id"] for t in _feed_tables(first.feeds[1])["trips.txt"]] == ["t2"]
+    # A delivered copy is the caller's; the stored outputs serve the repeat
+    # without matching, cropping or validating.
     first.feeds[0].write_bytes(b"")
     again = _area_fetch(monkeypatch, tmp_path, other)
-    assert len(calls) == 4
+    assert len(calls) == 7
     assert _timeless(first.reports) == _timeless(again.reports)
     assert first.repairs == again.repairs
+    assert [e["note"] for e in again.selection] == [e["note"] for e in first.selection]
     # A stored output that changed is made again.
     output, *_ = sorted((tmp_path / "cache").rglob("outputs/*-cropped.zip"))
     output.chmod(0o644)
     output.write_bytes(b"changed")
     _area_fetch(monkeypatch, tmp_path, other)
-    assert sorted(calls[4:]) == ["crop_feed", "validate_feed"]
+    assert sorted(calls[7:]) == ["crop_feed", "validate_feed"]
     # A version deleted for an unreadable sidecar leaves no outputs behind.
     from transitio.catalog._cache import FeedCache
 
@@ -1837,6 +1847,20 @@ def test_the_deduplicating_crop_is_reported(tmp_path, monkeypatch):
         assert _dropped_note(result.reports[1]) == (
             "dropped 1 stop_times.txt rows whose stop_id is not in stops.txt"
         )
+
+
+@pytest.mark.filterwarnings("ignore:no Mobility Database API token")
+def test_a_stored_comparison_names_the_feeds_compared(tmp_path, monkeypatch):
+    # The same archive under another id is another feed for the note to name,
+    # compared again; the first id's comparison is then read back unchanged.
+    calls, seen, cache_dir = _counted_matching(monkeypatch), [], tmp_path / "cache"
+    for n, first in enumerate("AZA"):
+        feeds, before = {first: C, "B": TWO}, len(calls)
+        options = {"cache_dir": cache_dir}
+        result, _ = _fetch_networks(tmp_path / str(n), monkeypatch, feeds, **options)
+        seen.append((result.selection[1]["note"], len(calls) - before))
+    notes = [f"1 repeated trips of {first} left out" for first in "AZA"]
+    assert seen == list(zip(notes, (1, 1, 0)))
 
 
 def _counted_matching(monkeypatch, failing=None):

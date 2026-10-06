@@ -188,7 +188,8 @@ offline too, and a repeated request uses the version it used before, so a
 repeated run delivers the same feeds and reports. A day no cached version
 serves downloads the feed and keeps the older versions. The crops, repairs
 and validation results made from a version are kept with it and read back
-by a call that makes the same.
+by a call that makes the same, as are the trips found repeating those of the
+other feeds the call delivers.
 
 ```python
 transitio.fetch(place="Helsinki", when="2026-09-01")   # downloads

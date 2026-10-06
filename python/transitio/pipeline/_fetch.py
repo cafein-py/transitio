@@ -1062,7 +1062,7 @@ def _drop_repeats(cache, record, processed, feeds, reports, directory, **options
         modes=None if modes is None else sorted(modes),
     )
     keys = [_request_key(run=run, made=item.key) for item in items]
-    found = _repeats(cache, items, keys, **options)
+    found = _stored_repeats(items, keys) or _repeats(cache, items, keys, **options)
     lost = {}
     for n, item, (outcome, made) in zip(order, items, found):
         entry = item.entry
@@ -1096,20 +1096,39 @@ def _drop_repeats(cache, record, processed, feeds, reports, directory, **options
     return lost
 
 
+def _stored_repeats(items, keys):
+    """What :func:`_repeats` stored of ``items`` under ``keys``, None unless
+    every feed has its outcome and every cut feed its deduplicated output."""
+    from transitio.catalog._cache import _repeats_record
+
+    found = []
+    for item, key in zip(items, keys):
+        outcome = item.version.sidecar["cache"].get("repeats", {}).get(key)
+        if not _repeats_record(key, outcome):
+            return None
+        made = None
+        if outcome["skip"] is None and outcome["dropped"]:
+            made = _stored_output(item.version, key)
+            if made is None or "validation" not in made:
+                return None
+        found.append((outcome, made))
+    return found
+
+
 def _repeats(cache, items, keys, budgets, modes, day):
     """Per feed of ``items``, in priority order, ``(outcome, made)``: the
     trips left out as repeats of the trips kept from the feeds before it
     (:func:`~transitio.gtfs._duplicates.repeated_trips`), the feeds holding
     them, and a skip reason, or a note and the service window with
-    ``made``, the deduplicated output (:func:`_without_repeats`), stored
-    under its key of ``keys`` once every feed is decided
+    ``made``, the deduplicated output (:func:`_without_repeats`). Once every
+    feed is decided, each outcome is stored under its key of ``keys``
     (:func:`_store_found`). A feed declaring another time zone than the
     rest (as ``merge_feeds(timezones="skip")`` sets apart), over
     ``max_total_bytes`` or unreadable is not compared. A feed left with
     none of ``modes`` is withdrawn and the matching runs again without it.
-    A failure keeps a feed's trips, with a note; a failed matching, or a
-    feed's file that cannot be opened, keeps every feed's and stores
-    nothing."""
+    A failure keeps a feed's trips, with a note, and is not stored; a failed
+    matching, or a feed's file that cannot be opened, keeps every feed's
+    and stores nothing."""
     from transitio.gtfs._duplicates import repeated_trips
     from transitio.gtfs._merge import _stop_zone, _timezone_outliers, _timezones
 
@@ -1131,7 +1150,7 @@ def _repeats(cache, items, keys, budgets, modes, day):
             read = None
         tables.append(read or {})
     ids = [item.entry["feed_id"] for item in items]
-    found = []
+    found, failed = [], set()
 
     try:
         # The deduplicated outputs wait here until every feed is decided.
@@ -1165,21 +1184,24 @@ def _repeats(cache, items, keys, budgets, modes, day):
                 except Exception as error:  # noqa: B902 — the feed keeps its trips
                     note = f"repeated trips kept: {error}"
                     outcome, made = {**outcome, "skip": None, "note": note}, None
+                    failed.add(n)
                 found.append((outcome, None if outcome["skip"] else made))
                 if again:
                     tables[n] = {}
                     break
-        return _store_found(cache, items, keys, found)
+        return _store_found(cache, items, keys, found, failed)
 
 
-def _store_found(cache, items, keys, found):
+def _store_found(cache, items, keys, found, failed):
     """``found``, what :func:`_repeats` decided of ``items``, once stored:
     a cut feed's deduplicated output moved to
-    ``outputs/<key>-deduplicated.zip`` beside its version, its key of
-    ``keys``, and stored (:func:`_store_output`). A cut feed whose output
-    cannot be stored keeps its trips, noted. Nothing is stored for a
-    version the cache no longer lists, and its feed, cut or withdrawn,
-    keeps its trips, noted."""
+    ``outputs/<key>-deduplicated.zip`` beside its version and stored
+    (:func:`_store_output`), and each outcome but those at the positions
+    ``failed`` stored with the version under its key of ``keys``. A cut feed
+    whose output cannot be stored keeps its trips, noted; an outcome not
+    stored is found again by a later call. Nothing is stored for a version
+    the cache no longer lists, and its feed, cut or withdrawn, keeps its
+    trips, noted."""
     from transitio.catalog._cache import _directory
 
     stored = []
@@ -1195,7 +1217,9 @@ def _store_found(cache, items, keys, found):
                     made = {**made, "path": folder / f"{key}-deduplicated.zip"}
                     os.replace(found[n][1]["path"], made["path"])
                     _store_output(cache, item.version, key, made)
-        except Exception as error:  # noqa: B902 — the feed keeps its trips
+                if listed and n not in failed:
+                    _store_repeats(cache, item.version, key, outcome)
+        except Exception as error:  # noqa: B902 — not stored, found again later
             if made is not None or outcome["skip"] is not None:
                 note = f"repeated trips kept: {error}"
                 outcome, made = {**outcome, "skip": None, "note": note}, None
@@ -1270,6 +1294,16 @@ def _without_repeats(made, output, trips, budgets):
             os.unlink(output)
         raise
     return made
+
+
+def _store_repeats(cache, version, key, outcome):
+    """Store with ``version`` what :func:`_repeats` decided of it under
+    ``key``."""
+
+    def change(sidecar):
+        sidecar["cache"].setdefault("repeats", {})[key] = outcome
+
+    cache.update(version, change)
 
 
 class _Archives:
@@ -1833,7 +1867,10 @@ def fetch(
     ``feed_window`` of either is that of what it kept. A step that fails,
     a crop that would also leave out trips repeating nothing, or a cut feed
     lacking a file GTFS requires keeps the feed's trips, noted ``"repeated
-    trips kept: <error>"``.
+    trips kept: <error>"``. What was found is stored with
+    each feed's cached version, keyed by the delivered feeds and their
+    outputs, the day and ``modes``, and a later call comparing the same
+    reads it back.
 
     Parameters
     ----------
