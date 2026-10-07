@@ -5,6 +5,76 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- `Place.recommend(when)` and `Area.recommend(when)` say which of a place's
+  feeds to use on a day and why the others are left out, as a
+  `Recommendation` (`print()` it, or `to_dataframe()`). Feeds stale when
+  indexed, whose indexed timetable does not run on the day or that need a
+  paid account are left out first. On an index that records which feeds run
+  the same lines, feeds are taken one at a time, each adding the most
+  departures the taken ones lack, until they cover 95 % of the place's
+  departures (`target=`) and 80 % of each mode, at most four
+  (`max_feeds=`); among feeds adding about as much, the open one with the
+  fewest stops is taken. An index without that evidence takes the feed with
+  the most departures.
+- `FeedList.to_dataframe()` lists a place's feeds one row each, with their
+  tiers, relevance, share of the place, service, modes, timetable window,
+  containment, access and stop count, the share of the place's departures
+  each covers and the feeds it repeats, and a reason in words.
+  `IndexedFeed` gains `share_of_place`, `stale_when_indexed`, `overlap` and
+  `catalogue_name`.
+- `fetch(place=..., feeds=...)` fetches only the feeds named, by id or as a
+  `Recommendation`, from any relevance category; an id the place does not
+  have raises `ValueError` before anything is downloaded.
+- `fetch` shows its progress on stderr: a line per feed, a progress bar per
+  download, a line per later step and a summary. `progress=False` turns it
+  off. tqdm draws the bars; in Jupyter they are widgets when ipywidgets is
+  installed, which the new `notebook` extra
+  (`pip install "transitio[notebook]"`) adds.
+- `transitio.index.area()` lists the feed-index places that cover an area,
+  as whole or partly covered parts with the shares they cover, and the share
+  of the area's land they cover together; `Area.feeds()` lists the parts'
+  feeds as `Place.feeds()` does, each feed once.
+- `fetch_pbf`'s provenance sidecar records `checked_bounds`, the bounds of
+  the area the extracts were checked to cover, `extract_bounds`, the box in
+  a single extract's PBF header, and each source's `bounds`. A crop cached
+  before is given `checked_bounds` from its own sidecar, with the extract
+  boxes unknown until `update=True`.
+
+### Changed
+
+- `fetch(aoi=...)` takes the feeds from the installed feed index when the
+  index places cover at least half of the area's land, with the same
+  `tiers`, `exclude`, `on_unknown`, selectors and containment as
+  `fetch(place=...)`, and `FetchResult.places` lists those places.
+  Otherwise it searches the Mobility Database catalogue by bounding box and
+  warns why before anything is downloaded; options only the index honours
+  are then refused. `index=False` searches the catalogue without a warning.
+  `DISCOVERY_SEMANTICS_VERSION` is 5.
+- Areas in km², such as those of the OSM area note, are measured in an
+  equal-area projection.
+- `transitio.index.refresh()` streams the index archive to disk instead of
+  memory and shows its download as a progress bar on stderr
+  (`progress=False` turns it off). The README and quickstart give the
+  download size and the disk space the snapshots take.
+- The Mobility Database catalogue export is downloaded through the same
+  retrying download as feeds and replaces the cached copy only when
+  complete.
+
+### Fixed
+
+- `MobilityDatabase.feed()` works without a refresh token: it reads the
+  catalogue export, as `search_feeds` does.
+- A feed matched by a whole-feed edge and an edge without a usable selector
+  is selected whole instead of as unavailable.
+- Stops at (0, 0) no longer count as located stops in the OSM area note.
+- A crop drops the `areas.txt`, `location_groups.txt` and `networks.txt`
+  rows that only the rows it removed named.
+- The index download no longer holds the whole archive in memory.
+
 ## 0.20.0 — 2026-10-07
 
 ### Added
