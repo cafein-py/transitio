@@ -2686,3 +2686,32 @@ def test_stops_at_the_origin_are_not_located(tmp_path):
     assert (record[0]["stops_outside_osm"], counts) == (1, (1, 3, 0))
     with zipfile.ZipFile(path) as archive:
         assert fingerprint._member_coords(archive)["zero"] == (0.0, 0.0)
+
+
+def test_a_crop_drops_the_areas_groups_and_networks_it_orphans(tmp_path):
+    # A crop pruned stop_areas.txt, location_group_stops.txt and
+    # route_networks.txt but kept every area, location group and network,
+    # so the cropped feed defined those of the stops and routes it removed.
+    files = {
+        **FEED,
+        "areas.txt": "area_id\na-in\na-out\n",
+        "stop_areas.txt": "area_id,stop_id\na-in,in1\na-out,out1\n",
+        "location_groups.txt": "location_group_id\nlg-in\nlg-out\n",
+        "location_group_stops.txt": (
+            "location_group_id,stop_id\nlg-in,in1\nlg-out,out1\n"
+        ),
+        "networks.txt": "network_id\nn-in\nn-out\n",
+        "route_networks.txt": "network_id,route_id\nn-in,r-in\nn-out,r-out\n",
+    }
+    source = write_zip(tmp_path / "feed.zip", files)
+    output = tmp_path / "cropped.zip"
+    crop_feed(source, output, aoi=CITY_BBOX, reference_date="20260601")
+    for name, kept in [
+        ("areas.txt", "a-in"),
+        ("location_groups.txt", "lg-in"),
+        ("networks.txt", "n-in"),
+    ]:
+        rows = csv.reader(io.StringIO(read_entry(output, name).decode()))
+        assert [row[0] for row in rows][1:] == [kept]
+    report = validate_feed(output, reference_date="20260601")
+    assert not any(n["severity"] == "ERROR" for n in report["notices"])
