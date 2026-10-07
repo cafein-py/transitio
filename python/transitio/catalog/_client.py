@@ -13,7 +13,7 @@ import platformdirs
 
 from transitio import _http
 from transitio.catalog._cache import FeedCache, _write_provenance
-from transitio.catalog._csv import fetch_catalog_csv, search_csv
+from transitio.catalog._csv import fetch_catalog_csv, find_feed, search_csv
 from transitio.catalog._models import Dataset, Feed, as_date
 from transitio.exceptions import DownloadError, MissingTokenError
 
@@ -93,6 +93,16 @@ class MobilityDatabase:
         Per-request timeout, in seconds when a float.
     transport : httpx.BaseTransport, optional
         Custom transport, mainly for testing.
+
+    Notes
+    -----
+    Without a refresh token, :meth:`search_feeds` and :meth:`feed` read the
+    public CSV catalogue export instead of the API, with a ``UserWarning``,
+    and :meth:`download_latest` needs no token. Dataset versions
+    (:meth:`datasets`, :meth:`dataset_for`, :meth:`datasets_for`) come from
+    the API alone and raise :class:`~transitio.exceptions.MissingTokenError`
+    without a token, so the versioned downloads of :meth:`download` and the
+    hosted reports of :meth:`validation_report` need one too.
     """
 
     def __init__(
@@ -142,6 +152,17 @@ class MobilityDatabase:
         self._access_token = payload["access_token"]
         self._token_expiry = time.monotonic() + payload.get("expires_in", 3600) - 60
         return self._access_token
+
+    def _csv_catalogue(self):
+        """The path of the CSV catalogue export, read without a token."""
+        warnings.warn(
+            "no Mobility Database refresh token configured; falling back "
+            "to the CSV catalogue export (no historical datasets or "
+            "hosted validation reports)",
+            UserWarning,
+            stacklevel=3,
+        )
+        return fetch_catalog_csv(self._cache_dir, self._http)
 
     def _get_json(self, path, params=None):
         url = f"{API_URL}{path}"
@@ -239,16 +260,8 @@ class MobilityDatabase:
             )
         bounds = _bounds(aoi) if aoi is not None else None
         if not self._refresh_token:
-            warnings.warn(
-                "no Mobility Database refresh token configured; falling back "
-                "to the CSV catalogue export (no historical datasets or "
-                "hosted validation reports)",
-                UserWarning,
-                stacklevel=2,
-            )
-            path = fetch_catalog_csv(self._cache_dir, self._http)
             return search_csv(
-                path,
+                self._csv_catalogue(),
                 bounds=bounds,
                 country_code=country_code,
                 subdivision=subdivision,
@@ -288,7 +301,22 @@ class MobilityDatabase:
         Returns
         -------
         Feed
+
+        Raises
+        ------
+        LookupError
+            Without a refresh token, when the catalogue export holds no GTFS
+            feed with this ID.
+
+        Notes
+        -----
+        Without a refresh token the feed is read from the Mobility Database
+        CSV catalogue export, with a ``UserWarning``, as :meth:`search_feeds`
+        does. Its ``locations`` then hold one entry without the country
+        name, and ``raw`` is the CSV row.
         """
+        if not self._refresh_token:
+            return find_feed(self._csv_catalogue(), feed_id)
         return Feed.from_api(self._get_json(f"/gtfs_feeds/{feed_id}"))
 
     def datasets(self, feed, *, limit=100):

@@ -137,6 +137,7 @@ The feed catalogs
    MobilityDatabase.feed
    MobilityDatabase.datasets
    MobilityDatabase.dataset_for
+   MobilityDatabase.datasets_for
    MobilityDatabase.download
    MobilityDatabase.download_latest
    MobilityDatabase.validation_report

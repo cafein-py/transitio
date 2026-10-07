@@ -2551,3 +2551,35 @@ def test_delivered_feeds_are_named_by_feed_id(tmp_path, monkeypatch):
         assert sidecar["feed_id"] == feed_id
     files = [name + end for name in names for end in (".zip", ".provenance.json")]
     assert sorted(path.name for path in out.iterdir()) == sorted(files)
+
+
+def test_a_feed_is_read_from_the_csv_export_without_a_token(tmp_path, monkeypatch):
+    # MobilityDatabase.feed() raised MissingTokenError without a token, while
+    # search_feeds() read the same feeds from the catalogue export.
+    import httpx
+
+    from transitio.catalog import MobilityDatabase
+
+    body = (
+        "id,data_type,status,provider,location.country_code,urls.latest\n"
+        "mdb-1,gtfs,active,HSL,FI,https://files.example/mdb-1/latest.zip\n"
+        "mdb-2,gtfs_rt,active,HSL RT,FI,\n"
+    )
+    sent = []
+
+    def handler(request):
+        sent.append(request)
+        return httpx.Response(200, text=body)
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    transport = httpx.MockTransport(handler)
+    with MobilityDatabase(None, cache_dir=tmp_path, transport=transport) as db:
+        with pytest.warns(UserWarning, match="CSV catalogue export") as caught:
+            feed = db.feed("mdb-1")
+            assert db.search_feeds(country_code="FI") == [feed]
+            for feed_id in ("mdb-2", "mdb-9"):
+                with pytest.raises(LookupError, match=f"no GTFS feed '{feed_id}'"):
+                    db.feed(feed_id)
+    # Every warning points at the caller, and no API request was made.
+    assert {warning.filename for warning in caught} == {__file__}
+    assert [request.url.path for request in sent] == ["/feeds_v2.csv"]

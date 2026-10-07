@@ -25,12 +25,17 @@ pip install .
 ## Optional pieces
 
 - **Mobility Database API token** — a free
-  [Mobility Database](https://mobilitydatabase.org/) refresh token unlocks
-  historical dataset selection, checksum-verified versioned downloads and the
-  hosted canonical-validator reports. Pass it as `refresh_token=` or set the
-  `MOBILITY_API_REFRESH_TOKEN` environment variable. Without one, transitio
-  transparently falls back to the public CSV catalogue and the latest hosted
-  feed zips (unverified moving targets).
+  [Mobility Database](https://mobilitydatabase.org/) refresh token, passed as
+  `refresh_token=` or set in the `MOBILITY_API_REFRESH_TOKEN` environment
+  variable. A token is needed for a feed's dataset versions
+  (`MobilityDatabase.datasets`, `dataset_for` and `datasets_for`), the
+  checksum-verified versioned downloads and hosted canonical-validator
+  reports that start from them (`download`, `validation_report`),
+  `compare_feed_history`, and the choice of historical Mobility Database
+  datasets by `fetch(when=...)`. Without one, `MobilityDatabase.search_feeds`
+  and `MobilityDatabase.feed` read the public CSV catalogue export, and
+  `download_latest` fetches the latest hosted feed zip (an unverified moving
+  target).
 - **Feed credentials** — some feeds need a free account with their
   provider. `IndexedFeed.access_instructions()` names the provider, where to
   register and the credential fields it issues. Store them with
