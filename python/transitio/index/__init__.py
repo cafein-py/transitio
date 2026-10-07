@@ -40,6 +40,7 @@ from transitio.index.places import (
     Suggestion,
     _PlaceLookup,
 )
+from transitio.index.recommend import Recommendation
 
 __all__ = [
     "AccessProvider",
@@ -49,6 +50,7 @@ __all__ = [
     "Index",
     "IndexedFeed",
     "Place",
+    "Recommendation",
     "Selector",
     "Suggestion",
     "read_index",

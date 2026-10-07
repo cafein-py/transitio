@@ -49,9 +49,11 @@ The index lists the feeds serving each place, by tier. ``place``, ``places``,
    area
    Area
    Area.feeds
+   Area.recommend
    AreaPart
    Place
    Place.feeds
+   Place.recommend
    Place.delineations
    Place.subtype
    Place.parent
@@ -87,6 +89,7 @@ The index lists the feeds serving each place, by tier. ``place``, ``places``,
    IndexedFeed.snapshot
    IndexedFeed.access_instructions
    AccessProvider
+   Recommendation
    Delineation
    Suggestion
    Selector

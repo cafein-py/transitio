@@ -427,7 +427,8 @@ table[["feed_id", "name", "covers", "repeats", "stop_count", "reason"]]
 ```
 
 One row per feed, with its tiers, relevance, `share_of_place` (its share
-of the departures summed over the place's feeds), its service there, its
+of the departures summed over the place's feeds, or of the stops where the
+index measured stops), its service there, its
 modes, its timetable window and whether it was `stale_when_indexed`, the
 feeds it is `contained_in`, its access and its stop count. On an index that
 records which feeds run the same lines, `covers` is the share of the place's

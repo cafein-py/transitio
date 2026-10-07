@@ -2795,3 +2795,38 @@ def test_the_munich_feeds_are_told_apart(tmp_path, monkeypatch):
         "f-urban": 0.94,
     }
     assert table.loc["f-urban", "repeats"] == "f-delfi 100 %, f-mvv 99 %"
+
+
+def test_munich_takes_one_feed_and_says_why_it_leaves_out_the_rest(
+    tmp_path, monkeypatch
+):
+    # Munich's view listed ten feeds and nothing said which to use: MVV alone
+    # runs nearly all of the city's service, its S-Bahn typed as tram.
+    import transitio
+    import transitio.index as transitio_index
+    from test_index_views import munich_index
+
+    monkeypatch.setattr(
+        transitio, "__version__", transitio_index.MIN_READER_VERSIONS[11]
+    )
+    munich = transitio_index.place("muc", index=munich_index(tmp_path))
+    found = munich.recommend("2026-10-13")
+    assert found.feed_ids == ["f-mvv"]
+    assert str(found).splitlines() == [
+        "Munich (city), 2026-10-13: take 1 feed, covering about 98 % of the "
+        "departures the index records there, each counted once",
+        "  + f-mvv: covers 98 % of the place's departures (98 % of bus; 98 % of "
+        "rail, subway and tram)",
+        "  - f-delfi (DELFI): repeats f-mvv (98 % of its departures); 550,396 "
+        "stops against 28,330",
+        "  - f-urban (Public Transport Germany): repeats f-mvv (99 % of its "
+        "departures); 674,929 stops against 28,330",
+        "  - f-mvg (MVG): repeats f-mvv (99 % of its departures); needs a free "
+        "account with MVG API",
+        "  - f-rail (Regional Rail): repeats f-mvv (100 % of its departures); "
+        "needs credentials the index has no details for",
+        "  - f-bw (BW aggregate): adds too little: 0.021 % of the place's "
+        "departures",
+        "  - f-tiny (Tiny): contained in f-bw",
+        "  - f-old (MVV (old)): stale when indexed: its timetable ended 2026-07-31",
+    ]
