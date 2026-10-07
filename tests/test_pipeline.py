@@ -1038,6 +1038,32 @@ def test_fetch_takes_only_the_feeds_named(tmp_path, monkeypatch, where, named, u
     assert str(caught.value) == message and len(fetched) == 2
 
 
+@pytest.mark.filterwarnings("ignore:no Mobility Database API token")
+def test_fetch_takes_the_place_and_day_of_a_recommendation(tmp_path, monkeypatch):
+    from transitio.index import place as resolve
+    from transitio.index.recommend import Choice, Recommendation
+
+    index = _partitioned_index(tmp_path, monkeypatch, dict.fromkeys(("f-a", "f-b"), {}))
+    _serve_by_id(monkeypatch, {"f-a": _zip(GTFS)})
+    taken = [Choice(types.SimpleNamespace(feed_id="f-a"), "covers it", 1.0)]
+    day = datetime.date(2026, 6, 1)
+    found = Recommendation(
+        resolve("Q1757", index=index), day, taken, [], 1.0, {}, "overlap", None
+    )
+    options = dict(directory=tmp_path / "out", crop=False, osm=False)
+    result = fetch(feeds=found, **options)
+    assert [(e["feed_id"], e["decision"]) for e in result.selection] == [
+        ("f-a", "delivered")
+    ]
+    for wrong, message in (
+        ({"place": "Q-other"}, "names its place"),
+        ({"aoi": (24.9, 60.1, 25.1, 60.3)}, "names its place"),
+        ({"when": "2026-06-02"}, "recommendation for 2026-06-01"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            fetch(feeds=found, **wrong, **options)
+
+
 def _calendar(start, end, days="1111111"):
     """GTFS whose one service runs on ``days`` (Monday first) from ``start``
     to ``end``."""

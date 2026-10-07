@@ -489,11 +489,11 @@ compared". The recommendation's `feed_ids` lists the taken feeds and
 `to_dataframe()` gives every feed with its reason; `area.recommend()` answers the same for
 an area, summing each feed's departures over the parts.
 
-To fetch only the feeds it takes, pass the recommendation to `fetch`:
+To fetch only the feeds it takes, pass the recommendation to `fetch`,
+which takes the place and the day from it:
 
 ```python
-day = "2026-10-13"
-result = transitio.fetch(place=munich, when=day, feeds=munich.recommend(day))
+result = transitio.fetch(feeds=munich.recommend("2026-10-13"))
 ```
 
 ### Feeds for an area
