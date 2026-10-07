@@ -1844,6 +1844,7 @@ def fetch(
     on_unknown="include",
     on_untrusted_selector="auto",
     contained="drop",
+    feeds=None,
     index=None,
     credentials=None,
     modes=None,
@@ -1879,10 +1880,10 @@ def fetch(
     Mobility Database catalogue by bounding box"``, and without an installed
     index how to install one. ``index=False`` searches the catalogue without
     a warning; it is refused with ``place``. ``tiers``, ``exclude``, ``on_unknown``,
-    ``on_untrusted_selector``, ``contained`` and ``credentials`` apply on
-    both index paths; on the catalogue path, ``tiers``, ``exclude``,
-    ``on_unknown="exclude"``, another ``on_untrusted_selector`` or
-    ``contained`` than the default, and ``credentials`` raise
+    ``on_untrusted_selector``, ``contained``, ``feeds`` and ``credentials``
+    apply on both index paths; on the catalogue path, ``tiers``,
+    ``exclude``, ``on_unknown="exclude"``, another ``on_untrusted_selector``
+    or ``contained`` than the default, ``feeds`` and ``credentials`` raise
     ``ValueError`` naming the option and the reason, before anything is
     downloaded. ``country_code`` applies only with ``aoi``. When
     a selector cannot be trusted -- its evidence was missing at build time,
@@ -2066,6 +2067,14 @@ def fetch(
         and one that starts later or runs on other weekdays stays. An
         unknown window passes the window checks, and a report without a
         ``moment`` for the day passes the day check.
+    feeds : list of str or object with ``feed_ids``, optional
+        Fetch only these feeds of the index: a list of feed ids (or one id),
+        or an object whose ``feed_ids`` attribute lists them. They are
+        taken from every relevance category of the place, or of the area's
+        places, not only the default view, and ``tiers``, ``exclude`` and
+        ``on_unknown`` still apply; ``selection`` lists only them. An id
+        not indexed for the place, or not in the tiers asked, raises
+        ``ValueError`` before anything is downloaded, as does an empty list.
     credentials : mapping, optional
         Credentials for feeds that need an account with their provider, as
         ``{provider_id: {field: value}}``. They win, field by field, over
@@ -2324,6 +2333,11 @@ def fetch(
         )
     if duplicate_trips not in ("drop", "exact", "keep"):
         raise ValueError("duplicate_trips= must be 'drop', 'exact' or 'keep'")
+    if feeds is not None:
+        feeds = getattr(feeds, "feed_ids", feeds)
+        feeds = {feeds} if isinstance(feeds, str) else set(feeds)
+        if not feeds:
+            raise ValueError("feeds= names no feed")
 
     if modes is not None:
         from transitio.gtfs._schedule import MODE_TYPES
@@ -2361,6 +2375,7 @@ def fetch(
             on_unknown=on_unknown,
             on_untrusted_selector=on_untrusted_selector,
             contained=contained,
+            wanted=feeds,
             index=index,
             credentials=credentials,
             when=when,
@@ -2388,6 +2403,7 @@ def fetch(
             on_untrusted_selector != "auto"
         ),
         f"contained={contained!r}": contained != "drop",
+        "feeds=": feeds is not None,
         "credentials=": credentials is not None,
     }
     refused = [name for name, given in named.items() if given]
@@ -2829,6 +2845,7 @@ def _fetch_place(
     on_unknown,
     on_untrusted_selector,
     contained,
+    wanted,
     index,
     credentials,
     when,
@@ -2896,7 +2913,30 @@ def _fetch_place(
         raise ValueError(f"place {place_obj.id} has no geometry to fetch for")
     study = when is not None
 
-    offered = place_obj.feeds(tiers=tiers, exclude=exclude, on_unknown=on_unknown)
+    def candidates(unknown):
+        # The view's feeds, or with ``wanted`` the named ones of any category.
+        found = place_obj.feeds(
+            tiers=tiers,
+            exclude=exclude,
+            on_unknown=unknown,
+            categories="default" if wanted is None else None,
+        )
+        return found if wanted is None else [f for f in found if f.feed_id in wanted]
+
+    offered = candidates(on_unknown)
+    if wanted is not None:
+        missing = wanted.difference(f.feed_id for f in candidates("include"))
+        if missing:
+            where = (
+                "the area's places"
+                if isinstance(place_obj, Area)
+                else f"place {place_obj.id}"
+            )
+            asked = "" if tiers is None and exclude is None else " in the tiers asked"
+            raise ValueError(
+                f"feeds= names feeds not indexed for {where}{asked}: "
+                f"{', '.join(sorted(missing))}"
+            )
     kept = _containers_first(offered) if contained == "drop" else offered
     # Credentials are checked and resolved before any download.
     explicit = {
@@ -3104,7 +3144,7 @@ def _fetch_place(
         return "delivered"
 
     if on_unknown == "exclude":
-        included = place_obj.feeds(tiers=tiers, exclude=exclude, on_unknown="include")
+        included = candidates("include")
         kept_ids = {f.feed_id for f in kept}
         for feed in included:
             entry = entry_for(feed)
@@ -3113,7 +3153,7 @@ def _fetch_place(
     for feed in offered:
         entry_for(feed)
     view_note = None
-    if tiers is None and not offered:
+    if tiers is None and wanted is None and not offered:
         # An empty default view may hide feeds a tier query would fetch.
         hidden = place_obj.feeds(
             exclude=exclude, on_unknown=on_unknown, categories=None

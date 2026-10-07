@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import pathlib
+import types
 import urllib.parse
 import warnings
 import zipfile
@@ -776,6 +777,7 @@ def test_fetch_place_selects_downloads_and_processes(tmp_path, monkeypatch):
         ({"on_unknown": "exclude"}, "on_unknown='exclude'"),
         ({"on_untrusted_selector": "drop"}, "on_untrusted_selector='drop'"),
         ({"contained": "keep"}, "contained='keep'"),
+        ({"feeds": ["f-a"]}, "feeds="),
         ({"credentials": {"p": {"key": "k"}}}, "credentials="),
     ],
 )
@@ -802,6 +804,8 @@ def test_fetch_rejects_invalid_options():
         fetch(place="X", duplicate_trips="maybe")
     with pytest.raises(ValueError, match="disagree"):
         fetch(place="X", when="2026-06-01", reference_date="20260602")
+    with pytest.raises(ValueError, match="feeds= names no feed"):
+        fetch(place="X", feeds=[])
 
 
 def _partitioned_index(
@@ -853,16 +857,9 @@ def _partitioned_index(
     return transitio_index.read_index(directory)
 
 
-def test_contained_keep_leaves_no_feed_out(tmp_path, monkeypatch):
-    import pathlib
-
-    ids = ("f-a", "f-b", "f-c")
-    index = _partitioned_index(
-        tmp_path, monkeypatch, dict.fromkeys(ids, {}), contained={"f-c": ["f-b"]}
-    )
-    later = {"stop_times.txt": GTFS["stop_times.txt"].replace("08:", "10:")}
-    other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "VR"), **later}
-    payloads = {"f-a": _zip(GTFS), "f-b": _zip(PARTIAL), "f-c": _zip(other)}
+def _serve_by_id(monkeypatch, payloads):
+    """Serve each feed's Atlas download from ``payloads`` (``{feed id: zip
+    bytes}``); returns the list the downloaded feed ids are appended to."""
     fetched = []
 
     def fake_download(self, feed, directory=None):
@@ -873,11 +870,23 @@ def test_contained_keep_leaves_no_feed_out(tmp_path, monkeypatch):
         path.write_bytes(payloads[feed.feed_id])
         return path
 
-    fake_pbf = tmp_path / "aoi.osm.pbf"
-    fake_pbf.write_bytes(b"\x00fake")
     monkeypatch.setattr(
         "transitio.catalog.TransitlandAtlas._fetch_static", fake_download
     )
+    return fetched
+
+
+def test_contained_keep_leaves_no_feed_out(tmp_path, monkeypatch):
+    ids = ("f-a", "f-b", "f-c")
+    index = _partitioned_index(
+        tmp_path, monkeypatch, dict.fromkeys(ids, {}), contained={"f-c": ["f-b"]}
+    )
+    later = {"stop_times.txt": GTFS["stop_times.txt"].replace("08:", "10:")}
+    other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "VR"), **later}
+    payloads = {"f-a": _zip(GTFS), "f-b": _zip(PARTIAL), "f-c": _zip(other)}
+    fetched = _serve_by_id(monkeypatch, payloads)
+    fake_pbf = tmp_path / "aoi.osm.pbf"
+    fake_pbf.write_bytes(b"\x00fake")
     monkeypatch.setattr("transitio.osm.fetch_pbf", lambda *a, **k: fake_pbf)
     monkeypatch.setattr("transitio.osm._fetch.fetch_pbf", lambda *a, **k: fake_pbf)
     result = fetch(
@@ -894,6 +903,39 @@ def test_contained_keep_leaves_no_feed_out(tmp_path, monkeypatch):
     assert sorted(fetched) == list(ids) and len(result.feeds) == 3
     assert result.contained == {}
     assert decisions == [(i, "delivered", []) for i in ids]
+
+
+@pytest.mark.parametrize(
+    "where, named, unknown",
+    [
+        ({"place": "Q1757"}, ["f-c", "f-a"], "place Q1757"),
+        (
+            {"aoi": (24.9, 60.1, 25.1, 60.3)},
+            types.SimpleNamespace(feed_ids=("f-c", "f-a")),
+            "the area's places",
+        ),
+    ],
+    ids=["place-list", "area-feed-ids"],
+)
+def test_fetch_takes_only_the_feeds_named(tmp_path, monkeypatch, where, named, unknown):
+    # f-c serves only nationally, outside a city's default view.
+    tertiary = {"tier": "national", "relevance_category": "tertiary"}
+    index = _partitioned_index(
+        tmp_path,
+        monkeypatch,
+        dict.fromkeys(("f-a", "f-b", "f-c"), {}),
+        edges={"f-c": tertiary},
+    )
+    fetched = _serve_by_id(monkeypatch, {"f-a": _zip(GTFS), "f-c": _zip(HKL)})
+    options = dict(index=index, directory=tmp_path / "out", crop=False, osm=False)
+    result = fetch(**where, feeds=named, reference_date="20260601", **options)
+    decisions = [(e["feed_id"], e["decision"]) for e in result.selection]
+    assert decisions == [("f-a", "delivered"), ("f-c", "delivered")]
+    assert sorted(fetched) == ["f-a", "f-c"]
+    message = f"feeds= names feeds not indexed for {unknown}: f-x, f-y"
+    with pytest.raises(ValueError) as caught:
+        fetch(**where, feeds=["f-a", "f-y", "f-x"], **options)
+    assert str(caught.value) == message and len(fetched) == 2
 
 
 def _calendar(start, end, days="1111111"):

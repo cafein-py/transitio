@@ -79,6 +79,11 @@ result = transitio.fetch(
 transitio.merge_feeds(result.feeds, "augsburg.gtfs.zip", check=False)
 ```
 
+`feeds=["<feed id>", ...]`, or a recommendation from `place.recommend()`
+(see "Which feeds to use" below), limits the call to those feeds of the
+place, from any relevance category; an id the place does not have raises
+`ValueError` before anything is downloaded.
+
 A feed that serves the place with only some of its routes is cropped to the
 routes of the requested tiers. When that selection cannot be trusted — its
 evidence was missing when the index was built, or the download no longer
@@ -438,6 +443,54 @@ f-germany~urban~transport 95 %"`; without that evidence both are empty.
 `reason` sums a row up in words, for example `"primary (local, regional
 tiers): 25 % of the departures summed over the place's feeds; repeats
 f-mdb-3215 (100 %)"`.
+
+### Which feeds to use
+
+Several feeds often run the same service: a city's own feed, a national
+aggregate and a regional one may each carry nearly all of a city's
+departures. `recommend()` says which feeds to take for a day and why it
+leaves out the others:
+
+```python
+munich = transitio.place("Munich", kind="city")
+print(munich.recommend("2026-10-13"))
+```
+
+prints, for example:
+
+```
+Munich (city), 2026-10-13: take 1 feed, covering about 98 % of the departures the index records there, each counted once
+  + f-u281z9-mvv: covers 98 % of the place's departures (98 % of bus; 98 % of rail, subway and tram)
+  - f-mdb-3215 (DELFI): repeats f-u281z9-mvv (98 % of its departures); 550,396 stops against 28,330
+  - f-germany~urban~transport (Public Transport Germany): repeats f-u281z9-mvv (99 % of its departures); 674,929 stops against 28,330
+  - f-mdb-2333 (Münchner Verkehrsgesellschaft): repeats f-u281z9-mvv (99 % of its departures)
+  - f-germany~regional~rail (Regional Rail Transport Germany): repeats f-u281z9-mvv (100 % of its departures)
+  - f-mdb-2393 (Aggregate feed for Baden-Württemberg): adds too little: 0.021 % of the place's departures
+  - f-nvbw~ding (ding): contained in f-mdb-2393
+  - f-mdb-779 (MVV): stale when indexed: its timetable ended 2026-07-31
+```
+
+Every feed serving the place is a candidate, whatever its category.
+Feeds that were stale when indexed, whose timetable as indexed does not run
+on the day (today when no day is given), or that need a paid account are
+left out first. On an index that records which feeds run the same lines,
+the place's departures are counted once and feeds are taken one at a time,
+each adding the most departures the taken feeds lack, until they cover
+95 % of them (`target=`) and 80 % of each mode, rail, subway and tram
+counting as one; at most four are taken (`max_feeds=`). Among feeds adding
+about as much, the open one with the fewest stops wins, which is why MVV's
+own feed is taken over the national DELFI feed. An index without that
+evidence takes the feed with the most departures and marks the others "not
+compared". The recommendation's `feed_ids` lists the taken feeds and
+`to_dataframe()` gives every feed with its reason; `area.recommend()` answers the same for
+an area, summing each feed's departures over the parts.
+
+To fetch only the feeds it takes, pass the recommendation to `fetch`:
+
+```python
+day = "2026-10-13"
+result = transitio.fetch(place=munich, when=day, feeds=munich.recommend(day))
+```
 
 ### Feeds for an area
 
