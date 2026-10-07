@@ -15,7 +15,7 @@ from transitio.exceptions import DownloadError, ExtractNotFoundError
 from transitio.osm import fetch_pbf
 from transitio.osm._fetch import _as_geometry, _buffered, _crop_filename
 
-pytest.importorskip("pyrosm")
+pyrosm = pytest.importorskip("pyrosm")
 
 from pyrosm.exceptions import ExtractDownloadError  # noqa: E402
 from pyrosm.exceptions import (  # noqa: E402
@@ -23,7 +23,9 @@ from pyrosm.exceptions import (  # noqa: E402
 )
 
 HELSINKI_BBOX = (24.6, 60.1, 25.2, 60.4)
-PBF_BYTES = b"\x00fake-pbf-payload"
+PBF_BYTES = Path(pyrosm.get_data("test_pbf")).read_bytes()
+# The bounding box in the header of pyrosm's test_pbf.
+PBF_BOUNDS = [26.929999999, 60.52, 26.969999999, 60.539999999]
 CROP_BYTES = b"\x00cropped-pbf"
 EXTRACT_URL = "https://download.geofabrik.de/europe/finland-latest.osm.pbf"
 FAILED_URL = "https://download.bbbike.org/osm/bbbike/Helsinki/Helsinki.osm.pbf"
@@ -133,6 +135,7 @@ def test_fetch_full_extract(tmp_path, area_extract, directory):
         "sha256": digest,
         "snapshot": SNAPSHOT.isoformat(),
         "retrieved_at": written,
+        "bounds": PBF_BOUNDS,
     }
     assert provenance == {
         "source_url": EXTRACT_URL,
@@ -148,6 +151,8 @@ def test_fetch_full_extract(tmp_path, area_extract, directory):
         "sources": [source],
         "snapshot": SNAPSHOT.isoformat(),
         "must_cover_bounds": None,
+        "checked_bounds": list(HELSINKI_BBOX),
+        "extract_bounds": PBF_BOUNDS,
     }
 
     # A repeat reuses the extract and keeps when it was downloaded; update
@@ -196,6 +201,35 @@ def test_fetch_cropped(tmp_path, area_extract):
     assert path.with_suffix(".provenance.json").exists()
 
 
+@pytest.mark.parametrize(
+    "must_cover, checked",
+    [
+        pytest.param(
+            shapely.Point(24.9, 60.2), [24.9, 60.2, 24.9, 60.2], id="must_cover"
+        ),
+        pytest.param(None, list(HELSINKI_BBOX), id="aoi"),
+    ],
+)
+def test_fetch_gives_a_cached_crop_sidecar_the_bounds(
+    tmp_path, area_extract, must_cover, checked
+):
+    # A crop whose sidecar was written without checked_bounds gains the
+    # bounds its own extraction checked; the extracts' boxes are unknown.
+    options = dict(must_cover=must_cover, cache_dir=tmp_path)
+    path = fetch_pbf(HELSINKI_BBOX, **options)
+    sidecar = path.with_suffix(".provenance.json")
+    old = json.loads(sidecar.read_text())
+    del old["checked_bounds"], old["extract_bounds"], old["sources"][0]["bounds"]
+    sidecar.write_text(json.dumps(old))
+
+    assert fetch_pbf(HELSINKI_BBOX, **options) == path
+    assert len(area_extract) == 1
+    new = json.loads(sidecar.read_text())
+    assert (new.pop("checked_bounds"), new.pop("extract_bounds")) == (checked, None)
+    assert new["sources"][0].pop("bounds") is None
+    assert new == old
+
+
 def test_fetch_merged_extracts(tmp_path, area_extract):
     older = SNAPSHOT - datetime.timedelta(hours=5)
     movisda = ("Movisda", "SE-BD", MOVISDA_URL, 300, older)
@@ -224,6 +258,7 @@ def test_fetch_merged_extracts(tmp_path, area_extract):
             "sha256": digest,
             "snapshot": snapshot.isoformat(),
             "retrieved_at": f"1970-01-0{day}T00:00:00+00:00",
+            "bounds": PBF_BOUNDS,
         }
         for (provider, extract, url, size, snapshot), day in zip(
             area_extract.sources, (3, 2)
@@ -244,6 +279,8 @@ def test_fetch_merged_extracts(tmp_path, area_extract):
         "sources": sources,
         "snapshot": older.isoformat(),
         "must_cover_bounds": [24.9, 60.2, 24.9, 60.2],
+        "checked_bounds": [24.9, 60.2, 24.9, 60.2],
+        "extract_bounds": None,
     }
 
 

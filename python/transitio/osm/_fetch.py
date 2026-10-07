@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import hashlib
+import json
 import os
 import re
 import warnings
@@ -183,6 +184,18 @@ def _isoformat(moment):
     return None if moment is None else moment.isoformat()
 
 
+def _header_bounds(path):
+    """The bounding box in the header of the PBF at ``path``, as ``[minx,
+    miny, maxx, maxy]``; None when the header has none."""
+    from pyrosm.pbf_export import read_header_block
+
+    header = read_header_block(str(path))
+    if not header.HasField("bbox"):
+        return None
+    nano = header.bbox
+    return [value / 1e9 for value in (nano.left, nano.bottom, nano.right, nano.top)]
+
+
 def _write_provenance(path, *, geometry, extract, must_cover, cropped):
     sources = [
         {
@@ -193,6 +206,7 @@ def _write_provenance(path, *, geometry, extract, must_cover, cropped):
             "sha256": source.sha256,
             "snapshot": _isoformat(source.snapshot),
             "retrieved_at": _written_at(source.path),
+            "bounds": _header_bounds(source.path),
         }
         for source in extract.sources
     ]
@@ -212,10 +226,30 @@ def _write_provenance(path, *, geometry, extract, must_cover, cropped):
         "sources": sources,
         "snapshot": _isoformat(extract.snapshot),
         "must_cover_bounds": None if must_cover is None else list(must_cover.bounds),
+        "checked_bounds": list((geometry if must_cover is None else must_cover).bounds),
+        "extract_bounds": sources[0]["bounds"] if len(sources) == 1 else None,
     }
     from transitio.catalog._client import _write_provenance as write_sidecar
 
     write_sidecar(path.with_suffix(".provenance.json"), record)
+
+
+def _add_bounds(sidecar):
+    """Give a crop's ``sidecar`` that lacks ``checked_bounds`` the keys
+    :func:`_write_provenance` records: ``checked_bounds`` from its own
+    ``must_cover_bounds``, else its ``aoi_bounds``. The extracts it was cut
+    from may have been replaced since, so ``extract_bounds`` and each
+    source's ``bounds`` are None."""
+    from transitio.catalog._client import _write_provenance as write_sidecar
+
+    record = json.loads(sidecar.read_text())
+    if "checked_bounds" in record:
+        return
+    for source in record.get("sources") or []:
+        source["bounds"] = None
+    record["checked_bounds"] = record.get("must_cover_bounds") or record["aoi_bounds"]
+    record["extract_bounds"] = None
+    write_sidecar(sidecar, record)
 
 
 @contextlib.contextmanager
@@ -257,21 +291,34 @@ def fetch_pbf(
     Ranking needs the network. pyrosm fetches Movisda's index (kept for a
     day) and asks Geofabrik and BBBike for download sizes (kept for a week);
     what it cannot fetch is skipped or ranked last, with a ``UserWarning``.
-    A ``.provenance.json`` sidecar records the source extract's URL,
-    provider, id and size, the smaller extracts whose download failed, the
-    checksums, the grown AOI's bounds and ``retrieved_at``, the time the
-    extract was downloaded (its file's modification time). ``sources`` lists
-    each downloaded extract in merge order (``url``, ``provider``,
-    ``extract``, ``bytes``, ``sha256``, ``snapshot`` and ``retrieved_at``),
-    ``snapshot`` is when the data was taken (from the PBF header; None when
-    it has none) and ``must_cover_bounds`` the bounds of the clipped
-    ``must_cover`` (None without it). For a merged set ``source_url`` and
-    ``extract_sha256`` are None, ``provider`` and ``extract`` join the
-    sources' with ``+``, ``extract_bytes`` is their total (None when one is
-    unknown) and ``retrieved_at`` and ``snapshot`` are the oldest source's.
-    A crop is reused while it and its sidecar exist. Calls sharing the cache
-    or ``directory`` take turns (a ``.fetch_pbf.lock`` file there), so a
-    file and its sidecar always describe the same extracts.
+    A ``.provenance.json`` sidecar records the source extract's URL
+    (``source_url``), ``provider``, id (``extract``) and size
+    (``extract_bytes``), the smaller extracts whose download failed
+    (``failed_extracts``), the checksums of the extract and the returned
+    file (``extract_sha256``, ``file_sha256``), whether that file is a crop
+    (``cropped``), the grown AOI's bounds (``aoi_bounds``) and
+    ``retrieved_at``, the time the extract was downloaded (its file's
+    modification time).
+    ``sources`` lists each downloaded extract in merge order (``url``,
+    ``provider``, ``extract``, ``bytes``, ``sha256``, ``snapshot``,
+    ``retrieved_at`` and ``bounds``, the bounding box in its PBF header;
+    None when it has none), ``snapshot`` is when the data was taken (from
+    the PBF header; None when it has none), ``must_cover_bounds`` the bounds
+    of the clipped ``must_cover`` (None without it; the extracts were then
+    checked against the grown AOI), ``checked_bounds`` the bounds of what
+    the extracts were checked to cover, the clipped ``must_cover`` or else
+    the grown AOI, and ``extract_bounds`` the extent of the extract's data,
+    the bounding box in its PBF header (None for a merged set or a header
+    without one). For a merged set ``source_url`` and ``extract_sha256``
+    are None, ``provider`` and ``extract`` join the sources' with ``+``,
+    ``extract_bytes`` is their total (None when one is unknown) and
+    ``retrieved_at`` and ``snapshot`` are the oldest source's. A crop is
+    reused while it and its sidecar exist; a sidecar written without
+    ``checked_bounds`` is given it, from its own ``must_cover_bounds`` or
+    else ``aoi_bounds``, with ``extract_bounds`` and each source's
+    ``bounds`` None (``update=True`` records them). Calls sharing the cache or
+    ``directory`` take turns (a ``.fetch_pbf.lock`` file there), so a file
+    and its sidecar always describe the same extracts.
 
     Parameters
     ----------
@@ -351,10 +398,17 @@ def fetch_pbf(
         # replaced and written again after.
         sidecar = target.with_suffix(".provenance.json")
         if target.exists() and sidecar.exists() and not update:
-            return target
+            # A sidecar without checked_bounds gains it under the lock, as
+            # does one another call removed meanwhile.
+            try:
+                if "checked_bounds" in json.loads(sidecar.read_text()):
+                    return target
+            except (OSError, ValueError):
+                pass
     with _taking_turns(source_dir, out_dir):
         # Another call may have made the crop while this one waited.
         if crop and target.exists() and sidecar.exists() and not update:
+            _add_bounds(sidecar)
             return target
         try:
             if crop:

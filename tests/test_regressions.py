@@ -2006,8 +2006,10 @@ def test_an_area_across_a_border_gets_the_smallest_extract_containing_it(
     # one had to cover the area's envelope.
     import json
     import pathlib
+    import shutil
     import types
 
+    from pyrosm import get_data
     from shapely.geometry import box
 
     from transitio.osm import fetch_pbf
@@ -2019,7 +2021,7 @@ def test_an_area_across_a_border_gets_the_smallest_extract_containing_it(
     def get_data_by_area(area, directory=None, **kwargs):
         areas.append(area)
         path = pathlib.Path(directory) / "bbbike_Basel.osm.pbf"
-        path.write_bytes(b"\x00pbf")
+        shutil.copyfile(get_data("test_pbf"), path)
         fields = dict(provider="BBBike", extract="Basel", url=url, bytes=100138363)
         source = types.SimpleNamespace(
             path=str(path), sha256="0" * 64, snapshot=None, **fields
@@ -2095,18 +2097,22 @@ def test_extracts_need_cover_only_the_stops_within_the_buffer(tmp_path, monkeypa
 
 def _finland_extract(path, update, output_path=None, crop=None):
     """An ``AreaExtract`` stand-in for Geofabrik's Finland extract at ``path``,
-    written as pyrosm would: when missing or on update, then cropped to
-    ``output_path`` when given by ``crop(path, output_path)``, by default
-    ``b"crop of "`` and the extract's bytes."""
+    written as pyrosm would: when missing, pyrosm's ``test_pbf``, on update
+    its ``helsinki_pbf``, then cropped to ``output_path`` when given by
+    ``crop(path, output_path)``, by default ``b"crop of "`` and the
+    extract's bytes."""
     import hashlib
     import pathlib
+    import shutil
     import types
+
+    from pyrosm import get_data
 
     def crop_of(source, target):
         target.write_bytes(b"crop of " + source.read_bytes())
 
     if update or not path.exists():
-        path.write_bytes(b"\x00new" if update else b"\x00old")
+        shutil.copyfile(get_data("helsinki_pbf" if update else "test_pbf"), path)
     written = path
     if output_path is not None:
         written = pathlib.Path(output_path)
@@ -2138,7 +2144,10 @@ def test_fetches_sharing_a_cache_take_turns(tmp_path, monkeypatch):
     import concurrent.futures
     import hashlib
     import json
+    import pathlib
     import threading
+
+    from pyrosm import get_data
 
     from transitio.osm import fetch_pbf
 
@@ -2173,9 +2182,13 @@ def test_fetches_sharing_a_cache_take_turns(tmp_path, monkeypatch):
     crop_sidecar, full_sidecar = (
         json.loads(path.with_suffix(".provenance.json").read_text()) for path in paths
     )
-    assert paths[0].read_bytes() == b"crop of \x00old"
-    assert crop_sidecar["extract_sha256"] == hashlib.sha256(b"\x00old").hexdigest()
-    assert full_sidecar["extract_sha256"] == hashlib.sha256(b"\x00new").hexdigest()
+    old, new = (
+        pathlib.Path(get_data(name)).read_bytes()
+        for name in ("test_pbf", "helsinki_pbf")
+    )
+    assert paths[0].read_bytes() == b"crop of " + old
+    assert crop_sidecar["extract_sha256"] == hashlib.sha256(old).hexdigest()
+    assert full_sidecar["extract_sha256"] == hashlib.sha256(new).hexdigest()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges")
