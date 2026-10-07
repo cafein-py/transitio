@@ -2668,3 +2668,21 @@ def test_an_area_fetch_selects_the_feeds_of_the_index_places(tmp_path, monkeypat
         "Mobility Database catalogue by bounding box"
     ) in [str(warning.message) for warning in caught]
     assert (searches, result.places, result.snapshot) == ([mostly_ee], [], None)
+
+
+def test_stops_at_the_origin_are_not_located(tmp_path):
+    # A stop at (0, 0), which stands for a missing position, was counted as a
+    # located stop outside the OSM area; the fingerprint still reads it, as the
+    # build's does.
+    import shapely
+
+    from transitio.index import fingerprint
+    from transitio.pipeline._fetch import _count_outside, _stop_coords
+
+    stops = FEED["stops.txt"] + "zero,Null Island,0.0,0.0\n"
+    path = write_zip(tmp_path / "feed.zip", {**FEED, "stops.txt": stops})
+    record = [{"decision": "delivered", "path": path}]
+    counts = _count_outside(record, shapely.box(*CITY_BBOX), {path: _stop_coords(path)})
+    assert (record[0]["stops_outside_osm"], counts) == (1, (1, 3, 0))
+    with zipfile.ZipFile(path) as archive:
+        assert fingerprint._member_coords(archive)["zero"] == (0.0, 0.0)

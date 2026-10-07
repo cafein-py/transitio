@@ -2259,8 +2259,9 @@ def fetch(
         version was obtained; None when none was), a reused version's
         ``fetched_from`` being its first acquisition's,
         ``stops_outside_osm`` (the delivered feed's located stops, the
-        stops.txt rows with usable coordinates, outside ``osm_area``; None
-        without an extract or when its stops.txt cannot be read) and
+        stops.txt rows with usable coordinates other than (0, 0), outside
+        ``osm_area``; None without an extract or when its stops.txt cannot
+        be read) and
         ``path`` (the delivered feed).
         Windows are ISO dates.
         ``selections``, with ``tiers``, ``exclude`` or
@@ -2660,8 +2661,9 @@ def _untrusted_action(policy, exclude, on_unknown):
 
 def _stop_coords(path):
     """The located stops of the feed at ``path``, its stops.txt rows with a
-    stop id and usable coordinates, as an ``(n, 2)`` array of ``(lon,
-    lat)``; None when its stops.txt is absent or cannot be read."""
+    stop id and usable coordinates other than (0, 0), which stands for a
+    missing position, as an ``(n, 2)`` array of ``(lon, lat)``; None when
+    its stops.txt is absent or cannot be read."""
     import numpy as np
 
     from transitio.index.fingerprint import _member_coords
@@ -2673,7 +2675,8 @@ def _stop_coords(path):
         return None
     if coords is None:
         return None
-    return np.array(list(coords.values()), dtype=float).reshape(-1, 2)
+    points = np.array(list(coords.values()), dtype=float).reshape(-1, 2)
+    return points[points.any(axis=1)]
 
 
 def _located_stops(coords):

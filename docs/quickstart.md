@@ -178,10 +178,11 @@ some stops can lie beyond the area of the OSM extract (`result.osm_area`).
 cafein may then find no walking network near such a stop and give it no
 footpaths. A journey that starts and ends in the area is routed as before;
 only a walking transfer at such a stop can be lost. The `stops_outside_osm` column of
-`result.selection_table()` counts each delivered feed's located stops, those
-with usable coordinates, outside `osm_area`, and `result.osm_note` sums
-them. The count is geometric and can differ from the number cafein
-reports without footpaths, either way: the extract spans the bounding box
+`result.selection_table()` counts each delivered feed's located stops outside
+`osm_area`, and `result.osm_note` sums them. A located stop has usable
+coordinates other than (0, 0), which stands for a missing position. The count
+is geometric and can differ from the number cafein reports without
+footpaths, either way: the extract spans the bounding box
 of the area and cafein snaps a stop up to 1.6 km away, while a stop inside
 the area can still lie far from any street or path.
 
