@@ -1203,7 +1203,7 @@ def _repeats(cache, items, keys, budgets, modes, day, duplicate_trips):
     A failure keeps a feed's trips, with a note, and is not stored; a failed
     matching, or a feed's file that cannot be opened, keeps every feed's
     and stores nothing."""
-    from transitio.gtfs._duplicates import repeated_trips
+    from transitio.gtfs._duplicates import _running, repeated_trips
     from transitio.gtfs._merge import _stop_zone, _timezone_outliers, _timezones
     from transitio.gtfs._schedule import _WEEKDAYS
 
@@ -1224,6 +1224,7 @@ def _repeats(cache, items, keys, budgets, modes, day, duplicate_trips):
         except Exception:  # noqa: B902 — an unreadable feed is not compared
             read = None
         tables.append(read or {})
+    held = [read.get("trips.txt", {}).get("trip_id") for read in tables]
     ids = [item.entry["feed_id"] for item in items]
     found, failed, near = [], set(), duplicate_trips == "drop"
 
@@ -1237,10 +1238,15 @@ def _repeats(cache, items, keys, budgets, modes, day, duplicate_trips):
     with staging as scratch:
         while len(found) < len(items):
             try:
-                if not found and len(set().union(*map(_timezones, tables))) > 1:
-                    located = [_stop_zone(read) for read in tables]
-                    for n in _timezone_outliers(tables, located=located):
-                        tables[n] = {}
+                if not found:
+                    if len(set().union(*map(_timezones, tables))) > 1:
+                        located = [_stop_zone(read) for read in tables]
+                        for n in _timezone_outliers(tables, located=located):
+                            tables[n] = {}
+                    # The time-zone check reads every stop time, the
+                    # matching only the day's.
+                    if day is not None:
+                        tables = [_running(read, (day, day)) for read in tables]
                 matched = repeated_trips(tables, near=near, day=day)
             except Exception as error:  # noqa: B902 — every feed keeps its trips
                 return unchanged(error)
@@ -1254,7 +1260,7 @@ def _repeats(cache, items, keys, budgets, modes, day, duplicate_trips):
                         output = pathlib.Path(scratch) / f"{n}.zip"
                         made = _without_repeats(items[n].made, output, trips, budgets)
                         again = _decide(
-                            outcome, made, tables[n], trips, scope, modes, day
+                            outcome, made, held[n], trips, scope, modes, day
                         )
                 except Exception as error:  # noqa: B902 — the feed keeps its trips
                     note = f"repeated trips kept: {error}"
@@ -1305,16 +1311,16 @@ def _store_found(cache, items, keys, found, failed):
     return stored
 
 
-def _decide(outcome, made, tables, trips, scope, modes, day):
+def _decide(outcome, made, held, trips, scope, modes, day):
     """Record in ``outcome`` what ``made``, the deduplicated output of the
-    feed read as ``tables`` without the repeated ``trips``, leaves: the
-    number of its trips left out and its service window, and a skip reason
-    when it lost every trip in ``scope`` or, with ``modes``, every requested
-    mode, else the note. Returns whether it lost the modes. Raises
-    ``ValueError`` when the crop left out other trips too or the output
-    lacks a file GTFS requires."""
+    feed whose trips.txt holds the trip ids ``held``, without the repeated
+    ``trips``, leaves: the number of its trips left out and its service
+    window, and a skip reason when it lost every trip in ``scope`` or, with
+    ``modes``, every requested mode, else the note. Returns whether it lost
+    the modes. Raises ``ValueError`` when the crop left out other trips too
+    or the output lacks a file GTFS requires."""
     left = _read_tables(made["path"], {"trips.txt"})["trips.txt"]
-    gone = set(tables["trips.txt"]["trip_id"]) - set(left["trip_id"])
+    gone = set(held) - set(left["trip_id"])
     if gone - trips:
         others = len(gone - trips)
         raise ValueError(
