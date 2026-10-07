@@ -149,6 +149,7 @@ def _find_duplicates(table_sets, near, within=None):
     )
     codes = pd.Series(signed.index, index=signed["trip_id"])
     runs = pd.DataFrame({"service": services, "day": days})
+    signed_ids = signed["trip_id"].to_numpy()
 
     def share_a_day(pairs):
         found = pd.DataFrame(
@@ -168,7 +169,7 @@ def _find_duplicates(table_sets, near, within=None):
         # Capacity counts within one input, so a trip every earlier input
         # repeats is dropped from each later one.
         allocation.used.clear()
-        gone = set()
+        gone, paired = set(), None
         if position:
             unpaired = allocation.pair(np.flatnonzero(signed["input"] == position))
             if near and unpaired:
@@ -178,22 +179,29 @@ def _find_duplicates(table_sets, near, within=None):
                 allocation.pair_near(
                     *(codes.loc[pairs[end]].to_numpy() for end in ("later", "earlier"))
                 )
-                aligned.append(paired)
         for trip_ids, members in blocks if position else ():
             if allocation.cover(members):
                 gone.update(trip_ids)
+        if paired is not None:
+            # Only the stops of the near pairs matched are kept.
+            kept = {
+                (signed_ids[a], signed_ids[b])
+                for a, b in allocation.matched
+                if a in allocation.near
+            }
+            ends = pd.MultiIndex.from_frame(paired[["later", "earlier"]])
+            aligned.append(paired[ends.isin(kept)])
         allocation.retain([members for ids, members in blocks if ids[0] not in gone])
         if near:
             retained.append(stops[position][~stops[position]["trip_id"].isin(gone)])
+            stops[position] = None
         dropped.append(gone)
-    trip_ids = signed["trip_id"].to_numpy()
-    matched = {(trip_ids[a], trip_ids[b]) for a, b in allocation.matched}
-    near_trips = set(trip_ids[sorted(allocation.near)])
+    matched = {(signed_ids[a], signed_ids[b]) for a, b in allocation.matched}
+    near_trips = set(signed_ids[sorted(allocation.near)])
     exact = {pair for pair in matched if pair[0] not in near_trips}
     columns = ["later", "earlier", "position", "later_stop", "earlier_stop"]
     aligned = pd.concat([pd.DataFrame(columns=columns), *aligned], ignore_index=True)
-    ends = pd.MultiIndex.from_frame(aligned[["later", "earlier"]])
-    return dropped, exact, aligned[ends.isin(matched - exact)], unexpanded
+    return dropped, exact, aligned, unexpanded
 
 
 def _blocks(trips, codes):

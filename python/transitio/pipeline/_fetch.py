@@ -792,9 +792,10 @@ def _containers_first(feeds):
 
 
 def _read_tables(path, names, max_total_bytes=None):
-    """The tables ``names`` of a feed zip, read as ``FeedEditor`` does; None
-    when together they are over ``max_total_bytes`` (default: the
-    ``FeedEditor`` budget)."""
+    """The tables ``names`` of a feed zip, read as ``FeedEditor`` does, with
+    ``names`` a mapping only the columns it lists for each, by stripped
+    name; None when together they are over ``max_total_bytes`` (default:
+    the ``FeedEditor`` budget)."""
     import pandas as pd
 
     from transitio.edit._editor import _MAX_TOTAL_BYTES, _normalise_table
@@ -805,10 +806,14 @@ def _read_tables(path, names, max_total_bytes=None):
         members = [m for m in archive.infolist() if m.filename in names]
         if sum(m.file_size for m in members) > limit:
             return None
-        return {
-            m.filename: _normalise_table(pd.read_csv(archive.open(m), **csv))[0]
-            for m in members
-        }
+        tables = {}
+        for m in members:
+            table = pd.read_csv(archive.open(m), **csv)
+            if isinstance(names, dict):
+                wanted = names[m.filename]
+                table = table.loc[:, [str(c).strip() in wanted for c in table.columns]]
+            tables[m.filename] = _normalise_table(table)[0]
+        return tables
 
 
 def _service(path, day=None, max_total_bytes=None):
@@ -1137,6 +1142,62 @@ def _stored_repeats(items, keys):
     return found
 
 
+# The columns the matching of repeated trips and its time-zone check read,
+# by table; _repeats adds calendar.txt's weekdays.
+_MATCHED_COLUMNS = {
+    "agency.txt": {"agency_id", "agency_name", "agency_timezone"},
+    "stops.txt": {"stop_id", "stop_lat", "stop_lon"},
+    "routes.txt": {
+        "route_id",
+        "agency_id",
+        "route_short_name",
+        "route_long_name",
+        "route_type",
+        "continuous_pickup",
+        "continuous_drop_off",
+    },
+    "trips.txt": {
+        "trip_id",
+        "route_id",
+        "service_id",
+        "block_id",
+        "wheelchair_accessible",
+        "bikes_allowed",
+    },
+    "stop_times.txt": {
+        "trip_id",
+        "stop_id",
+        "stop_sequence",
+        "arrival_time",
+        "departure_time",
+        "pickup_type",
+        "drop_off_type",
+        "continuous_pickup",
+        "continuous_drop_off",
+    },
+    "calendar.txt": {"service_id", "start_date", "end_date"},
+    "calendar_dates.txt": {"service_id", "date", "exception_type"},
+    "frequencies.txt": {
+        "trip_id",
+        "start_time",
+        "end_time",
+        "headway_secs",
+        "exact_times",
+    },
+    "transfers.txt": {"from_trip_id", "to_trip_id"},
+}
+
+
+def _release_arrow_memory():
+    """Give back to the system the memory Arrow's default pool keeps once
+    pandas frees the strings in it, as far as the pool can."""
+    import pyarrow
+
+    release = getattr(pyarrow.default_memory_pool(), "release_unused", None)
+    if release is not None:
+        release()
+
+
 def _repeats(cache, items, keys, budgets, modes, day, duplicate_trips):
     """Per feed of ``items``, in priority order, ``(outcome, made)``: the
     trips left out as repeats, with ``duplicate_trips="drop"`` also near
@@ -1152,15 +1213,16 @@ def _repeats(cache, items, keys, budgets, modes, day, duplicate_trips):
     A failure keeps a feed's trips, with a note, and is not stored; a failed
     matching, or a feed's file that cannot be opened, keeps every feed's
     and stores nothing."""
-    from transitio.gtfs._duplicates import repeated_trips
+    from transitio.gtfs._duplicates import _running, repeated_trips
     from transitio.gtfs._merge import _stop_zone, _timezone_outliers, _timezones
+    from transitio.gtfs._schedule import _WEEKDAYS
 
     def unchanged(error):
         kept = {"dropped": None, "of": [], "skip": None, "window": None}
         return [({**kept, "note": f"repeated trips kept: {error}"}, None)] * len(items)
 
-    names = {"agency.txt", "stops.txt", "routes.txt", "trips.txt", "stop_times.txt"}
-    names |= {"calendar.txt", "calendar_dates.txt", "frequencies.txt", "transfers.txt"}
+    names = dict(_MATCHED_COLUMNS)
+    names["calendar.txt"] = names["calendar.txt"] | set(_WEEKDAYS)
     tables = []
     for item in items:
         try:
@@ -1172,6 +1234,7 @@ def _repeats(cache, items, keys, budgets, modes, day, duplicate_trips):
         except Exception:  # noqa: B902 — an unreadable feed is not compared
             read = None
         tables.append(read or {})
+    held = [read.get("trips.txt", {}).get("trip_id") for read in tables]
     ids = [item.entry["feed_id"] for item in items]
     found, failed, near = [], set(), duplicate_trips == "drop"
 
@@ -1185,11 +1248,18 @@ def _repeats(cache, items, keys, budgets, modes, day, duplicate_trips):
     with staging as scratch:
         while len(found) < len(items):
             try:
-                if not found and len(set().union(*map(_timezones, tables))) > 1:
-                    located = [_stop_zone(read) for read in tables]
-                    for n in _timezone_outliers(tables, located=located):
-                        tables[n] = {}
+                if not found:
+                    if len(set().union(*map(_timezones, tables))) > 1:
+                        located = [_stop_zone(read) for read in tables]
+                        for n in _timezone_outliers(tables, located=located):
+                            tables[n] = {}
+                    # The time-zone check reads every stop time, the
+                    # matching only the day's.
+                    if day is not None:
+                        tables = [_running(read, (day, day)) for read in tables]
+                        _release_arrow_memory()
                 matched = repeated_trips(tables, near=near, day=day)
+                _release_arrow_memory()
             except Exception as error:  # noqa: B902 — every feed keeps its trips
                 return unchanged(error)
             for n in range(len(found), len(items)):
@@ -1202,7 +1272,7 @@ def _repeats(cache, items, keys, budgets, modes, day, duplicate_trips):
                         output = pathlib.Path(scratch) / f"{n}.zip"
                         made = _without_repeats(items[n].made, output, trips, budgets)
                         again = _decide(
-                            outcome, made, tables[n], trips, scope, modes, day
+                            outcome, made, held[n], trips, scope, modes, day
                         )
                 except Exception as error:  # noqa: B902 — the feed keeps its trips
                     note = f"repeated trips kept: {error}"
@@ -1253,16 +1323,16 @@ def _store_found(cache, items, keys, found, failed):
     return stored
 
 
-def _decide(outcome, made, tables, trips, scope, modes, day):
+def _decide(outcome, made, held, trips, scope, modes, day):
     """Record in ``outcome`` what ``made``, the deduplicated output of the
-    feed read as ``tables`` without the repeated ``trips``, leaves: the
-    number of its trips left out and its service window, and a skip reason
-    when it lost every trip in ``scope`` or, with ``modes``, every requested
-    mode, else the note. Returns whether it lost the modes. Raises
-    ``ValueError`` when the crop left out other trips too or the output
-    lacks a file GTFS requires."""
+    feed whose trips.txt holds the trip ids ``held``, without the repeated
+    ``trips``, leaves: the number of its trips left out and its service
+    window, and a skip reason when it lost every trip in ``scope`` or, with
+    ``modes``, every requested mode, else the note. Returns whether it lost
+    the modes. Raises ``ValueError`` when the crop left out other trips too
+    or the output lacks a file GTFS requires."""
     left = _read_tables(made["path"], {"trips.txt"})["trips.txt"]
-    gone = set(tables["trips.txt"]["trip_id"]) - set(left["trip_id"])
+    gone = set(held) - set(left["trip_id"])
     if gone - trips:
         others = len(gone - trips)
         raise ValueError(

@@ -109,8 +109,8 @@ the same stops and times, or nearly (within 50 m and 3 minutes). With
 `when`, the trips of that day are compared. Without it, a trip is left out
 only when the earlier feeds run it on every date it runs, which reads every
 feed's whole calendar: for the nine feeds of the Munich metro area the
-comparison took about 50 seconds, against about 15 seconds for one day, and
-memory peaked at 8 GB against 5 to 6 GB. A feed is left out only when every
+comparison took about 60 seconds, against about 15 seconds for one day, and
+memory peaked at about 6.6 GB against 2.7 GB. A feed is left out only when every
 trip in scope, with `when` that day's, repeats a trip of an earlier feed; a
 trip the comparison cannot read, such as one whose calendar cannot be read,
 keeps its feed. The delivered feeds are separate feeds, so no transfer or

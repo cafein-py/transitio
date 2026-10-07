@@ -92,6 +92,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are averaged over the period a feed's timetable covers, a feed stale when
   indexed counts in no feed's share of the place nor in the place's sums,
   and a merged index sums the place over every build's feeds.
+- `fetch`'s removal of repeated trips and `merge_feeds`' near-trip matching
+  use less memory: they read only the columns they compare, match only the
+  day's trips with `when`, and join candidate trips in parts. For the nine
+  feeds of the Munich metro area the peak fell from about 4.2 to 2.7 GB with
+  `when`, and from about 9.3 to 6.6 GB without it, where the comparison
+  takes about 60 seconds instead of 50; the results are unchanged.
 
 ### Fixed
 
