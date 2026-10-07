@@ -8,6 +8,7 @@ from pathlib import Path
 
 from shapely.geometry import box
 
+from transitio import _http
 from transitio.catalog._models import Feed
 
 CSV_CATALOG_URL = "https://files.mobilitydatabase.org/feeds_v2.csv"
@@ -89,14 +90,12 @@ def _gtfs_rows(path):
 
 
 def fetch_catalog_csv(cache_dir, client, *, update=False):
-    """Download the CSV catalogue export, reusing a cached copy under 24h old."""
+    """Download the CSV catalogue export (:func:`transitio._http.download`),
+    reusing a cached copy under 24h old."""
     path = Path(cache_dir) / "catalog" / "feeds_v2.csv"
     fresh = path.exists() and time.time() - path.stat().st_mtime < _MAX_AGE_SECONDS
     if update or not fresh:
-        response = client.get(CSV_CATALOG_URL)
-        response.raise_for_status()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(response.content)
+        _http.download(client, CSV_CATALOG_URL, path)
     return path
 
 

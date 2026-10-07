@@ -5,6 +5,8 @@ import json
 import logging
 import os
 import pathlib
+import re
+import sys
 import types
 import urllib.parse
 import warnings
@@ -217,6 +219,99 @@ def test_an_area_fetch_keeps_each_feeds_download_apart(pipeline_env, monkeypatch
     refreshed = _area_fetch(monkeypatch, tmp_path, page, use_cache=False)
     assert sorted(e["cache"] for e in refreshed.selection) == ["fallback", "refreshed"]
     assert len(refreshed.feeds) == 2
+
+
+@pytest.mark.parametrize("progress", [True, False])
+def test_fetch_shows_its_progress_on_stderr(
+    pipeline_env, monkeypatch, capsys, progress
+):
+    tmp_path, _ = pipeline_env
+    # mdb-11 serves a page, then HKL's copy of GTFS, while mdb-10's is cached.
+    copy = {**GTFS, "agency.txt": HKL["agency.txt"]}
+    for second in (b"<html></html>", _zip(copy)):
+        _area_fetch(monkeypatch, tmp_path, second, progress=progress)
+    page = "https://files.example.com/mdb-11/latest.zip: not a zip archive"
+    start = [
+        "Fetching 2 feeds from the Mobility Database catalogue",
+        "Fetching the OSM extract",
+    ]
+    expected = [
+        # The first call downloads the catalogue export; off a terminal its
+        # bar, as each one, is a line.
+        "Downloading the Mobility Database catalogue",
+        *start,
+        "[1/2] mdb-10 (HSL)",
+        "[1/2] mdb-10: cropping and validating",
+        "[2/2] mdb-11 (HKL)",
+        f"[2/2] mdb-11: skipped (download failed: {page})",
+        "Done: 1 feed delivered, 1 skipped, 0.0 MB downloaded",
+        *start,
+        "[1/2] mdb-10: cached copy reused",
+        "[2/2] mdb-11 (HKL)",
+        "[2/2] mdb-11: cropping and validating",
+        "Comparing trips across 2 feeds",
+        "[2/2] mdb-11: left out (every trip repeats a trip of mdb-10)",
+        "Done: 1 feed delivered, 1 skipped, 0.0 MB downloaded",
+    ]
+    said = re.sub(r"Done in [^:]+:", "Done:", capsys.readouterr().err)
+    assert said.splitlines() == (expected if progress else [])
+
+
+@pytest.mark.parametrize(
+    "shell, widgets, expected",
+    [
+        ("ZMQInteractiveShell", True, ("tqdm.notebook", False)),
+        ("ZMQInteractiveShell", False, ("tqdm.std", False)),
+        ("TerminalInteractiveShell", True, ("tqdm.std", None)),
+        (None, True, ("tqdm.std", None)),
+    ],
+    ids=["jupyter-widgets", "jupyter-text", "ipython-terminal", "no-ipython"],
+)
+def test_the_bar_is_a_widget_in_jupyter_with_ipywidgets(
+    monkeypatch, shell, widgets, expected
+):
+    import importlib.util
+
+    import tqdm.notebook  # noqa: F401 — imported before IPython is replaced
+
+    from transitio import _progress
+
+    ipython = None
+    if shell is not None:
+        ipython = types.SimpleNamespace(get_ipython=type(shell, (), {}))
+    monkeypatch.setitem(sys.modules, "IPython", ipython)
+    find_spec = importlib.util.find_spec
+
+    def found(name, *args):
+        if name == "ipywidgets":
+            return object() if widgets else None
+        return find_spec(name, *args)
+
+    monkeypatch.setattr(importlib.util, "find_spec", found)
+    bar_class, disable = _progress._bar_class()
+    assert (bar_class.__module__, disable) == expected
+
+
+def test_progress_text_has_no_control_characters(monkeypatch, capsys):
+    from transitio import _progress
+
+    hostile = "München\r\n\x1b]0;t\x07\x1b[2J\t\x7f\x9b"
+    shown = "München   ]0;t  [2J   "
+    made = []
+
+    class Bar:
+        def __init__(self, **options):
+            made.append(options)
+
+        def set_description(self, desc):
+            made.append(desc)
+
+    monkeypatch.setattr(_progress, "_bar_class", lambda: (Bar, False))
+    _progress.bar(hostile, None)
+    _progress.say(f"[1/1] f-x: skipped ({hostile})")
+    # The widget bar escapes a description only when it redraws.
+    assert "desc" not in made[0] and made[1:] == [shown]
+    assert capsys.readouterr().err == f"[1/1] f-x: skipped ({shown})\n"
 
 
 def test_a_repeated_fetch_reuses_what_processing_made(pipeline_env, monkeypatch):
@@ -693,14 +788,16 @@ def test_download_indexed_tries_the_producer_then_the_hosted_copy(
     atlas = SimpleNamespace(
         _fetch_static=lambda record, directory: serve(record.static_url, directory)
     )
+    said = []
+    progress = SimpleNamespace(retry=lambda reason, url: said.append(reason))
     if source is None:
         with pytest.raises(DownloadError) as caught:
-            _download_indexed(feed, db, atlas, tmp_path, None)
+            _download_indexed(feed, db, atlas, tmp_path, None, progress=progress)
         expected = "; ".join(failures) or "feed f-a has no downloadable url"
         assert str(caught.value) == expected
     else:
         path, fetched_from, seen, url = _download_indexed(
-            feed, db, atlas, tmp_path, None
+            feed, db, atlas, tmp_path, None, progress=progress
         )
         assert (zipfile.is_zipfile(path), fetched_from, seen, url) == (
             True,
@@ -709,6 +806,9 @@ def test_download_indexed_tries_the_producer_then_the_hosted_copy(
             calls[-1],
         )
     assert called == calls
+    # Each failure is said when another URL follows it.
+    reasons = [failure.split(": ", 1)[1] for failure in failures]
+    assert said == reasons[: len(reasons) - (source is None)]
 
 
 def test_fetch_place_selects_downloads_and_processes(tmp_path, monkeypatch):
@@ -1317,7 +1417,7 @@ NONE = (None, None, None)
     ],
 )
 def test_schema_11_downloads(
-    tmp_path, monkeypatch, caplog, columns, credentials, routes, seen, outcome
+    tmp_path, monkeypatch, caplog, capsys, columns, credentials, routes, seen, outcome
 ):
     from transitio.index import place
 
@@ -1379,7 +1479,8 @@ def test_schema_11_downloads(
     paths = "\n".join(str(path) for path in tmp_path.rglob("*"))
     sidecars = [p.read_text() for p in tmp_path.rglob("*.provenance.json")]
     logged = [record.getMessage() for record in caplog.records]
-    texts = [repr(result), paths, *sidecars, *logged, *map(str, caught)]
+    said = capsys.readouterr().err
+    texts = [repr(result), paths, *sidecars, *logged, *map(str, caught), said]
     assert not any(map(_leaks, texts))
 
 
@@ -3245,7 +3346,7 @@ def test_untrusted_action_maps_the_policy(policy, exclude, on_unknown, expected)
     assert _untrusted_action(policy, exclude, on_unknown) == expected
 
 
-def test_fetch_place_excludes_an_unknown_only_feed(tmp_path, monkeypatch):
+def test_fetch_place_excludes_an_unknown_only_feed(tmp_path, monkeypatch, capsys):
     from index_fixture import edge as _edge
 
     service = {"stops": 1, "routes": 1, "departures_per_day": 1.0}
@@ -3264,6 +3365,14 @@ def test_fetch_place_excludes_an_unknown_only_feed(tmp_path, monkeypatch):
     )
     assert result.feeds == []
     assert result.skipped == [("f-a", "only unknown-tier edges")]
+    # Skipped before the feed loop, the feed is still counted and said.
+    said = re.sub(r"Done in [^:]+:", "Done:", capsys.readouterr().err)
+    assert said.splitlines() == [
+        "Fetching 1 feed for Q1757",
+        "[1/1] f-a: skipped (only unknown-tier edges)",
+        "Fetching the OSM extract",
+        "Done: 0 feeds delivered, 1 skipped",
+    ]
 
 
 _EXTRACT_FAILURE = "https://download.example/extract.osm.pbf: HTTP 404 Not Found"

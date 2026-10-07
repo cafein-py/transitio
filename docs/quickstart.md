@@ -12,6 +12,10 @@ import transitio
 result = transitio.fetch("Helsinki")
 ```
 
+`fetch` shows its progress on stderr, a bar per download (a widget in
+Jupyter with `pip install "transitio[notebook]"`, which adds ipywidgets);
+`progress=False` turns it off.
+
 The area of interest can be a place name (geocoded via Nominatim), a shapely
 geometry, a GeoDataFrame/GeoSeries, or a `(minx, miny, maxx, maxy)` bounding
 box in WGS84. The pipeline:

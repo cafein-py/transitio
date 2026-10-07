@@ -30,6 +30,10 @@ net = result.to_cafein()   # routable cafein.TransportNetwork
 osm = result.to_pyrosm()   # pyrosm.OSM reader over the extract
 ```
 
+`fetch` shows its progress on stderr, a bar per download (a widget in
+Jupyter with `pip install "transitio[notebook]"`, which adds ipywidgets);
+`progress=False` turns it off.
+
 `fetch` accepts `when="2026-09-01"` to pick the dataset versions covering a
 service day (needs a free Mobility Database API token, passed as
 `refresh_token=` or via the `MOBILITY_API_REFRESH_TOKEN` environment
@@ -168,6 +172,8 @@ pip install transitio
 
 Binary wheels cover Linux, macOS and Windows. Building from source instead
 requires a Rust toolchain (`pip install .`).
+`pip install "transitio[notebook]"` also installs ipywidgets, so the
+download progress bars show as widgets in Jupyter.
 
 ## License
 

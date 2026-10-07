@@ -21,14 +21,13 @@ import gzip
 import os
 import shutil
 import stat
-import sys
 import tarfile
 import tempfile
 from pathlib import Path
 
 import platformdirs
 
-from transitio import _http
+from transitio import _http, _progress
 from transitio.exceptions import DownloadError, IncompatibleIndexError, TransitioError
 from transitio.index import release as contract
 
@@ -547,24 +546,6 @@ def _prune(root, keep, protect):
     return removed, leftover
 
 
-def _say(text, end="\n"):
-    print(text, end=end, file=sys.stderr, flush=True)
-
-
-def _tenths(size):
-    """A download callback that prints each tenth of ``size`` reached."""
-    shown = 0
-
-    def report(written):
-        nonlocal shown
-        reached = min(written * 10 // size, 10)
-        while shown < reached:
-            shown += 1
-            _say(f" {shown * 10}%", end="")
-
-    return report
-
-
 def _download(release, manifest, directory, transport, progress):
     """Stream the release's archive into ``directory`` and check it against
     the size and digest its manifest declares; return its path."""
@@ -590,11 +571,7 @@ def _download(release, manifest, directory, transport, progress):
     archive = directory / contract.archive_name(snapshot_id)
     report = None
     if progress:
-        _say(
-            f"Downloading feed index snapshot {snapshot_id} ({size / 1e6:.0f} MB):",
-            end="",
-        )
-        report = _tenths(size)
+        report = _progress.Download(f"Downloading feed index snapshot {snapshot_id}")
     # Not the API client: the asset URL is absolute and redirects to the
     # asset host.
     try:
@@ -603,8 +580,8 @@ def _download(release, manifest, directory, transport, progress):
         ) as client:
             digest = _http.download(client, url, archive, limit=size, progress=report)
     finally:
-        if progress:
-            _say("")
+        if report is not None:
+            report.close()
     if archive.stat().st_size != size or digest != expected:
         raise DownloadError(
             "the archive does not match the size and digest its manifest declares"
@@ -625,9 +602,9 @@ def refresh(
 
     The archive, about 420 MB, is streamed to a private directory in the
     cache and unpacked from there; an installed snapshot takes about 550 MB,
-    so about 1 GB must be free while a refresh runs. The download's progress
-    and the unpacking are reported on stderr; ``progress=False`` prints
-    nothing.
+    so about 1 GB must be free while a refresh runs. A progress bar for the
+    download (a widget in Jupyter when ipywidgets is installed) and a line
+    for the unpacking go to stderr; ``progress=False`` prints nothing.
 
     Returns a summary: the snapshot id, whether it was newly ``installed``
     (a damaged install is replaced), the releases ``skipped`` (newer but
@@ -675,7 +652,7 @@ def refresh(
                         "run transitio.index.refresh() again"
                     )
                 if progress:
-                    _say(f"Unpacking and checking snapshot {snapshot_id}")
+                    _progress.say(f"Unpacking and checking snapshot {snapshot_id}")
                 _install(root, snapshot_id, archive)
             removed, leftover = _prune(root, keep, {snapshot_id, _pinned(cache_dir)[1]})
     # The next query resolves afresh: a newer snapshot may now be active.

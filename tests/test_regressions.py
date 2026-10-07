@@ -2767,10 +2767,9 @@ def test_the_index_download_shows_its_progress(tmp_path, monkeypatch, capsys):
             progress=progress,
         )
         assert summary["installed"] and summary["snapshot_id"] == snapshot_id
-        tenths = "".join(f" {n}%" for n in range(10, 101, 10))
+        # Off a terminal the download's bar is a line.
         expected = (
-            f"Downloading feed index snapshot {snapshot_id} "
-            f"({asset['size'] / 1e6:.0f} MB):{tenths}\n"
+            f"Downloading feed index snapshot {snapshot_id}\n"
             f"Unpacking and checking snapshot {snapshot_id}\n"
         )
         assert capsys.readouterr() == ("", expected if progress else "")

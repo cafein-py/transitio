@@ -9,7 +9,12 @@ pip install transitio
 ```
 
 Binary wheels ship for Linux, macOS and Windows, so no Rust toolchain is
-needed.
+needed. The `notebook` extra adds ipywidgets, so the download progress bars
+of `fetch` and `transitio.index.refresh` show as widgets in Jupyter:
+
+```
+pip install "transitio[notebook]"
+```
 
 ## From source
 

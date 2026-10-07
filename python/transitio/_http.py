@@ -12,6 +12,7 @@ from pathlib import Path
 
 import httpx
 
+from transitio import _progress
 from transitio.exceptions import DownloadError
 
 try:
@@ -79,8 +80,11 @@ def download(
     from; an encoded or unpinned body restarts from zero, and an attempt that
     adds resumable bytes does not count as failed. A connection that cannot
     be opened and any other status fail at once, as does a body longer than
-    ``limit`` bytes when that is given. ``progress``, when given, is called
-    with the bytes written so far after each chunk.
+    ``limit`` bytes when that is given. After each chunk ``progress`` is
+    called with ``(written, total)``: the bytes written so far and the full
+    body length when known (an unencoded 200's Content-Length, a 206's
+    Content-Range total), else None; without it, the callback
+    :func:`transitio._progress.reporting` set, if any.
 
     With ``access`` (a :class:`~transitio.catalog._access._Access` whose URL
     is ``url``) the download sends its credentials through
@@ -93,6 +97,8 @@ def download(
     the last failure.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    if progress is None:
+        progress = _progress.current()
     if access is None:
         with replacing(path) as handle:
             return _fetch(client, url, _Partial(handle, limit, progress))
@@ -172,8 +178,9 @@ def _discard(path):
 
 class _Partial:
     """A download's partial file: its bytes, their digest, the bytes the
-    current request added and the ``(header, value)`` a resume is pinned to,
-    with the download's byte ``limit`` and ``progress`` callback."""
+    current request added, the ``(header, value)`` a resume is pinned to and
+    the ``total`` length of the body when known, with the download's byte
+    ``limit`` and ``progress`` callback."""
 
     def __init__(self, handle, limit=None, progress=None):
         self.handle = handle
@@ -188,6 +195,7 @@ class _Partial:
         self.digest = hashlib.sha256()
         self.written = 0
         self.pin = pin
+        self.total = None
 
     def write(self, chunk):
         self.handle.write(chunk)
@@ -195,7 +203,7 @@ class _Partial:
         self.written += len(chunk)
         self.added += len(chunk)
         if self.progress is not None:
-            self.progress(self.written)
+            self.progress(self.written, self.total)
 
 
 def _fetch(client, url, partial, access=None):
@@ -240,10 +248,13 @@ def _request(client, url, partial):
             if expected is None:
                 partial.restart()
                 return "unusable resume answer", True
+            partial.total = expected
         else:
             partial.restart(_pin(response))
             declared = response.headers.get("Content-Length", "")
             expected = int(declared) if declared.isdigit() else None
+            # An encoded body's length on the wire is not the file's.
+            partial.total = None if _encoded(response) else expected
         for chunk in response.iter_bytes():
             partial.write(chunk)
             if partial.limit is not None and partial.written > partial.limit:

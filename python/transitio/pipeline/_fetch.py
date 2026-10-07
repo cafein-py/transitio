@@ -14,6 +14,7 @@ import pathlib
 import re
 import shutil
 import tempfile
+import time
 import warnings
 import zipfile
 
@@ -394,6 +395,7 @@ def _process_feed(
     routes=None,
     provenance=None,
     outputs=None,
+    progress=None,
 ):
     """Crop, repair, mode-filter, validate and report one downloaded feed,
     writing what it makes beside it; the report carries ``provenance``.
@@ -407,7 +409,8 @@ def _process_feed(
     what the crop, repair and validation make is stored with the version
     (:func:`_store_output`) and a later call making the same reads it back
     instead (:func:`_stored_output`); the mode filter, the day checks and the
-    report run again on every call.
+    report run again on every call. ``progress`` (:class:`_Progress`) says
+    when the crop, repair and validation start.
 
     Returns ``(path, report, made, key, window)``: ``made`` what
     :func:`_transform` and the validation made, its ``present_routes`` the
@@ -428,6 +431,8 @@ def _process_feed(
         key = _output_key(version, geometry, routes, crop, repair, budgets)
         made = _stored_output(version, key)
     if made is None:
+        if progress is not None:
+            progress.processing(crop or routes is not None, repair)
         if outputs is None:
             folder, stem = path.parent, f"{path.stem}-{tag}"
         else:
@@ -1057,7 +1062,9 @@ class _Processed:
     hosted: dict
 
 
-def _drop_repeats(cache, record, processed, feeds, reports, directory, **options):
+def _drop_repeats(
+    cache, record, processed, feeds, reports, directory, progress=None, **options
+):
     """Leave out of the delivered feeds the trips that repeat a trip kept
     from a feed before them in ``record``, as :func:`fetch` describes.
 
@@ -1069,9 +1076,10 @@ def _drop_repeats(cache, record, processed, feeds, reports, directory, **options
     ``directory`` removed. A failed replacement or removal keeps the feed as
     delivered, noted. Each compared entry gets its ``duplicate_trips``
     count. ``options`` are ``budgets``, ``modes``, ``day``, the study day or
-    None, and ``duplicate_trips``, ``"keep"`` comparing nothing. Returns
-    ``{feed id: [ids]}``: for each feed cut or withdrawn, the feeds holding
-    the trips it repeated.
+    None, and ``duplicate_trips``, ``"keep"`` comparing nothing;
+    ``progress`` (:class:`_Progress`) says when the comparison starts.
+    Returns ``{feed id: [ids]}``: for each feed cut or withdrawn, the feeds
+    holding the trips it repeated.
     """
     from transitio import _http
 
@@ -1086,6 +1094,8 @@ def _drop_repeats(cache, record, processed, feeds, reports, directory, **options
     )
     if len(order) < 2 or options["duplicate_trips"] == "keep":
         return {}
+    if progress is not None:
+        progress.say(f"Comparing trips across {len(order)} feeds")
     items = [processed[n] for n in order]
     day, modes = options["day"], options["modes"]
     run = _request_key(
@@ -1445,7 +1455,14 @@ class _Archives:
 
 
 def _download_indexed(
-    feed, db, atlas, base_dir, archives, max_total_bytes=None, access=None
+    feed,
+    db,
+    atlas,
+    base_dir,
+    archives,
+    max_total_bytes=None,
+    access=None,
+    progress=None,
 ):
     """Download an indexed feed from the first of its URLs that serves a zip
     archive: the Mobility Database direct download, the Transitland Atlas
@@ -1463,6 +1480,7 @@ def _download_indexed(
     (:func:`~transitio.catalog._nested.split_fragment`) takes the archive
     from ``archives`` and extracts that member within ``max_total_bytes``;
     its sidecar records the archive's URL and SHA-256 beside the feed's.
+    ``progress`` (:class:`_Progress`) says each failure another URL follows.
 
     Returns ``(path, fetched_from, failures, url)``: ``fetched_from`` is
     ``"producer"`` for the feed's own URLs and ``"mdb_latest"`` for the hosted
@@ -1525,11 +1543,12 @@ def _download_indexed(
     elif "download_url" in feed._row:
         crawled = ("download_url", "producer", feed.download_url, from_url, atlas)
         attempts = (crawled, hosted, mdb, static)
-    tried, failures = set(), []
-    for label, source, url, download, client in attempts:
-        if not url or url in tried:
-            continue
-        tried.add(url)
+    runs = {}
+    for attempt in attempts:
+        if attempt[2]:
+            runs.setdefault(attempt[2], attempt)
+    failures = []
+    for n, (label, source, url, download, client) in enumerate(runs.values(), 1):
         outer, member = split_fragment(url)
         try:
             if member is None:
@@ -1539,24 +1558,159 @@ def _download_indexed(
                 keys = access if label == "download_url" else None
                 path = from_archive(client, url, outer, member, keys)
         except Exception as error:  # noqa: B902 — try the next URL
-            failures.append(f"{label}: {error}")
-            continue
-        if zipfile.is_zipfile(path):
-            return path, source, failures, url
-        failures.append(f"{label}: not a zip archive")
+            reason = str(error)
+        else:
+            if zipfile.is_zipfile(path):
+                return path, source, failures, url
+            reason = "not a zip archive"
+        failures.append(f"{label}: {reason}")
+        if progress is not None and n < len(runs):
+            progress.retry(reason, outer)
     if failures:
         raise DownloadError("; ".join(failures))
     raise DownloadError(f"feed {feed.feed_id} has no downloadable url")
 
 
-def _held(cache, feeds, feed_id):
-    """``(feed, staging)`` for each of ``feeds``, the loop body running under
-    the feed's cache lock with a fresh staging folder
-    (:meth:`~transitio.catalog._cache.FeedCache.staging`); ``feed_id`` gives
-    a feed's id."""
+class _Progress:
+    """What a :func:`fetch` call says on stderr as it runs, nothing when not
+    ``shown`` (:mod:`transitio._progress`): a start line; per feed, numbered
+    in the call's selection, a bar per download and a line for a failed URL,
+    the crop and validation, a skip, a cached copy reused or a feed left out
+    after delivery; a line per later step and a summary."""
+
+    def __init__(self, shown):
+        self.shown = shown
+        self.started = time.monotonic()
+        self.count = self.downloaded = 0
+        self.feed_id = self.bar = None
+        # Each feed's number, and its decision when its block ended.
+        self.numbers, self.said = {}, {}
+        # A protected feed's redaction of its credentials, by feed id.
+        self.masks = {}
+
+    def say(self, text):
+        if self.shown:
+            from transitio import _progress
+
+            _progress.say(text)
+
+    def start(self, count, where, skipped=()):
+        """Say that ``count`` feeds are fetched ``where``, then number the
+        record entries ``skipped`` before the feed loop and say why."""
+        self.count = count
+        self.say(f"Fetching {count} feed{'' if count == 1 else 's'} {where}")
+        for entry in skipped:
+            self._next(entry)
+            self.line(f"skipped ({entry['reason']})")
+
+    def _next(self, entry):
+        """Make ``entry``'s feed the current one, numbered next."""
+        self.feed_id = entry["feed_id"]
+        self.numbers[self.feed_id] = len(self.numbers) + 1
+
+    @property
+    def prefix(self):
+        return f"[{self.numbers[self.feed_id]}/{self.count}] {self.feed_id}"
+
+    @contextlib.contextmanager
+    def downloads(self, desc):
+        """A bar described ``desc`` for each download in the block, their
+        bytes counted."""
+        from transitio import _progress
+
+        self.bar = _progress.Download(desc) if self.shown else None
+        try:
+            with _progress.reporting(self.bar):
+                yield
+        finally:
+            if self.bar is not None:
+                self.bar.close()
+                self.downloaded += self.bar.downloaded
+            self.bar = None
+
+    @contextlib.contextmanager
+    def feed(self, entry):
+        """The block of the next feed, ``entry`` its record: a bar per
+        download, described ``[n/count] <id> (<name>)``, and once the block
+        ends, a line when the feed was skipped or a cached copy reused."""
+        self._next(entry)
+        name = entry["name"]
+        named = name and name != self.feed_id
+        with self.downloads(f"{self.prefix} ({name})" if named else self.prefix):
+            yield
+            if entry["decision"] == "skipped":
+                self.line(f"skipped ({entry['reason']})")
+            elif entry["cache"] in ("reused", "fallback"):
+                self.line("cached copy reused")
+            self.said[self.feed_id] = entry["decision"]
+
+    def line(self, text):
+        """Say ``text`` about the current feed, below its closed bar."""
+        if self.bar is not None:
+            self.bar.close()
+        mask = self.masks.get(self.feed_id)
+        self.say(f"{self.prefix}: {text if mask is None else mask(text)}")
+
+    def processing(self, crop, repair):
+        """Say that the current feed's crop, when ``crop``, repair, when
+        ``repair``, and validation start."""
+        steps = [step for step, on in (("cropping", crop), ("repairing", repair)) if on]
+        self.line(" and ".join(filter(None, [", ".join(steps), "validating"])))
+
+    def left_out(self, record):
+        """Say why each feed of ``record`` whose block ended delivered was
+        skipped after all."""
+        for entry in record:
+            self.feed_id = entry["feed_id"]
+            was = self.said.get(self.feed_id)
+            if was == "delivered" and entry["decision"] == "skipped":
+                self.said[self.feed_id] = "skipped"
+                self.line(f"left out ({entry['reason']})")
+
+    def retry(self, reason, url):
+        """Say that the current feed's download from ``url`` failed for
+        ``reason`` and the next URL follows."""
+        reason = reason.removeprefix(f"{url}: ")
+        self.line(f"download failed ({reason}), trying the next URL")
+
+    def done(self, record):
+        """Say how many feeds of ``record`` were delivered and skipped, the
+        bytes downloaded and the time the call took."""
+        delivered = sum(entry["decision"] == "delivered" for entry in record)
+        skipped = sum(entry["decision"] == "skipped" for entry in record)
+        parts = [
+            f"{delivered} feed{'' if delivered == 1 else 's'} delivered",
+            f"{skipped} skipped",
+        ]
+        if self.downloaded:
+            unit, scale = ("GB", 1e9) if self.downloaded >= 1e9 else ("MB", 1e6)
+            parts.append(f"{self.downloaded / scale:.1f} {unit} downloaded")
+        minutes, seconds = divmod(round(time.monotonic() - self.started), 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            took = f"{hours} h {minutes} min"
+        elif minutes:
+            took = f"{minutes} min {seconds} s"
+        else:
+            took = f"{seconds} s"
+        self.say(f"Done in {took}: {', '.join(parts)}")
+
+
+def _held(cache, feeds, entry_for, progress):
+    """``(feed, entry, staging)`` for each of ``feeds``, ``entry`` its
+    selection-record entry (``entry_for``), the loop body running under the
+    feed's cache lock with a fresh staging folder
+    (:meth:`~transitio.catalog._cache.FeedCache.staging`) as the current
+    feed of ``progress`` (:meth:`_Progress.feed`)."""
     for feed in feeds:
-        with cache.lock(feed_id(feed)), cache.staging(feed_id(feed)) as staging:
-            yield feed, staging
+        entry = entry_for(feed)
+        feed_id = entry["feed_id"]
+        with (
+            cache.lock(feed_id),
+            cache.staging(feed_id) as staging,
+            progress.feed(entry),
+        ):
+            yield feed, entry, staging
 
 
 def _add_version(cache, feed_id, path, url, fetched_from, errors, **options):
@@ -1858,6 +2012,7 @@ def fetch(
     directory=None,
     country_code=None,
     use_cache=True,
+    progress=True,
     **budgets,
 ):
     """Fetch everything cafein needs for an area in one call.
@@ -2198,6 +2353,11 @@ def fetch(
         again and, once a download succeeds, deletes the feed's other
         versions; when every attempt fails, the version a cached call would
         use is delivered with a ``UserWarning``.
+    progress : bool, default True
+        Progress lines and download bars on stderr; a widget bar in Jupyter
+        when ipywidgets is installed (``pip install "transitio[notebook]"``).
+        Elsewhere a bar shows on a terminal only, and a line names the
+        download instead. ``False`` prints nothing.
     **budgets
         The ``validate_feed`` keyword arguments. A feed with a table that a
         budget cuts short cannot be cropped and lands in ``skipped``, the
@@ -2306,6 +2466,7 @@ def fetch(
         extract was fetched for (None with ``osm=False`` or a failed
         download).
     """
+    progress = _Progress(progress)
     if credentials is not None:
         from transitio.credentials import _explicit
 
@@ -2392,6 +2553,7 @@ def fetch(
             directory=directory,
             use_cache=use_cache,
             budgets=budgets,
+            progress=progress,
         )
 
     # The options only the index paths honour, refused on the catalogue path.
@@ -2436,9 +2598,12 @@ def fetch(
                 UserWarning,
                 stacklevel=2,
             )
-        candidates = sorted(
-            db.search_feeds(aoi=geometry, country_code=country_code), key=_rank
-        )
+        # Without a token the search reads the catalogue export, downloaded
+        # when the cached copy is missing or a day old.
+        with progress.downloads("Downloading the Mobility Database catalogue"):
+            found = db.search_feeds(aoi=geometry, country_code=country_code)
+        candidates = sorted(found, key=_rank)
+        progress.start(len(candidates), "from the Mobility Database catalogue")
         if index is not False:
             count = len(candidates)
             found = f"{count} feed{'' if count == 1 else 's'}"
@@ -2452,6 +2617,7 @@ def fetch(
                 stacklevel=2,
             )
         if osm:
+            progress.say("Fetching the OSM extract")
             osm_pbf, osm_note = _osm_extract(
                 geometry, cache_dir=cache_dir, directory=directory
             )
@@ -2482,6 +2648,7 @@ def fetch(
                     study=study,
                     hosted=hosted,
                     budgets=budgets,
+                    progress=progress,
                 )
                 path = _deliver(path, directory, origin)
                 cache.touch(version, served=(key, dataset_id))
@@ -2535,9 +2702,11 @@ def fetch(
             if use_cache or not reuse(feed, entry, cached, "fallback"):
                 _skip(entry, reason)
 
-        for feed, staging in _held(cache, candidates, lambda feed: feed.id):
-            entry = _entry(feed.id, feed.raw.get("feed_name") or feed.provider)
-            record.append(entry)
+        def entry_for(feed):
+            record.append(_entry(feed.id, feed.raw.get("feed_name") or feed.provider))
+            return record[-1]
+
+        for feed, entry, staging in _held(cache, candidates, entry_for, progress):
             cached = _candidates(cache, feed.id, key, False)
             if use_cache and reuse(feed, entry, cached, "reused"):
                 continue
@@ -2600,7 +2769,10 @@ def fetch(
 
     repeats = dict(budgets=budgets, modes=modes, day=day if study else None)
     repeats["duplicate_trips"] = duplicate_trips
-    _drop_repeats(cache, record, processed, feeds, reports, directory, **repeats)
+    _drop_repeats(
+        cache, record, processed, feeds, reports, directory, progress, **repeats
+    )
+    progress.left_out(record)
     rows = [
         n for n, item in enumerate(processed) if item.entry["decision"] == "delivered"
     ]
@@ -2611,6 +2783,7 @@ def fetch(
         coords = {path: _stop_coords(path) for path in feeds}
         counts = _count_outside(record, geometry, coords)
         osm_note = _osm_note(geometry, geometry, *counts)
+    progress.done(record)
     return FetchResult(
         osm_pbf=osm_pbf,
         feeds=feeds,
@@ -2862,6 +3035,7 @@ def _fetch_place(
     directory,
     use_cache,
     budgets,
+    progress,
 ):
     """The index paths, ``fetch(place=...)`` and ``fetch(aoi=...)`` given an
     :class:`~transitio.index.Area`: the place geometry, or the area's, is the
@@ -2878,7 +3052,8 @@ def _fetch_place(
     (:meth:`_Access.redact`). The versions among the delivered feeds are
     settled after the feed loop, then their repeated trips left out
     (:func:`_drop_repeats`), and the OSM extract comes last, for the parts
-    of the place the remaining feeds serve, or for the area."""
+    of the place the remaining feeds serve, or for the area. ``progress``
+    (:class:`_Progress`) says how it goes."""
     from transitio import __version__
     from transitio.catalog import Feed, MobilityDatabase, TransitlandAtlas
     from transitio.catalog._client import _dataset_entry
@@ -2947,6 +3122,11 @@ def _fetch_place(
         feed.feed_id: _access_for(feed, explicit)
         for feed in kept
         if feed.access == "key"
+    }
+    progress.masks = {
+        feed_id: access.redact
+        for feed_id, (access, _) in decided.items()
+        if access is not None
     }
     feeds, reports, repairs, selections, record = [], [], [], [], []
     delivered = _Delivered()
@@ -3080,6 +3260,7 @@ def _fetch_place(
                 hosted=hosted,
                 budgets=budgets,
                 routes=routes,
+                progress=progress,
             )
         except _SkipFeed as skip:
             if not last:
@@ -3165,6 +3346,13 @@ def _fetch_place(
     cache = _feed_cache(cache_dir, directory)
     snapshot = provenance["snapshot"]
     area = hashlib.sha256(geometry.wkb).hexdigest()
+    where = (
+        "for the area"
+        if isinstance(place_obj, Area)
+        else f"for {place_obj.name or place_obj.id}"
+    )
+    early = [entry for entry in record if entry["decision"] == "skipped"]
+    progress.start(len(record), where, early)
     # Archives read by URL fragment live only for the call.
     with (
         MobilityDatabase(refresh_token, cache_dir=cache_dir) as db,
@@ -3285,8 +3473,7 @@ def _fetch_place(
             attempt(feed, entry, deferred, key, notes, keyless, label, True, proven)
             return True
 
-        for feed, staging in _held(cache, kept, lambda feed: feed.feed_id):
-            entry = entry_for(feed)
+        for feed, entry, staging in _held(cache, kept, entry_for, progress):
             access, refusal = decided.get(feed.feed_id, (None, None))
             keyless = None
             if refusal is not None:
@@ -3353,6 +3540,7 @@ def _fetch_place(
                     fetched_from = "mdb_dataset"
                 except Exception as error:  # noqa: B902 — try the fallback next
                     errors.append(f"mdb dataset: {error}")
+                    progress.retry(str(error), url)
                 if path is None and expired_unchanged(feed, entry):
                     continue
             if path is None:
@@ -3361,7 +3549,7 @@ def _fetch_place(
                     unchanged(feed)
                 try:
                     path, fetched_from, failures, url = _download_indexed(
-                        feed, db, atlas, staging, archives, budget, access
+                        feed, db, atlas, staging, archives, budget, access, progress
                     )
                     errors.extend(failures)
                 except Exception as error:  # noqa: B902
@@ -3428,12 +3616,15 @@ def _fetch_place(
         entries[feed_id]["path"] = feeds[n]
     repeats = dict(budgets=budgets, modes=modes, day=day if study else None)
     repeats["duplicate_trips"] = duplicate_trips
-    lost = _drop_repeats(cache, record, processed, feeds, reports, directory, **repeats)
+    lost = _drop_repeats(
+        cache, record, processed, feeds, reports, directory, progress, **repeats
+    )
     for feed_id, (access, _) in decided.items():
         entry = entries[feed_id]
         for key in ("reason", "note", "download_errors"):
             if access is not None and entry[key] is not None:
                 entry[key] = access.redact(entry[key])
+    progress.left_out(record)
     rows = [
         n for n, item in enumerate(processed) if item.entry["decision"] == "delivered"
     ]
@@ -3463,6 +3654,7 @@ def _fetch_place(
                 "buffer_m": _OSM_BUFFER_M,
                 "must_cover": _osm_stops(osm_area, coords),
             }
+        progress.say("Fetching the OSM extract")
         osm_pbf, osm_note = _osm_extract(
             parts, cache_dir=cache_dir, directory=directory, **grown
         )
@@ -3472,6 +3664,7 @@ def _fetch_place(
             counts = _count_outside(record, osm_area, coords)
             osm_note = _osm_note(geometry, parts, *counts)
 
+    progress.done(record)
     return FetchResult(
         osm_pbf=osm_pbf,
         feeds=feeds,
