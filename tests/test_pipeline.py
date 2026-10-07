@@ -5,6 +5,9 @@ import json
 import logging
 import os
 import pathlib
+import re
+import sys
+import types
 import urllib.parse
 import warnings
 import zipfile
@@ -16,7 +19,11 @@ pytest.importorskip("transitio._core")
 
 import transitio.catalog  # noqa: E402
 import transitio.osm  # noqa: E402
-from transitio.exceptions import DownloadError, StaleSelectorError  # noqa: E402
+from transitio.exceptions import (  # noqa: E402
+    DownloadError,
+    StaleSelectorError,
+    TransitioError,
+)
 from transitio.pipeline import fetch  # noqa: E402
 
 GTFS = {
@@ -109,16 +116,25 @@ def pipeline_env(tmp_path, monkeypatch):
     return tmp_path, fake_pbf
 
 
-def test_fetch_end_to_end(pipeline_env):
+def test_fetch_end_to_end(pipeline_env, monkeypatch):
     tmp_path, fake_pbf = pipeline_env
-    with pytest.warns(UserWarning):
+    with pytest.warns(UserWarning) as caught:
         result = fetch(
             (24.6, 60.1, 25.2, 60.4),
             directory=tmp_path,
             reference_date="20260601",
         )
-    assert result.osm_pbf == fake_pbf
+    assert (
+        "no compatible feed index is installed; 1 feed from the Mobility Database "
+        "catalogue by bounding box; transitio.index.refresh() installs the feed index"
+    ) in [str(warning.message) for warning in caught]
+    assert result.osm_pbf == fake_pbf and result.places == []
     assert result.osm_area.bounds == (24.6, 60.1, 25.2, 60.4)
+    # A pinned snapshot that is not installed is an error, not a fallback.
+    monkeypatch.setenv("TRANSITIO_INDEX_SNAPSHOT", "0123456789abcdef")
+    with pytest.raises(TransitioError, match="0123456789abcdef is not installed"):
+        fetch((24.6, 60.1, 25.2, 60.4), directory=tmp_path)
+    monkeypatch.delenv("TRANSITIO_INDEX_SNAPSHOT")
     # Every stop lies in the area, so there is no OSM note.
     (entry,) = result.selection
     assert entry["stops_outside_osm"] == 0 and result.osm_note is None
@@ -203,6 +219,99 @@ def test_an_area_fetch_keeps_each_feeds_download_apart(pipeline_env, monkeypatch
     refreshed = _area_fetch(monkeypatch, tmp_path, page, use_cache=False)
     assert sorted(e["cache"] for e in refreshed.selection) == ["fallback", "refreshed"]
     assert len(refreshed.feeds) == 2
+
+
+@pytest.mark.parametrize("progress", [True, False])
+def test_fetch_shows_its_progress_on_stderr(
+    pipeline_env, monkeypatch, capsys, progress
+):
+    tmp_path, _ = pipeline_env
+    # mdb-11 serves a page, then HKL's copy of GTFS, while mdb-10's is cached.
+    copy = {**GTFS, "agency.txt": HKL["agency.txt"]}
+    for second in (b"<html></html>", _zip(copy)):
+        _area_fetch(monkeypatch, tmp_path, second, progress=progress)
+    page = "https://files.example.com/mdb-11/latest.zip: not a zip archive"
+    start = [
+        "Fetching 2 feeds from the Mobility Database catalogue",
+        "Fetching the OSM extract",
+    ]
+    expected = [
+        # The first call downloads the catalogue export; off a terminal its
+        # bar, as each one, is a line.
+        "Downloading the Mobility Database catalogue",
+        *start,
+        "[1/2] mdb-10 (HSL)",
+        "[1/2] mdb-10: cropping and validating",
+        "[2/2] mdb-11 (HKL)",
+        f"[2/2] mdb-11: skipped (download failed: {page})",
+        "Done: 1 feed delivered, 1 skipped, 0.0 MB downloaded",
+        *start,
+        "[1/2] mdb-10: cached copy reused",
+        "[2/2] mdb-11 (HKL)",
+        "[2/2] mdb-11: cropping and validating",
+        "Comparing trips across 2 feeds",
+        "[2/2] mdb-11: left out (every trip repeats a trip of mdb-10)",
+        "Done: 1 feed delivered, 1 skipped, 0.0 MB downloaded",
+    ]
+    said = re.sub(r"Done in [^:]+:", "Done:", capsys.readouterr().err)
+    assert said.splitlines() == (expected if progress else [])
+
+
+@pytest.mark.parametrize(
+    "shell, widgets, expected",
+    [
+        ("ZMQInteractiveShell", True, ("tqdm.notebook", False)),
+        ("ZMQInteractiveShell", False, ("tqdm.std", False)),
+        ("TerminalInteractiveShell", True, ("tqdm.std", None)),
+        (None, True, ("tqdm.std", None)),
+    ],
+    ids=["jupyter-widgets", "jupyter-text", "ipython-terminal", "no-ipython"],
+)
+def test_the_bar_is_a_widget_in_jupyter_with_ipywidgets(
+    monkeypatch, shell, widgets, expected
+):
+    import importlib.util
+
+    import tqdm.notebook  # noqa: F401 — imported before IPython is replaced
+
+    from transitio import _progress
+
+    ipython = None
+    if shell is not None:
+        ipython = types.SimpleNamespace(get_ipython=type(shell, (), {}))
+    monkeypatch.setitem(sys.modules, "IPython", ipython)
+    find_spec = importlib.util.find_spec
+
+    def found(name, *args):
+        if name == "ipywidgets":
+            return object() if widgets else None
+        return find_spec(name, *args)
+
+    monkeypatch.setattr(importlib.util, "find_spec", found)
+    bar_class, disable = _progress._bar_class()
+    assert (bar_class.__module__, disable) == expected
+
+
+def test_progress_text_has_no_control_characters(monkeypatch, capsys):
+    from transitio import _progress
+
+    hostile = "München\r\n\x1b]0;t\x07\x1b[2J\t\x7f\x9b"
+    shown = "München   ]0;t  [2J   "
+    made = []
+
+    class Bar:
+        def __init__(self, **options):
+            made.append(options)
+
+        def set_description(self, desc):
+            made.append(desc)
+
+    monkeypatch.setattr(_progress, "_bar_class", lambda: (Bar, False))
+    _progress.bar(hostile, None)
+    _progress.say(f"[1/1] f-x: skipped ({hostile})")
+    # The widget bar escapes a description only when it redraws.
+    assert "desc" not in made[0] and made[1:] == [shown]
+    assert capsys.readouterr().err == f"[1/1] f-x: skipped ({shown})\n"
 
 
 def test_a_repeated_fetch_reuses_what_processing_made(pipeline_env, monkeypatch):
@@ -679,14 +788,16 @@ def test_download_indexed_tries_the_producer_then_the_hosted_copy(
     atlas = SimpleNamespace(
         _fetch_static=lambda record, directory: serve(record.static_url, directory)
     )
+    said = []
+    progress = SimpleNamespace(retry=lambda reason, url: said.append(reason))
     if source is None:
         with pytest.raises(DownloadError) as caught:
-            _download_indexed(feed, db, atlas, tmp_path, None)
+            _download_indexed(feed, db, atlas, tmp_path, None, progress=progress)
         expected = "; ".join(failures) or "feed f-a has no downloadable url"
         assert str(caught.value) == expected
     else:
         path, fetched_from, seen, url = _download_indexed(
-            feed, db, atlas, tmp_path, None
+            feed, db, atlas, tmp_path, None, progress=progress
         )
         assert (zipfile.is_zipfile(path), fetched_from, seen, url) == (
             True,
@@ -695,6 +806,9 @@ def test_download_indexed_tries_the_producer_then_the_hosted_copy(
             calls[-1],
         )
     assert called == calls
+    # Each failure is said when another URL follows it.
+    reasons = [failure.split(": ", 1)[1] for failure in failures]
+    assert said == reasons[: len(reasons) - (source is None)]
 
 
 def test_fetch_place_selects_downloads_and_processes(tmp_path, monkeypatch):
@@ -755,16 +869,33 @@ def test_fetch_place_selects_downloads_and_processes(tmp_path, monkeypatch):
     assert second["same_as"] == [first["feed_id"]]
 
 
-def test_fetch_aoi_rejects_place_only_arguments():
-    for kwargs in (
-        {"exclude": ["national"]},
-        {"tiers": ["local"]},
-        {"on_unknown": "exclude"},
-        {"contained": "keep"},
-        {"credentials": {"p": {"key": "k"}}},
-    ):
-        with pytest.raises(ValueError, match="apply only with place="):
-            fetch((0, 0, 1, 1), **kwargs)
+@pytest.mark.parametrize(
+    "option, name",
+    [
+        ({"tiers": ["local"]}, "tiers="),
+        ({"exclude": ["national"]}, "exclude="),
+        ({"on_unknown": "exclude"}, "on_unknown='exclude'"),
+        ({"on_untrusted_selector": "drop"}, "on_untrusted_selector='drop'"),
+        ({"contained": "keep"}, "contained='keep'"),
+        ({"feeds": ["f-a"]}, "feeds="),
+        ({"credentials": {"p": {"key": "k"}}}, "credentials="),
+    ],
+)
+def test_fetch_aoi_options_need_the_index(monkeypatch, option, name):
+    def download(*args, **kwargs):
+        raise AssertionError("searched or downloaded before the refusal")
+
+    monkeypatch.setattr("transitio.catalog.MobilityDatabase", download)
+    monkeypatch.setattr("transitio.osm.fetch_pbf", download)
+    message = f"{name} needs the feed index; no compatible feed index is installed"
+    with pytest.raises(ValueError) as caught:
+        fetch((0, 0, 1, 1), **option)
+    assert str(caught.value) == message
+
+
+def test_fetch_rejects_invalid_options():
+    with pytest.raises(ValueError, match="index=False applies only with aoi="):
+        fetch(place="X", index=False)
     with pytest.raises(ValueError, match="'keep' or 'drop'"):
         fetch(place="X", contained="maybe")
     with pytest.raises(ValueError, match="'skip' or 'keep'"):
@@ -773,6 +904,8 @@ def test_fetch_aoi_rejects_place_only_arguments():
         fetch(place="X", duplicate_trips="maybe")
     with pytest.raises(ValueError, match="disagree"):
         fetch(place="X", when="2026-06-01", reference_date="20260602")
+    with pytest.raises(ValueError, match="feeds= names no feed"):
+        fetch(place="X", feeds=[])
 
 
 def _partitioned_index(
@@ -824,16 +957,9 @@ def _partitioned_index(
     return transitio_index.read_index(directory)
 
 
-def test_contained_keep_leaves_no_feed_out(tmp_path, monkeypatch):
-    import pathlib
-
-    ids = ("f-a", "f-b", "f-c")
-    index = _partitioned_index(
-        tmp_path, monkeypatch, dict.fromkeys(ids, {}), contained={"f-c": ["f-b"]}
-    )
-    later = {"stop_times.txt": GTFS["stop_times.txt"].replace("08:", "10:")}
-    other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "VR"), **later}
-    payloads = {"f-a": _zip(GTFS), "f-b": _zip(PARTIAL), "f-c": _zip(other)}
+def _serve_by_id(monkeypatch, payloads):
+    """Serve each feed's Atlas download from ``payloads`` (``{feed id: zip
+    bytes}``); returns the list the downloaded feed ids are appended to."""
     fetched = []
 
     def fake_download(self, feed, directory=None):
@@ -844,11 +970,23 @@ def test_contained_keep_leaves_no_feed_out(tmp_path, monkeypatch):
         path.write_bytes(payloads[feed.feed_id])
         return path
 
-    fake_pbf = tmp_path / "aoi.osm.pbf"
-    fake_pbf.write_bytes(b"\x00fake")
     monkeypatch.setattr(
         "transitio.catalog.TransitlandAtlas._fetch_static", fake_download
     )
+    return fetched
+
+
+def test_contained_keep_leaves_no_feed_out(tmp_path, monkeypatch):
+    ids = ("f-a", "f-b", "f-c")
+    index = _partitioned_index(
+        tmp_path, monkeypatch, dict.fromkeys(ids, {}), contained={"f-c": ["f-b"]}
+    )
+    later = {"stop_times.txt": GTFS["stop_times.txt"].replace("08:", "10:")}
+    other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "VR"), **later}
+    payloads = {"f-a": _zip(GTFS), "f-b": _zip(PARTIAL), "f-c": _zip(other)}
+    fetched = _serve_by_id(monkeypatch, payloads)
+    fake_pbf = tmp_path / "aoi.osm.pbf"
+    fake_pbf.write_bytes(b"\x00fake")
     monkeypatch.setattr("transitio.osm.fetch_pbf", lambda *a, **k: fake_pbf)
     monkeypatch.setattr("transitio.osm._fetch.fetch_pbf", lambda *a, **k: fake_pbf)
     result = fetch(
@@ -865,6 +1003,39 @@ def test_contained_keep_leaves_no_feed_out(tmp_path, monkeypatch):
     assert sorted(fetched) == list(ids) and len(result.feeds) == 3
     assert result.contained == {}
     assert decisions == [(i, "delivered", []) for i in ids]
+
+
+@pytest.mark.parametrize(
+    "where, named, unknown",
+    [
+        ({"place": "Q1757"}, ["f-c", "f-a"], "place Q1757"),
+        (
+            {"aoi": (24.9, 60.1, 25.1, 60.3)},
+            types.SimpleNamespace(feed_ids=("f-c", "f-a")),
+            "the area's places",
+        ),
+    ],
+    ids=["place-list", "area-feed-ids"],
+)
+def test_fetch_takes_only_the_feeds_named(tmp_path, monkeypatch, where, named, unknown):
+    # f-c serves only nationally, outside a city's default view.
+    tertiary = {"tier": "national", "relevance_category": "tertiary"}
+    index = _partitioned_index(
+        tmp_path,
+        monkeypatch,
+        dict.fromkeys(("f-a", "f-b", "f-c"), {}),
+        edges={"f-c": tertiary},
+    )
+    fetched = _serve_by_id(monkeypatch, {"f-a": _zip(GTFS), "f-c": _zip(HKL)})
+    options = dict(index=index, directory=tmp_path / "out", crop=False, osm=False)
+    result = fetch(**where, feeds=named, reference_date="20260601", **options)
+    decisions = [(e["feed_id"], e["decision"]) for e in result.selection]
+    assert decisions == [("f-a", "delivered"), ("f-c", "delivered")]
+    assert sorted(fetched) == ["f-a", "f-c"]
+    message = f"feeds= names feeds not indexed for {unknown}: f-x, f-y"
+    with pytest.raises(ValueError) as caught:
+        fetch(**where, feeds=["f-a", "f-y", "f-x"], **options)
+    assert str(caught.value) == message and len(fetched) == 2
 
 
 def _calendar(start, end, days="1111111"):
@@ -1246,7 +1417,7 @@ NONE = (None, None, None)
     ],
 )
 def test_schema_11_downloads(
-    tmp_path, monkeypatch, caplog, columns, credentials, routes, seen, outcome
+    tmp_path, monkeypatch, caplog, capsys, columns, credentials, routes, seen, outcome
 ):
     from transitio.index import place
 
@@ -1308,7 +1479,8 @@ def test_schema_11_downloads(
     paths = "\n".join(str(path) for path in tmp_path.rglob("*"))
     sidecars = [p.read_text() for p in tmp_path.rglob("*.provenance.json")]
     logged = [record.getMessage() for record in caplog.records]
-    texts = [repr(result), paths, *sidecars, *logged, *map(str, caught)]
+    said = capsys.readouterr().err
+    texts = [repr(result), paths, *sidecars, *logged, *map(str, caught), said]
     assert not any(map(_leaks, texts))
 
 
@@ -2287,34 +2459,48 @@ def test_timezone_note(tmp_path, zone, stops, budget, expected):
     assert _timezone_note(path, budget) == expected
 
 
+PLACE_VIEW = "default view (city: primary, secondary) holds none of the place's "
+
+
 @pytest.mark.parametrize(
-    "hidden, expected",
+    "area, hidden, expected",
     [
         pytest.param(
+            False,
             [("f-u", "unknown", {"unknown"})],
-            "1 feed: f-u (unknown); tiers=['local', 'regional', 'national'] fetches it",
+            PLACE_VIEW + "1 feed: f-u (unknown); "
+            "tiers=['local', 'regional', 'national'] fetches it",
             id="unknown-only",
         ),
         pytest.param(
+            False,
             [(f"f-{n}", "tertiary", {"national", "regional"}) for n in range(7)],
-            "7 feeds: f-0 (tertiary), f-1 (tertiary), f-2 (tertiary), f-3 (tertiary),"
-            " f-4 (tertiary) and 2 more; tiers=['regional', 'national'] fetches them",
+            PLACE_VIEW + "7 feeds: f-0 (tertiary), f-1 (tertiary), f-2 (tertiary), "
+            "f-3 (tertiary), f-4 (tertiary) and 2 more; "
+            "tiers=['regional', 'national'] fetches them",
             id="seven",
+        ),
+        pytest.param(
+            True,
+            [("f-l", "primary", {"local"})],
+            "default view of the area's places holds none of their 1 feed: "
+            "f-l (primary); tiers=['local'] fetches it",
+            id="area",
         ),
     ],
 )
-def test_hidden_view_note(hidden, expected):
+def test_hidden_view_note(area, hidden, expected):
     from types import SimpleNamespace
 
+    from transitio.index import Area
     from transitio.pipeline._fetch import _hidden_note
 
     feeds = [
         SimpleNamespace(feed_id=feed_id, relevance_category=category, tiers=tiers)
         for feed_id, category, tiers in hidden
     ]
-    note = _hidden_note(SimpleNamespace(kind="city"), feeds)
-    prefix = "default view (city: primary, secondary) holds none of the place's "
-    assert note == prefix + expected
+    target = Area(None, None, (), 1.0, None) if area else SimpleNamespace(kind="city")
+    assert _hidden_note(target, feeds) == expected
 
 
 @pytest.mark.parametrize("path", ["area", "place"])
@@ -2632,7 +2818,7 @@ def test_osm_parts_are_those_holding_a_delivered_stop(
     assert must_cover == (None if inside is None else shapely.multipoints(inside))
 
 
-_PARTS_NOTE = "OSM area: 1 of 2 parts (247 of 487 km²)"
+_PARTS_NOTE = "OSM area: 1 of 2 parts (247 of 488 km²)"
 
 
 @pytest.mark.parametrize(
@@ -3160,7 +3346,7 @@ def test_untrusted_action_maps_the_policy(policy, exclude, on_unknown, expected)
     assert _untrusted_action(policy, exclude, on_unknown) == expected
 
 
-def test_fetch_place_excludes_an_unknown_only_feed(tmp_path, monkeypatch):
+def test_fetch_place_excludes_an_unknown_only_feed(tmp_path, monkeypatch, capsys):
     from index_fixture import edge as _edge
 
     service = {"stops": 1, "routes": 1, "departures_per_day": 1.0}
@@ -3179,6 +3365,14 @@ def test_fetch_place_excludes_an_unknown_only_feed(tmp_path, monkeypatch):
     )
     assert result.feeds == []
     assert result.skipped == [("f-a", "only unknown-tier edges")]
+    # Skipped before the feed loop, the feed is still counted and said.
+    said = re.sub(r"Done in [^:]+:", "Done:", capsys.readouterr().err)
+    assert said.splitlines() == [
+        "Fetching 1 feed for Q1757",
+        "[1/1] f-a: skipped (only unknown-tier edges)",
+        "Fetching the OSM extract",
+        "Done: 0 feeds delivered, 1 skipped",
+    ]
 
 
 _EXTRACT_FAILURE = "https://download.example/extract.osm.pbf: HTTP 404 Not Found"

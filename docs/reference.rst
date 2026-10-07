@@ -46,8 +46,14 @@ The index lists the feeds serving each place, by tier. ``place``, ``places``,
    read_index
    load
    links
+   area
+   Area
+   Area.feeds
+   Area.recommend
+   AreaPart
    Place
    Place.feeds
+   Place.recommend
    Place.delineations
    Place.subtype
    Place.parent
@@ -68,6 +74,10 @@ The index lists the feeds serving each place, by tier. ``place``, ``places``,
    IndexedFeed.service_end
    IndexedFeed.relevance
    IndexedFeed.relevance_category
+   IndexedFeed.share_of_place
+   IndexedFeed.stale_when_indexed
+   IndexedFeed.overlap
+   IndexedFeed.catalogue_name
    IndexedFeed.selector
    IndexedFeed.coverage
    IndexedFeed.files
@@ -79,6 +89,7 @@ The index lists the feeds serving each place, by tier. ``place``, ``places``,
    IndexedFeed.snapshot
    IndexedFeed.access_instructions
    AccessProvider
+   Recommendation
    Delineation
    Suggestion
    Selector
@@ -89,6 +100,16 @@ The index lists the feeds serving each place, by tier. ``place``, ``places``,
    Index.realtime_unlinked
    Index.discovery_semantics_version
    Index.access_provider
+
+A query's feeds come as a ``FeedList``, a list with tabular exports.
+
+.. currentmodule:: transitio.index.feeds
+
+.. autosummary::
+   :toctree: api/
+
+   FeedList.to_dataframe
+   FeedList.to_geodataframe
 
 Feed credentials
 ----------------
@@ -137,6 +158,7 @@ The feed catalogs
    MobilityDatabase.feed
    MobilityDatabase.datasets
    MobilityDatabase.dataset_for
+   MobilityDatabase.datasets_for
    MobilityDatabase.download
    MobilityDatabase.download_latest
    MobilityDatabase.validation_report

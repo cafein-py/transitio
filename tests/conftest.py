@@ -57,3 +57,11 @@ def helsinki_metro_pbf():
     if not path.exists():
         pytest.skip("helsinki-metro.osm.pbf is generated locally; not in CI")
     return path
+
+
+@pytest.fixture(autouse=True)
+def _no_bundled_index(tmp_path_factory, monkeypatch):
+    """No index bundled beside the package: a test sees only the snapshots
+    it installs."""
+    empty = tmp_path_factory.mktemp("no-bundled-index")
+    monkeypatch.setattr("transitio.index._refresh._bundled_root", lambda: empty)

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from shapely.geometry import box
 
+from transitio import _http
 from transitio.catalog._models import Feed
 
 CSV_CATALOG_URL = "https://files.mobilitydatabase.org/feeds_v2.csv"
@@ -81,15 +82,20 @@ def _row_box(row):
     return box(*values)
 
 
+def _gtfs_rows(path):
+    with open(path, newline="", encoding="utf-8-sig") as handle:
+        for row in csv.DictReader(handle):
+            if _first(row, "data_type") == "gtfs":
+                yield row
+
+
 def fetch_catalog_csv(cache_dir, client, *, update=False):
-    """Download the CSV catalogue export, reusing a cached copy under 24h old."""
+    """Download the CSV catalogue export (:func:`transitio._http.download`),
+    reusing a cached copy under 24h old."""
     path = Path(cache_dir) / "catalog" / "feeds_v2.csv"
     fresh = path.exists() and time.time() - path.stat().st_mtime < _MAX_AGE_SECONDS
     if update or not fresh:
-        response = client.get(CSV_CATALOG_URL)
-        response.raise_for_status()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(response.content)
+        _http.download(client, CSV_CATALOG_URL, path)
     return path
 
 
@@ -115,45 +121,52 @@ def search_csv(
     aoi_box = box(*bounds) if bounds is not None else None
     feeds = []
     scored = []
-    with open(path, newline="", encoding="utf-8-sig") as handle:
-        for row in csv.DictReader(handle):
-            if _first(row, "data_type") != "gtfs":
+    for row in _gtfs_rows(path):
+        if country_code:
+            value = _first(row, *_ALIASES["country_code"]) or ""
+            if value.upper() != country_code.upper():
                 continue
-            if country_code:
-                value = _first(row, *_ALIASES["country_code"]) or ""
-                if value.upper() != country_code.upper():
-                    continue
-            if subdivision:
-                value = _first(row, *_ALIASES["subdivision"]) or ""
-                if value.lower() != subdivision.lower():
-                    continue
-            if municipality:
-                value = _first(row, *_ALIASES["municipality"]) or ""
-                if value.lower() != municipality.lower():
-                    continue
-            feed_box = None
-            if aoi_box is not None:
-                feed_box = _row_box(row)
-                if feed_box is None:
-                    continue
-                if enclosure == "completely_enclosed":
-                    if not aoi_box.contains(feed_box):
-                        continue
-                elif not aoi_box.intersects(feed_box):
-                    continue
-            feed = _feed_from_row(row)
-            if status is not None and feed.status != status:
+        if subdivision:
+            value = _first(row, *_ALIASES["subdivision"]) or ""
+            if value.lower() != subdivision.lower():
                 continue
-            if official_only and not feed.official:
+        if municipality:
+            value = _first(row, *_ALIASES["municipality"]) or ""
+            if value.lower() != municipality.lower():
                 continue
-            if aoi_box is None:
-                feeds.append(feed)
-                if len(feeds) >= limit:
-                    break
-            else:
-                scored.append((_overlap_share(aoi_box, feed_box), feed))
+        feed_box = None
+        if aoi_box is not None:
+            feed_box = _row_box(row)
+            if feed_box is None:
+                continue
+            if enclosure == "completely_enclosed":
+                if not aoi_box.contains(feed_box):
+                    continue
+            elif not aoi_box.intersects(feed_box):
+                continue
+        feed = _feed_from_row(row)
+        if status is not None and feed.status != status:
+            continue
+        if official_only and not feed.official:
+            continue
+        if aoi_box is None:
+            feeds.append(feed)
+            if len(feeds) >= limit:
+                break
+        else:
+            scored.append((_overlap_share(aoi_box, feed_box), feed))
     if aoi_box is not None:
         # Stable sort: equal shares keep their catalogue order.
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return [feed for _, feed in scored[:limit]]
     return feeds
+
+
+def find_feed(path, feed_id):
+    """The GTFS feed ``feed_id`` of the CSV catalogue export."""
+    for row in _gtfs_rows(path):
+        if row.get("id") == feed_id:
+            return _feed_from_row(row)
+    raise LookupError(
+        f"no GTFS feed {feed_id!r} in the Mobility Database catalogue export"
+    )

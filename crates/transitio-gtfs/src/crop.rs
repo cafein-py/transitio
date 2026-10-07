@@ -739,9 +739,10 @@ fn write_cropped(
 ) -> Result<BTreeMap<String, usize>, String> {
     let mut zip = ZipOutput::create(staging)?;
     let mut counts = BTreeMap::new();
-    let mut kept_stops: HashSet<String> = HashSet::new();
+    let mut served = Served::default();
     {
         let stops = ids(result, "stops.txt", "stop_id");
+        let groups = ids(result, "location_groups.txt", "location_group_id");
         let (before, notices_before) = (dropped.clone(), source_notices.len());
         let mut short = HashSet::new();
         let mut written = write_stop_times(
@@ -751,7 +752,8 @@ fn write_cropped(
             kept_trips,
             &short,
             stops.as_ref(),
-            &mut kept_stops,
+            groups.as_ref(),
+            &mut served,
             dropped,
             source_notices,
         )?;
@@ -761,7 +763,7 @@ fn write_cropped(
             short = std::mem::take(found);
             *dropped = before;
             source_notices.truncate(notices_before);
-            kept_stops.clear();
+            served = Served::default();
             zip = zip.restart()?;
             written = write_stop_times(
                 source,
@@ -770,7 +772,8 @@ fn write_cropped(
                 kept_trips,
                 &short,
                 stops.as_ref(),
-                &mut kept_stops,
+                groups.as_ref(),
+                &mut served,
                 dropped,
                 source_notices,
             )?;
@@ -791,7 +794,7 @@ fn write_cropped(
         result,
         kept_trips,
         (&crop_options.start_date, &crop_options.end_date),
-        kept_stops,
+        served,
     );
     // An optional table the crop emptied is left out rather than written as
     // a header alone, which validators report as an empty file.
@@ -823,9 +826,19 @@ fn write_cropped(
     Ok(counts)
 }
 
+/// What the stop_times rows name: the stops and defined location groups of
+/// the rows written, and the defined location groups of every row read.
+#[derive(Default)]
+struct Served {
+    stops: HashSet<String>,
+    location_groups: HashSet<String>,
+    named_location_groups: HashSet<String>,
+}
+
 /// Stream the kept trips' stop_times from the source into `zip`, leaving
 /// out a row naming a stop that `stops` lacks and every row of the `short`
-/// trips, and add the stops served to `kept_stops`. Returns the rows
+/// trips, and record in `served` what the rows name, of location groups
+/// only those `groups` defines. Returns the rows
 /// written and the kept trips that lost such a row and kept fewer than two
 /// of their two or more; None without stop_times.txt.
 #[allow(clippy::too_many_arguments)]
@@ -836,7 +849,8 @@ fn write_stop_times(
     kept_trips: &HashSet<String>,
     short: &HashSet<String>,
     stops: Option<&HashSet<&str>>,
-    kept_stops: &mut HashSet<String>,
+    groups: Option<&HashSet<&str>>,
+    served: &mut Served,
     dropped: &mut Dropped,
     source_notices: &mut Vec<Notice>,
 ) -> Result<Option<(usize, HashSet<String>)>, String> {
@@ -847,11 +861,22 @@ fn write_stop_times(
     let headers = reader.headers().to_vec();
     let trip = position(&headers, "trip_id");
     let stop = position(&headers, "stop_id");
+    let group = position(&headers, "location_group_id");
     // Per kept trip, its rows and the rows left out.
     let mut tally: HashMap<&str, (usize, usize)> =
         kept_trips.iter().map(|t| (t.as_str(), (0, 0))).collect();
     let mut notices = Vec::new();
     let rows = std::iter::from_fn(|| reader.next_row(&mut notices)).filter_map(|row| {
+        // Only defined groups are recorded, so the sets stay within the
+        // loaded location_groups.txt.
+        let group = group
+            .map(|i| &row.fields[i])
+            .filter(|g| groups.is_some_and(|known| known.contains(g.as_str())));
+        if let Some(g) = group {
+            if !served.named_location_groups.contains(g) {
+                served.named_location_groups.insert(g.clone());
+            }
+        }
         let id = row.fields[trip?].as_str();
         let (seen, lost) = tally.get_mut(id)?;
         *seen += 1;
@@ -866,7 +891,10 @@ fn write_stop_times(
             return None;
         }
         if let Some(v) = value {
-            kept_stops.insert(v.clone());
+            served.stops.insert(v.clone());
+        }
+        if let Some(g) = group {
+            served.location_groups.insert(g.clone());
         }
         Some(row.fields)
     });
@@ -882,19 +910,25 @@ fn write_stop_times(
 }
 
 /// Retain only the kept trips and everything they reference, then the
-/// supporting entities between retained stops.
+/// supporting entities between retained stops and the definitions still
+/// named.
 fn retain(
     result: &mut ScanResult,
     kept_trips: &HashSet<String>,
     window: (&Option<String>, &Option<String>),
-    kept_stops: HashSet<String>,
+    served: Served,
 ) {
+    let mut named = named_definitions(result);
+    named
+        .entry("location_groups.txt")
+        .or_default()
+        .extend(served.named_location_groups);
     keep_rows(result, "trips.txt", "trip_id", kept_trips);
     keep_rows(result, "stop_times.txt", "trip_id", kept_trips);
     keep_rows(result, "frequencies.txt", "trip_id", kept_trips);
 
     // Stops actually served (their full sequences), plus their parents.
-    let mut kept_stops = kept_stops;
+    let mut kept_stops = served.stops;
     if let Some(stops) = result.tables.get("stops.txt") {
         if let (Some(id), Some(parent)) =
             (column(stops, "stop_id"), column(stops, "parent_station"))
@@ -1019,6 +1053,7 @@ fn retain(
                 .retain(|row| kept_routes.contains(&row.fields[i]));
         }
     }
+    prune_definitions(result, &named, served.location_groups);
     let kept_agencies = referenced(result, "routes.txt", "agency_id");
     if let Some(agency) = result.tables.get_mut("agency.txt") {
         if let Some(id) = column(agency, "agency_id") {
@@ -1041,6 +1076,82 @@ fn retain(
         }
     }
     retain_fares(result, &kept_routes, &kept_agencies);
+}
+
+/// A file and one of its columns.
+type Column = (&'static str, &'static str);
+
+/// The definition tables, their id column and the columns naming their
+/// rows. stop_times.txt also names location groups; it is streamed, so its
+/// ids come through `Served`.
+const DEFINITIONS: &[(&str, &str, &[Column])] = &[
+    (
+        "areas.txt",
+        "area_id",
+        &[
+            ("stop_areas.txt", "area_id"),
+            ("fare_leg_rules.txt", "from_area_id"),
+            ("fare_leg_rules.txt", "to_area_id"),
+        ],
+    ),
+    (
+        "location_groups.txt",
+        "location_group_id",
+        &[("location_group_stops.txt", "location_group_id")],
+    ),
+    (
+        "networks.txt",
+        "network_id",
+        &[
+            ("route_networks.txt", "network_id"),
+            ("routes.txt", "network_id"),
+            ("fare_leg_rules.txt", "network_id"),
+            ("fare_leg_join_rules.txt", "from_network_id"),
+            ("fare_leg_join_rules.txt", "to_network_id"),
+        ],
+    ),
+];
+
+/// Per definition table, the ids its naming columns hold.
+fn named_definitions(result: &ScanResult) -> HashMap<&'static str, HashSet<String>> {
+    DEFINITIONS
+        .iter()
+        .map(|&(file, _, naming)| {
+            let named = naming
+                .iter()
+                .flat_map(|&(table, field)| referenced(result, table, field))
+                .collect();
+            (file, named)
+        })
+        .collect()
+}
+
+/// Leave out a definition row whose id was `named` before the crop and is
+/// named by no kept row; `location_groups` holds the ids the kept
+/// stop_times rows name.
+fn prune_definitions(
+    result: &mut ScanResult,
+    named: &HashMap<&'static str, HashSet<String>>,
+    location_groups: HashSet<String>,
+) {
+    let mut still = named_definitions(result);
+    still
+        .entry("location_groups.txt")
+        .or_default()
+        .extend(location_groups);
+    for &(file, field, _) in DEFINITIONS {
+        let Some(table) = result.tables.get_mut(file) else {
+            continue;
+        };
+        let Some(i) = column(table, field) else {
+            continue;
+        };
+        let (before, after) = (&named[file], &still[file]);
+        table.rows.retain(|row| {
+            let id = &row.fields[i];
+            !before.contains(id) || after.contains(id)
+        });
+    }
 }
 
 /// A fare rule naming a removed route or zone goes. Its fare goes whole,
@@ -1377,5 +1488,126 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The minimal feed with `extra` added or replacing its entries,
+    /// cropped to route r1 in a directory of its own named after `name`.
+    fn crop_to_r1(name: &str, extra: &[(&'static str, &'static str)]) -> CropResult {
+        let dir =
+            std::env::temp_dir().join(format!("transitio-crop-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut files = crate::scan::tests::minimal();
+        files.retain(|(file, _)| extra.iter().all(|(other, _)| other != file));
+        files.extend_from_slice(extra);
+        let source = dir.join("source.zip");
+        std::fs::write(&source, crate::scan::tests::build_zip(&files).into_inner()).unwrap();
+        let crop_options = CropOptions {
+            bbox: None,
+            polygon: None,
+            start_date: None,
+            end_date: None,
+            full_trips_only: false,
+            routes: Some(HashSet::from(["r1".to_string()])),
+            exclude_trips: None,
+        };
+        let output = dir.join("cropped.zip");
+        let result = crop(&source, &output, ScanOptions::default(), &crop_options);
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap()
+    }
+
+    /// The ids left in a cropped table, sorted.
+    fn left(result: &CropResult, file: &str, field: &str) -> Vec<String> {
+        let mut ids: Vec<String> = referenced(&result.validation, file, field)
+            .into_iter()
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn definitions_follow_the_rows_that_name_them() {
+        let result = crop_to_r1(
+            "definitions",
+            &[
+                (
+                    "stops.txt",
+                    "stop_id,stop_name,stop_lat,stop_lon\n\
+                     s1,Kamppi,60.169,24.931\ns2,Steissi,60.171,24.941\ns3,Espoo,60.205,24.655\n",
+                ),
+                (
+                    "routes.txt",
+                    "route_id,agency_id,route_short_name,route_type\n\
+                     r1,hsl,1,3\nr2,hsl,2,3\nr3,hsl,3,3\n",
+                ),
+                (
+                    "trips.txt",
+                    "route_id,service_id,trip_id\nr1,wk,t1\nr2,wk,t2\n",
+                ),
+                (
+                    "stop_times.txt",
+                    "trip_id,arrival_time,departure_time,stop_id,location_group_id,\
+                     stop_sequence,start_pickup_drop_off_window,end_pickup_drop_off_window\n\
+                     t1,08:00:00,08:00:00,s1,,1,,\nt1,08:05:00,08:05:00,s2,,2,,\n\
+                     t1,,,,lg-flex,3,08:05:00,09:00:00\n\
+                     t2,09:00:00,09:00:00,s3,,1,,\nt2,09:30:00,09:30:00,s3,,2,,\n\
+                     t2,,,,lg-trip,3,09:30:00,10:00:00\n",
+                ),
+                ("areas.txt", "area_id\na-in\na-out\na-fare\na-free\n"),
+                (
+                    "stop_areas.txt",
+                    "area_id,stop_id\na-in,s1\na-out,s3\na-fare,s3\n",
+                ),
+                (
+                    "fare_leg_rules.txt",
+                    "leg_group_id,from_area_id,fare_product_id\nl1,a-fare,p1\n",
+                ),
+                ("networks.txt", "network_id\nn-in\nn-out\nn-fare\n"),
+                (
+                    "route_networks.txt",
+                    "network_id,route_id\nn-in,r1\nn-out,r2\nn-fare,r3\n",
+                ),
+                (
+                    "fare_leg_join_rules.txt",
+                    "from_network_id,to_network_id\nn-fare,n-in\n",
+                ),
+                (
+                    "location_groups.txt",
+                    "location_group_id\nlg-in\nlg-flex\nlg-trip\n",
+                ),
+                (
+                    "location_group_stops.txt",
+                    "location_group_id,stop_id\nlg-in,s1\nlg-flex,s3\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            left(&result, "areas.txt", "area_id"),
+            ["a-fare", "a-free", "a-in"]
+        );
+        assert_eq!(
+            left(&result, "networks.txt", "network_id"),
+            ["n-fare", "n-in"]
+        );
+        assert_eq!(
+            left(&result, "location_groups.txt", "location_group_id"),
+            ["lg-flex", "lg-in"]
+        );
+    }
+
+    #[test]
+    fn route_network_ids_name_networks() {
+        let result = crop_to_r1(
+            "route-networks",
+            &[
+                (
+                    "routes.txt",
+                    "route_id,agency_id,route_short_name,route_type,network_id\n\
+                     r1,hsl,1,3,n-in\nr2,hsl,2,3,n-out\n",
+                ),
+                ("networks.txt", "network_id\nn-in\nn-out\n"),
+            ],
+        );
+        assert_eq!(left(&result, "networks.txt", "network_id"), ["n-in"]);
     }
 }

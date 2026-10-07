@@ -32,19 +32,31 @@ from transitio.index.feeds import (
     Selector,
     _access_provider,
 )
-from transitio.index.places import Delineation, Place, Suggestion, _PlaceLookup
+from transitio.index.places import (
+    Area,
+    AreaPart,
+    Delineation,
+    Place,
+    Suggestion,
+    _PlaceLookup,
+)
+from transitio.index.recommend import Recommendation
 
 __all__ = [
     "AccessProvider",
+    "Area",
+    "AreaPart",
     "Delineation",
     "Index",
     "IndexedFeed",
     "Place",
+    "Recommendation",
     "Selector",
     "Suggestion",
     "read_index",
     "load",
     "links",
+    "area",
     "place",
     "places",
     "prepare_suggestions",
@@ -83,7 +95,7 @@ MIN_READER_VERSIONS = {
 # Bumped whenever name resolution, ranking or filtering changes: the snapshot
 # pins the data, this pins how the reader interprets it, and a result that
 # records both (with the transitio version) is reproducible.
-DISCOVERY_SEMANTICS_VERSION = 4
+DISCOVERY_SEMANTICS_VERSION = 5
 
 FEEDS_FILE = "feeds.parquet"
 REALTIME_FILE = "realtime.parquet"
@@ -118,7 +130,8 @@ _PARTITION_TABLES = {
 _MAX_PARTITIONS = 300
 
 # Ceilings on what one index file may be, so a swapped-in or damaged file cannot
-# read an unbounded amount into memory. A real index is a few MB.
+# read an unbounded amount into memory. A real index's largest table is about
+# 50 MB.
 _MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 _MAX_FEEDS_BYTES = 512 * 1024 * 1024
 _MAX_PLACES_BYTES = 512 * 1024 * 1024
@@ -1135,6 +1148,36 @@ def place(query, *, kind=None, definition=None, index=None):
     """
     lookup = _lookup_for(_coerce_index(index))
     return lookup.resolve(query, kind=kind, definition=definition)
+
+
+def area(geometry, *, country=None, index=None):
+    """The index places that cover an area, the share they cover and their
+    feeds, as an :class:`Area`.
+
+    ``geometry`` is a shapely geometry, a GeoDataFrame/GeoSeries or a
+    ``(minx, miny, maxx, maxy)`` tuple, in WGS84, and ``country`` an ISO
+    code keeping only that country's places. The candidates are the cities,
+    regions and countries with at least one feed whose boundary intersects
+    the area; metros are left out. Each is measured on its part inside the
+    area: ``inside``, the share of the place, and ``holds``, the share of the
+    area. A candidate at least half inside is a whole part unless a place
+    containing it (:attr:`Place.ancestors`) is also at least half inside.
+    One less than half inside is a partial part when it holds at least 1 %
+    of the area and no place containing it is a whole part, and it gives way
+    to the places it contains that are parts: Munich city and its Landkreis
+    make two whole parts, not Bavaria, and a box inside one district gives
+    that district alone. ``coverage`` is the area the parts cover, divided
+    by the area's land: its part within the index's country places, with or
+    without feeds, or with ``country`` within that country's, plus the
+    parts. Land in a country without feeds counts as uncovered, sea and land
+    outside every country place of the index are left out, and an area with
+    no land has a coverage of 0. Areas are measured in km² in an equal-area
+    projection (EPSG:6933). :meth:`Area.feeds` lists the parts' feeds.
+    """
+    from transitio.osm._fetch import _as_geometry
+
+    lookup = _lookup_for(_coerce_index(index))
+    return lookup.area(_as_geometry(geometry), country)
 
 
 def places(query, *, index=None):

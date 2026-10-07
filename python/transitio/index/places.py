@@ -428,6 +428,30 @@ class Place:
             international=international,
         )
 
+    def recommend(
+        self, when=None, *, tiers=None, exclude=None, target=0.95, max_feeds=4
+    ):
+        """Which of the place's feeds to use on ``when`` (a date, today when
+        None), and why the others are left out, as a
+        :class:`~transitio.index.Recommendation`; ``print()`` it to read it.
+
+        Every feed serving the place is a candidate, whatever its category;
+        ``tiers`` and ``exclude`` narrow them as in :meth:`feeds`. A feed is
+        left out when it was stale when indexed, when its timetable as
+        indexed does not run on the day, or when it needs a paid account. On
+        an index that records which feeds run the same lines, feeds are
+        taken until they cover ``target`` of the place's departures, each
+        counted once, and 80 % of each mode's (rail, subway and tram
+        together), at most ``max_feeds`` of them; among feeds adding about
+        as much, the open one with the fewest stops is taken. Without that
+        evidence the feed with the most departures is taken. See
+        :mod:`transitio.index.recommend`.
+        """
+        from transitio.index.recommend import recommend
+
+        feeds = self.feeds(tiers=tiers, exclude=exclude, categories=None)
+        return recommend(self, feeds, when, goal=target, max_feeds=max_feeds)
+
     def __eq__(self, other):
         return isinstance(other, Place) and other.id == self.id
 
@@ -436,6 +460,90 @@ class Place:
 
     def __repr__(self):
         return f"Place({self.id}, {self.kind}, {self.name!r})"
+
+
+# A place covering part of an area: the index's place, the share of the
+# place inside the area, the share of the area it holds, and whether it is
+# a whole part.
+AreaPart = namedtuple("AreaPart", ["place", "inside", "holds", "whole"])
+
+# A candidate at least this much inside an area may be a whole part; one
+# holding at least this much of the area, a partial part.
+_WHOLE_SHARE = 0.5
+_PARTIAL_SHARE = 0.01
+
+
+class Area:
+    """The index places that cover an area (:func:`transitio.index.area`).
+
+    ``geometry`` is the area as given, in WGS84, and ``country`` the
+    ``country=`` filter or None. ``parts`` holds an :class:`AreaPart` per
+    place, ordered by ``holds`` descending, then place id, and ``coverage``
+    is the share of the area's land the parts cover, from 0 to 1.
+    """
+
+    def __init__(self, geometry, country, parts, coverage, index):
+        self.geometry = geometry
+        self.country = country
+        self.parts = tuple(parts)
+        self.coverage = coverage
+        self._index = index
+
+    def feeds(
+        self,
+        *,
+        tiers=None,
+        exclude=None,
+        spec="gtfs",
+        on_unknown="include",
+        requires=None,
+        categories="default",
+        international=False,
+    ):
+        """The feeds serving the area's parts, as :class:`IndexedFeed`
+        objects, each feed once.
+
+        Each part answers as :meth:`Place.feeds` does, its kind's default
+        view included, with the same arguments. A feed's ``edges`` are keyed
+        by ``(place_id, tier)``, its ``selector`` unites theirs (a
+        ``whole_feed`` one makes it whole, else an ``unavailable`` one makes
+        it unavailable, otherwise the route ids are united) and ``service`` is its
+        service in the first part it serves. The feeds come back as a
+        place's view orders them.
+        """
+        from transitio.index.feeds import _feeds_for_places
+
+        return _feeds_for_places(
+            self._index,
+            [part.place for part in self.parts],
+            tiers=tiers,
+            exclude=exclude,
+            spec=spec,
+            on_unknown=on_unknown,
+            requires=requires,
+            categories=categories,
+            international=international,
+        )
+
+    def recommend(
+        self, when=None, *, tiers=None, exclude=None, target=0.95, max_feeds=4
+    ):
+        """Which of the feeds serving the area's parts to use on ``when``,
+        as :meth:`Place.recommend` answers for a place, each feed's
+        departures and the shares other feeds run summed over the parts."""
+        from transitio.index.recommend import recommend
+
+        feeds = self.feeds(tiers=tiers, exclude=exclude, categories=None)
+        return recommend(self, feeds, when, goal=target, max_feeds=max_feeds)
+
+    def __repr__(self):
+        from transitio.osm._fetch import _fmt_coord
+
+        bounds = ", ".join(_fmt_coord(value) for value in self.geometry.bounds)
+        return (
+            f"Area(bounds=({bounds}), parts={len(self.parts)}, "
+            f"coverage={self.coverage:.2f})"
+        )
 
 
 def _labels_of(record):
@@ -654,6 +762,59 @@ class _PlaceLookup:
         from transitio.index.feeds import feeds_for_place
 
         return feeds_for_place(self._index, place, **query)
+
+    def area(self, geometry, country=None):
+        """The :class:`Area` this index's places make of ``geometry`` (see
+        :func:`transitio.index.area`)."""
+        import numpy as np
+        import shapely
+
+        from transitio.osm._fetch import _areas_km2
+
+        places = self._index.places
+        rows = places.sindex.query(geometry, predicate="intersects")
+        ids = places["place_id"].to_numpy()[rows]
+        kinds = places["kind"].to_numpy()[rows]
+        if country is not None:
+            mine = places["country_code"].to_numpy()[rows] == country
+            rows, ids, kinds = rows[mine], ids[mine], kinds[mine]
+        # The candidates have a feed; every country place bounds the land.
+        fed = np.array([self._feed_count(pid) > 0 for pid in ids], dtype=bool)
+        candidate = np.isin(kinds, ["city", "region", "country"]) & fed
+        land = kinds == "country"
+        keep = candidate | land
+        rows, ids, candidate, land = rows[keep], ids[keep], candidate[keep], land[keep]
+        geoms = places.geometry.to_numpy()[rows]
+        clips = shapely.intersection(geoms, geometry)
+        aoi = np.array([geometry], dtype=object)
+        sizes = _areas_km2(np.concatenate([geoms[candidate], clips[candidate], aoi]))
+        ids = ids[candidate].tolist()
+        own, clipped, total = np.split(sizes, [len(ids), 2 * len(ids)])
+        if not total[0]:
+            return Area(geometry, country, (), 0.0, self._index)
+        inside = np.divide(clipped, own, out=np.zeros(len(ids)), where=own > 0)
+        inside, holds = np.minimum(inside, 1.0), np.minimum(clipped / total[0], 1.0)
+        share = dict(zip(ids, zip(inside.tolist(), holds.tolist())))
+        above = {pid: {p.id for p in self.get(pid).ancestors} for pid in ids}
+        half = {pid for pid in ids if share[pid][0] >= _WHOLE_SHARE}
+        whole = {pid for pid in half if not above[pid] & half}
+        partial = {
+            pid
+            for pid in ids
+            if pid not in half
+            and share[pid][1] >= _PARTIAL_SHARE
+            and not above[pid] & whole
+        }
+        # A broad place gives way to a narrower one that is a part itself.
+        partial -= set().union(*(above[pid] for pid in partial | whole))
+        chosen = sorted(whole | partial, key=lambda pid: (-share[pid][1], pid))
+        held = dict(zip(ids, clips[candidate]))
+        covered = shapely.union_all([held[pid] for pid in chosen])
+        ground = shapely.union_all([*clips[land], covered])
+        covered_km2, land_km2 = _areas_km2([covered, ground])
+        coverage = min(float(covered_km2 / land_km2), 1.0) if land_km2 else 0.0
+        parts = [AreaPart(self.get(pid), *share[pid], pid in whole) for pid in chosen]
+        return Area(geometry, country, parts, coverage, self._index)
 
     def _tier(self, query_norm, query_tokens, labels):
         best = 0

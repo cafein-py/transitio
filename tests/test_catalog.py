@@ -983,6 +983,37 @@ def test_download_retries_and_resumes(
 
 
 @pytest.mark.parametrize(
+    "script, total",
+    [
+        pytest.param([_answer(body=BODY)], len(BODY), id="content-length"),
+        pytest.param(
+            [(200, {"ETag": STRONG}, BODY, 1024), _rest(1024, etag=STRONG)],
+            len(BODY),
+            id="content-range",
+        ),
+        pytest.param(
+            [_answer(body=gzip.compress(BODY, mtime=0), content_encoding="gzip")],
+            None,
+            id="gzip-encoded",
+        ),
+        pytest.param([(200, {}, BODY, None)], None, id="chunked"),
+    ],
+)
+def test_download_reports_the_bytes_written_and_the_total(tmp_path, script, total):
+    answers, calls = iter(script), []
+
+    def handler(request):
+        status, headers, body, drop = next(answers)
+        return httpx.Response(status, headers=headers, stream=_Body(body, drop))
+
+    with _http.client(transport=httpx.MockTransport(handler)) as client:
+        _http.download(
+            client, URL, tmp_path / "feed.zip", progress=lambda *c: calls.append(c)
+        )
+    assert calls[-1] == (len(BODY), total)
+
+
+@pytest.mark.parametrize(
     "fragment, member",
     [
         pytest.param(

@@ -30,6 +30,10 @@ net = result.to_cafein()   # routable cafein.TransportNetwork
 osm = result.to_pyrosm()   # pyrosm.OSM reader over the extract
 ```
 
+`fetch` shows its progress on stderr, a bar per download (a widget in
+Jupyter with `pip install "transitio[notebook]"`, which adds ipywidgets);
+`progress=False` turns it off.
+
 `fetch` accepts `when="2026-09-01"` to pick the dataset versions covering a
 service day (needs a free Mobility Database API token, passed as
 `refresh_token=` or via the `MOBILITY_API_REFRESH_TOKEN` environment
@@ -39,6 +43,14 @@ extract when only the timetables are needed, and `crop=False` to keep feeds
 whole. With a token, GTFS downloads are catalogued dataset versions verified
 against catalog checksums; without one, the latest hosted zips are fetched
 as-is — unverified moving targets.
+
+With the feed index installed (below), `fetch` takes the feeds of the index
+places that cover the area, when they cover at least half of its land, and
+`result.places` lists those places. Otherwise it searches the Mobility
+Database catalogue for feeds whose bounding box meets the area's, and a
+warning gives the reason and the number of feeds before anything is
+downloaded; `index=False` searches the catalogue without the index or a
+warning.
 
 ### Feeds for a place
 
@@ -59,6 +71,13 @@ result = transitio.fetch(
 )
 transitio.merge_feeds(result.feeds, "augsburg.gtfs.zip", check=False)
 ```
+
+The first refresh downloads about 420 MB (about 35 s at 100 Mbit/s, 3
+minutes at 20 Mbit/s) and takes about 10 s more to unpack and check it; it
+prints its progress to stderr unless called with `progress=False`. A
+snapshot takes about 550 MB on disk, and the cache keeps the newest three
+plus a pinned one, up to about 2.2 GB; a refresh needs about 1 GB free
+while it runs.
 
 Each feed is cropped to the place's boundary; a national feed such as
 Germany's is streamed through the crop, so it fits in memory bounded by the
@@ -153,6 +172,8 @@ pip install transitio
 
 Binary wheels cover Linux, macOS and Windows. Building from source instead
 requires a Rust toolchain (`pip install .`).
+`pip install "transitio[notebook]"` also installs ipywidgets, so the
+download progress bars show as widgets in Jupyter.
 
 ## License
 

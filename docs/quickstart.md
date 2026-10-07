@@ -12,6 +12,10 @@ import transitio
 result = transitio.fetch("Helsinki")
 ```
 
+`fetch` shows its progress on stderr, a bar per download (a widget in
+Jupyter with `pip install "transitio[notebook]"`, which adds ipywidgets);
+`progress=False` turns it off.
+
 The area of interest can be a place name (geocoded via Nominatim), a shapely
 geometry, a GeoDataFrame/GeoSeries, or a `(minx, miny, maxx, maxy)` bounding
 box in WGS84. The pipeline:
@@ -20,9 +24,11 @@ box in WGS84. The pipeline:
    a set of extracts smaller in total, merged into one (Geofabrik, BBBike or
    Movisda), and crops it to the area's bounding box (skipped with
    `osm=False`),
-2. discovers every GTFS feed overlapping the area in the Mobility Database
-   (official feeds first, then by spatial specificity) — or, for a place,
-   takes the feeds the index lists for it,
+2. takes the feeds the feed index lists for the places covering the area,
+   or for the place — or, when no index is installed or its places cover
+   less than half of the area's land, every GTFS feed whose bounding box
+   meets the area's in the Mobility Database catalogue (official feeds
+   first, then by spatial specificity), with a warning,
 3. downloads each feed, crops it to the area (its polygon, else its bounding
    box), repairs it when asked, and validates it with the canonical notice
    codes,
@@ -76,6 +82,11 @@ result = transitio.fetch(
 )
 transitio.merge_feeds(result.feeds, "augsburg.gtfs.zip", check=False)
 ```
+
+`feeds=["<feed id>", ...]`, or a recommendation from `place.recommend()`
+(see "Which feeds to use" below), limits the call to those feeds of the
+place, from any relevance category; an id the place does not have raises
+`ValueError` before anything is downloaded.
 
 A feed that serves the place with only some of its routes is cropped to the
 routes of the requested tiers. When that selection cannot be trusted — its
@@ -176,10 +187,11 @@ some stops can lie beyond the area of the OSM extract (`result.osm_area`).
 cafein may then find no walking network near such a stop and give it no
 footpaths. A journey that starts and ends in the area is routed as before;
 only a walking transfer at such a stop can be lost. The `stops_outside_osm` column of
-`result.selection_table()` counts each delivered feed's located stops, those
-with usable coordinates, outside `osm_area`, and `result.osm_note` sums
-them. The count is geometric and can differ from the number cafein
-reports without footpaths, either way: the extract spans the bounding box
+`result.selection_table()` counts each delivered feed's located stops outside
+`osm_area`, and `result.osm_note` sums them. A located stop has usable
+coordinates other than (0, 0), which stands for a missing position. The count
+is geometric and can differ from the number cafein reports without
+footpaths, either way: the extract spans the bounding box
 of the area and cafein snaps a stop up to 1.6 km away, while a stop inside
 the area can still lie far from any street or path.
 
@@ -279,6 +291,13 @@ The index is a versioned snapshot published by
 `transitio.index.use(snapshot_id)` (or the `TRANSITIO_INDEX_SNAPSHOT`
 environment variable) pins one for the process. Queries read the pinned
 snapshot, else the newest installed one.
+
+The first refresh downloads about 420 MB (about 35 s at 100 Mbit/s, 3
+minutes at 20 Mbit/s) and takes about 10 s more to unpack and check it. It
+prints the download's progress to stderr unless called with
+`refresh(progress=False)`. A snapshot takes about 550 MB on disk; the cache
+keeps the newest three plus a pinned one, up to about 2.2 GB, and a refresh
+needs about 1 GB free while it runs.
 
 ### Finding a place
 
@@ -407,6 +426,121 @@ warning repeats it. `exclude` drops named tiers and
 `feed.realtime` lists the GTFS-realtime companions tied to a static feed;
 the companions the index could not tie to one are in
 `Index.realtime_unlinked()`.
+
+To compare a place's feeds side by side, take them as a table:
+
+```python
+munich = transitio.place("Munich", kind="city")
+table = munich.feeds(categories=None).to_dataframe()
+table[["feed_id", "name", "covers", "repeats", "stop_count", "reason"]]
+```
+
+One row per feed, with its tiers, relevance, `share_of_place` (its share
+of the departures summed over the place's feeds, or of the stops where the
+index measured stops), its service there, its
+modes, its timetable window and whether it was `stale_when_indexed`, the
+feeds it is `contained_in`, its access and its stop count. On an index that
+records which feeds run the same lines, `covers` is the share of the place's
+departures the feed runs, each departure counted once, and `repeats` names
+the feeds that also run its departures, such as `"f-mdb-3215 100 %,
+f-germany~urban~transport 95 %"`; without that evidence both are empty.
+`reason` sums a row up in words, for example `"primary (local, regional
+tiers): 25 % of the departures summed over the place's feeds; repeats
+f-mdb-3215 (100 %)"`.
+
+### Which feeds to use
+
+Several feeds often run the same service: a city's own feed, a national
+aggregate and a regional one may each carry nearly all of a city's
+departures. `recommend()` says which feeds to take for a day and why it
+leaves out the others:
+
+```python
+munich = transitio.place("Munich", kind="city")
+print(munich.recommend("2026-10-13"))
+```
+
+prints, for example:
+
+```
+Munich (city), 2026-10-13: take 1 feed, covering about 98 % of the departures the index records there, each counted once
+  + f-u281z9-mvv: covers 98 % of the place's departures (98 % of bus; 98 % of rail, subway and tram)
+  - f-mdb-3215 (DELFI): repeats f-u281z9-mvv (98 % of its departures); 550,396 stops against 28,330
+  - f-germany~urban~transport (Public Transport Germany): repeats f-u281z9-mvv (99 % of its departures); 674,929 stops against 28,330
+  - f-mdb-2333 (Münchner Verkehrsgesellschaft): repeats f-u281z9-mvv (99 % of its departures)
+  - f-germany~regional~rail (Regional Rail Transport Germany): repeats f-u281z9-mvv (100 % of its departures)
+  - f-mdb-2393 (Aggregate feed for Baden-Württemberg): adds too little: 0.021 % of the place's departures
+  - f-nvbw~ding (ding): contained in f-mdb-2393
+  - f-mdb-779 (MVV): stale when indexed: its timetable ended 2026-07-31
+```
+
+Every feed serving the place is a candidate, whatever its category.
+Feeds that were stale when indexed, whose timetable as indexed does not run
+on the day (today when no day is given), or that need a paid account are
+left out first. On an index that records which feeds run the same lines,
+the place's departures are counted once and feeds are taken one at a time,
+each adding the most departures the taken feeds lack, until they cover
+95 % of them (`target=`) and 80 % of each mode, rail, subway and tram
+counting as one; at most four are taken (`max_feeds=`). Among feeds adding
+about as much, the open one with the fewest stops wins, which is why MVV's
+own feed is taken over the national DELFI feed. An index without that
+evidence takes the feed with the most departures and marks the others "not
+compared". The recommendation's `feed_ids` lists the taken feeds and
+`to_dataframe()` gives every feed with its reason; `area.recommend()` answers the same for
+an area, summing each feed's departures over the parts.
+
+To fetch only the feeds it takes, pass the recommendation to `fetch`:
+
+```python
+day = "2026-10-13"
+result = transitio.fetch(place=munich, when=day, feeds=munich.recommend(day))
+```
+
+### Feeds for an area
+
+`transitio.index.area` finds the index places that cover an area of your
+own, such as a study region drawn as a polygon:
+
+```python
+import shapely
+
+munich = transitio.place("Munich", kind="city")
+district = transitio.place("Munich District")
+region = shapely.union_all([munich.geometry, district.geometry])
+area = transitio.index.area(region)
+area.coverage          # 1.0: the share of the area's land the parts cover
+for part in area.parts:
+    part.place, part.whole, part.inside, part.holds
+area.feeds()           # each part's feeds, every feed once
+```
+
+Only cities, regions and countries with feeds count; metros do not. A place
+at least half inside the area is a whole part, unless a place containing it
+is too: Munich and its district are two whole parts, not Bavaria. A place
+less than half inside is a partial part when it holds at least 1 % of the
+area and no place containing it is a whole part, and it gives way to any
+smaller place inside it that is a part, so a box in one district gives that
+district, not its city or region. `inside` is the share of the place inside
+the area and `holds` the share of the area inside the place. `coverage`
+divides the area the parts cover by the area's land, its part inside the
+index's countries: sea does not count, and land in a country without feeds
+counts as uncovered. `country="DE"` keeps the places of one country.
+`area.feeds()` asks each part for its feeds as `place.feeds()` does, with
+the same arguments, and lists each feed once.
+
+`fetch` reads an area this way. When the parts cover at least half of the
+area's land, it fetches their feeds, with the same `tiers`, `exclude` and
+`on_unknown` as for a place, and `result.places` lists the parts.
+Otherwise it searches the Mobility Database catalogue by bounding box and
+warns, for example `"the feed index's places cover 20% of the area; 3 feeds
+from the Mobility Database catalogue by bounding box"`; `index=False`
+searches the catalogue without the index or a warning. The OSM extract
+covers the area itself.
+
+```python
+result = transitio.fetch(region, tiers=["local", "regional"], osm=False)
+[place.name for place in result.places]   # ['Munich District', 'Munich']
+```
 
 ## Reading the validation report
 

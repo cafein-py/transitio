@@ -37,8 +37,8 @@ __all__ = [
 
 API_URL = "https://api.github.com"
 DEFAULT_REPOSITORY = "transitio-dev/transitio-index"
-# GitHub caps release assets at 2 GiB; an index is a few MB, a manifest a
-# few hundred bytes.
+# GitHub caps release assets at 2 GiB; an index archive is about 420 MB, a
+# manifest a few hundred bytes.
 MAX_ASSET_BYTES = 2 * 1024 * 1024 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
 TAG_PREFIX = "index-"

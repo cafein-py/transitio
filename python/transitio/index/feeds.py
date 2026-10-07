@@ -1,12 +1,14 @@
 """The feed-membership read API: which feeds serve a place, and how.
 
-:meth:`Place.feeds` queries the index's membership edges for one place and
-returns :class:`IndexedFeed` objects — a feed joined with its matched edges.
+:meth:`Place.feeds` queries the index's membership edges for one place, and
+:meth:`Area.feeds` for the places covering an area, and each returns
+:class:`IndexedFeed` objects — a feed joined with its matched edges.
 ``edges`` is the authoritative per-tier record; the singular fields are
 aggregates over *the tiers the query matched*: ``needs_review`` is the *or*,
-``selector`` the union — always a :class:`Selector` object, never ``None``,
-with ``unavailable`` dominating, because a union that silently omitted the
-unfilterable part would be exactly the wrong answer — and ``service`` the
+``selector`` the union — always a :class:`Selector` object, never ``None``:
+the whole feed when any edge selects it, else ``unavailable`` dominating,
+because a union that silently omitted the unfilterable part would be exactly
+the wrong answer — and ``service`` the
 feed's service level in the place (stops, routes, departures per day), which
 every tier edge of the pair carries identically.
 
@@ -155,10 +157,19 @@ def _relevance(value):
     return None if number != number else number
 
 
+# The mode families feeds are compared in: tram, subway and rail make one
+# rail-bound family, since feeds type the same line differently (an S-Bahn
+# as tram in one feed, as rail in another).
+_FAMILIES = {"tram": "rail", "subway": "rail", "rail": "rail"}
+# A copy of the build's rank.STALE_DAYS.
+_STALE_DAYS = 30
+
+
 class TierEdge:
     """One membership edge, as the query matched it."""
 
     def __init__(self, record):
+        self.place_id = record["place_id"]
         self.tier = record["tier"]
         self.tier_confidence = float(record["tier_confidence"])
         self.method = record["method"]
@@ -172,6 +183,9 @@ class TierEdge:
         # Schema 7: the rank stage's relevance; None on an older index.
         self.relevance_category = _scalar(record.get("relevance_category"))
         self.relevance = _relevance(record.get("relevance"))
+        # The feed's share of the place's service, as the rank stage
+        # recorded it; None when unknown.
+        self.share_of_place = _relevance((self.evidence or {}).get("share_of_place"))
         cross = record.get("cross_border")
         self.cross_border = None if cross is None or cross != cross else bool(cross)
 
@@ -307,9 +321,9 @@ class RealtimeFeed:
 
 
 class IndexedFeed:
-    """A feed serving a place: its identity row plus the matched tier edges,
-    on schema 8 its GTFS-RT companions, and on schema 11 how to get the
-    credentials a protected feed needs (from ``index``, when given)."""
+    """A feed serving a place or an area: its identity row plus the matched
+    tier edges, on schema 8 its GTFS-RT companions, and on schema 11 how to
+    get the credentials a protected feed needs (from ``index``, when given)."""
 
     def __init__(self, row, edges, realtime=(), index=None):
         self._row = row
@@ -406,9 +420,7 @@ class IndexedFeed:
         if self.access != "key":
             return None
         name = self.name or self.feed_id
-        provider = None
-        if self._index is not None and self.access_provider is not None:
-            provider = self._index.access_provider(self.access_provider)
+        provider = self._provider()
         if provider is None:
             lead = "needs credentials; the index has no access details for it yet"
         else:
@@ -430,6 +442,13 @@ class IndexedFeed:
                 "download the feed by hand."
             )
         return " ".join(parts)
+
+    def _provider(self):
+        """The :class:`AccessProvider` the feed's credentials come from, or
+        None."""
+        if self._index is None or self.access_provider is None:
+            return None
+        return self._index.access_provider(self.access_provider)
 
     @property
     def coverage_source(self):
@@ -510,7 +529,7 @@ class IndexedFeed:
 
     @property
     def tiers(self):
-        return frozenset(self.edges)
+        return frozenset(edge.tier for edge in self.edges.values())
 
     @property
     def relevance_category(self):
@@ -531,6 +550,70 @@ class IndexedFeed:
         return max(scores) if scores else None
 
     @property
+    def share_of_place(self):
+        """The feed's share of the place's service summed over its feeds, as
+        the index recorded it (schema 7), the largest over the matched edges
+        (0 for a feed stale when indexed); None when no matched edge records
+        one."""
+        shares = [e.share_of_place for e in self.edges.values()]
+        shares = [share for share in shares if share is not None]
+        return max(shares) if shares else None
+
+    @property
+    def stale_when_indexed(self):
+        """The day the feed's timetable ended, when that was more than 30
+        days before the index crawled it, as a ``datetime.date``; None
+        otherwise."""
+        for edge in self.edges.values():
+            ended = _day((edge.evidence or {}).get("stale_when_indexed"))
+            if ended is not None:
+                return ended
+        crawled = self.last_crawled
+        crawled = _day(crawled[:10]) if isinstance(crawled, str) else None
+        end = self.service_end
+        if end is None or crawled is None or (crawled - end).days <= _STALE_DAYS:
+            return None
+        return end
+
+    @property
+    def overlap(self):
+        """How much of the feed's service other feeds also run, from the
+        matched edges' overlap evidence: ``{"departures": {mode: per day},
+        "with": {feed_id: {mode: share}}}``, departures summed over the
+        edges and each share weighted by them. None when no matched edge
+        records it."""
+        departures, run, found = {}, {}, False
+        for edge in self.edges.values():
+            block = (edge.evidence or {}).get("overlap")
+            if not isinstance(block, dict):
+                continue
+            found = True
+            counts = {m: float(v) for m, v in (block.get("departures") or {}).items()}
+            for mode, value in counts.items():
+                departures[mode] = departures.get(mode, 0.0) + value
+            for other, shares in (block.get("with") or {}).items():
+                for mode, share in shares.items():
+                    key = (other, mode)
+                    run[key] = run.get(key, 0.0) + counts.get(mode, 0.0) * share
+        if not found:
+            return None
+        shares = {}
+        for (other, mode), value in run.items():
+            if departures.get(mode):
+                shares.setdefault(other, {})[mode] = value / departures[mode]
+        return {"departures": departures, "with": shares}
+
+    @property
+    def catalogue_name(self):
+        """The feed's name in the Mobility Database, else in the Transitland
+        Atlas, as the catalogue gives it; None without one."""
+        for source in ("mdb", "atlas"):
+            name = (_parse(self._row.get(source)) or {}).get("name")
+            if name:
+                return name
+        return None
+
+    @property
     def cross_border(self):
         return any(e.cross_border for e in self.edges.values())
 
@@ -546,18 +629,19 @@ class IndexedFeed:
 
     @property
     def selector(self):
-        """The union of the matched edges' selectors; the weakest link decides.
+        """The union of the matched edges' selectors: the whole feed when an
+        edge selects it, else the weakest link decides.
 
         Fail-safe: an unknown selector state, or a ``complete`` edge carrying no
         route ids, counts as ``unavailable`` — a trusted empty selector would let
         downstream filtering silently drop routes.
         """
         states = {edge.selector_state for edge in self.edges.values()}
-        if states - {"whole_feed", "complete"}:
-            return Selector("unavailable")
         if "whole_feed" in states:
-            # A whole-feed claim absorbs any route subset it is unioned with.
+            # A whole-feed claim absorbs any selector it is unioned with.
             return Selector("whole_feed")
+        if states - {"complete"}:
+            return Selector("unavailable")
         route_ids = set()
         declared = []
         for edge in self.edges.values():
@@ -626,6 +710,222 @@ class FeedList(list):
             for feed in self
         ]
         return geopandas.GeoDataFrame(data, geometry=hulls, crs="EPSG:4326")
+
+    def to_dataframe(self):
+        """The feeds as a DataFrame, one row per feed, in the list's order,
+        with the columns that rank them and a ``reason`` in words.
+
+        ``departures_per_day``, ``stops`` and ``routes`` are the feed's
+        service in the place, summed over an area's parts. ``modes`` lists
+        the feed's modes there, most departures first. ``covers`` is the
+        share of the departures of all the listed feeds, each departure
+        counted once, that the feed runs, and ``repeats`` names up to three
+        listed feeds running the most of the feed's own departures, with
+        their shares; both come from the index's overlap evidence and are
+        None without it. ``reason`` gives the category and tiers, the share
+        of the departures summed over the place's feeds, the feed repeating
+        the most of it, and where they apply, staleness, the feeds
+        containing it and the account it needs.
+        """
+        import pandas
+
+        blocks = _family_blocks(self)
+        universe = sum(_universe(blocks).values())
+        listed = [feed.feed_id for feed in self]
+        rows = []
+        for feed in self:
+            departures = (feed.overlap or {"departures": {}})["departures"]
+            block = blocks.get(feed.feed_id)
+            repeats = None
+            if block is not None:
+                others = [i for i in listed if i != feed.feed_id]
+                repeats = _repeated_by(block, others)[:3]
+            rows.append(
+                {
+                    "feed_id": feed.feed_id,
+                    "name": feed.name,
+                    "catalogue_name": feed.catalogue_name,
+                    "tiers": sorted(feed.tiers),
+                    "relevance_category": feed.relevance_category,
+                    "relevance": feed.relevance,
+                    "share_of_place": feed.share_of_place,
+                    **_summed_service(feed),
+                    "modes": sorted(departures, key=departures.get, reverse=True),
+                    "covers": (
+                        min(1.0, sum(block[0].values()) / universe)
+                        if block is not None and universe
+                        else None
+                    ),
+                    "repeats": (
+                        ", ".join(f"{i} {_percent(s)}" for i, s in repeats)
+                        if repeats
+                        else None
+                    ),
+                    "service_start": feed.service_start,
+                    "service_end": feed.service_end,
+                    "stale_when_indexed": feed.stale_when_indexed,
+                    "contained_in": feed.contained_in,
+                    "access": feed.access,
+                    "stop_count": feed.stop_count,
+                    "reason": _ranking_reason(feed, repeats),
+                }
+            )
+        return pandas.DataFrame(rows, columns=_TABLE_COLUMNS)
+
+
+_TABLE_COLUMNS = (
+    "feed_id",
+    "name",
+    "catalogue_name",
+    "tiers",
+    "relevance_category",
+    "relevance",
+    "share_of_place",
+    "departures_per_day",
+    "stops",
+    "routes",
+    "modes",
+    "covers",
+    "repeats",
+    "service_start",
+    "service_end",
+    "stale_when_indexed",
+    "contained_in",
+    "access",
+    "stop_count",
+    "reason",
+)
+
+
+def _summed_service(feed):
+    """The feed's departures per day, stops and routes, each place of its
+    matched edges counted once; None where no place records the number."""
+    services = {edge.place_id: edge.service for edge in feed.edges.values()}
+    summed = {}
+    for field in ("departures_per_day", "stops", "routes"):
+        values = [getattr(s, field) for s in services.values()]
+        values = [value for value in values if value is not None]
+        summed[field] = sum(values) if values else None
+    return summed
+
+
+def _family_blocks(feeds):
+    """Each feed's overlap evidence by mode family, for the feeds that record
+    departures: ``{feed_id: (departures, shares)}``, ``departures`` per
+    family and ``shares`` per other feed, the share of each family's
+    departures that feed also runs."""
+    blocks = {}
+    for feed in feeds:
+        overlap = feed.overlap
+        if overlap is None:
+            continue
+        departures, run = {}, {}
+        for mode, value in overlap["departures"].items():
+            family = _FAMILIES.get(mode, mode)
+            departures[family] = departures.get(family, 0.0) + value
+        for other, shares in overlap["with"].items():
+            mine = run.setdefault(other, {})
+            for mode, share in shares.items():
+                family = _FAMILIES.get(mode, mode)
+                value = share * overlap["departures"].get(mode, 0.0)
+                mine[family] = mine.get(family, 0.0) + value
+        if sum(departures.values()) > 0:
+            shares = {
+                other: {
+                    f: v / departures[f] for f, v in by.items() if departures.get(f)
+                }
+                for other, by in run.items()
+            }
+            blocks[feed.feed_id] = (departures, shares)
+    return blocks
+
+
+def _unrun(block, others):
+    """Per family, the departures of a feed that ``others`` do not run, by
+    the largest share any of them runs there."""
+    departures, shares = block
+    return {
+        family: value
+        * (1 - max((shares.get(o, {}).get(family, 0.0) for o in others), default=0))
+        for family, value in departures.items()
+    }
+
+
+def _repeated_by(block, others):
+    """The ``(feed_id, share)`` of each of ``others`` running part of a
+    feed's departures, the largest share first."""
+    total = sum(block[0].values())
+    found = [(o, 1 - sum(_unrun(block, [o]).values()) / total) for o in others]
+    return sorted(
+        [(o, share) for o, share in found if share > 0], key=lambda f: (-f[1], f[0])
+    )
+
+
+def _universe(blocks):
+    """Departures per mode family over the feeds of ``blocks``, each counted
+    once: each family's feeds in order of their departures there, each
+    adding the departures that the feeds before it do not run."""
+    universe = {}
+    for family in {f for departures, _ in blocks.values() for f in departures}:
+        order = sorted((-block[0].get(family, 0.0), i) for i, block in blocks.items())
+        seen = []
+        for _, feed_id in order:
+            unrun = _unrun(blocks[feed_id], seen).get(family, 0.0)
+            universe[family] = universe.get(family, 0.0) + unrun
+            seen.append(feed_id)
+    return universe
+
+
+def _percent(share):
+    """A share as the reasons print it: whole percent rounded down,
+    "over 99 %" from 0.995, two significant figures under 1 %."""
+    percent = share * 100
+    if percent >= 100 - 1e-9:
+        return "100 %"
+    if percent >= 99.5:
+        return "over 99 %"
+    if percent >= 1:
+        return f"{math.floor(percent + 1e-9)} %"
+    if percent <= 0:
+        return "0 %"
+    return f"{percent:.{1 - math.floor(math.log10(percent))}f} %"
+
+
+def _access_note(feed):
+    """What the feed's access asks of a user, in words; None when open."""
+    if feed.access != "key":
+        return None
+    provider = feed._provider()
+    if provider is None:
+        return "needs credentials the index has no details for"
+    account = {True: "a free account", False: "a paid account"}.get(
+        provider.free, "an account"
+    )
+    return f"needs {account} with {provider.name or provider.provider_id}"
+
+
+def _ranking_reason(feed, repeats):
+    """Why the feed ranks where it does, in words (see
+    :meth:`FeedList.to_dataframe`)."""
+    tiers = sorted(feed.tiers)
+    reason = f"{', '.join(tiers)} tier{'s' if len(tiers) > 1 else ''}"
+    if feed.relevance_category is not None:
+        reason = f"{feed.relevance_category} ({reason})"
+    if feed.share_of_place is not None:
+        bases = {(e.evidence or {}).get("share_basis") for e in feed.edges.values()}
+        basis = "stops" if bases == {"stops"} else "departures"
+        share = _percent(feed.share_of_place)
+        reason += f": {share} of the {basis} summed over the place's feeds"
+    notes = []
+    if repeats:
+        notes.append(f"repeats {repeats[0][0]} ({_percent(repeats[0][1])})")
+    ended = feed.stale_when_indexed
+    if ended is not None:
+        notes.append(f"stale when indexed: its timetable ended {ended}")
+    if feed.contained_in:
+        notes.append(f"contained in {', '.join(feed.contained_in)}")
+    notes.append(_access_note(feed))
+    return "; ".join([reason] + [note for note in notes if note])
 
 
 def _matched(edges, tiers, exclude, on_unknown, categories=None):
@@ -707,12 +1007,12 @@ def _companions(index, feed_id, partition=None):
     return [RealtimeFeed(record) for record in mine.to_dict("records")]
 
 
-def _link_edges(index, place):
-    """The cross-border edges to ``place`` a country load does not carry in
-    its edges, with the rows of the feeds they name."""
+def _link_edges(index, place_ids):
+    """The cross-border edges to the places ``place_ids`` a country load does
+    not carry in its edges, with the rows of the feeds they name."""
     if index.links is None or index.country is None:
         return [], {}
-    links = index.links[index.links["place_id"] == place.id]
+    links = index.links[index.links["place_id"].isin(place_ids)]
     records = links.to_dict("records")
     rows = {}
     for partition in sorted({r["feed_partition"] for r in records}):
@@ -729,18 +1029,7 @@ def _view_key(feed):
     return (rank, -(feed.relevance or 0.0), feed.feed_id)
 
 
-def feeds_for_place(
-    index,
-    place,
-    *,
-    tiers=None,
-    exclude=None,
-    spec="gtfs",
-    on_unknown="include",
-    requires=None,
-    categories="default",
-    international=False,
-):
+def feeds_for_place(index, place, **query):
     """The :class:`IndexedFeed` list for ``place``, filtered by the query.
 
     A feed is returned when its spec is selected — ``spec="gtfs"`` by default,
@@ -768,8 +1057,32 @@ def feeds_for_place(
     by category, then relevance high to low, then id. An older index has no
     relevance: every feed is listed, sorted by id.
     """
+    found = _feeds_for_places(index, [place], **query)
+    for feed in found:
+        feed.edges = {tier: edge for (_, tier), edge in feed.edges.items()}
+    return found
+
+
+def _feeds_for_places(
+    index,
+    places,
+    *,
+    tiers=None,
+    exclude=None,
+    spec="gtfs",
+    on_unknown="include",
+    requires=None,
+    categories="default",
+    international=False,
+):
+    """The :class:`IndexedFeed` list for ``places``, each feed once: every
+    place answers as in :func:`feeds_for_place`, and a feed's matched edges
+    are keyed by ``(place_id, tier)``, in the order of ``places``."""
     if on_unknown not in ("include", "exclude"):
         raise ValueError("on_unknown must be 'include' or 'exclude'")
+    if categories not in (None, "default"):
+        # Read once: every place applies the same categories.
+        categories = frozenset(categories)
     if requires is None:
         needed = frozenset()
     else:
@@ -782,24 +1095,30 @@ def feeds_for_place(
     )
     if index.edges is None and not (ranked and international):
         return FeedList()
+    ids = [place.id for place in places]
     records = []
     if index.edges is not None:
-        records = index.edges[index.edges["place_id"] == place.id].to_dict("records")
+        records = index.edges[index.edges["place_id"].isin(ids)].to_dict("records")
     if ranked and not international:
         records = [e for e in records if not e.get("cross_border")]
     rows = {}
-    if index.feeds is not None:
-        rows = {row["feed_id"]: row for row in index.feeds.to_dict("records")}
     if ranked and international:
-        linked, link_rows = _link_edges(index, place)
+        linked, rows = _link_edges(index, ids)
         records += linked
-        rows = {**link_rows, **rows}
-    wanted = (
-        _default_categories(place, tiers, categories, international) if ranked else None
-    )
+    if index.feeds is not None:
+        named = {edge["feed_id"] for edge in records}
+        own = index.feeds[index.feeds["feed_id"].isin(named)]
+        rows.update((row["feed_id"], row) for row in own.to_dict("records"))
+    wanted = dict.fromkeys(ids)
+    if ranked:
+        wanted = {
+            p.id: _default_categories(p, tiers, categories, international)
+            for p in places
+        }
     by_feed = {}
     for edge in records:
-        by_feed.setdefault(edge["feed_id"], []).append(edge)
+        by_place = by_feed.setdefault(edge["feed_id"], {})
+        by_place.setdefault(edge["place_id"], []).append(edge)
     found = FeedList()
     for feed_id in sorted(by_feed):
         row = rows.get(feed_id)
@@ -807,7 +1126,12 @@ def feeds_for_place(
             continue
         if allowed is not None and row.get("spec") not in allowed:
             continue
-        matched = _matched(by_feed[feed_id], tiers, exclude, on_unknown, wanted)
+        matched = {}
+        for place_id in ids:
+            edges = by_feed[feed_id].get(place_id, ())
+            query = (tiers, exclude, on_unknown, wanted[place_id])
+            for tier, edge in _matched(edges, *query).items():
+                matched[(place_id, tier)] = edge
         if not matched:
             continue
         feed = IndexedFeed(

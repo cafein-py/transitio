@@ -8,11 +8,13 @@ import datetime
 import hashlib
 import io
 import json
+import math
 import os
 import pathlib
 import re
 import shutil
 import tempfile
+import time
 import warnings
 import zipfile
 
@@ -31,6 +33,11 @@ _STOP_DECIMALS = 3
 
 # Metres the place path grows the OSM area by: cafein's default snap distance.
 _OSM_BUFFER_M = 1600
+
+# The share of an area's land the feed index's places must cover for
+# fetch(aoi=...) to select the area's feeds from the index.
+_AREA_COVERAGE = 0.5
+_NO_INDEX = "no compatible feed index is installed"
 
 # Feed ids a delivered feed is named by as they are: lowercase ASCII, at
 # most 100 characters, and none of the device names Windows reserves.
@@ -70,13 +77,13 @@ class FetchResult:
     reports: list
     repairs: list
     skipped: list
-    # How each feed's route selector was checked and applied on the place
-    # path (keys as fetch's Returns lists them); empty without tiers,
+    # How each feed's route selector was checked and applied on the index
+    # paths (keys as fetch's Returns lists them); empty without tiers,
     # exclude or on_unknown="exclude".
     selections: list = dataclasses.field(default_factory=list)
     provenance: dict = None
-    # The index snapshot the feeds were discovered from; None for the AOI path,
-    # which discovers by bounding box and has no snapshot.
+    # The index snapshot the feeds were discovered from; None for the
+    # catalogue path, which discovers by bounding box and has no snapshot.
     snapshot: str = None
     # {feed id: [ids of the delivered feeds carrying it]} for each feed left
     # out as contained, in selection order; empty otherwise.
@@ -93,6 +100,9 @@ class FetchResult:
     # The place parts the OSM extract leaves out and the delivered stops
     # outside its area, or why it was not fetched.
     osm_note: str | None = None
+    # The index places the feeds were selected for: the place, the area's
+    # parts, or none on the catalogue path.
+    places: list = dataclasses.field(default_factory=list)
 
     def __iter__(self):  # convenient (pbf, feeds) unpacking
         return iter((self.osm_pbf, self.feeds))
@@ -385,6 +395,7 @@ def _process_feed(
     routes=None,
     provenance=None,
     outputs=None,
+    progress=None,
 ):
     """Crop, repair, mode-filter, validate and report one downloaded feed,
     writing what it makes beside it; the report carries ``provenance``.
@@ -398,7 +409,8 @@ def _process_feed(
     what the crop, repair and validation make is stored with the version
     (:func:`_store_output`) and a later call making the same reads it back
     instead (:func:`_stored_output`); the mode filter, the day checks and the
-    report run again on every call.
+    report run again on every call. ``progress`` (:class:`_Progress`) says
+    when the crop, repair and validation start.
 
     Returns ``(path, report, made, key, window)``: ``made`` what
     :func:`_transform` and the validation made, its ``present_routes`` the
@@ -408,8 +420,8 @@ def _process_feed(
     rather than a false empty one — ``key`` the output key (None without
     ``outputs``) and ``window`` the computed service window as ISO dates,
     None when unknown. The report is :func:`_report`'s. Raises
-    :class:`_SkipFeed` when the feed drops out. Shared by the AOI and the
-    place paths.
+    :class:`_SkipFeed` when the feed drops out. Shared by the catalogue and
+    the index paths.
     """
     from transitio.validate import validate_feed
 
@@ -419,6 +431,8 @@ def _process_feed(
         key = _output_key(version, geometry, routes, crop, repair, budgets)
         made = _stored_output(version, key)
     if made is None:
+        if progress is not None:
+            progress.processing(crop or routes is not None, repair)
         if outputs is None:
             folder, stem = path.parent, f"{path.stem}-{tag}"
         else:
@@ -1048,7 +1062,9 @@ class _Processed:
     hosted: dict
 
 
-def _drop_repeats(cache, record, processed, feeds, reports, directory, **options):
+def _drop_repeats(
+    cache, record, processed, feeds, reports, directory, progress=None, **options
+):
     """Leave out of the delivered feeds the trips that repeat a trip kept
     from a feed before them in ``record``, as :func:`fetch` describes.
 
@@ -1060,9 +1076,10 @@ def _drop_repeats(cache, record, processed, feeds, reports, directory, **options
     ``directory`` removed. A failed replacement or removal keeps the feed as
     delivered, noted. Each compared entry gets its ``duplicate_trips``
     count. ``options`` are ``budgets``, ``modes``, ``day``, the study day or
-    None, and ``duplicate_trips``, ``"keep"`` comparing nothing. Returns
-    ``{feed id: [ids]}``: for each feed cut or withdrawn, the feeds holding
-    the trips it repeated.
+    None, and ``duplicate_trips``, ``"keep"`` comparing nothing;
+    ``progress`` (:class:`_Progress`) says when the comparison starts.
+    Returns ``{feed id: [ids]}``: for each feed cut or withdrawn, the feeds
+    holding the trips it repeated.
     """
     from transitio import _http
 
@@ -1077,6 +1094,8 @@ def _drop_repeats(cache, record, processed, feeds, reports, directory, **options
     )
     if len(order) < 2 or options["duplicate_trips"] == "keep":
         return {}
+    if progress is not None:
+        progress.say(f"Comparing trips across {len(order)} feeds")
     items = [processed[n] for n in order]
     day, modes = options["day"], options["modes"]
     run = _request_key(
@@ -1436,7 +1455,14 @@ class _Archives:
 
 
 def _download_indexed(
-    feed, db, atlas, base_dir, archives, max_total_bytes=None, access=None
+    feed,
+    db,
+    atlas,
+    base_dir,
+    archives,
+    max_total_bytes=None,
+    access=None,
+    progress=None,
 ):
     """Download an indexed feed from the first of its URLs that serves a zip
     archive: the Mobility Database direct download, the Transitland Atlas
@@ -1454,6 +1480,7 @@ def _download_indexed(
     (:func:`~transitio.catalog._nested.split_fragment`) takes the archive
     from ``archives`` and extracts that member within ``max_total_bytes``;
     its sidecar records the archive's URL and SHA-256 beside the feed's.
+    ``progress`` (:class:`_Progress`) says each failure another URL follows.
 
     Returns ``(path, fetched_from, failures, url)``: ``fetched_from`` is
     ``"producer"`` for the feed's own URLs and ``"mdb_latest"`` for the hosted
@@ -1516,11 +1543,12 @@ def _download_indexed(
     elif "download_url" in feed._row:
         crawled = ("download_url", "producer", feed.download_url, from_url, atlas)
         attempts = (crawled, hosted, mdb, static)
-    tried, failures = set(), []
-    for label, source, url, download, client in attempts:
-        if not url or url in tried:
-            continue
-        tried.add(url)
+    runs = {}
+    for attempt in attempts:
+        if attempt[2]:
+            runs.setdefault(attempt[2], attempt)
+    failures = []
+    for n, (label, source, url, download, client) in enumerate(runs.values(), 1):
         outer, member = split_fragment(url)
         try:
             if member is None:
@@ -1530,24 +1558,159 @@ def _download_indexed(
                 keys = access if label == "download_url" else None
                 path = from_archive(client, url, outer, member, keys)
         except Exception as error:  # noqa: B902 — try the next URL
-            failures.append(f"{label}: {error}")
-            continue
-        if zipfile.is_zipfile(path):
-            return path, source, failures, url
-        failures.append(f"{label}: not a zip archive")
+            reason = str(error)
+        else:
+            if zipfile.is_zipfile(path):
+                return path, source, failures, url
+            reason = "not a zip archive"
+        failures.append(f"{label}: {reason}")
+        if progress is not None and n < len(runs):
+            progress.retry(reason, outer)
     if failures:
         raise DownloadError("; ".join(failures))
     raise DownloadError(f"feed {feed.feed_id} has no downloadable url")
 
 
-def _held(cache, feeds, feed_id):
-    """``(feed, staging)`` for each of ``feeds``, the loop body running under
-    the feed's cache lock with a fresh staging folder
-    (:meth:`~transitio.catalog._cache.FeedCache.staging`); ``feed_id`` gives
-    a feed's id."""
+class _Progress:
+    """What a :func:`fetch` call says on stderr as it runs, nothing when not
+    ``shown`` (:mod:`transitio._progress`): a start line; per feed, numbered
+    in the call's selection, a bar per download and a line for a failed URL,
+    the crop and validation, a skip, a cached copy reused or a feed left out
+    after delivery; a line per later step and a summary."""
+
+    def __init__(self, shown):
+        self.shown = shown
+        self.started = time.monotonic()
+        self.count = self.downloaded = 0
+        self.feed_id = self.bar = None
+        # Each feed's number, and its decision when its block ended.
+        self.numbers, self.said = {}, {}
+        # A protected feed's redaction of its credentials, by feed id.
+        self.masks = {}
+
+    def say(self, text):
+        if self.shown:
+            from transitio import _progress
+
+            _progress.say(text)
+
+    def start(self, count, where, skipped=()):
+        """Say that ``count`` feeds are fetched ``where``, then number the
+        record entries ``skipped`` before the feed loop and say why."""
+        self.count = count
+        self.say(f"Fetching {count} feed{'' if count == 1 else 's'} {where}")
+        for entry in skipped:
+            self._next(entry)
+            self.line(f"skipped ({entry['reason']})")
+
+    def _next(self, entry):
+        """Make ``entry``'s feed the current one, numbered next."""
+        self.feed_id = entry["feed_id"]
+        self.numbers[self.feed_id] = len(self.numbers) + 1
+
+    @property
+    def prefix(self):
+        return f"[{self.numbers[self.feed_id]}/{self.count}] {self.feed_id}"
+
+    @contextlib.contextmanager
+    def downloads(self, desc):
+        """A bar described ``desc`` for each download in the block, their
+        bytes counted."""
+        from transitio import _progress
+
+        self.bar = _progress.Download(desc) if self.shown else None
+        try:
+            with _progress.reporting(self.bar):
+                yield
+        finally:
+            if self.bar is not None:
+                self.bar.close()
+                self.downloaded += self.bar.downloaded
+            self.bar = None
+
+    @contextlib.contextmanager
+    def feed(self, entry):
+        """The block of the next feed, ``entry`` its record: a bar per
+        download, described ``[n/count] <id> (<name>)``, and once the block
+        ends, a line when the feed was skipped or a cached copy reused."""
+        self._next(entry)
+        name = entry["name"]
+        named = name and name != self.feed_id
+        with self.downloads(f"{self.prefix} ({name})" if named else self.prefix):
+            yield
+            if entry["decision"] == "skipped":
+                self.line(f"skipped ({entry['reason']})")
+            elif entry["cache"] in ("reused", "fallback"):
+                self.line("cached copy reused")
+            self.said[self.feed_id] = entry["decision"]
+
+    def line(self, text):
+        """Say ``text`` about the current feed, below its closed bar."""
+        if self.bar is not None:
+            self.bar.close()
+        mask = self.masks.get(self.feed_id)
+        self.say(f"{self.prefix}: {text if mask is None else mask(text)}")
+
+    def processing(self, crop, repair):
+        """Say that the current feed's crop, when ``crop``, repair, when
+        ``repair``, and validation start."""
+        steps = [step for step, on in (("cropping", crop), ("repairing", repair)) if on]
+        self.line(" and ".join(filter(None, [", ".join(steps), "validating"])))
+
+    def left_out(self, record):
+        """Say why each feed of ``record`` whose block ended delivered was
+        skipped after all."""
+        for entry in record:
+            self.feed_id = entry["feed_id"]
+            was = self.said.get(self.feed_id)
+            if was == "delivered" and entry["decision"] == "skipped":
+                self.said[self.feed_id] = "skipped"
+                self.line(f"left out ({entry['reason']})")
+
+    def retry(self, reason, url):
+        """Say that the current feed's download from ``url`` failed for
+        ``reason`` and the next URL follows."""
+        reason = reason.removeprefix(f"{url}: ")
+        self.line(f"download failed ({reason}), trying the next URL")
+
+    def done(self, record):
+        """Say how many feeds of ``record`` were delivered and skipped, the
+        bytes downloaded and the time the call took."""
+        delivered = sum(entry["decision"] == "delivered" for entry in record)
+        skipped = sum(entry["decision"] == "skipped" for entry in record)
+        parts = [
+            f"{delivered} feed{'' if delivered == 1 else 's'} delivered",
+            f"{skipped} skipped",
+        ]
+        if self.downloaded:
+            unit, scale = ("GB", 1e9) if self.downloaded >= 1e9 else ("MB", 1e6)
+            parts.append(f"{self.downloaded / scale:.1f} {unit} downloaded")
+        minutes, seconds = divmod(round(time.monotonic() - self.started), 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            took = f"{hours} h {minutes} min"
+        elif minutes:
+            took = f"{minutes} min {seconds} s"
+        else:
+            took = f"{seconds} s"
+        self.say(f"Done in {took}: {', '.join(parts)}")
+
+
+def _held(cache, feeds, entry_for, progress):
+    """``(feed, entry, staging)`` for each of ``feeds``, ``entry`` its
+    selection-record entry (``entry_for``), the loop body running under the
+    feed's cache lock with a fresh staging folder
+    (:meth:`~transitio.catalog._cache.FeedCache.staging`) as the current
+    feed of ``progress`` (:meth:`_Progress.feed`)."""
     for feed in feeds:
-        with cache.lock(feed_id(feed)), cache.staging(feed_id(feed)) as staging:
-            yield feed, staging
+        entry = entry_for(feed)
+        feed_id = entry["feed_id"]
+        with (
+            cache.lock(feed_id),
+            cache.staging(feed_id) as staging,
+            progress.feed(entry),
+        ):
+            yield feed, entry, staging
 
 
 def _add_version(cache, feed_id, path, url, fetched_from, errors, **options):
@@ -1796,6 +1959,35 @@ def _access_for(feed, explicit):
         return None, str(error)
 
 
+def _area_for(geometry, index, country_code):
+    """``(area, None)`` when the feed index's places, of ``country_code``
+    when given, cover at least half of ``geometry``'s land
+    (:func:`transitio.index.area`); else ``(None, why)``, the reason the
+    catalogue is searched instead. Without an installed index the catalogue
+    is searched; a given ``index``, or a pinned snapshot, that cannot be read
+    raises."""
+    from transitio.exceptions import TransitioError
+    from transitio.index import _coerce_index, area
+    from transitio.index._refresh import _pinned
+
+    if index is False:
+        return None, "index=False searches the catalogue"
+    try:
+        resolved = _coerce_index(index)
+    except TransitioError:
+        if index is not None or _pinned()[1] is not None:
+            raise
+        return None, _NO_INDEX
+    if resolved.places is None:
+        return None, "the feed index carries no places"
+    found = area(geometry, country=country_code, index=resolved)
+    if found.coverage < _AREA_COVERAGE:
+        # Rounded down, so a share just under the threshold never reads as it.
+        share = math.floor(found.coverage * 100)
+        return None, f"the feed index's places cover {share}% of the area"
+    return found, None
+
+
 def fetch(
     aoi=None,
     when=None,
@@ -1806,6 +1998,7 @@ def fetch(
     on_unknown="include",
     on_untrusted_selector="auto",
     contained="drop",
+    feeds=None,
     index=None,
     credentials=None,
     modes=None,
@@ -1819,17 +2012,35 @@ def fetch(
     directory=None,
     country_code=None,
     use_cache=True,
+    progress=True,
     **budgets,
 ):
     """Fetch everything cafein needs for an area in one call.
 
-    Pass exactly one of ``aoi`` (a geometry, bbox or place name geocoded for
-    the OSM stage) or ``place`` (a place name, QID or :class:`Place`). With
-    ``place``, feeds are selected from the built index by tier -- ``tiers``,
+    Pass exactly one of ``aoi`` (a geometry, bbox or place name geocoded
+    once) or ``place`` (a place name, QID or :class:`Place`). With
+    ``place``, feeds are selected from the feed index by tier -- ``tiers``,
     ``exclude`` and ``on_unknown`` filter the edges -- and the place geometry
-    supplies the AOI; ``tiers``, ``exclude``, ``on_unknown``,
-    ``on_untrusted_selector``, ``contained``, ``index`` and ``credentials``
-    apply only with ``place``, and ``country_code`` only with ``aoi``. When
+    supplies the AOI. With ``aoi``, the feeds come from the feed index too
+    when its places cover at least half of the area's land
+    (:func:`transitio.index.area`, ``country_code`` keeping one country's
+    places): those of the area's places, selected as for ``place``
+    (:meth:`~transitio.index.Area.feeds`), and ``FetchResult.places`` lists
+    the places. When no index is installed, the index has no places or they
+    cover less than half of the area, the call falls back to the catalogue
+    path: the Mobility Database catalogue is searched for feeds whose
+    bounding box meets the area's, and before any feed or OSM download a
+    ``UserWarning`` gives the reason and the number of feeds found, e.g.
+    ``"the feed index's places cover 20% of the area; 3 feeds from the
+    Mobility Database catalogue by bounding box"``, and without an installed
+    index how to install one. ``index=False`` searches the catalogue without
+    a warning; it is refused with ``place``. ``tiers``, ``exclude``, ``on_unknown``,
+    ``on_untrusted_selector``, ``contained``, ``feeds`` and ``credentials``
+    apply on both index paths; on the catalogue path, ``tiers``,
+    ``exclude``, ``on_unknown="exclude"``, another ``on_untrusted_selector``
+    or ``contained`` than the default, ``feeds`` and ``credentials`` raise
+    ``ValueError`` naming the option and the reason, before anything is
+    downloaded. ``country_code`` applies only with ``aoi``. When
     a selector cannot be trusted -- its evidence was missing at build time,
     or its fingerprint no longer
     matches the download -- ``on_untrusted_selector`` decides the outcome:
@@ -1857,15 +2068,16 @@ def fetch(
     ``contained="keep"`` leaves no feed out for containment, and
     ``contained`` is empty.
 
-    Resolves and crops the OSM extract, discovers the GTFS feeds (overlapping
-    the AOI, or the place's indexed feeds), downloads each feed, spatially
+    Resolves and crops the OSM extract, discovers the GTFS feeds (the
+    indexed feeds of the place or the area, or the catalogue's overlapping
+    the AOI), downloads each feed, spatially
     crops it, optionally repairs it, validates it, and builds a merged report
     per feed.
     With an API token, downloads come from catalogued dataset versions
     (checksum-verified, with the hosted canonical-validator report);
     without one, the unversioned latest hosted zip is fetched — a moving
     target with no upstream checksum, documented in its provenance
-    sidecar as such. On the place path, a feed without a catalogued dataset,
+    sidecar as such. On the index paths, a feed without a catalogued dataset,
     or whose dataset download fails, is read from the first of its indexed
     URLs that serves a zip archive: the Mobility Database direct download,
     the Transitland Atlas static feed, then the Mobility Database hosted
@@ -1884,7 +2096,7 @@ def fetch(
     and, for a catalogued dataset, ``dataset_id`` and
     ``service_date_range``.
 
-    On the place path a cached version that serves the request is used
+    On the index paths a cached version that serves the request is used
     without a download. A feed's versions are tried before any dataset
     selection, probe or download: first the one that served the same request
     before, then the newest first, each checked as a download is (route
@@ -1900,9 +2112,9 @@ def fetch(
     without usable credentials uses only versions once fetched without
     them; credentials for a provider count alike whichever key they hold.
     The hosted validation report of a dataset is stored with it at its first
-    use, so a reused dataset is reported as when downloaded. The area path
-    reuses its feeds' versions alike, though the Mobility Database is still
-    searched for the feeds; a dataset is selected only for a feed no cached
+    use, so a reused dataset is reported as when downloaded. The catalogue
+    path reuses its feeds' versions alike, though the Mobility Database is
+    still searched for the feeds; a dataset is selected only for a feed no cached
     version serves. What the crop, repair and validation make of a cached
     version is stored with it, keyed by the transitio release, the exact
     area when cropped to it, the routes, ``crop``, ``repair`` and the
@@ -1923,7 +2135,7 @@ def fetch(
     otherwise it is delivered cut to its own routes, ``same_as`` naming the
     earlier feed.
 
-    On the place path, delivered feeds whose route keys (agency name, route
+    On the index paths, delivered feeds whose route keys (agency name, route
     short else long name, mode) and stops (coordinates at 3 decimals) share
     0.9 and 0.8 or more are versions, ranked by later start, more trips,
     then candidate order. Agency names compare casefolded, without
@@ -1951,9 +2163,10 @@ def fetch(
 
     With ``duplicate_trips="drop"`` (default) the delivered feeds do not
     repeat each other's trips. A trip that a feed earlier in the selection
-    record also runs is left out of the later feed: on the place path the
-    record follows the place's view (:meth:`~transitio.index.Place.feeds`:
-    category, then relevance, then id), on the area path the order above.
+    record also runs is left out of the later feed: on the index paths the
+    record follows the view (:meth:`~transitio.index.Place.feeds` or
+    :meth:`~transitio.index.Area.feeds`: category, then relevance, then id),
+    on the catalogue path the order above.
     Trips compare as :func:`~transitio.gtfs.merge_feeds` compares them:
     route name and mode (the route type's basic mode, as ``modes`` names
     them, else the type itself, so local bus 704 equals bus 3), stops and
@@ -2009,6 +2222,14 @@ def fetch(
         and one that starts later or runs on other weekdays stays. An
         unknown window passes the window checks, and a report without a
         ``moment`` for the day passes the day check.
+    feeds : list of str or object with ``feed_ids``, optional
+        Fetch only these feeds of the index: a list of feed ids (or one id),
+        or an object whose ``feed_ids`` attribute lists them. They are
+        taken from every relevance category of the place, or of the area's
+        places, not only the default view, and ``tiers``, ``exclude`` and
+        ``on_unknown`` still apply; ``selection`` lists only them. An id
+        not indexed for the place, or not in the tiers asked, raises
+        ``ValueError`` before anything is downloaded, as does an empty list.
     credentials : mapping, optional
         Credentials for feeds that need an account with their provider, as
         ``{provider_id: {field: value}}``. They win, field by field, over
@@ -2053,7 +2274,7 @@ def fetch(
         as above: ``"exact"`` leaves out exact repeats only, and ``"keep"``
         compares nothing. Another value raises ``ValueError``.
     expired : {"skip", "keep"}, default "skip"
-        With ``"skip"``, on the place path, an indexed feed whose index
+        With ``"skip"``, on the index paths, an indexed feed whose index
         service window misses the day (ends before it, or starts after the
         study day) is skipped before download when a conditional ``HEAD``
         to the URL the index crawled, carrying the ETag or Last-Modified it
@@ -2084,7 +2305,8 @@ def fetch(
         delivered or a delivered feed's stops.txt cannot be read), each part
         grown by 1.6 km, cafein's default snap distance. Parts of that area
         farther than 1.6 km from every delivered stop may lack OSM data, as
-        the extract need only cover the stops' surroundings. The crop keeps
+        the extract need only cover the stops' surroundings. With ``aoi`` it
+        covers the area itself, from the index or the catalogue. The crop keeps
         each trip that serves the area whole, so a delivered feed's stops
         can lie beyond the OSM area and get no footpaths in cafein;
         ``stops_outside_osm`` in ``selection`` counts them. With ``osm=False``
@@ -2117,14 +2339,25 @@ def fetch(
         are the files in the cache, an untransformed one the read-only
         cached version itself. The OSM extract goes here too. It must lie
         outside the download cache (``ValueError``).
+    index : Index, str, pathlib.Path or False, optional
+        The feed index both index paths select from: an
+        :class:`~transitio.index.Index` or the path of one, by default the
+        installed index (:func:`transitio.index.refresh`). ``False``, with
+        ``aoi`` only, searches the catalogue instead.
     refresh_token, cache_dir, country_code
         Passed to the catalog and OSM layers; downloads are cached under
-        ``cache_dir``, by default the platform cache.
+        ``cache_dir``, by default the platform cache. ``country_code`` also
+        keeps only that country's index places for ``aoi``.
     use_cache : bool, default True
         Serve feeds from the cache as above. ``False`` downloads every feed
         again and, once a download succeeds, deletes the feed's other
         versions; when every attempt fails, the version a cached call would
         use is delivered with a ``UserWarning``.
+    progress : bool, default True
+        Progress lines and download bars on stderr; a widget bar in Jupyter
+        when ipywidgets is installed (``pip install "transitio[notebook]"``).
+        Elsewhere a bar shows on a terminal only, and a line names the
+        download instead. ``False`` prints nothing.
     **budgets
         The ``validate_feed`` keyword arguments. A feed with a table that a
         budget cuts short cannot be cropped and lands in ``skipped``, the
@@ -2142,8 +2375,10 @@ def fetch(
         repair ``repairs`` (fix logs, empty without ``repair=True``) per
         kept feed, ``paths`` (``{feed id: path}`` of the same feeds, in the
         order of ``feeds``), ``skipped`` (feed id, reason) pairs, the
-        ``selection`` record and, on the place path, ``selections`` and
-        ``contained`` (above). Reports merge the local validation of the
+        ``selection`` record, on the index paths ``selections`` and
+        ``contained`` (above), and ``places``, the index places the feeds
+        were selected for (the place, the area's parts; empty on the
+        catalogue path). Reports merge the local validation of the
         delivered feed with the hosted report of the published dataset, so
         after cropping or repair the hosted side describes the pre-transform
         original. A report's ``summary["droppedRows"]`` lists the rows the
@@ -2168,7 +2403,7 @@ def fetch(
         ``"dropped 8 exact duplicate trips.txt rows"``, the repeated trips
         left out or kept; several join with ``"; "``),
         ``index_window`` (the index's ``[start, end]``; None undated or on
-        the area path), ``feed_window`` (the computed window of a validated
+        the catalogue path), ``feed_window`` (the computed window of a validated
         download, delivered or not; None otherwise or when unknown),
         ``same_as`` (earlier deliveries of the same archive) and
         ``contained_in`` (the index's containers a containment skip names),
@@ -2193,8 +2428,9 @@ def fetch(
         version was obtained; None when none was), a reused version's
         ``fetched_from`` being its first acquisition's,
         ``stops_outside_osm`` (the delivered feed's located stops, the
-        stops.txt rows with usable coordinates, outside ``osm_area``; None
-        without an extract or when its stops.txt cannot be read) and
+        stops.txt rows with usable coordinates other than (0, 0), outside
+        ``osm_area``; None without an extract or when its stops.txt cannot
+        be read) and
         ``path`` (the delivered feed).
         Windows are ISO dates.
         ``selections``, with ``tiers``, ``exclude`` or
@@ -2211,7 +2447,8 @@ def fetch(
         ``{"tier", "selector_state", "route_ids"}``).
         When ``place`` is fetched without ``tiers`` and its default view
         (:meth:`~transitio.index.Place.feeds`) holds none of the place's
-        feeds, ``view_note`` names them and the tiers that fetch them, and a
+        feeds, or an area's places hold none of theirs in their views,
+        ``view_note`` names them and the tiers that fetch them, and a
         ``UserWarning`` repeats it, e.g. ``"default view (region: secondary,
         tertiary) holds none of the place's 2 feeds: f-a (primary), f-b
         (primary); tiers=['local'] fetches them"``.
@@ -2229,6 +2466,7 @@ def fetch(
         extract was fetched for (None with ``osm=False`` or a failed
         download).
     """
+    progress = _Progress(progress)
     if credentials is not None:
         from transitio.credentials import _explicit
 
@@ -2242,31 +2480,25 @@ def fetch(
 
     if (aoi is None) == (place is None):
         raise ValueError("pass exactly one of aoi= or place=")
-    if aoi is not None and (
-        tiers is not None
-        or exclude is not None
-        or index is not None
-        or credentials is not None
-        or on_unknown != "include"
-        or on_untrusted_selector != "auto"
-        or contained != "drop"
-    ):
-        raise ValueError(
-            "tiers=, exclude=, on_unknown=, on_untrusted_selector=, contained=, "
-            "index= and credentials= apply only with place="
-        )
     if contained not in ("keep", "drop"):
         raise ValueError("contained= must be 'keep' or 'drop'")
     if expired not in ("skip", "keep"):
         raise ValueError("expired= must be 'skip' or 'keep'")
     if place is not None and country_code is not None:
         raise ValueError("country_code= applies only with aoi=")
+    if place is not None and index is False:
+        raise ValueError("index=False applies only with aoi=")
     if on_untrusted_selector not in ("auto", "whole", "drop", "error"):
         raise ValueError(
             "on_untrusted_selector= must be 'auto', 'whole', 'drop' or 'error'"
         )
     if duplicate_trips not in ("drop", "exact", "keep"):
         raise ValueError("duplicate_trips= must be 'drop', 'exact' or 'keep'")
+    if feeds is not None:
+        feeds = getattr(feeds, "feed_ids", feeds)
+        feeds = {feeds} if isinstance(feeds, str) else set(feeds)
+        if not feeds:
+            raise ValueError("feeds= names no feed")
 
     if modes is not None:
         from transitio.gtfs._schedule import MODE_TYPES
@@ -2293,6 +2525,9 @@ def fetch(
             raise ValueError("when and reference_date disagree; pass only one")
     budgets.setdefault("reference_date", day.strftime("%Y%m%d") if study else None)
 
+    if aoi is not None:
+        geometry = _as_geometry(aoi)
+        place, why = _area_for(geometry, index, country_code)
     if place is not None:
         return _fetch_place(
             place,
@@ -2301,6 +2536,7 @@ def fetch(
             on_unknown=on_unknown,
             on_untrusted_selector=on_untrusted_selector,
             contained=contained,
+            wanted=feeds,
             index=index,
             credentials=credentials,
             when=when,
@@ -2317,16 +2553,28 @@ def fetch(
             directory=directory,
             use_cache=use_cache,
             budgets=budgets,
+            progress=progress,
         )
 
-    geometry = _as_geometry(aoi)
+    # The options only the index paths honour, refused on the catalogue path.
+    named = {
+        "tiers=": tiers is not None,
+        "exclude=": exclude is not None,
+        f"on_unknown={on_unknown!r}": on_unknown != "include",
+        f"on_untrusted_selector={on_untrusted_selector!r}": (
+            on_untrusted_selector != "auto"
+        ),
+        f"contained={contained!r}": contained != "drop",
+        "feeds=": feeds is not None,
+        "credentials=": credentials is not None,
+    }
+    refused = [name for name, given in named.items() if given]
+    if refused:
+        need = "needs" if len(refused) == 1 else "need"
+        raise ValueError(f"{', '.join(refused)} {need} the feed index; {why}")
 
     cache = _feed_cache(cache_dir, directory)
     osm_pbf = osm_note = None
-    if osm:
-        osm_pbf, osm_note = _osm_extract(
-            geometry, cache_dir=cache_dir, directory=directory
-        )
 
     from transitio.catalog._client import _dataset_entry
 
@@ -2350,9 +2598,29 @@ def fetch(
                 UserWarning,
                 stacklevel=2,
             )
-        candidates = sorted(
-            db.search_feeds(aoi=geometry, country_code=country_code), key=_rank
-        )
+        # Without a token the search reads the catalogue export, downloaded
+        # when the cached copy is missing or a day old.
+        with progress.downloads("Downloading the Mobility Database catalogue"):
+            found = db.search_feeds(aoi=geometry, country_code=country_code)
+        candidates = sorted(found, key=_rank)
+        progress.start(len(candidates), "from the Mobility Database catalogue")
+        if index is not False:
+            count = len(candidates)
+            found = f"{count} feed{'' if count == 1 else 's'}"
+            hint = ""
+            if why == _NO_INDEX:
+                hint = "; transitio.index.refresh() installs the feed index"
+            warnings.warn(
+                f"{why}; {found} from the Mobility Database catalogue by "
+                f"bounding box{hint}",
+                UserWarning,
+                stacklevel=2,
+            )
+        if osm:
+            progress.say("Fetching the OSM extract")
+            osm_pbf, osm_note = _osm_extract(
+                geometry, cache_dir=cache_dir, directory=directory
+            )
 
         def take(feed, entry, version, dataset_id, hosted, last=True):
             # ``version`` checked against the feeds delivered so far and
@@ -2380,6 +2648,7 @@ def fetch(
                     study=study,
                     hosted=hosted,
                     budgets=budgets,
+                    progress=progress,
                 )
                 path = _deliver(path, directory, origin)
                 cache.touch(version, served=(key, dataset_id))
@@ -2433,9 +2702,11 @@ def fetch(
             if use_cache or not reuse(feed, entry, cached, "fallback"):
                 _skip(entry, reason)
 
-        for feed, staging in _held(cache, candidates, lambda feed: feed.id):
-            entry = _entry(feed.id, feed.raw.get("feed_name") or feed.provider)
-            record.append(entry)
+        def entry_for(feed):
+            record.append(_entry(feed.id, feed.raw.get("feed_name") or feed.provider))
+            return record[-1]
+
+        for feed, entry, staging in _held(cache, candidates, entry_for, progress):
             cached = _candidates(cache, feed.id, key, False)
             if use_cache and reuse(feed, entry, cached, "reused"):
                 continue
@@ -2498,7 +2769,10 @@ def fetch(
 
     repeats = dict(budgets=budgets, modes=modes, day=day if study else None)
     repeats["duplicate_trips"] = duplicate_trips
-    _drop_repeats(cache, record, processed, feeds, reports, directory, **repeats)
+    _drop_repeats(
+        cache, record, processed, feeds, reports, directory, progress, **repeats
+    )
+    progress.left_out(record)
     rows = [
         n for n, item in enumerate(processed) if item.entry["decision"] == "delivered"
     ]
@@ -2509,6 +2783,7 @@ def fetch(
         coords = {path: _stop_coords(path) for path in feeds}
         counts = _count_outside(record, geometry, coords)
         osm_note = _osm_note(geometry, geometry, *counts)
+    progress.done(record)
     return FetchResult(
         osm_pbf=osm_pbf,
         feeds=feeds,
@@ -2575,8 +2850,9 @@ def _untrusted_action(policy, exclude, on_unknown):
 
 def _stop_coords(path):
     """The located stops of the feed at ``path``, its stops.txt rows with a
-    stop id and usable coordinates, as an ``(n, 2)`` array of ``(lon,
-    lat)``; None when its stops.txt is absent or cannot be read."""
+    stop id and usable coordinates other than (0, 0), which stands for a
+    missing position, as an ``(n, 2)`` array of ``(lon, lat)``; None when
+    its stops.txt is absent or cannot be read."""
     import numpy as np
 
     from transitio.index.fingerprint import _member_coords
@@ -2588,7 +2864,8 @@ def _stop_coords(path):
         return None
     if coords is None:
         return None
-    return np.array(list(coords.values()), dtype=float).reshape(-1, 2)
+    points = np.array(list(coords.values()), dtype=float).reshape(-1, 2)
+    return points[points.any(axis=1)]
 
 
 def _located_stops(coords):
@@ -2641,14 +2918,19 @@ def _osm_stops(area, coords):
 
 
 def _hidden_note(place, hidden):
-    """The ``view_note`` on a place whose default view holds none of its
-    ``hidden`` feeds: the view's categories, the feeds (at most five
-    named) and the tiers that fetch them, local, regional and national when
-    only unknown edges remain."""
+    """The ``view_note`` on a place, or an area, whose default view holds
+    none of its ``hidden`` feeds: the view's categories (for an area, its
+    places'), the feeds (at most five named) and the tiers that fetch them,
+    local, regional and national when only unknown edges remain."""
+    from transitio.index import Area
     from transitio.index.feeds import CATEGORY_ORDER, _default_categories
 
-    shown = _default_categories(place, None, "default", False) or ()
-    categories = ", ".join(c for c in CATEGORY_ORDER if c in shown)
+    if isinstance(place, Area):
+        view, whose = "default view of the area's places", "their"
+    else:
+        shown = _default_categories(place, None, "default", False) or ()
+        categories = ", ".join(c for c in CATEGORY_ORDER if c in shown)
+        view, whose = f"default view ({place.kind}: {categories})", "the place's"
     named = ", ".join(
         f"{feed.feed_id} ({feed.relevance_category})" for feed in hidden[:5]
     )
@@ -2659,8 +2941,8 @@ def _hidden_note(place, hidden):
     tiers = [tier for tier in order if tier in found] or list(order[:3])
     feeds, them = ("feed", "it") if len(hidden) == 1 else ("feeds", "them")
     return (
-        f"default view ({place.kind}: {categories}) holds none of the place's "
-        f"{len(hidden)} {feeds}: {named}; tiers={tiers} fetches {them}"
+        f"{view} holds none of {whose} {len(hidden)} {feeds}: {named}; "
+        f"tiers={tiers} fetches {them}"
     )
 
 
@@ -2736,6 +3018,7 @@ def _fetch_place(
     on_unknown,
     on_untrusted_selector,
     contained,
+    wanted,
     index,
     credentials,
     when,
@@ -2752,12 +3035,14 @@ def _fetch_place(
     directory,
     use_cache,
     budgets,
+    progress,
 ):
-    """The ``fetch(place=...)`` path: the place geometry is the AOI, feeds come
-    from the index by tier, each served by a cached version when one serves
-    the request, else downloaded MDB-then-Atlas (decision I) and then from
-    the MDB hosted copy (:func:`_download_indexed`), and a bundled
-    feed is cropped to the routes its matched tiers select, the drop
+    """The index paths, ``fetch(place=...)`` and ``fetch(aoi=...)`` given an
+    :class:`~transitio.index.Area`: the place geometry, or the area's, is the
+    AOI, feeds come from the index by tier, each served by a cached version
+    when one serves the request, else downloaded MDB-then-Atlas (decision I)
+    and then from the MDB hosted copy (:func:`_download_indexed`), and a
+    bundled feed is cropped to the routes its matched tiers select, the drop
     recorded in ``selections``. A feed whose index window misses ``day`` is
     skipped before download when a probe proves the archive unchanged since
     indexed; ``window_day`` is what the computed window is tested against.
@@ -2767,7 +3052,8 @@ def _fetch_place(
     (:meth:`_Access.redact`). The versions among the delivered feeds are
     settled after the feed loop, then their repeated trips left out
     (:func:`_drop_repeats`), and the OSM extract comes last, for the parts
-    the remaining feeds serve."""
+    of the place the remaining feeds serve, or for the area. ``progress``
+    (:class:`_Progress`) says how it goes."""
     from transitio import __version__
     from transitio.catalog import Feed, MobilityDatabase, TransitlandAtlas
     from transitio.catalog._client import _dataset_entry
@@ -2775,6 +3061,7 @@ def _fetch_place(
     from transitio.exceptions import DownloadError, StaleSelectorError
     from transitio.index import (
         DISCOVERY_SEMANTICS_VERSION,
+        Area,
         Place,
         _coerce_index,
         place as resolve_place,
@@ -2783,7 +3070,9 @@ def _fetch_place(
     from transitio.index.places import _as_shape
     from transitio.osm._fetch import _buffered
 
-    if isinstance(place, Place):
+    if isinstance(place, Area):
+        place_obj, resolved_index = place, place._index
+    elif isinstance(place, Place):
         place_obj = place
         resolved_index = place._lookup._index
     else:
@@ -2799,7 +3088,30 @@ def _fetch_place(
         raise ValueError(f"place {place_obj.id} has no geometry to fetch for")
     study = when is not None
 
-    offered = place_obj.feeds(tiers=tiers, exclude=exclude, on_unknown=on_unknown)
+    def candidates(unknown):
+        # The view's feeds, or with ``wanted`` the named ones of any category.
+        found = place_obj.feeds(
+            tiers=tiers,
+            exclude=exclude,
+            on_unknown=unknown,
+            categories="default" if wanted is None else None,
+        )
+        return found if wanted is None else [f for f in found if f.feed_id in wanted]
+
+    offered = candidates(on_unknown)
+    if wanted is not None:
+        missing = wanted.difference(f.feed_id for f in candidates("include"))
+        if missing:
+            where = (
+                "the area's places"
+                if isinstance(place_obj, Area)
+                else f"place {place_obj.id}"
+            )
+            asked = "" if tiers is None and exclude is None else " in the tiers asked"
+            raise ValueError(
+                f"feeds= names feeds not indexed for {where}{asked}: "
+                f"{', '.join(sorted(missing))}"
+            )
     kept = _containers_first(offered) if contained == "drop" else offered
     # Credentials are checked and resolved before any download.
     explicit = {
@@ -2810,6 +3122,11 @@ def _fetch_place(
         feed.feed_id: _access_for(feed, explicit)
         for feed in kept
         if feed.access == "key"
+    }
+    progress.masks = {
+        feed_id: access.redact
+        for feed_id, (access, _) in decided.items()
+        if access is not None
     }
     feeds, reports, repairs, selections, record = [], [], [], [], []
     delivered = _Delivered()
@@ -2943,6 +3260,7 @@ def _fetch_place(
                 hosted=hosted,
                 budgets=budgets,
                 routes=routes,
+                progress=progress,
             )
         except _SkipFeed as skip:
             if not last:
@@ -3007,7 +3325,7 @@ def _fetch_place(
         return "delivered"
 
     if on_unknown == "exclude":
-        included = place_obj.feeds(tiers=tiers, exclude=exclude, on_unknown="include")
+        included = candidates("include")
         kept_ids = {f.feed_id for f in kept}
         for feed in included:
             entry = entry_for(feed)
@@ -3016,7 +3334,7 @@ def _fetch_place(
     for feed in offered:
         entry_for(feed)
     view_note = None
-    if tiers is None and not offered:
+    if tiers is None and wanted is None and not offered:
         # An empty default view may hide feeds a tier query would fetch.
         hidden = place_obj.feeds(
             exclude=exclude, on_unknown=on_unknown, categories=None
@@ -3028,6 +3346,13 @@ def _fetch_place(
     cache = _feed_cache(cache_dir, directory)
     snapshot = provenance["snapshot"]
     area = hashlib.sha256(geometry.wkb).hexdigest()
+    where = (
+        "for the area"
+        if isinstance(place_obj, Area)
+        else f"for {place_obj.name or place_obj.id}"
+    )
+    early = [entry for entry in record if entry["decision"] == "skipped"]
+    progress.start(len(record), where, early)
     # Archives read by URL fragment live only for the call.
     with (
         MobilityDatabase(refresh_token, cache_dir=cache_dir) as db,
@@ -3148,8 +3473,7 @@ def _fetch_place(
             attempt(feed, entry, deferred, key, notes, keyless, label, True, proven)
             return True
 
-        for feed, staging in _held(cache, kept, lambda feed: feed.feed_id):
-            entry = entry_for(feed)
+        for feed, entry, staging in _held(cache, kept, entry_for, progress):
             access, refusal = decided.get(feed.feed_id, (None, None))
             keyless = None
             if refusal is not None:
@@ -3216,6 +3540,7 @@ def _fetch_place(
                     fetched_from = "mdb_dataset"
                 except Exception as error:  # noqa: B902 — try the fallback next
                     errors.append(f"mdb dataset: {error}")
+                    progress.retry(str(error), url)
                 if path is None and expired_unchanged(feed, entry):
                     continue
             if path is None:
@@ -3224,7 +3549,7 @@ def _fetch_place(
                     unchanged(feed)
                 try:
                     path, fetched_from, failures, url = _download_indexed(
-                        feed, db, atlas, staging, archives, budget, access
+                        feed, db, atlas, staging, archives, budget, access, progress
                     )
                     errors.extend(failures)
                 except Exception as error:  # noqa: B902
@@ -3291,12 +3616,15 @@ def _fetch_place(
         entries[feed_id]["path"] = feeds[n]
     repeats = dict(budgets=budgets, modes=modes, day=day if study else None)
     repeats["duplicate_trips"] = duplicate_trips
-    lost = _drop_repeats(cache, record, processed, feeds, reports, directory, **repeats)
+    lost = _drop_repeats(
+        cache, record, processed, feeds, reports, directory, progress, **repeats
+    )
     for feed_id, (access, _) in decided.items():
         entry = entries[feed_id]
         for key in ("reason", "note", "download_errors"):
             if access is not None and entry[key] is not None:
                 entry[key] = access.redact(entry[key])
+    progress.left_out(record)
     rows = [
         n for n, item in enumerate(processed) if item.entry["decision"] == "delivered"
     ]
@@ -3314,14 +3642,21 @@ def _fetch_place(
 
     osm_pbf = osm_area = osm_note = None
     if osm:
-        parts, coords = _osm_parts(geometry, feeds)
-        osm_area = _buffered(parts, _OSM_BUFFER_M)
+        if isinstance(place, Area):
+            # An area's extract covers the area itself, as on the catalogue path.
+            parts = osm_area = geometry
+            coords = {path: _stop_coords(path) for path in feeds}
+            grown = {}
+        else:
+            parts, coords = _osm_parts(geometry, feeds)
+            osm_area = _buffered(parts, _OSM_BUFFER_M)
+            grown = {
+                "buffer_m": _OSM_BUFFER_M,
+                "must_cover": _osm_stops(osm_area, coords),
+            }
+        progress.say("Fetching the OSM extract")
         osm_pbf, osm_note = _osm_extract(
-            parts,
-            buffer_m=_OSM_BUFFER_M,
-            must_cover=_osm_stops(osm_area, coords),
-            cache_dir=cache_dir,
-            directory=directory,
+            parts, cache_dir=cache_dir, directory=directory, **grown
         )
         if osm_pbf is None:
             osm_area = None
@@ -3329,6 +3664,7 @@ def _fetch_place(
             counts = _count_outside(record, osm_area, coords)
             osm_note = _osm_note(geometry, parts, *counts)
 
+    progress.done(record)
     return FetchResult(
         osm_pbf=osm_pbf,
         feeds=feeds,
@@ -3343,4 +3679,9 @@ def _fetch_place(
         osm_area=osm_area,
         view_note=view_note,
         osm_note=osm_note,
+        places=(
+            [part.place for part in place.parts]
+            if isinstance(place, Area)
+            else [place_obj]
+        ),
     )

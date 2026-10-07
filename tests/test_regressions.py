@@ -2006,8 +2006,10 @@ def test_an_area_across_a_border_gets_the_smallest_extract_containing_it(
     # one had to cover the area's envelope.
     import json
     import pathlib
+    import shutil
     import types
 
+    from pyrosm import get_data
     from shapely.geometry import box
 
     from transitio.osm import fetch_pbf
@@ -2019,7 +2021,7 @@ def test_an_area_across_a_border_gets_the_smallest_extract_containing_it(
     def get_data_by_area(area, directory=None, **kwargs):
         areas.append(area)
         path = pathlib.Path(directory) / "bbbike_Basel.osm.pbf"
-        path.write_bytes(b"\x00pbf")
+        shutil.copyfile(get_data("test_pbf"), path)
         fields = dict(provider="BBBike", extract="Basel", url=url, bytes=100138363)
         source = types.SimpleNamespace(
             path=str(path), sha256="0" * 64, snapshot=None, **fields
@@ -2095,18 +2097,22 @@ def test_extracts_need_cover_only_the_stops_within_the_buffer(tmp_path, monkeypa
 
 def _finland_extract(path, update, output_path=None, crop=None):
     """An ``AreaExtract`` stand-in for Geofabrik's Finland extract at ``path``,
-    written as pyrosm would: when missing or on update, then cropped to
-    ``output_path`` when given by ``crop(path, output_path)``, by default
-    ``b"crop of "`` and the extract's bytes."""
+    written as pyrosm would: when missing, pyrosm's ``test_pbf``, on update
+    its ``helsinki_pbf``, then cropped to ``output_path`` when given by
+    ``crop(path, output_path)``, by default ``b"crop of "`` and the
+    extract's bytes."""
     import hashlib
     import pathlib
+    import shutil
     import types
+
+    from pyrosm import get_data
 
     def crop_of(source, target):
         target.write_bytes(b"crop of " + source.read_bytes())
 
     if update or not path.exists():
-        path.write_bytes(b"\x00new" if update else b"\x00old")
+        shutil.copyfile(get_data("helsinki_pbf" if update else "test_pbf"), path)
     written = path
     if output_path is not None:
         written = pathlib.Path(output_path)
@@ -2138,7 +2144,10 @@ def test_fetches_sharing_a_cache_take_turns(tmp_path, monkeypatch):
     import concurrent.futures
     import hashlib
     import json
+    import pathlib
     import threading
+
+    from pyrosm import get_data
 
     from transitio.osm import fetch_pbf
 
@@ -2173,9 +2182,13 @@ def test_fetches_sharing_a_cache_take_turns(tmp_path, monkeypatch):
     crop_sidecar, full_sidecar = (
         json.loads(path.with_suffix(".provenance.json").read_text()) for path in paths
     )
-    assert paths[0].read_bytes() == b"crop of \x00old"
-    assert crop_sidecar["extract_sha256"] == hashlib.sha256(b"\x00old").hexdigest()
-    assert full_sidecar["extract_sha256"] == hashlib.sha256(b"\x00new").hexdigest()
+    old, new = (
+        pathlib.Path(get_data(name)).read_bytes()
+        for name in ("test_pbf", "helsinki_pbf")
+    )
+    assert paths[0].read_bytes() == b"crop of " + old
+    assert crop_sidecar["extract_sha256"] == hashlib.sha256(old).hexdigest()
+    assert full_sidecar["extract_sha256"] == hashlib.sha256(new).hexdigest()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges")
@@ -2551,3 +2564,268 @@ def test_delivered_feeds_are_named_by_feed_id(tmp_path, monkeypatch):
         assert sidecar["feed_id"] == feed_id
     files = [name + end for name in names for end in (".zip", ".provenance.json")]
     assert sorted(path.name for path in out.iterdir()) == sorted(files)
+
+
+def test_a_feed_is_read_from_the_csv_export_without_a_token(tmp_path, monkeypatch):
+    # MobilityDatabase.feed() raised MissingTokenError without a token, while
+    # search_feeds() read the same feeds from the catalogue export.
+    import httpx
+
+    from transitio.catalog import MobilityDatabase
+
+    body = (
+        "id,data_type,status,provider,location.country_code,urls.latest\n"
+        "mdb-1,gtfs,active,HSL,FI,https://files.example/mdb-1/latest.zip\n"
+        "mdb-2,gtfs_rt,active,HSL RT,FI,\n"
+    )
+    sent = []
+
+    def handler(request):
+        sent.append(request)
+        return httpx.Response(200, text=body)
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    transport = httpx.MockTransport(handler)
+    with MobilityDatabase(None, cache_dir=tmp_path, transport=transport) as db:
+        with pytest.warns(UserWarning, match="CSV catalogue export") as caught:
+            feed = db.feed("mdb-1")
+            assert db.search_feeds(country_code="FI") == [feed]
+            for feed_id in ("mdb-2", "mdb-9"):
+                with pytest.raises(LookupError, match=f"no GTFS feed '{feed_id}'"):
+                    db.feed(feed_id)
+    # Every warning points at the caller, and no API request was made.
+    assert {warning.filename for warning in caught} == {__file__}
+    assert [request.url.path for request in sent] == ["/feeds_v2.csv"]
+
+
+def test_an_area_fetch_selects_the_feeds_of_the_index_places(tmp_path, monkeypatch):
+    # fetch(aoi=...) searched the catalogue by bounding box and downloaded
+    # every feed whose box met the area's, continental aggregates included.
+    import datetime
+    import pathlib
+
+    import shapely
+
+    import transitio
+    import transitio.index as transitio_index
+    from index_fixture import covered_feed, edge, place, write_partitioned_index
+    from transitio.catalog import MobilityDatabase
+    from transitio.pipeline import fetch
+
+    monkeypatch.setattr(
+        transitio, "__version__", transitio_index.MIN_READER_VERSIONS[7], raising=False
+    )
+    monkeypatch.setattr(
+        "transitio.pipeline._fetch._today", lambda: datetime.date(2026, 6, 1)
+    )
+
+    def box(*bounds):
+        return shapely.to_wkb(shapely.box(*bounds)).hex()
+
+    places = [
+        place("fi", "country", geometry=box(24, 60, 26, 61)),
+        place("ee", "country", country_code="EE", geometry=box(24, 59, 26, 60)),
+        place("c", "city", parent_id="fi", geometry=box(*CITY_BBOX)),
+    ]
+    tiers = {"local": "primary", "regional": "secondary", "national": "tertiary"}
+    feeds = [
+        {
+            **covered_feed(f"f-{tier}"),
+            "atlas": {"urls": {"static_current": f"https://feeds.example/{tier}"}},
+            "home_country": "FI",
+            "scope": "domestic",
+        }
+        for tier in tiers
+    ]
+    edges = [
+        edge(where, f"f-{tier}", tier=tier, relevance_category=category, relevance=1)
+        for tier, category in tiers.items()
+        for where in ("c", "fi")
+    ]
+    index = transitio_index.read_index(
+        write_partitioned_index(
+            tmp_path / "index", feeds=feeds, places=places, edges=edges
+        )
+    )
+    downloads, searches, extracts = [], [], []
+
+    def download(self, feed, directory=None):
+        downloads.append(feed.feed_id)
+        return write_zip(pathlib.Path(directory) / "latest.zip", FEED)
+
+    def search(self, *args, **kwargs):
+        searches.append(kwargs["aoi"].bounds)
+        return []
+
+    def extract(area, **options):
+        extracts.append((area.bounds, sorted(options)))
+        return tmp_path / "area.osm.pbf"
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas._fetch_static", download)
+    monkeypatch.setattr(MobilityDatabase, "search_feeds", search)
+    monkeypatch.setattr("transitio.osm.fetch_pbf", extract)
+    options = dict(index=index, directory=tmp_path / "out", crop=False)
+    result = fetch(CITY_BBOX, **options)
+    assert (downloads, searches) == (["f-local", "f-regional"], [])
+    assert [p.id for p in result.places] == ["c"]
+    assert result.snapshot == index.snapshot_id
+    # The extract covers the area itself, not grown.
+    assert extracts == [(CITY_BBOX, ["cache_dir", "directory"])]
+    # Mostly in a country without feeds: the catalogue, with a warning.
+    mostly_ee = (24.9, 59.7, 25.0, 60.2)
+    with pytest.warns(UserWarning) as caught:
+        result = fetch(mostly_ee, **options)
+    assert (
+        "the feed index's places cover 19% of the area; 0 feeds from the "
+        "Mobility Database catalogue by bounding box"
+    ) in [str(warning.message) for warning in caught]
+    assert (searches, result.places, result.snapshot) == ([mostly_ee], [], None)
+
+
+def test_stops_at_the_origin_are_not_located(tmp_path):
+    # A stop at (0, 0), which stands for a missing position, was counted as a
+    # located stop outside the OSM area; the fingerprint still reads it, as the
+    # build's does.
+    import shapely
+
+    from transitio.index import fingerprint
+    from transitio.pipeline._fetch import _count_outside, _stop_coords
+
+    stops = FEED["stops.txt"] + "zero,Null Island,0.0,0.0\n"
+    path = write_zip(tmp_path / "feed.zip", {**FEED, "stops.txt": stops})
+    record = [{"decision": "delivered", "path": path}]
+    counts = _count_outside(record, shapely.box(*CITY_BBOX), {path: _stop_coords(path)})
+    assert (record[0]["stops_outside_osm"], counts) == (1, (1, 3, 0))
+    with zipfile.ZipFile(path) as archive:
+        assert fingerprint._member_coords(archive)["zero"] == (0.0, 0.0)
+
+
+def test_a_crop_drops_the_areas_groups_and_networks_it_orphans(tmp_path):
+    # A crop pruned stop_areas.txt, location_group_stops.txt and
+    # route_networks.txt but kept every area, location group and network,
+    # so the cropped feed defined those of the stops and routes it removed.
+    files = {
+        **FEED,
+        "areas.txt": "area_id\na-in\na-out\n",
+        "stop_areas.txt": "area_id,stop_id\na-in,in1\na-out,out1\n",
+        "location_groups.txt": "location_group_id\nlg-in\nlg-out\n",
+        "location_group_stops.txt": (
+            "location_group_id,stop_id\nlg-in,in1\nlg-out,out1\n"
+        ),
+        "networks.txt": "network_id\nn-in\nn-out\n",
+        "route_networks.txt": "network_id,route_id\nn-in,r-in\nn-out,r-out\n",
+    }
+    source = write_zip(tmp_path / "feed.zip", files)
+    output = tmp_path / "cropped.zip"
+    crop_feed(source, output, aoi=CITY_BBOX, reference_date="20260601")
+    for name, kept in [
+        ("areas.txt", "a-in"),
+        ("location_groups.txt", "lg-in"),
+        ("networks.txt", "n-in"),
+    ]:
+        rows = csv.reader(io.StringIO(read_entry(output, name).decode()))
+        assert [row[0] for row in rows][1:] == [kept]
+    report = validate_feed(output, reference_date="20260601")
+    assert not any(n["severity"] == "ERROR" for n in report["notices"])
+
+
+def test_the_index_download_shows_its_progress(tmp_path, monkeypatch, capsys):
+    # A refresh held the whole archive, about 420 MB, in memory and printed
+    # nothing while it downloaded.
+    import httpx
+
+    from index_fixture import API, DOWNLOADS, FakeGitHub, index, release
+    from transitio.index import _refresh
+    from transitio.index import release as contract
+
+    monkeypatch.setattr(_refresh, "_state", {key: None for key in _refresh._state})
+    fake = FakeGitHub()
+    snapshot_id = release(fake, index(tmp_path))
+    (asset,) = [
+        asset
+        for _, asset in fake.assets.values()
+        if asset["name"] == contract.archive_name(snapshot_id)
+    ]
+    # As on GitHub, the archive's URL redirects to the asset host.
+    path = asset["browser_download_url"].removeprefix(DOWNLOADS)
+    asset["browser_download_url"] = "https://github.example" + path
+
+    def handle(request):
+        if request.url.host == "github.example":
+            return httpx.Response(302, headers={"Location": DOWNLOADS + path})
+        return fake.handle(request)
+
+    transport = httpx.MockTransport(handle)
+    for progress in (True, False):
+        cache = tmp_path / f"cache-{progress}"
+        summary = _refresh.refresh(
+            repository="o/r",
+            api_url=API,
+            cache_dir=cache,
+            transport=transport,
+            progress=progress,
+        )
+        assert summary["installed"] and summary["snapshot_id"] == snapshot_id
+        # Off a terminal the download's bar is a line.
+        expected = (
+            f"Downloading feed index snapshot {snapshot_id}\n"
+            f"Unpacking and checking snapshot {snapshot_id}\n"
+        )
+        assert capsys.readouterr() == ("", expected if progress else "")
+
+
+def test_the_munich_feeds_are_told_apart(tmp_path, monkeypatch):
+    # Munich's feeds showed shares of about a quarter each and nothing said
+    # that MVV, DELFI and gtfs.de urban each run nearly all of its service.
+    import transitio
+    import transitio.index as transitio_index
+    from test_index_views import MUNICH, munich_index
+
+    monkeypatch.setattr(
+        transitio, "__version__", transitio_index.MIN_READER_VERSIONS[11]
+    )
+    three = {feed_id: MUNICH[feed_id] for feed_id in ("f-mvv", "f-delfi", "f-urban")}
+    munich = transitio_index.place("muc", index=munich_index(tmp_path, three))
+    table = munich.feeds(categories=None).to_dataframe().set_index("feed_id")
+    assert table["covers"].round(2).to_dict() == {
+        "f-mvv": 0.99,
+        "f-delfi": 1.0,
+        "f-urban": 0.94,
+    }
+    assert table.loc["f-urban", "repeats"] == "f-delfi 100 %, f-mvv 99 %"
+
+
+def test_munich_takes_one_feed_and_says_why_it_leaves_out_the_rest(
+    tmp_path, monkeypatch
+):
+    # Munich's view listed ten feeds and nothing said which to use: MVV alone
+    # runs nearly all of the city's service, its S-Bahn typed as tram.
+    import transitio
+    import transitio.index as transitio_index
+    from test_index_views import munich_index
+
+    monkeypatch.setattr(
+        transitio, "__version__", transitio_index.MIN_READER_VERSIONS[11]
+    )
+    munich = transitio_index.place("muc", index=munich_index(tmp_path))
+    found = munich.recommend("2026-10-13")
+    assert found.feed_ids == ["f-mvv"]
+    assert str(found).splitlines() == [
+        "Munich (city), 2026-10-13: take 1 feed, covering about 98 % of the "
+        "departures the index records there, each counted once",
+        "  + f-mvv: covers 98 % of the place's departures (98 % of bus; 98 % of "
+        "rail, subway and tram)",
+        "  - f-delfi (DELFI): repeats f-mvv (98 % of its departures); 550,396 "
+        "stops against 28,330",
+        "  - f-urban (Public Transport Germany): repeats f-mvv (99 % of its "
+        "departures); 674,929 stops against 28,330",
+        "  - f-mvg (MVG): repeats f-mvv (99 % of its departures); needs a free "
+        "account with MVG API",
+        "  - f-rail (Regional Rail): repeats f-mvv (100 % of its departures); "
+        "needs credentials the index has no details for",
+        "  - f-bw (BW aggregate): adds too little: 0.021 % of the place's "
+        "departures",
+        "  - f-tiny (Tiny): contained in f-bw",
+        "  - f-old (MVV (old)): stale when indexed: its timetable ended 2026-07-31",
+    ]
