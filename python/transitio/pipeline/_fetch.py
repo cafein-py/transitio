@@ -792,9 +792,10 @@ def _containers_first(feeds):
 
 
 def _read_tables(path, names, max_total_bytes=None):
-    """The tables ``names`` of a feed zip, read as ``FeedEditor`` does; None
-    when together they are over ``max_total_bytes`` (default: the
-    ``FeedEditor`` budget)."""
+    """The tables ``names`` of a feed zip, read as ``FeedEditor`` does, with
+    ``names`` a mapping only the columns it lists for each, by stripped
+    name; None when together they are over ``max_total_bytes`` (default:
+    the ``FeedEditor`` budget)."""
     import pandas as pd
 
     from transitio.edit._editor import _MAX_TOTAL_BYTES, _normalise_table
@@ -805,10 +806,14 @@ def _read_tables(path, names, max_total_bytes=None):
         members = [m for m in archive.infolist() if m.filename in names]
         if sum(m.file_size for m in members) > limit:
             return None
-        return {
-            m.filename: _normalise_table(pd.read_csv(archive.open(m), **csv))[0]
-            for m in members
-        }
+        tables = {}
+        for m in members:
+            table = pd.read_csv(archive.open(m), **csv)
+            if isinstance(names, dict):
+                wanted = names[m.filename]
+                table = table.loc[:, [str(c).strip() in wanted for c in table.columns]]
+            tables[m.filename] = _normalise_table(table)[0]
+        return tables
 
 
 def _service(path, day=None, max_total_bytes=None):
@@ -1137,6 +1142,52 @@ def _stored_repeats(items, keys):
     return found
 
 
+# The columns the matching of repeated trips and its time-zone check read,
+# by table; _repeats adds calendar.txt's weekdays.
+_MATCHED_COLUMNS = {
+    "agency.txt": {"agency_id", "agency_name", "agency_timezone"},
+    "stops.txt": {"stop_id", "stop_lat", "stop_lon"},
+    "routes.txt": {
+        "route_id",
+        "agency_id",
+        "route_short_name",
+        "route_long_name",
+        "route_type",
+        "continuous_pickup",
+        "continuous_drop_off",
+    },
+    "trips.txt": {
+        "trip_id",
+        "route_id",
+        "service_id",
+        "block_id",
+        "wheelchair_accessible",
+        "bikes_allowed",
+    },
+    "stop_times.txt": {
+        "trip_id",
+        "stop_id",
+        "stop_sequence",
+        "arrival_time",
+        "departure_time",
+        "pickup_type",
+        "drop_off_type",
+        "continuous_pickup",
+        "continuous_drop_off",
+    },
+    "calendar.txt": {"service_id", "start_date", "end_date"},
+    "calendar_dates.txt": {"service_id", "date", "exception_type"},
+    "frequencies.txt": {
+        "trip_id",
+        "start_time",
+        "end_time",
+        "headway_secs",
+        "exact_times",
+    },
+    "transfers.txt": {"from_trip_id", "to_trip_id"},
+}
+
+
 def _repeats(cache, items, keys, budgets, modes, day, duplicate_trips):
     """Per feed of ``items``, in priority order, ``(outcome, made)``: the
     trips left out as repeats, with ``duplicate_trips="drop"`` also near
@@ -1154,13 +1205,14 @@ def _repeats(cache, items, keys, budgets, modes, day, duplicate_trips):
     and stores nothing."""
     from transitio.gtfs._duplicates import repeated_trips
     from transitio.gtfs._merge import _stop_zone, _timezone_outliers, _timezones
+    from transitio.gtfs._schedule import _WEEKDAYS
 
     def unchanged(error):
         kept = {"dropped": None, "of": [], "skip": None, "window": None}
         return [({**kept, "note": f"repeated trips kept: {error}"}, None)] * len(items)
 
-    names = {"agency.txt", "stops.txt", "routes.txt", "trips.txt", "stop_times.txt"}
-    names |= {"calendar.txt", "calendar_dates.txt", "frequencies.txt", "transfers.txt"}
+    names = dict(_MATCHED_COLUMNS)
+    names["calendar.txt"] = names["calendar.txt"] | set(_WEEKDAYS)
     tables = []
     for item in items:
         try:

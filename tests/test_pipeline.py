@@ -1870,6 +1870,19 @@ def test_the_deduplicating_crop_is_reported(tmp_path, monkeypatch):
         )
 
 
+def test_the_matching_reads_only_the_columns_it_compares(tmp_path):
+    from transitio.pipeline._fetch import _read_tables
+
+    # " trip_id " folds into trip_id, whose blank value gives way to t1.
+    trips = "route_id, trip_id ,trip_id,shape_id\nr1,,t1,s1\n"
+    path = tmp_path / "feed.zip"
+    path.write_bytes(_zip({"trips.txt": trips, "stops.txt": "stop_id\ns1\n"}))
+    tables = _read_tables(path, {"trips.txt": {"trip_id"}})
+    assert {n: t.to_dict("list") for n, t in tables.items()} == {
+        "trips.txt": {"trip_id": ["t1"]}
+    }
+
+
 @pytest.mark.filterwarnings("ignore:no Mobility Database API token")
 def test_a_stored_comparison_names_the_feeds_compared(tmp_path, monkeypatch):
     # The same archive under another id is another feed for the note to name,
