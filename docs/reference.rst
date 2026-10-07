@@ -72,6 +72,10 @@ The index lists the feeds serving each place, by tier. ``place``, ``places``,
    IndexedFeed.service_end
    IndexedFeed.relevance
    IndexedFeed.relevance_category
+   IndexedFeed.share_of_place
+   IndexedFeed.stale_when_indexed
+   IndexedFeed.overlap
+   IndexedFeed.catalogue_name
    IndexedFeed.selector
    IndexedFeed.coverage
    IndexedFeed.files
@@ -93,6 +97,16 @@ The index lists the feeds serving each place, by tier. ``place``, ``places``,
    Index.realtime_unlinked
    Index.discovery_semantics_version
    Index.access_provider
+
+A query's feeds come as a ``FeedList``, a list with tabular exports.
+
+.. currentmodule:: transitio.index.feeds
+
+.. autosummary::
+   :toctree: api/
+
+   FeedList.to_dataframe
+   FeedList.to_geodataframe
 
 Feed credentials
 ----------------

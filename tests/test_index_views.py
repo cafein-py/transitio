@@ -1,6 +1,8 @@
 """Schema 7: a place's default view by kind, cross-border feeds on request,
 and ordering by relevance."""
 
+import datetime
+
 import pytest
 
 pytest.importorskip("geopandas")
@@ -348,3 +350,202 @@ def test_an_area_is_made_of_the_places_covering_it(
     once = area.feeds(categories=iter(["primary"]))
     every = area.feeds(categories=["primary"])
     assert [sorted(f.edges) for f in once] == [sorted(f.edges) for f in every]
+
+
+# A Munich-like city: three large feeds each running nearly all of its
+# service (f-mvv nameless, its S-Bahn typed as tram), a smaller city feed
+# behind an account, a regional rail feed behind unknown credentials, a stale
+# copy, a regional aggregate and a small feed it contains. Each feed's
+# departures a day by mode, its stop count and, per other feed, the share of
+# each mode's departures it also runs.
+MUNICH = {
+    "f-mvv": {
+        "name": None,
+        "tiers": ("local", "regional"),
+        "modes": {"bus": 283773, "tram": 76006, "subway": 37658, "rail": 1938},
+        "stops": 28330,
+        "end": "2026-11-30",
+        "with": {
+            "f-delfi": {"bus": 1.0, "tram": 1.0, "subway": 1.0, "rail": 1.0},
+            "f-mvg": {"bus": 0.97, "tram": 0.81, "subway": 1.0},
+            "f-urban": {"bus": 0.99, "tram": 0.81, "subway": 1.0},
+            "f-rail": {"tram": 0.19, "rail": 1.0},
+        },
+    },
+    "f-delfi": {
+        "name": "DELFI",
+        "mdb": {"name": "Registration required at the DELFI portal"},
+        "tiers": ("regional",),
+        "modes": {"bus": 288266, "tram": 61747, "subway": 37658, "rail": 17631},
+        "stops": 550396,
+        "with": {
+            "f-mvv": {"bus": 0.98, "tram": 1.0, "subway": 1.0, "rail": 0.98},
+            "f-urban": {"bus": 0.98, "tram": 1.0, "subway": 1.0},
+            "f-mvg": {"bus": 0.95, "tram": 1.0, "subway": 1.0},
+            "f-rail": {"rail": 0.97},
+        },
+    },
+    "f-urban": {
+        "name": "Public Transport Germany",
+        "modes": {"bus": 283289, "tram": 61747, "subway": 37860},
+        "stops": 674929,
+        "end": "2026-11-02",
+        "with": {
+            "f-mvv": {"bus": 0.99, "tram": 1.0, "subway": 0.99},
+            "f-delfi": {"bus": 1.0, "tram": 1.0, "subway": 1.0},
+            "f-mvg": {"bus": 0.96, "tram": 1.0, "subway": 0.99},
+        },
+    },
+    "f-mvg": {
+        "name": "MVG",
+        "modes": {"bus": 274129, "tram": 61747, "subway": 37658},
+        "stops": 4250,
+        "access": "key",
+        "provider": "mvg-api",
+        "with": {
+            "f-mvv": {"bus": 0.99, "tram": 1.0, "subway": 1.0},
+            "f-delfi": {"bus": 1.0, "tram": 1.0, "subway": 1.0},
+            "f-urban": {"bus": 0.99, "tram": 1.0, "subway": 1.0},
+        },
+    },
+    "f-rail": {
+        "name": "Regional Rail",
+        "tiers": ("regional",),
+        "modes": {"rail": 17190},
+        "stops": 16688,
+        "end": "2026-11-02",
+        "access": "key",
+        "with": {"f-mvv": {"rail": 1.0}, "f-delfi": {"rail": 1.0}},
+    },
+    "f-old": {"name": "MVV (old)", "stops": 27000, "end": "2026-07-31"},
+    "f-bw": {
+        "name": "BW aggregate",
+        "tiers": ("regional",),
+        "modes": {"bus": 200, "rail": 46},
+        "stops": 61261,
+        "with": {
+            "f-mvv": {"bus": 0.6, "rail": 0.85},
+            "f-delfi": {"bus": 0.95, "rail": 0.95},
+            "f-rail": {"rail": 0.55},
+        },
+    },
+    "f-tiny": {
+        "name": "Tiny",
+        "modes": {"bus": 30},
+        "stops": 120,
+        "contained": ["f-bw"],
+        "with": {
+            "f-mvv": {"bus": 0.77},
+            "f-delfi": {"bus": 0.96},
+            "f-bw": {"bus": 1.0},
+        },
+    },
+}
+MUNICH_PROVIDERS = [
+    {
+        "provider_id": "mvg-api",
+        "name": "MVG API",
+        "credential_fields": ["key"],
+        "free": True,
+    },
+]
+
+
+def munich_index(directory, feeds=MUNICH, *, overlap=True, providers=None):
+    """A schema-11 index of one city, ``muc``, served by ``feeds`` (specs as
+    in :data:`MUNICH`); ``overlap=False`` leaves out the overlap evidence
+    and the recorded staleness, as an index built before them."""
+    total = sum(sum(spec.get("modes", {}).values()) for spec in feeds.values())
+    records, edges = [], []
+    for feed_id, spec in feeds.items():
+        records.append(
+            {
+                **covered_feed(feed_id, name=spec["name"]),
+                "home_country": "DE",
+                "scope": "domestic",
+                "mdb": spec.get("mdb"),
+                "stop_count": spec["stops"],
+                "service_start": spec.get("start", "2026-06-01"),
+                "service_end": spec.get("end", "2026-12-31"),
+                "last_crawled": "2026-10-01T03:00:00+00:00",
+                "access": spec.get("access", "open"),
+                "access_provider": spec.get("provider"),
+            }
+        )
+        modes = spec.get("modes")
+        departures = sum(modes.values()) if modes else None
+        evidence = {"share_basis": "departures"}
+        evidence["share_of_place"] = (departures or 0) / total
+        if overlap and modes:
+            evidence["overlap"] = {"departures": modes, "with": spec.get("with", {})}
+        if overlap and spec.get("end") == "2026-07-31":
+            evidence["stale_when_indexed"] = spec["end"]
+        evidence.update(spec.get("evidence", {}))
+        service = {"stops": 100, "routes": 10, "departures_per_day": departures}
+        for n, tier in enumerate(spec.get("tiers", ("local",))):
+            category = "primary" if tier == "local" else "secondary"
+            edges.append(
+                {
+                    **_edge("muc", feed_id, tier, category, 0.5, service=service),
+                    # The first tier's routes run all of the feed's service.
+                    "evidence": evidence if n == 0 else {**evidence, "overlap": None},
+                }
+            )
+    path = write_partitioned_index(
+        directory,
+        feeds=records,
+        places=[place("muc", "city", country_code="DE", name="Munich")],
+        edges=edges,
+        contained={i: spec.get("contained", []) for i, spec in feeds.items()},
+        access={"providers": MUNICH_PROVIDERS if providers is None else providers},
+    )
+    return reader.read_index(path)
+
+
+@pytest.mark.parametrize("overlap", [True, False], ids=["overlap", "no-overlap"])
+def test_the_feed_table_ranks_and_explains_each_feed(tmp_path, monkeypatch, overlap):
+    monkeypatch.setattr(transitio, "__version__", reader.MIN_READER_VERSIONS[11])
+    munich = reader.place("muc", index=munich_index(tmp_path, overlap=overlap))
+    table = munich.feeds(categories=None).to_dataframe().set_index("feed_id")
+    assert (
+        list(table.reset_index().columns)
+        == (
+            "feed_id name catalogue_name tiers relevance_category relevance "
+            "share_of_place departures_per_day stops routes modes covers repeats "
+            "service_start service_end stale_when_indexed contained_in access "
+            "stop_count reason"
+        ).split()
+    )
+    mvv, delfi = table.loc["f-mvv"], table.loc["f-delfi"]
+    assert table["name"].isna()["f-mvv"]
+    assert delfi["catalogue_name"].startswith("Registration")
+    assert mvv["departures_per_day"] == 399375 and mvv["stop_count"] == 28330
+    assert table.loc["f-old", "stale_when_indexed"] == datetime.date(2026, 7, 31)
+    assert table.loc["f-tiny", "contained_in"] == ["f-bw"]
+    # The departures summed over the feeds are 1,578,573; each counted once,
+    # 405,314.3: f-delfi's, plus the share of f-bw's that f-delfi does not
+    # run (5 % of 246).
+    share = "25 % of the departures summed over the place's feeds"
+    if not overlap:
+        assert table["covers"].isna().all() and table["repeats"].isna().all()
+        assert mvv["modes"] == [] and mvv["share_of_place"] == 399375 / 1578573
+        assert mvv["reason"] == f"primary (local, regional tiers): {share}"
+    else:
+        assert mvv["covers"] == pytest.approx(399375 / 405314.3)
+        assert mvv["modes"] == ["bus", "tram", "subway", "rail"]
+        assert mvv["repeats"] == "f-delfi 100 %, f-urban 95 %, f-mvg 93 %"
+        assert mvv["reason"] == (
+            f"primary (local, regional tiers): {share}; repeats f-delfi (100 %)"
+        )
+        assert table.loc["f-tiny", "reason"] == (
+            "primary (local tier): 0.0019 % of the departures summed over the "
+            "place's feeds; repeats f-bw (100 %); contained in f-bw"
+        )
+    assert table.loc["f-old", "reason"] == (
+        "primary (local tier): 0 % of the departures summed over the place's "
+        "feeds; stale when indexed: its timetable ended 2026-07-31"
+    )
+    assert table.loc["f-mvg", "reason"].endswith("; needs a free account with MVG API")
+    assert table.loc["f-rail", "reason"].endswith(
+        "; needs credentials the index has no details for"
+    )

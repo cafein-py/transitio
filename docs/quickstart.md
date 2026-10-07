@@ -418,6 +418,26 @@ warning repeats it. `exclude` drops named tiers and
 the companions the index could not tie to one are in
 `Index.realtime_unlinked()`.
 
+To compare a place's feeds side by side, take them as a table:
+
+```python
+munich = transitio.place("Munich", kind="city")
+table = munich.feeds(categories=None).to_dataframe()
+table[["feed_id", "name", "covers", "repeats", "stop_count", "reason"]]
+```
+
+One row per feed, with its tiers, relevance, `share_of_place` (its share
+of the departures summed over the place's feeds), its service there, its
+modes, its timetable window and whether it was `stale_when_indexed`, the
+feeds it is `contained_in`, its access and its stop count. On an index that
+records which feeds run the same lines, `covers` is the share of the place's
+departures the feed runs, each departure counted once, and `repeats` names
+the feeds that also run its departures, such as `"f-mdb-3215 100 %,
+f-germany~urban~transport 95 %"`; without that evidence both are empty.
+`reason` sums a row up in words, for example `"primary (local, regional
+tiers): 25 % of the departures summed over the place's feeds; repeats
+f-mdb-3215 (100 %)"`.
+
 ### Feeds for an area
 
 `transitio.index.area` finds the index places that cover an area of your

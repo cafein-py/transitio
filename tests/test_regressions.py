@@ -2774,3 +2774,24 @@ def test_the_index_download_shows_its_progress(tmp_path, monkeypatch, capsys):
             f"Unpacking and checking snapshot {snapshot_id}\n"
         )
         assert capsys.readouterr() == ("", expected if progress else "")
+
+
+def test_the_munich_feeds_are_told_apart(tmp_path, monkeypatch):
+    # Munich's feeds showed shares of about a quarter each and nothing said
+    # that MVV, DELFI and gtfs.de urban each run nearly all of its service.
+    import transitio
+    import transitio.index as transitio_index
+    from test_index_views import MUNICH, munich_index
+
+    monkeypatch.setattr(
+        transitio, "__version__", transitio_index.MIN_READER_VERSIONS[11]
+    )
+    three = {feed_id: MUNICH[feed_id] for feed_id in ("f-mvv", "f-delfi", "f-urban")}
+    munich = transitio_index.place("muc", index=munich_index(tmp_path, three))
+    table = munich.feeds(categories=None).to_dataframe().set_index("feed_id")
+    assert table["covers"].round(2).to_dict() == {
+        "f-mvv": 0.99,
+        "f-delfi": 1.0,
+        "f-urban": 0.94,
+    }
+    assert table.loc["f-urban", "repeats"] == "f-delfi 100 %, f-mvv 99 %"
