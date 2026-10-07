@@ -2888,3 +2888,55 @@ def test_a_feed_running_the_same_lines_less_often_does_not_replace_it(
     index = transitio_index.read_index(path)
     area = transitio_index.area((2, 0, 2.8, 0.4), index=index)
     assert sorted(area.recommend("2026-10-13").feed_ids) == ["f-agg", "f-city"]
+
+
+def test_a_feed_measured_apart_is_not_counted_as_new_service(tmp_path, monkeypatch):
+    # The merged index measured MVV's feed in another build than DELFI's, so
+    # neither named the other and MVV was taken as service DELFI lacks; a
+    # tram feed measured with DELFI and sharing no line still adds service.
+    import transitio
+    import transitio.index as transitio_index
+    from test_index_views import munich_index
+
+    monkeypatch.setattr(
+        transitio, "__version__", transitio_index.MIN_READER_VERSIONS[11]
+    )
+
+    def spec(name, modes, stops, compared, shares=None):
+        overlap = {"departures": modes, "with": shares or {}, "compared": compared}
+        return {
+            "name": name,
+            "modes": modes,
+            "stops": stops,
+            "evidence": {"overlap": overlap},
+        }
+
+    feeds = {
+        "f-delfi": spec(
+            "DELFI",
+            {"bus": 900, "rail": 500},
+            5000,
+            ["f-mvg", "f-tram"],
+            {"f-mvg": {"bus": 1.0}},
+        ),
+        "f-mvg": spec(
+            "MVG", {"bus": 400}, 300, ["f-delfi", "f-tram"], {"f-delfi": {"bus": 1.0}}
+        ),
+        "f-tram": spec("Tram", {"tram": 100}, 50, ["f-delfi", "f-mvg"]),
+        "f-mvv": spec("MVV", {"bus": 900, "rail": 500}, 1000, []),
+        # Apart too, but contained in DELFI: left out for that.
+        "f-sub": {**spec("Sub", {"bus": 20}, 10, []), "contained": ["f-delfi"]},
+    }
+    found = transitio_index.place("muc", index=munich_index(tmp_path, feeds)).recommend(
+        "2026-10-13"
+    )
+    assert found.feed_ids == ["f-delfi", "f-tram"]
+    reasons = {c.feed.feed_id: c.reason for c in found.left_out}
+    assert reasons["f-mvv"] == (
+        "not compared: the index measured it apart from the feeds taken"
+    )
+    assert reasons["f-sub"] == "contained in f-delfi"
+    assert found.note == (
+        "the coverage leaves out 1 feed not compared with the others "
+        "(1,400 departures a day)"
+    )

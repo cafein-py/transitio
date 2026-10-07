@@ -158,7 +158,7 @@ def test_a_recommendation_takes_what_each_feed_adds(
     if overlap:
         assert found.basis == "overlap"
         assert found.note == (
-            "the coverage leaves out 1 feed the index records no overlap for "
+            "the coverage leaves out 1 feed not compared with the others "
             "(1,000 departures a day)"
             if uncompared
             else None
