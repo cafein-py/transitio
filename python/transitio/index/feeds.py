@@ -813,30 +813,54 @@ def _family_blocks(feeds):
     """Each feed's overlap evidence by mode family, for the feeds that record
     departures: ``{feed_id: (departures, shares)}``, ``departures`` per
     family and ``shares`` per other feed, the share of each family's
-    departures that feed also runs."""
-    blocks = {}
+    departures that feed also runs, summed over the places of the matched
+    edges. The index records which lines another feed runs, so at each place
+    a listed feed is credited with at most its own departures there in the
+    family: a feed running the same lines with fewer trips does not stand in
+    for all of them. Another feed recording no departures there keeps the
+    recorded share."""
+    by_place = {}
     for feed in feeds:
-        overlap = feed.overlap
-        if overlap is None:
-            continue
-        departures, run = {}, {}
-        for mode, value in overlap["departures"].items():
-            family = _FAMILIES.get(mode, mode)
-            departures[family] = departures.get(family, 0.0) + value
-        for other, shares in overlap["with"].items():
-            mine = run.setdefault(other, {})
-            for mode, share in shares.items():
+        for edge in feed.edges.values():
+            block = (edge.evidence or {}).get("overlap")
+            if not isinstance(block, dict):
+                continue
+            here = by_place.setdefault(edge.place_id, {})
+            departures, run = here.setdefault(feed.feed_id, ({}, {}))
+            counts = {m: float(v) for m, v in (block.get("departures") or {}).items()}
+            for mode, value in counts.items():
                 family = _FAMILIES.get(mode, mode)
-                value = share * overlap["departures"].get(mode, 0.0)
-                mine[family] = mine.get(family, 0.0) + value
+                departures[family] = departures.get(family, 0.0) + value
+            for other, shares in (block.get("with") or {}).items():
+                mine = run.setdefault(other, {})
+                for mode, share in shares.items():
+                    family = _FAMILIES.get(mode, mode)
+                    value = share * counts.get(mode, 0.0)
+                    mine[family] = mine.get(family, 0.0) + value
+    totals, credited = {}, {}
+    for here in by_place.values():
+        for feed_id, (departures, run) in here.items():
+            total = totals.setdefault(feed_id, {})
+            for family, value in departures.items():
+                total[family] = total.get(family, 0.0) + value
+            mine = credited.setdefault(feed_id, {})
+            for other, by in run.items():
+                theirs = here[other][0] if other in here else None
+                into = mine.setdefault(other, {})
+                for family, value in by.items():
+                    if theirs is not None:
+                        value = min(value, theirs.get(family, 0.0))
+                    into[family] = into.get(family, 0.0) + value
+    blocks = {}
+    for feed_id, departures in totals.items():
         if sum(departures.values()) > 0:
             shares = {
                 other: {
                     f: v / departures[f] for f, v in by.items() if departures.get(f)
                 }
-                for other, by in run.items()
+                for other, by in credited[feed_id].items()
             }
-            blocks[feed.feed_id] = (departures, shares)
+            blocks[feed_id] = (departures, shares)
     return blocks
 
 
