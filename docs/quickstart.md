@@ -408,6 +408,38 @@ warning repeats it. `exclude` drops named tiers and
 the companions the index could not tie to one are in
 `Index.realtime_unlinked()`.
 
+### Feeds for an area
+
+`transitio.index.area` finds the index places that cover an area of your
+own, such as a study region drawn as a polygon:
+
+```python
+import shapely
+
+munich = transitio.place("Munich", kind="city")
+district = transitio.place("Munich District")
+region = shapely.union_all([munich.geometry, district.geometry])
+area = transitio.index.area(region)
+area.coverage          # 1.0: the share of the area's land the parts cover
+for part in area.parts:
+    part.place, part.whole, part.inside, part.holds
+area.feeds()           # each part's feeds, every feed once
+```
+
+Only cities, regions and countries with feeds count; metros do not. A place
+at least half inside the area is a whole part, unless a place containing it
+is too: Munich and its district are two whole parts, not Bavaria. A place
+less than half inside is a partial part when it holds at least 1 % of the
+area and no place containing it is a whole part, and it gives way to any
+smaller place inside it that is a part, so a box in one district gives that
+district, not its city or region. `inside` is the share of the place inside
+the area and `holds` the share of the area inside the place. `coverage`
+divides the area the parts cover by the area's land, its part inside the
+index's countries: sea does not count, and land in a country without feeds
+counts as uncovered. `country="DE"` keeps the places of one country.
+`area.feeds()` asks each part for its feeds as `place.feeds()` does, with
+the same arguments, and lists each feed once.
+
 ## Reading the validation report
 
 Notices follow the canonical

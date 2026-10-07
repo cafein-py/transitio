@@ -46,6 +46,10 @@ The index lists the feeds serving each place, by tier. ``place``, ``places``,
    read_index
    load
    links
+   area
+   Area
+   Area.feeds
+   AreaPart
    Place
    Place.feeds
    Place.delineations

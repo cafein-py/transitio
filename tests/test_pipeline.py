@@ -2632,7 +2632,7 @@ def test_osm_parts_are_those_holding_a_delivered_stop(
     assert must_cover == (None if inside is None else shapely.multipoints(inside))
 
 
-_PARTS_NOTE = "OSM area: 1 of 2 parts (247 of 487 km²)"
+_PARTS_NOTE = "OSM area: 1 of 2 parts (247 of 488 km²)"
 
 
 @pytest.mark.parametrize(

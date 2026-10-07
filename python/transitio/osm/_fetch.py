@@ -54,7 +54,8 @@ def _as_geometry(aoi):
 
 def _utm_groups(geoms):
     """Yield ``(central meridian, projected)`` per UTM zone: the geometries
-    whose centroid falls in the zone, as a GeoSeries in that zone's CRS."""
+    whose centroid falls in the zone, as a GeoSeries in that zone's CRS
+    indexed by their positions in ``geoms``."""
     import geopandas as gpd
 
     centroids = shapely.centroid(geoms)
@@ -62,8 +63,9 @@ def _utm_groups(geoms):
     zones = np.floor((lon + 180.0) / 6.0).astype(int) % 60 + 1
     codes = np.where(lat < 0, 32700, 32600) + zones
     for code in np.unique(codes):
-        chosen = gpd.GeoSeries(geoms[codes == code], crs="EPSG:4326")
-        yield 6 * (int(code) % 100) - 183, chosen.to_crs(int(code))
+        chosen = np.flatnonzero(codes == code)
+        series = gpd.GeoSeries(geoms[chosen], index=chosen, crs="EPSG:4326")
+        yield 6 * (int(code) % 100) - 183, series.to_crs(int(code))
 
 
 def _buffered(geometry, buffer_m):
@@ -91,11 +93,19 @@ def _buffered(geometry, buffer_m):
     return shapely.union_all(grown)
 
 
+def _areas_km2(geoms):
+    """The area in km² of each WGS84 geometry in ``geoms``, measured in an
+    equal-area projection (EPSG:6933), so shares of areas far apart or of
+    whole countries compare; 0 for a null or empty one."""
+    import geopandas as gpd
+
+    series = gpd.GeoSeries(np.asarray(geoms, dtype=object), crs="EPSG:4326")
+    return np.nan_to_num(series.to_crs(6933).area.to_numpy()) / 1e6
+
+
 def _area_km2(geometry):
-    """The area of ``geometry`` in km², each part measured in the UTM zone of
-    its centroid."""
-    parts = shapely.get_parts(geometry)
-    return sum(projected.area.sum() for _, projected in _utm_groups(parts)) / 1e6
+    """The area of ``geometry`` in km² (:func:`_areas_km2`)."""
+    return float(_areas_km2([geometry])[0])
 
 
 def _extract(geometry, update, directory, must_cover, output_path=None):

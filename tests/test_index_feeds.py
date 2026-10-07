@@ -237,6 +237,15 @@ def test_malformed_selector_states_fail_safe_to_unavailable():
     metro = transitio_index.place("Q102", index=idx)
     for feed in metro.feeds():
         assert feed.selector.state == "unavailable"
+    # A whole-feed edge absorbs one without a usable selector.
+    edges.append(
+        _edge_row("Q102", "f-mix", tier="national", selector_state="whole_feed")
+    )
+    metro = transitio_index.place("Q102", index=_index(edges=edges))
+    (mix,) = [
+        f for f in metro.feeds(tiers=["local", "national"]) if f.feed_id == "f-mix"
+    ]
+    assert mix.selector.state == "whole_feed"
 
 
 def test_a_feed_carries_its_snapshot_id(idx):

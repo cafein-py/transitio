@@ -1,12 +1,14 @@
 """The feed-membership read API: which feeds serve a place, and how.
 
-:meth:`Place.feeds` queries the index's membership edges for one place and
-returns :class:`IndexedFeed` objects — a feed joined with its matched edges.
+:meth:`Place.feeds` queries the index's membership edges for one place, and
+:meth:`Area.feeds` for the places covering an area, and each returns
+:class:`IndexedFeed` objects — a feed joined with its matched edges.
 ``edges`` is the authoritative per-tier record; the singular fields are
 aggregates over *the tiers the query matched*: ``needs_review`` is the *or*,
-``selector`` the union — always a :class:`Selector` object, never ``None``,
-with ``unavailable`` dominating, because a union that silently omitted the
-unfilterable part would be exactly the wrong answer — and ``service`` the
+``selector`` the union — always a :class:`Selector` object, never ``None``:
+the whole feed when any edge selects it, else ``unavailable`` dominating,
+because a union that silently omitted the unfilterable part would be exactly
+the wrong answer — and ``service`` the
 feed's service level in the place (stops, routes, departures per day), which
 every tier edge of the pair carries identically.
 
@@ -159,6 +161,7 @@ class TierEdge:
     """One membership edge, as the query matched it."""
 
     def __init__(self, record):
+        self.place_id = record["place_id"]
         self.tier = record["tier"]
         self.tier_confidence = float(record["tier_confidence"])
         self.method = record["method"]
@@ -307,9 +310,9 @@ class RealtimeFeed:
 
 
 class IndexedFeed:
-    """A feed serving a place: its identity row plus the matched tier edges,
-    on schema 8 its GTFS-RT companions, and on schema 11 how to get the
-    credentials a protected feed needs (from ``index``, when given)."""
+    """A feed serving a place or an area: its identity row plus the matched
+    tier edges, on schema 8 its GTFS-RT companions, and on schema 11 how to
+    get the credentials a protected feed needs (from ``index``, when given)."""
 
     def __init__(self, row, edges, realtime=(), index=None):
         self._row = row
@@ -510,7 +513,7 @@ class IndexedFeed:
 
     @property
     def tiers(self):
-        return frozenset(self.edges)
+        return frozenset(edge.tier for edge in self.edges.values())
 
     @property
     def relevance_category(self):
@@ -546,18 +549,19 @@ class IndexedFeed:
 
     @property
     def selector(self):
-        """The union of the matched edges' selectors; the weakest link decides.
+        """The union of the matched edges' selectors: the whole feed when an
+        edge selects it, else the weakest link decides.
 
         Fail-safe: an unknown selector state, or a ``complete`` edge carrying no
         route ids, counts as ``unavailable`` — a trusted empty selector would let
         downstream filtering silently drop routes.
         """
         states = {edge.selector_state for edge in self.edges.values()}
-        if states - {"whole_feed", "complete"}:
-            return Selector("unavailable")
         if "whole_feed" in states:
-            # A whole-feed claim absorbs any route subset it is unioned with.
+            # A whole-feed claim absorbs any selector it is unioned with.
             return Selector("whole_feed")
+        if states - {"complete"}:
+            return Selector("unavailable")
         route_ids = set()
         declared = []
         for edge in self.edges.values():
@@ -707,12 +711,12 @@ def _companions(index, feed_id, partition=None):
     return [RealtimeFeed(record) for record in mine.to_dict("records")]
 
 
-def _link_edges(index, place):
-    """The cross-border edges to ``place`` a country load does not carry in
-    its edges, with the rows of the feeds they name."""
+def _link_edges(index, place_ids):
+    """The cross-border edges to the places ``place_ids`` a country load does
+    not carry in its edges, with the rows of the feeds they name."""
     if index.links is None or index.country is None:
         return [], {}
-    links = index.links[index.links["place_id"] == place.id]
+    links = index.links[index.links["place_id"].isin(place_ids)]
     records = links.to_dict("records")
     rows = {}
     for partition in sorted({r["feed_partition"] for r in records}):
@@ -729,18 +733,7 @@ def _view_key(feed):
     return (rank, -(feed.relevance or 0.0), feed.feed_id)
 
 
-def feeds_for_place(
-    index,
-    place,
-    *,
-    tiers=None,
-    exclude=None,
-    spec="gtfs",
-    on_unknown="include",
-    requires=None,
-    categories="default",
-    international=False,
-):
+def feeds_for_place(index, place, **query):
     """The :class:`IndexedFeed` list for ``place``, filtered by the query.
 
     A feed is returned when its spec is selected — ``spec="gtfs"`` by default,
@@ -768,8 +761,32 @@ def feeds_for_place(
     by category, then relevance high to low, then id. An older index has no
     relevance: every feed is listed, sorted by id.
     """
+    found = _feeds_for_places(index, [place], **query)
+    for feed in found:
+        feed.edges = {tier: edge for (_, tier), edge in feed.edges.items()}
+    return found
+
+
+def _feeds_for_places(
+    index,
+    places,
+    *,
+    tiers=None,
+    exclude=None,
+    spec="gtfs",
+    on_unknown="include",
+    requires=None,
+    categories="default",
+    international=False,
+):
+    """The :class:`IndexedFeed` list for ``places``, each feed once: every
+    place answers as in :func:`feeds_for_place`, and a feed's matched edges
+    are keyed by ``(place_id, tier)``, in the order of ``places``."""
     if on_unknown not in ("include", "exclude"):
         raise ValueError("on_unknown must be 'include' or 'exclude'")
+    if categories not in (None, "default"):
+        # Read once: every place applies the same categories.
+        categories = frozenset(categories)
     if requires is None:
         needed = frozenset()
     else:
@@ -782,24 +799,30 @@ def feeds_for_place(
     )
     if index.edges is None and not (ranked and international):
         return FeedList()
+    ids = [place.id for place in places]
     records = []
     if index.edges is not None:
-        records = index.edges[index.edges["place_id"] == place.id].to_dict("records")
+        records = index.edges[index.edges["place_id"].isin(ids)].to_dict("records")
     if ranked and not international:
         records = [e for e in records if not e.get("cross_border")]
     rows = {}
-    if index.feeds is not None:
-        rows = {row["feed_id"]: row for row in index.feeds.to_dict("records")}
     if ranked and international:
-        linked, link_rows = _link_edges(index, place)
+        linked, rows = _link_edges(index, ids)
         records += linked
-        rows = {**link_rows, **rows}
-    wanted = (
-        _default_categories(place, tiers, categories, international) if ranked else None
-    )
+    if index.feeds is not None:
+        named = {edge["feed_id"] for edge in records}
+        own = index.feeds[index.feeds["feed_id"].isin(named)]
+        rows.update((row["feed_id"], row) for row in own.to_dict("records"))
+    wanted = dict.fromkeys(ids)
+    if ranked:
+        wanted = {
+            p.id: _default_categories(p, tiers, categories, international)
+            for p in places
+        }
     by_feed = {}
     for edge in records:
-        by_feed.setdefault(edge["feed_id"], []).append(edge)
+        by_place = by_feed.setdefault(edge["feed_id"], {})
+        by_place.setdefault(edge["place_id"], []).append(edge)
     found = FeedList()
     for feed_id in sorted(by_feed):
         row = rows.get(feed_id)
@@ -807,7 +830,12 @@ def feeds_for_place(
             continue
         if allowed is not None and row.get("spec") not in allowed:
             continue
-        matched = _matched(by_feed[feed_id], tiers, exclude, on_unknown, wanted)
+        matched = {}
+        for place_id in ids:
+            edges = by_feed[feed_id].get(place_id, ())
+            query = (tiers, exclude, on_unknown, wanted[place_id])
+            for tier, edge in _matched(edges, *query).items():
+                matched[(place_id, tier)] = edge
         if not matched:
             continue
         feed = IndexedFeed(

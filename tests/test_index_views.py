@@ -206,3 +206,145 @@ def test_an_index_without_relevance_lists_every_feed_by_id():
     assert _ids(feeds) == sorted(_ids(feeds))
     assert feeds[0].relevance_category is None and feeds[0].relevance is None
     assert _ids(metro.feeds(international=True, spec=None)) == _ids(feeds)
+
+
+# Near the equator, so shares follow the boxes' degree areas. Country aa
+# holds region r with two cities; bb a city; cc has no feeds.
+AREA_PLACES = [
+    place("aa", "country", country_code="AA", geometry=_box(2, 0, 4, 2)),
+    place("r", "region", country_code="AA", parent_id="aa", geometry=_box(2, 0, 3, 1)),
+    place(
+        "c1", "city", country_code="AA", parent_id="r", geometry=_box(2, 0, 2.4, 0.4)
+    ),
+    place(
+        "k2",
+        "city",
+        source_subtype="county",
+        country_code="AA",
+        parent_id="r",
+        geometry=_box(2.4, 0, 2.8, 0.4),
+    ),
+    place("m", "metro", country_code="AA", geometry=_box(2, 0, 2.8, 0.4)),
+    place("bb", "country", country_code="BB", geometry=_box(4, 0, 6, 2)),
+    place(
+        "b1", "city", country_code="BB", parent_id="bb", geometry=_box(4, 0, 4.4, 0.4)
+    ),
+    place("cc", "country", country_code="CC", geometry=_box(0, 0, 2, 2)),
+]
+AREA_EDGES = [
+    edge(place_id, feed_id, tier=tier)
+    for place_id, feed_id, tier in (
+        ("aa", "f-aa", "national"),
+        ("r", "f-r", "regional"),
+        ("c1", "f-c1", "local"),
+        ("c1", "f-bus", "local"),
+        ("k2", "f-bus", "local"),
+        ("m", "f-m", "local"),
+        ("bb", "f-bb", "national"),
+        ("b1", "f-b1", "local"),
+    )
+]
+
+
+@pytest.mark.parametrize(
+    "bounds, country, parts, coverage, feeds",
+    [
+        pytest.param(
+            (2, 0, 2.8, 0.4),
+            None,
+            [("c1", True, 1.0, 0.5), ("k2", True, 1.0, 0.5)],
+            1.0,
+            {"f-bus": ["c1", "k2"], "f-c1": ["c1"]},
+            id="city-and-county",
+        ),
+        pytest.param(
+            (2.1, 0.1, 2.2, 0.2),
+            None,
+            [("c1", False, 0.06, 1.0)],
+            1.0,
+            {"f-bus": ["c1"], "f-c1": ["c1"]},
+            id="box-in-a-district",
+        ),
+        pytest.param(
+            (2.3, 0.1, 2.5, 0.25),
+            None,
+            [("c1", False, 0.09, 0.5), ("k2", False, 0.09, 0.5)],
+            1.0,
+            {"f-bus": ["c1", "k2"], "f-c1": ["c1"]},
+            id="across-two-cities",
+        ),
+        pytest.param((10, 0, 10.5, 0.5), None, [], 0.0, {}, id="off-the-country"),
+        pytest.param(
+            (3.9, 0, 4.1, 0.3),
+            "BB",
+            [("b1", False, 0.19, 0.5)],
+            1.0,
+            {"f-b1": ["b1"]},
+            id="country-filter",
+        ),
+        pytest.param(
+            (1.4, 1.1, 2.2, 1.3),
+            None,
+            [("aa", False, 0.01, 0.25)],
+            0.25,
+            {"f-aa": ["aa"]},
+            id="mostly-in-a-country-without-feeds",
+        ),
+        pytest.param(
+            (2.5, 0.3, 2.9, 0.95),
+            None,
+            [("k2", False, 0.19, 0.12)],
+            0.12,
+            {"f-bus": ["k2"]},
+            id="city-over-1pc-displaces-its-region",
+        ),
+        pytest.param(
+            (2.79, 0.39, 2.99, 0.79),
+            None,
+            [("r", False, 0.08, 1.0)],
+            1.0,
+            {"f-r": ["r"]},
+            id="city-under-1pc-leaves-its-region",
+        ),
+    ],
+)
+def test_an_area_is_made_of_the_places_covering_it(
+    tmp_path, bounds, country, parts, coverage, feeds
+):
+    from index_fixture import covered_feed as feed, write_index
+
+    ids = sorted({edge["feed_id"] for edge in AREA_EDGES})
+    index = reader.read_index(
+        write_index(
+            tmp_path / "index",
+            feeds=[feed(feed_id) for feed_id in ids],
+            places=AREA_PLACES,
+            edges=AREA_EDGES,
+        )
+    )
+    area = reader.area(bounds, country=country, index=index)
+    found = [
+        (part.place.id, part.whole, round(part.inside, 2), round(part.holds, 2))
+        for part in area.parts
+    ]
+    assert found == parts
+    assert round(area.coverage, 2) == coverage
+    assert f"parts={len(parts)}, coverage={coverage:.2f})" in repr(area)
+    listed = {f.feed_id: sorted({p for p, _ in f.edges}) for f in area.feeds()}
+    assert listed == feeds
+    # Categories given once serve every part.
+    ranked = [
+        {**e, "relevance_category": "primary", "relevance": 0.5} for e in AREA_EDGES
+    ]
+    ranked_index = reader.read_index(
+        write_partitioned_index(
+            tmp_path / "ranked",
+            feeds=[feed(feed_id) for feed_id in ids],
+            places=AREA_PLACES,
+            edges=ranked,
+        )
+    )
+    area = reader.area(bounds, country=country, index=ranked_index)
+    once = area.feeds(categories=iter(["primary"]))
+    every = area.feeds(categories=["primary"])
+    assert [sorted(f.edges) for f in once] == [sorted(f.edges) for f in every]
