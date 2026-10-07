@@ -1,12 +1,13 @@
 """Installing and selecting published index snapshots on this machine.
 
 :func:`refresh` lists the index repository's releases, takes the newest one
-whose manifest this reader supports, downloads its archive, verifies the
-digest the manifest declares, unpacks it defensively into a private staging
-directory, validates the layout with the reader, and only then activates it
-by one atomic rename into the platformdirs cache — a failed or incompatible
-download leaves the previous snapshot in place. :func:`use` selects among
-installed snapshots for this process only: it writes nothing to disk.
+whose manifest this reader supports, streams its archive into the cache,
+verifies the size and digest the manifest declares, unpacks it defensively
+into a private staging directory, validates the layout with the reader, and
+only then activates it by one atomic rename into the platformdirs cache — a
+failed or incompatible download leaves the previous snapshot in place.
+:func:`use` selects among installed snapshots for this process only: it
+writes nothing to disk.
 
 Which snapshot a query reads is resolved lazily on first index access, never
 at import: an active :func:`use` selection, then the ``TRANSITIO_INDEX_SNAPSHOT``
@@ -17,11 +18,10 @@ that says to run :func:`refresh`.
 
 import contextlib
 import gzip
-import hashlib
-import io
 import os
 import shutil
 import stat
+import sys
 import tarfile
 import tempfile
 from pathlib import Path
@@ -400,14 +400,18 @@ def _client(api_url, transport):
     )
 
 
-def _unpack(data, staging):
-    """Write the archive's members into ``staging``: only the expected names,
-    each once, regular files only, within their ceilings — a digest proves
-    the archive is ours, not that extracting it is safe."""
+def _unpack(archive, staging):
+    """Write the members of the archive at ``archive`` into ``staging``: only
+    the expected names, each once, regular files only, within their ceilings
+    — a digest proves the archive is ours, not that extracting it is safe."""
     seen = set()
     try:
-        stream = _Bounded(gzip.GzipFile(fileobj=io.BytesIO(data)), _MAX_STREAM_BYTES)
-        with tarfile.open(fileobj=stream, mode="r|") as tar:
+        with (
+            gzip.open(archive, "rb") as compressed,
+            tarfile.open(
+                fileobj=_Bounded(compressed, _MAX_STREAM_BYTES), mode="r|"
+            ) as tar,
+        ):
             for member in tar:
                 name = member.name
                 if not _is_member_name(name):
@@ -461,17 +465,17 @@ def _installing(root):
         yield
 
 
-def _install(root, snapshot_id, data):
-    """Unpack, validate and activate one snapshot under the cache lock; the
-    previous one stays whole whatever fails. A target that another refresh
-    completed meanwhile is accepted once it reads back whole; a damaged one
-    is set aside and replaced."""
+def _install(root, snapshot_id, archive):
+    """Unpack the archive at ``archive``, validate and activate its snapshot
+    under the cache lock; the previous one stays whole whatever fails. A
+    target that another refresh completed meanwhile is accepted once it reads
+    back whole; a damaged one is set aside and replaced."""
     from transitio.index import read_index
 
     snapshots = _snapshots(root)
     staging = Path(tempfile.mkdtemp(prefix=f".incoming-{snapshot_id}-", dir=snapshots))
     try:
-        _unpack(data, staging)
+        _unpack(archive, staging)
         try:
             index = read_index(staging)
         except (TransitioError, ValueError, OSError) as error:
@@ -543,6 +547,71 @@ def _prune(root, keep, protect):
     return removed, leftover
 
 
+def _say(text, end="\n"):
+    print(text, end=end, file=sys.stderr, flush=True)
+
+
+def _tenths(size):
+    """A download callback that prints each tenth of ``size`` reached."""
+    shown = 0
+
+    def report(written):
+        nonlocal shown
+        reached = min(written * 10 // size, 10)
+        while shown < reached:
+            shown += 1
+            _say(f" {shown * 10}%", end="")
+
+    return report
+
+
+def _download(release, manifest, directory, transport, progress):
+    """Stream the release's archive into ``directory`` and check it against
+    the size and digest its manifest declares; return its path."""
+    snapshot_id = manifest["snapshot_id"]
+    assets = {a.get("name"): a for a in release.get("assets") or ()}
+    url = (assets.get(contract.archive_name(snapshot_id)) or {}).get(
+        "browser_download_url"
+    )
+    declared = manifest.get("archive") or {}
+    expected = declared.get("sha256")
+    size = declared.get("bytes")
+    # The manifest bounds the download exactly: no size, no download.
+    if (
+        not isinstance(url, str)
+        or not isinstance(expected, str)
+        or type(size) is not int
+        or not 0 < size <= contract.MAX_ASSET_BYTES
+    ):
+        raise DownloadError(
+            f"release {release.get('tag_name')} does not declare a verifiable "
+            "archive"
+        )
+    archive = directory / contract.archive_name(snapshot_id)
+    report = None
+    if progress:
+        _say(
+            f"Downloading feed index snapshot {snapshot_id} ({size / 1e6:.0f} MB):",
+            end="",
+        )
+        report = _tenths(size)
+    # Not the API client: the asset URL is absolute and redirects to the
+    # asset host.
+    try:
+        with _http.client(
+            timeout=TIMEOUT, follow_redirects=True, transport=transport
+        ) as client:
+            digest = _http.download(client, url, archive, limit=size, progress=report)
+    finally:
+        if progress:
+            _say("")
+    if archive.stat().st_size != size or digest != expected:
+        raise DownloadError(
+            "the archive does not match the size and digest its manifest declares"
+        )
+    return archive
+
+
 def refresh(
     *,
     repository=contract.DEFAULT_REPOSITORY,
@@ -550,8 +619,15 @@ def refresh(
     cache_dir=None,
     transport=None,
     keep=KEEP,
+    progress=True,
 ):
     """Install the newest published snapshot this reader supports.
+
+    The archive, about 420 MB, is streamed to a private directory in the
+    cache and unpacked from there; an installed snapshot takes about 550 MB,
+    so about 1 GB must be free while a refresh runs. The download's progress
+    and the unpacking are reported on stderr; ``progress=False`` prints
+    nothing.
 
     Returns a summary: the snapshot id, whether it was newly ``installed``
     (a damaged install is replaced), the releases ``skipped`` (newer but
@@ -571,55 +647,37 @@ def refresh(
         release, manifest, skipped = contract.newest_compatible(
             releases, lambda asset: contract.read_manifest(client, asset)
         )
-        if manifest is None:
-            reasons = "; ".join(f"{tag}: {reason}" for tag, reason in skipped)
-            raise IncompatibleIndexError(
-                "no published index release is one this transitio reads"
-                + (f" ({reasons})" if reasons else "")
-            )
-        snapshot_id = manifest["snapshot_id"]
-        data = None
+    if manifest is None:
+        reasons = "; ".join(f"{tag}: {reason}" for tag, reason in skipped)
+        raise IncompatibleIndexError(
+            "no published index release is one this transitio reads"
+            + (f" ({reasons})" if reasons else "")
+        )
+    snapshot_id = manifest["snapshot_id"]
+    _snapshots(root).mkdir(parents=True, exist_ok=True)
+    # The archive stays here until it is installed; the directory's name is
+    # no snapshot id, so nothing reads it as an installed snapshot.
+    with tempfile.TemporaryDirectory(
+        dir=_snapshots(root), prefix=".download-", ignore_cleanup_errors=True
+    ) as directory:
+        archive = None
         if not _verified(root, snapshot_id):
-            assets = {a.get("name"): a for a in release.get("assets") or ()}
-            asset = assets.get(contract.archive_name(snapshot_id))
-            declared = manifest.get("archive") or {}
-            expected = declared.get("sha256")
-            size = declared.get("bytes")
-            # The manifest bounds the download exactly: no size, no download.
-            if (
-                asset is None
-                or not isinstance(expected, str)
-                or type(size) is not int
-                or not 0 < size <= contract.MAX_ASSET_BYTES
-            ):
-                raise DownloadError(
-                    f"release {release.get('tag_name')} does not declare a verifiable "
-                    "archive"
-                )
-            try:
-                data = contract.download(
-                    client, asset["browser_download_url"], "archive", size
-                )
-            except (contract.ReleaseError, KeyError) as error:
-                raise DownloadError(str(error)) from error
-            if len(data) != size or hashlib.sha256(data).hexdigest() != expected:
-                raise DownloadError(
-                    "the archive does not match the size and digest its manifest "
-                    "declares"
-                )
-    # Verified, installed and pruned as one step under the cache lock: the
-    # download above is the only slow part, and nothing decided before it
-    # is trusted once the lock is held.
-    with _installing(root):
-        already = _verified(root, snapshot_id)
-        if not already:
-            if data is None:
-                raise DownloadError(
-                    f"snapshot {snapshot_id} was removed while being verified; run "
-                    "transitio.index.refresh() again"
-                )
-            _install(root, snapshot_id, data)
-        removed, leftover = _prune(root, keep, {snapshot_id, _pinned(cache_dir)[1]})
+            archive = _download(release, manifest, Path(directory), transport, progress)
+        # Verified, installed and pruned as one step under the cache lock: the
+        # download above is the only slow part, and nothing decided before it
+        # is trusted once the lock is held.
+        with _installing(root):
+            already = _verified(root, snapshot_id)
+            if not already:
+                if archive is None:
+                    raise DownloadError(
+                        f"snapshot {snapshot_id} was removed while being verified; "
+                        "run transitio.index.refresh() again"
+                    )
+                if progress:
+                    _say(f"Unpacking and checking snapshot {snapshot_id}")
+                _install(root, snapshot_id, archive)
+            removed, leftover = _prune(root, keep, {snapshot_id, _pinned(cache_dir)[1]})
     # The next query resolves afresh: a newer snapshot may now be active.
     _release("handle_lock")
     _state["handle"] = None

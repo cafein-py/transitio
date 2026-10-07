@@ -283,6 +283,13 @@ The index is a versioned snapshot published by
 environment variable) pins one for the process. Queries read the pinned
 snapshot, else the newest installed one.
 
+The first refresh downloads about 420 MB (about 35 s at 100 Mbit/s, 3
+minutes at 20 Mbit/s) and takes about 10 s more to unpack and check it. It
+prints the download's progress to stderr unless called with
+`refresh(progress=False)`. A snapshot takes about 550 MB on disk; the cache
+keeps the newest three plus a pinned one, up to about 2.2 GB, and a refresh
+needs about 1 GB free while it runs.
+
 ### Finding a place
 
 ```python

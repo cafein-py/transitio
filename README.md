@@ -68,6 +68,13 @@ result = transitio.fetch(
 transitio.merge_feeds(result.feeds, "augsburg.gtfs.zip", check=False)
 ```
 
+The first refresh downloads about 420 MB (about 35 s at 100 Mbit/s, 3
+minutes at 20 Mbit/s) and takes about 10 s more to unpack and check it; it
+prints its progress to stderr unless called with `progress=False`. A
+snapshot takes about 550 MB on disk, and the cache keeps the newest three
+plus a pinned one, up to about 2.2 GB; a refresh needs about 1 GB free
+while it runs.
+
 Each feed is cropped to the place's boundary; a national feed such as
 Germany's is streamed through the crop, so it fits in memory bounded by the
 area. `merge_feeds` writes one feed from the cropped ones; with

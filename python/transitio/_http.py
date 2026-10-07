@@ -64,7 +64,9 @@ def sha256_stream(handle):
     return digest.hexdigest()
 
 
-def download(client, url, path, *, access=None, transport=None):
+def download(
+    client, url, path, *, access=None, transport=None, limit=None, progress=None
+):
     """Stream ``url`` to ``path`` with ``client``; return the SHA-256 hex.
 
     The body goes to a unique partial file beside ``path``, which replaces
@@ -76,7 +78,9 @@ def download(client, url, path, *, access=None, transport=None):
     the strong ETag, else the Last-Modified, of the response the file started
     from; an encoded or unpinned body restarts from zero, and an attempt that
     adds resumable bytes does not count as failed. A connection that cannot
-    be opened and any other status fail at once.
+    be opened and any other status fail at once, as does a body longer than
+    ``limit`` bytes when that is given. ``progress``, when given, is called
+    with the bytes written so far after each chunk.
 
     With ``access`` (a :class:`~transitio.catalog._access._Access` whose URL
     is ``url``) the download sends its credentials through
@@ -91,10 +95,10 @@ def download(client, url, path, *, access=None, transport=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     if access is None:
         with replacing(path) as handle:
-            return _fetch(client, url, _Partial(handle))
+            return _fetch(client, url, _Partial(handle, limit, progress))
     try:
         with access.session(client, transport) as session, replacing(path) as handle:
-            return _fetch(session, url, _Partial(handle), access)
+            return _fetch(session, url, _Partial(handle, limit, progress), access)
     except DownloadError as error:
         message = access.redact(str(error))
     # Raised outside the handler, so nothing is chained to it.
@@ -168,10 +172,13 @@ def _discard(path):
 
 class _Partial:
     """A download's partial file: its bytes, their digest, the bytes the
-    current request added and the ``(header, value)`` a resume is pinned to."""
+    current request added and the ``(header, value)`` a resume is pinned to,
+    with the download's byte ``limit`` and ``progress`` callback."""
 
-    def __init__(self, handle):
+    def __init__(self, handle, limit=None, progress=None):
         self.handle = handle
+        self.limit = limit
+        self.progress = progress
         self.added = 0
         self.restart()
 
@@ -187,6 +194,8 @@ class _Partial:
         self.digest.update(chunk)
         self.written += len(chunk)
         self.added += len(chunk)
+        if self.progress is not None:
+            self.progress(self.written)
 
 
 def _fetch(client, url, partial, access=None):
@@ -237,6 +246,8 @@ def _request(client, url, partial):
             expected = int(declared) if declared.isdigit() else None
         for chunk in response.iter_bytes():
             partial.write(chunk)
+            if partial.limit is not None and partial.written > partial.limit:
+                return f"larger than {partial.limit} bytes", False
         if status != 206 and _encoded(response):
             received = response.num_bytes_downloaded
         else:

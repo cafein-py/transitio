@@ -2728,3 +2728,49 @@ def test_a_crop_drops_the_areas_groups_and_networks_it_orphans(tmp_path):
         assert [row[0] for row in rows][1:] == [kept]
     report = validate_feed(output, reference_date="20260601")
     assert not any(n["severity"] == "ERROR" for n in report["notices"])
+
+
+def test_the_index_download_shows_its_progress(tmp_path, monkeypatch, capsys):
+    # A refresh held the whole archive, about 420 MB, in memory and printed
+    # nothing while it downloaded.
+    import httpx
+
+    from index_fixture import API, DOWNLOADS, FakeGitHub, index, release
+    from transitio.index import _refresh
+    from transitio.index import release as contract
+
+    monkeypatch.setattr(_refresh, "_state", {key: None for key in _refresh._state})
+    fake = FakeGitHub()
+    snapshot_id = release(fake, index(tmp_path))
+    (asset,) = [
+        asset
+        for _, asset in fake.assets.values()
+        if asset["name"] == contract.archive_name(snapshot_id)
+    ]
+    # As on GitHub, the archive's URL redirects to the asset host.
+    path = asset["browser_download_url"].removeprefix(DOWNLOADS)
+    asset["browser_download_url"] = "https://github.example" + path
+
+    def handle(request):
+        if request.url.host == "github.example":
+            return httpx.Response(302, headers={"Location": DOWNLOADS + path})
+        return fake.handle(request)
+
+    transport = httpx.MockTransport(handle)
+    for progress in (True, False):
+        cache = tmp_path / f"cache-{progress}"
+        summary = _refresh.refresh(
+            repository="o/r",
+            api_url=API,
+            cache_dir=cache,
+            transport=transport,
+            progress=progress,
+        )
+        assert summary["installed"] and summary["snapshot_id"] == snapshot_id
+        tenths = "".join(f" {n}%" for n in range(10, 101, 10))
+        expected = (
+            f"Downloading feed index snapshot {snapshot_id} "
+            f"({asset['size'] / 1e6:.0f} MB):{tenths}\n"
+            f"Unpacking and checking snapshot {snapshot_id}\n"
+        )
+        assert capsys.readouterr() == ("", expected if progress else "")

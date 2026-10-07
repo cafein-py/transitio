@@ -199,6 +199,23 @@ def test_a_digest_mismatch_is_refused(tmp_path):
     )
     with pytest.raises(DownloadError, match="does not match the size and digest"):
         _refresh(fake)
+    # A body longer than the declared size is refused as it streams.
+    long = FakeGitHub()
+    _seed_archive(
+        long,
+        "00000000000000ae",
+        archive,
+        manifest={
+            "archive": {
+                "name": contract.archive_name("00000000000000ae"),
+                "sha256": hashlib.sha256(archive).hexdigest(),
+                "bytes": len(archive) - 1,
+            }
+        },
+    )
+    with pytest.raises(DownloadError, match="larger than"):
+        _refresh(long)
+    assert list((client.cache_root() / "snapshots").iterdir()) == []
     # A manifest that declares no exact size authorises no download at all.
     short = FakeGitHub()
     _seed_archive(

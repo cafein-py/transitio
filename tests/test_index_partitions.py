@@ -99,6 +99,14 @@ def _partitioned(tmp_path):
     )
 
 
+def _unpack(archive, staging):
+    """Unpack the archive bytes ``archive`` into a new ``staging`` directory."""
+    path = staging.with_name(staging.name + ".tar.gz")
+    path.write_bytes(archive)
+    staging.mkdir()
+    _refresh._unpack(path, staging)
+
+
 def test_a_partitioned_index_reads_whole_and_per_country(tmp_path):
     directory = _partitioned(tmp_path)
     listing = json.loads((directory / "snapshot.json").read_text())["partitions"]
@@ -247,8 +255,7 @@ def test_the_release_members_follow_the_snapshot(tmp_path):
     assets = pack(directory)
     archive = assets[contract.archive_name(snapshot["snapshot_id"])]
     staging = tmp_path / "staging"
-    staging.mkdir()
-    _refresh._unpack(archive, staging)
+    _unpack(archive, staging)
     assert _refresh._whole_members(staging)
     assert reader.read_index(staging).snapshot_id == snapshot["snapshot_id"]
     # An archive missing a listed partition file, or holding an unlisted
@@ -257,13 +264,11 @@ def test_the_release_members_follow_the_snapshot(tmp_path):
     from index_fixture import _archive
 
     short = _archive([m for m in members if m[0] != "FI/edges.parquet"])
-    (tmp_path / "s1").mkdir()
     with pytest.raises(Exception, match="lacks FI/edges.parquet"):
-        _refresh._unpack(short, tmp_path / "s1")
+        _unpack(short, tmp_path / "s1")
     extra = _archive(members + [("SE/feeds.parquet", members[1][1])])
-    (tmp_path / "s2").mkdir()
     with pytest.raises(Exception, match="does not list: SE/feeds.parquet"):
-        _refresh._unpack(extra, tmp_path / "s2")
+        _unpack(extra, tmp_path / "s2")
 
 
 REALTIME = [
@@ -359,8 +364,7 @@ def test_a_schema_8_index_carries_the_realtime_companions(tmp_path):
     )
     assets = pack(directory)
     staging = tmp_path / "staging"
-    staging.mkdir()
-    _refresh._unpack(assets[contract.archive_name(SNAPSHOT_ID)], staging)
+    _unpack(assets[contract.archive_name(SNAPSHOT_ID)], staging)
     assert len(reader.read_index(staging).realtime) == 4
 
 
@@ -536,8 +540,7 @@ def test_a_schema_11_index_carries_feed_access_and_place_centres(tmp_path, monke
         "access_providers.parquet",
     ]
     staging = tmp_path / "staging"
-    staging.mkdir()
-    _refresh._unpack(pack(directory)[contract.archive_name(SNAPSHOT_ID)], staging)
+    _unpack(pack(directory)[contract.archive_name(SNAPSHOT_ID)], staging)
     assert _refresh._whole_members(staging)
     assert len(reader.read_index(staging).access_providers) == 2
     # The table must be declared and match its digest.
@@ -670,6 +673,5 @@ def test_a_schema_9_index_carries_the_feed_spans_and_place_validity(tmp_path):
     # The release members and the unpacker take the schema-9 tables as before.
     assets = pack(directory)
     staging = tmp_path / "staging"
-    staging.mkdir()
-    _refresh._unpack(assets[contract.archive_name(snapshot["snapshot_id"])], staging)
+    _unpack(assets[contract.archive_name(snapshot["snapshot_id"])], staging)
     assert reader.read_index(staging).schema_version == 9

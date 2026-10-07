@@ -128,7 +128,8 @@ _PARTITION_TABLES = {
 _MAX_PARTITIONS = 300
 
 # Ceilings on what one index file may be, so a swapped-in or damaged file cannot
-# read an unbounded amount into memory. A real index is a few MB.
+# read an unbounded amount into memory. A real index's largest table is about
+# 50 MB.
 _MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 _MAX_FEEDS_BYTES = 512 * 1024 * 1024
 _MAX_PLACES_BYTES = 512 * 1024 * 1024
