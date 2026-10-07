@@ -93,7 +93,7 @@ MIN_READER_VERSIONS = {
 # Bumped whenever name resolution, ranking or filtering changes: the snapshot
 # pins the data, this pins how the reader interprets it, and a result that
 # records both (with the transitio version) is reproducible.
-DISCOVERY_SEMANTICS_VERSION = 4
+DISCOVERY_SEMANTICS_VERSION = 5
 
 FEEDS_FILE = "feeds.parquet"
 REALTIME_FILE = "realtime.parquet"

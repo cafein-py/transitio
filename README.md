@@ -40,6 +40,14 @@ whole. With a token, GTFS downloads are catalogued dataset versions verified
 against catalog checksums; without one, the latest hosted zips are fetched
 as-is — unverified moving targets.
 
+With the feed index installed (below), `fetch` takes the feeds of the index
+places that cover the area, when they cover at least half of its land, and
+`result.places` lists those places. Otherwise it searches the Mobility
+Database catalogue for feeds whose bounding box meets the area's, and a
+warning gives the reason and the number of feeds before anything is
+downloaded; `index=False` searches the catalogue without the index or a
+warning.
+
 ### Feeds for a place
 
 The feed index lists the feeds serving each place, by the tier of service

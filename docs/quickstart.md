@@ -20,9 +20,11 @@ box in WGS84. The pipeline:
    a set of extracts smaller in total, merged into one (Geofabrik, BBBike or
    Movisda), and crops it to the area's bounding box (skipped with
    `osm=False`),
-2. discovers every GTFS feed overlapping the area in the Mobility Database
-   (official feeds first, then by spatial specificity) — or, for a place,
-   takes the feeds the index lists for it,
+2. takes the feeds the feed index lists for the places covering the area,
+   or for the place — or, when no index is installed or its places cover
+   less than half of the area's land, every GTFS feed whose bounding box
+   meets the area's in the Mobility Database catalogue (official feeds
+   first, then by spatial specificity), with a warning,
 3. downloads each feed, crops it to the area (its polygon, else its bounding
    box), repairs it when asked, and validates it with the canonical notice
    codes,
@@ -439,6 +441,20 @@ index's countries: sea does not count, and land in a country without feeds
 counts as uncovered. `country="DE"` keeps the places of one country.
 `area.feeds()` asks each part for its feeds as `place.feeds()` does, with
 the same arguments, and lists each feed once.
+
+`fetch` reads an area this way. When the parts cover at least half of the
+area's land, it fetches their feeds, with the same `tiers`, `exclude` and
+`on_unknown` as for a place, and `result.places` lists the parts.
+Otherwise it searches the Mobility Database catalogue by bounding box and
+warns, for example `"the feed index's places cover 20% of the area; 3 feeds
+from the Mobility Database catalogue by bounding box"`; `index=False`
+searches the catalogue without the index or a warning. The OSM extract
+covers the area itself.
+
+```python
+result = transitio.fetch(region, tiers=["local", "regional"], osm=False)
+[place.name for place in result.places]   # ['Munich District', 'Munich']
+```
 
 ## Reading the validation report
 

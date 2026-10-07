@@ -16,7 +16,11 @@ pytest.importorskip("transitio._core")
 
 import transitio.catalog  # noqa: E402
 import transitio.osm  # noqa: E402
-from transitio.exceptions import DownloadError, StaleSelectorError  # noqa: E402
+from transitio.exceptions import (  # noqa: E402
+    DownloadError,
+    StaleSelectorError,
+    TransitioError,
+)
 from transitio.pipeline import fetch  # noqa: E402
 
 GTFS = {
@@ -109,16 +113,25 @@ def pipeline_env(tmp_path, monkeypatch):
     return tmp_path, fake_pbf
 
 
-def test_fetch_end_to_end(pipeline_env):
+def test_fetch_end_to_end(pipeline_env, monkeypatch):
     tmp_path, fake_pbf = pipeline_env
-    with pytest.warns(UserWarning):
+    with pytest.warns(UserWarning) as caught:
         result = fetch(
             (24.6, 60.1, 25.2, 60.4),
             directory=tmp_path,
             reference_date="20260601",
         )
-    assert result.osm_pbf == fake_pbf
+    assert (
+        "no compatible feed index is installed; 1 feed from the Mobility Database "
+        "catalogue by bounding box; transitio.index.refresh() installs the feed index"
+    ) in [str(warning.message) for warning in caught]
+    assert result.osm_pbf == fake_pbf and result.places == []
     assert result.osm_area.bounds == (24.6, 60.1, 25.2, 60.4)
+    # A pinned snapshot that is not installed is an error, not a fallback.
+    monkeypatch.setenv("TRANSITIO_INDEX_SNAPSHOT", "0123456789abcdef")
+    with pytest.raises(TransitioError, match="0123456789abcdef is not installed"):
+        fetch((24.6, 60.1, 25.2, 60.4), directory=tmp_path)
+    monkeypatch.delenv("TRANSITIO_INDEX_SNAPSHOT")
     # Every stop lies in the area, so there is no OSM note.
     (entry,) = result.selection
     assert entry["stops_outside_osm"] == 0 and result.osm_note is None
@@ -755,16 +768,32 @@ def test_fetch_place_selects_downloads_and_processes(tmp_path, monkeypatch):
     assert second["same_as"] == [first["feed_id"]]
 
 
-def test_fetch_aoi_rejects_place_only_arguments():
-    for kwargs in (
-        {"exclude": ["national"]},
-        {"tiers": ["local"]},
-        {"on_unknown": "exclude"},
-        {"contained": "keep"},
-        {"credentials": {"p": {"key": "k"}}},
-    ):
-        with pytest.raises(ValueError, match="apply only with place="):
-            fetch((0, 0, 1, 1), **kwargs)
+@pytest.mark.parametrize(
+    "option, name",
+    [
+        ({"tiers": ["local"]}, "tiers="),
+        ({"exclude": ["national"]}, "exclude="),
+        ({"on_unknown": "exclude"}, "on_unknown='exclude'"),
+        ({"on_untrusted_selector": "drop"}, "on_untrusted_selector='drop'"),
+        ({"contained": "keep"}, "contained='keep'"),
+        ({"credentials": {"p": {"key": "k"}}}, "credentials="),
+    ],
+)
+def test_fetch_aoi_options_need_the_index(monkeypatch, option, name):
+    def download(*args, **kwargs):
+        raise AssertionError("searched or downloaded before the refusal")
+
+    monkeypatch.setattr("transitio.catalog.MobilityDatabase", download)
+    monkeypatch.setattr("transitio.osm.fetch_pbf", download)
+    message = f"{name} needs the feed index; no compatible feed index is installed"
+    with pytest.raises(ValueError) as caught:
+        fetch((0, 0, 1, 1), **option)
+    assert str(caught.value) == message
+
+
+def test_fetch_rejects_invalid_options():
+    with pytest.raises(ValueError, match="index=False applies only with aoi="):
+        fetch(place="X", index=False)
     with pytest.raises(ValueError, match="'keep' or 'drop'"):
         fetch(place="X", contained="maybe")
     with pytest.raises(ValueError, match="'skip' or 'keep'"):
@@ -2287,34 +2316,48 @@ def test_timezone_note(tmp_path, zone, stops, budget, expected):
     assert _timezone_note(path, budget) == expected
 
 
+PLACE_VIEW = "default view (city: primary, secondary) holds none of the place's "
+
+
 @pytest.mark.parametrize(
-    "hidden, expected",
+    "area, hidden, expected",
     [
         pytest.param(
+            False,
             [("f-u", "unknown", {"unknown"})],
-            "1 feed: f-u (unknown); tiers=['local', 'regional', 'national'] fetches it",
+            PLACE_VIEW + "1 feed: f-u (unknown); "
+            "tiers=['local', 'regional', 'national'] fetches it",
             id="unknown-only",
         ),
         pytest.param(
+            False,
             [(f"f-{n}", "tertiary", {"national", "regional"}) for n in range(7)],
-            "7 feeds: f-0 (tertiary), f-1 (tertiary), f-2 (tertiary), f-3 (tertiary),"
-            " f-4 (tertiary) and 2 more; tiers=['regional', 'national'] fetches them",
+            PLACE_VIEW + "7 feeds: f-0 (tertiary), f-1 (tertiary), f-2 (tertiary), "
+            "f-3 (tertiary), f-4 (tertiary) and 2 more; "
+            "tiers=['regional', 'national'] fetches them",
             id="seven",
+        ),
+        pytest.param(
+            True,
+            [("f-l", "primary", {"local"})],
+            "default view of the area's places holds none of their 1 feed: "
+            "f-l (primary); tiers=['local'] fetches it",
+            id="area",
         ),
     ],
 )
-def test_hidden_view_note(hidden, expected):
+def test_hidden_view_note(area, hidden, expected):
     from types import SimpleNamespace
 
+    from transitio.index import Area
     from transitio.pipeline._fetch import _hidden_note
 
     feeds = [
         SimpleNamespace(feed_id=feed_id, relevance_category=category, tiers=tiers)
         for feed_id, category, tiers in hidden
     ]
-    note = _hidden_note(SimpleNamespace(kind="city"), feeds)
-    prefix = "default view (city: primary, secondary) holds none of the place's "
-    assert note == prefix + expected
+    target = Area(None, None, (), 1.0, None) if area else SimpleNamespace(kind="city")
+    assert _hidden_note(target, feeds) == expected
 
 
 @pytest.mark.parametrize("path", ["area", "place"])

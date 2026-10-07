@@ -2583,3 +2583,88 @@ def test_a_feed_is_read_from_the_csv_export_without_a_token(tmp_path, monkeypatc
     # Every warning points at the caller, and no API request was made.
     assert {warning.filename for warning in caught} == {__file__}
     assert [request.url.path for request in sent] == ["/feeds_v2.csv"]
+
+
+def test_an_area_fetch_selects_the_feeds_of_the_index_places(tmp_path, monkeypatch):
+    # fetch(aoi=...) searched the catalogue by bounding box and downloaded
+    # every feed whose box met the area's, continental aggregates included.
+    import datetime
+    import pathlib
+
+    import shapely
+
+    import transitio
+    import transitio.index as transitio_index
+    from index_fixture import covered_feed, edge, place, write_partitioned_index
+    from transitio.catalog import MobilityDatabase
+    from transitio.pipeline import fetch
+
+    monkeypatch.setattr(
+        transitio, "__version__", transitio_index.MIN_READER_VERSIONS[7], raising=False
+    )
+    monkeypatch.setattr(
+        "transitio.pipeline._fetch._today", lambda: datetime.date(2026, 6, 1)
+    )
+
+    def box(*bounds):
+        return shapely.to_wkb(shapely.box(*bounds)).hex()
+
+    places = [
+        place("fi", "country", geometry=box(24, 60, 26, 61)),
+        place("ee", "country", country_code="EE", geometry=box(24, 59, 26, 60)),
+        place("c", "city", parent_id="fi", geometry=box(*CITY_BBOX)),
+    ]
+    tiers = {"local": "primary", "regional": "secondary", "national": "tertiary"}
+    feeds = [
+        {
+            **covered_feed(f"f-{tier}"),
+            "atlas": {"urls": {"static_current": f"https://feeds.example/{tier}"}},
+            "home_country": "FI",
+            "scope": "domestic",
+        }
+        for tier in tiers
+    ]
+    edges = [
+        edge(where, f"f-{tier}", tier=tier, relevance_category=category, relevance=1)
+        for tier, category in tiers.items()
+        for where in ("c", "fi")
+    ]
+    index = transitio_index.read_index(
+        write_partitioned_index(
+            tmp_path / "index", feeds=feeds, places=places, edges=edges
+        )
+    )
+    downloads, searches, extracts = [], [], []
+
+    def download(self, feed, directory=None):
+        downloads.append(feed.feed_id)
+        return write_zip(pathlib.Path(directory) / "latest.zip", FEED)
+
+    def search(self, *args, **kwargs):
+        searches.append(kwargs["aoi"].bounds)
+        return []
+
+    def extract(area, **options):
+        extracts.append((area.bounds, sorted(options)))
+        return tmp_path / "area.osm.pbf"
+
+    monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
+    monkeypatch.setattr("transitio.catalog.TransitlandAtlas._fetch_static", download)
+    monkeypatch.setattr(MobilityDatabase, "search_feeds", search)
+    monkeypatch.setattr("transitio.osm.fetch_pbf", extract)
+    options = dict(index=index, directory=tmp_path / "out", crop=False)
+    result = fetch(CITY_BBOX, **options)
+    assert (downloads, searches) == (["f-local", "f-regional"], [])
+    assert [p.id for p in result.places] == ["c"]
+    assert result.snapshot == index.snapshot_id
+    # The extract covers the area itself, not grown.
+    assert extracts == [(CITY_BBOX, ["cache_dir", "directory"])]
+    # Mostly in a country without feeds: the catalogue, with a warning.
+    mostly_ee = (24.9, 59.7, 25.0, 60.2)
+    with pytest.warns(UserWarning) as caught:
+        result = fetch(mostly_ee, **options)
+    assert (
+        "the feed index's places cover 19% of the area; 0 feeds from the "
+        "Mobility Database catalogue by bounding box"
+    ) in [str(warning.message) for warning in caught]
+    assert (searches, result.places, result.snapshot) == ([mostly_ee], [], None)

@@ -8,6 +8,7 @@ import datetime
 import hashlib
 import io
 import json
+import math
 import os
 import pathlib
 import re
@@ -31,6 +32,11 @@ _STOP_DECIMALS = 3
 
 # Metres the place path grows the OSM area by: cafein's default snap distance.
 _OSM_BUFFER_M = 1600
+
+# The share of an area's land the feed index's places must cover for
+# fetch(aoi=...) to select the area's feeds from the index.
+_AREA_COVERAGE = 0.5
+_NO_INDEX = "no compatible feed index is installed"
 
 # Feed ids a delivered feed is named by as they are: lowercase ASCII, at
 # most 100 characters, and none of the device names Windows reserves.
@@ -70,13 +76,13 @@ class FetchResult:
     reports: list
     repairs: list
     skipped: list
-    # How each feed's route selector was checked and applied on the place
-    # path (keys as fetch's Returns lists them); empty without tiers,
+    # How each feed's route selector was checked and applied on the index
+    # paths (keys as fetch's Returns lists them); empty without tiers,
     # exclude or on_unknown="exclude".
     selections: list = dataclasses.field(default_factory=list)
     provenance: dict = None
-    # The index snapshot the feeds were discovered from; None for the AOI path,
-    # which discovers by bounding box and has no snapshot.
+    # The index snapshot the feeds were discovered from; None for the
+    # catalogue path, which discovers by bounding box and has no snapshot.
     snapshot: str = None
     # {feed id: [ids of the delivered feeds carrying it]} for each feed left
     # out as contained, in selection order; empty otherwise.
@@ -93,6 +99,9 @@ class FetchResult:
     # The place parts the OSM extract leaves out and the delivered stops
     # outside its area, or why it was not fetched.
     osm_note: str | None = None
+    # The index places the feeds were selected for: the place, the area's
+    # parts, or none on the catalogue path.
+    places: list = dataclasses.field(default_factory=list)
 
     def __iter__(self):  # convenient (pbf, feeds) unpacking
         return iter((self.osm_pbf, self.feeds))
@@ -408,8 +417,8 @@ def _process_feed(
     rather than a false empty one — ``key`` the output key (None without
     ``outputs``) and ``window`` the computed service window as ISO dates,
     None when unknown. The report is :func:`_report`'s. Raises
-    :class:`_SkipFeed` when the feed drops out. Shared by the AOI and the
-    place paths.
+    :class:`_SkipFeed` when the feed drops out. Shared by the catalogue and
+    the index paths.
     """
     from transitio.validate import validate_feed
 
@@ -1796,6 +1805,35 @@ def _access_for(feed, explicit):
         return None, str(error)
 
 
+def _area_for(geometry, index, country_code):
+    """``(area, None)`` when the feed index's places, of ``country_code``
+    when given, cover at least half of ``geometry``'s land
+    (:func:`transitio.index.area`); else ``(None, why)``, the reason the
+    catalogue is searched instead. Without an installed index the catalogue
+    is searched; a given ``index``, or a pinned snapshot, that cannot be read
+    raises."""
+    from transitio.exceptions import TransitioError
+    from transitio.index import _coerce_index, area
+    from transitio.index._refresh import _pinned
+
+    if index is False:
+        return None, "index=False searches the catalogue"
+    try:
+        resolved = _coerce_index(index)
+    except TransitioError:
+        if index is not None or _pinned()[1] is not None:
+            raise
+        return None, _NO_INDEX
+    if resolved.places is None:
+        return None, "the feed index carries no places"
+    found = area(geometry, country=country_code, index=resolved)
+    if found.coverage < _AREA_COVERAGE:
+        # Rounded down, so a share just under the threshold never reads as it.
+        share = math.floor(found.coverage * 100)
+        return None, f"the feed index's places cover {share}% of the area"
+    return found, None
+
+
 def fetch(
     aoi=None,
     when=None,
@@ -1823,13 +1861,30 @@ def fetch(
 ):
     """Fetch everything cafein needs for an area in one call.
 
-    Pass exactly one of ``aoi`` (a geometry, bbox or place name geocoded for
-    the OSM stage) or ``place`` (a place name, QID or :class:`Place`). With
-    ``place``, feeds are selected from the built index by tier -- ``tiers``,
+    Pass exactly one of ``aoi`` (a geometry, bbox or place name geocoded
+    once) or ``place`` (a place name, QID or :class:`Place`). With
+    ``place``, feeds are selected from the feed index by tier -- ``tiers``,
     ``exclude`` and ``on_unknown`` filter the edges -- and the place geometry
-    supplies the AOI; ``tiers``, ``exclude``, ``on_unknown``,
-    ``on_untrusted_selector``, ``contained``, ``index`` and ``credentials``
-    apply only with ``place``, and ``country_code`` only with ``aoi``. When
+    supplies the AOI. With ``aoi``, the feeds come from the feed index too
+    when its places cover at least half of the area's land
+    (:func:`transitio.index.area`, ``country_code`` keeping one country's
+    places): those of the area's places, selected as for ``place``
+    (:meth:`~transitio.index.Area.feeds`), and ``FetchResult.places`` lists
+    the places. When no index is installed, the index has no places or they
+    cover less than half of the area, the call falls back to the catalogue
+    path: the Mobility Database catalogue is searched for feeds whose
+    bounding box meets the area's, and before any feed or OSM download a
+    ``UserWarning`` gives the reason and the number of feeds found, e.g.
+    ``"the feed index's places cover 20% of the area; 3 feeds from the
+    Mobility Database catalogue by bounding box"``, and without an installed
+    index how to install one. ``index=False`` searches the catalogue without
+    a warning; it is refused with ``place``. ``tiers``, ``exclude``, ``on_unknown``,
+    ``on_untrusted_selector``, ``contained`` and ``credentials`` apply on
+    both index paths; on the catalogue path, ``tiers``, ``exclude``,
+    ``on_unknown="exclude"``, another ``on_untrusted_selector`` or
+    ``contained`` than the default, and ``credentials`` raise
+    ``ValueError`` naming the option and the reason, before anything is
+    downloaded. ``country_code`` applies only with ``aoi``. When
     a selector cannot be trusted -- its evidence was missing at build time,
     or its fingerprint no longer
     matches the download -- ``on_untrusted_selector`` decides the outcome:
@@ -1857,15 +1912,16 @@ def fetch(
     ``contained="keep"`` leaves no feed out for containment, and
     ``contained`` is empty.
 
-    Resolves and crops the OSM extract, discovers the GTFS feeds (overlapping
-    the AOI, or the place's indexed feeds), downloads each feed, spatially
+    Resolves and crops the OSM extract, discovers the GTFS feeds (the
+    indexed feeds of the place or the area, or the catalogue's overlapping
+    the AOI), downloads each feed, spatially
     crops it, optionally repairs it, validates it, and builds a merged report
     per feed.
     With an API token, downloads come from catalogued dataset versions
     (checksum-verified, with the hosted canonical-validator report);
     without one, the unversioned latest hosted zip is fetched — a moving
     target with no upstream checksum, documented in its provenance
-    sidecar as such. On the place path, a feed without a catalogued dataset,
+    sidecar as such. On the index paths, a feed without a catalogued dataset,
     or whose dataset download fails, is read from the first of its indexed
     URLs that serves a zip archive: the Mobility Database direct download,
     the Transitland Atlas static feed, then the Mobility Database hosted
@@ -1884,7 +1940,7 @@ def fetch(
     and, for a catalogued dataset, ``dataset_id`` and
     ``service_date_range``.
 
-    On the place path a cached version that serves the request is used
+    On the index paths a cached version that serves the request is used
     without a download. A feed's versions are tried before any dataset
     selection, probe or download: first the one that served the same request
     before, then the newest first, each checked as a download is (route
@@ -1900,9 +1956,9 @@ def fetch(
     without usable credentials uses only versions once fetched without
     them; credentials for a provider count alike whichever key they hold.
     The hosted validation report of a dataset is stored with it at its first
-    use, so a reused dataset is reported as when downloaded. The area path
-    reuses its feeds' versions alike, though the Mobility Database is still
-    searched for the feeds; a dataset is selected only for a feed no cached
+    use, so a reused dataset is reported as when downloaded. The catalogue
+    path reuses its feeds' versions alike, though the Mobility Database is
+    still searched for the feeds; a dataset is selected only for a feed no cached
     version serves. What the crop, repair and validation make of a cached
     version is stored with it, keyed by the transitio release, the exact
     area when cropped to it, the routes, ``crop``, ``repair`` and the
@@ -1923,7 +1979,7 @@ def fetch(
     otherwise it is delivered cut to its own routes, ``same_as`` naming the
     earlier feed.
 
-    On the place path, delivered feeds whose route keys (agency name, route
+    On the index paths, delivered feeds whose route keys (agency name, route
     short else long name, mode) and stops (coordinates at 3 decimals) share
     0.9 and 0.8 or more are versions, ranked by later start, more trips,
     then candidate order. Agency names compare casefolded, without
@@ -1951,9 +2007,10 @@ def fetch(
 
     With ``duplicate_trips="drop"`` (default) the delivered feeds do not
     repeat each other's trips. A trip that a feed earlier in the selection
-    record also runs is left out of the later feed: on the place path the
-    record follows the place's view (:meth:`~transitio.index.Place.feeds`:
-    category, then relevance, then id), on the area path the order above.
+    record also runs is left out of the later feed: on the index paths the
+    record follows the view (:meth:`~transitio.index.Place.feeds` or
+    :meth:`~transitio.index.Area.feeds`: category, then relevance, then id),
+    on the catalogue path the order above.
     Trips compare as :func:`~transitio.gtfs.merge_feeds` compares them:
     route name and mode (the route type's basic mode, as ``modes`` names
     them, else the type itself, so local bus 704 equals bus 3), stops and
@@ -2053,7 +2110,7 @@ def fetch(
         as above: ``"exact"`` leaves out exact repeats only, and ``"keep"``
         compares nothing. Another value raises ``ValueError``.
     expired : {"skip", "keep"}, default "skip"
-        With ``"skip"``, on the place path, an indexed feed whose index
+        With ``"skip"``, on the index paths, an indexed feed whose index
         service window misses the day (ends before it, or starts after the
         study day) is skipped before download when a conditional ``HEAD``
         to the URL the index crawled, carrying the ETag or Last-Modified it
@@ -2084,7 +2141,8 @@ def fetch(
         delivered or a delivered feed's stops.txt cannot be read), each part
         grown by 1.6 km, cafein's default snap distance. Parts of that area
         farther than 1.6 km from every delivered stop may lack OSM data, as
-        the extract need only cover the stops' surroundings. The crop keeps
+        the extract need only cover the stops' surroundings. With ``aoi`` it
+        covers the area itself, from the index or the catalogue. The crop keeps
         each trip that serves the area whole, so a delivered feed's stops
         can lie beyond the OSM area and get no footpaths in cafein;
         ``stops_outside_osm`` in ``selection`` counts them. With ``osm=False``
@@ -2117,9 +2175,15 @@ def fetch(
         are the files in the cache, an untransformed one the read-only
         cached version itself. The OSM extract goes here too. It must lie
         outside the download cache (``ValueError``).
+    index : Index, str, pathlib.Path or False, optional
+        The feed index both index paths select from: an
+        :class:`~transitio.index.Index` or the path of one, by default the
+        installed index (:func:`transitio.index.refresh`). ``False``, with
+        ``aoi`` only, searches the catalogue instead.
     refresh_token, cache_dir, country_code
         Passed to the catalog and OSM layers; downloads are cached under
-        ``cache_dir``, by default the platform cache.
+        ``cache_dir``, by default the platform cache. ``country_code`` also
+        keeps only that country's index places for ``aoi``.
     use_cache : bool, default True
         Serve feeds from the cache as above. ``False`` downloads every feed
         again and, once a download succeeds, deletes the feed's other
@@ -2142,8 +2206,10 @@ def fetch(
         repair ``repairs`` (fix logs, empty without ``repair=True``) per
         kept feed, ``paths`` (``{feed id: path}`` of the same feeds, in the
         order of ``feeds``), ``skipped`` (feed id, reason) pairs, the
-        ``selection`` record and, on the place path, ``selections`` and
-        ``contained`` (above). Reports merge the local validation of the
+        ``selection`` record, on the index paths ``selections`` and
+        ``contained`` (above), and ``places``, the index places the feeds
+        were selected for (the place, the area's parts; empty on the
+        catalogue path). Reports merge the local validation of the
         delivered feed with the hosted report of the published dataset, so
         after cropping or repair the hosted side describes the pre-transform
         original. A report's ``summary["droppedRows"]`` lists the rows the
@@ -2168,7 +2234,7 @@ def fetch(
         ``"dropped 8 exact duplicate trips.txt rows"``, the repeated trips
         left out or kept; several join with ``"; "``),
         ``index_window`` (the index's ``[start, end]``; None undated or on
-        the area path), ``feed_window`` (the computed window of a validated
+        the catalogue path), ``feed_window`` (the computed window of a validated
         download, delivered or not; None otherwise or when unknown),
         ``same_as`` (earlier deliveries of the same archive) and
         ``contained_in`` (the index's containers a containment skip names),
@@ -2211,7 +2277,8 @@ def fetch(
         ``{"tier", "selector_state", "route_ids"}``).
         When ``place`` is fetched without ``tiers`` and its default view
         (:meth:`~transitio.index.Place.feeds`) holds none of the place's
-        feeds, ``view_note`` names them and the tiers that fetch them, and a
+        feeds, or an area's places hold none of theirs in their views,
+        ``view_note`` names them and the tiers that fetch them, and a
         ``UserWarning`` repeats it, e.g. ``"default view (region: secondary,
         tertiary) holds none of the place's 2 feeds: f-a (primary), f-b
         (primary); tiers=['local'] fetches them"``.
@@ -2242,25 +2309,14 @@ def fetch(
 
     if (aoi is None) == (place is None):
         raise ValueError("pass exactly one of aoi= or place=")
-    if aoi is not None and (
-        tiers is not None
-        or exclude is not None
-        or index is not None
-        or credentials is not None
-        or on_unknown != "include"
-        or on_untrusted_selector != "auto"
-        or contained != "drop"
-    ):
-        raise ValueError(
-            "tiers=, exclude=, on_unknown=, on_untrusted_selector=, contained=, "
-            "index= and credentials= apply only with place="
-        )
     if contained not in ("keep", "drop"):
         raise ValueError("contained= must be 'keep' or 'drop'")
     if expired not in ("skip", "keep"):
         raise ValueError("expired= must be 'skip' or 'keep'")
     if place is not None and country_code is not None:
         raise ValueError("country_code= applies only with aoi=")
+    if place is not None and index is False:
+        raise ValueError("index=False applies only with aoi=")
     if on_untrusted_selector not in ("auto", "whole", "drop", "error"):
         raise ValueError(
             "on_untrusted_selector= must be 'auto', 'whole', 'drop' or 'error'"
@@ -2293,6 +2349,9 @@ def fetch(
             raise ValueError("when and reference_date disagree; pass only one")
     budgets.setdefault("reference_date", day.strftime("%Y%m%d") if study else None)
 
+    if aoi is not None:
+        geometry = _as_geometry(aoi)
+        place, why = _area_for(geometry, index, country_code)
     if place is not None:
         return _fetch_place(
             place,
@@ -2319,14 +2378,24 @@ def fetch(
             budgets=budgets,
         )
 
-    geometry = _as_geometry(aoi)
+    # The options only the index paths honour, refused on the catalogue path.
+    named = {
+        "tiers=": tiers is not None,
+        "exclude=": exclude is not None,
+        f"on_unknown={on_unknown!r}": on_unknown != "include",
+        f"on_untrusted_selector={on_untrusted_selector!r}": (
+            on_untrusted_selector != "auto"
+        ),
+        f"contained={contained!r}": contained != "drop",
+        "credentials=": credentials is not None,
+    }
+    refused = [name for name, given in named.items() if given]
+    if refused:
+        need = "needs" if len(refused) == 1 else "need"
+        raise ValueError(f"{', '.join(refused)} {need} the feed index; {why}")
 
     cache = _feed_cache(cache_dir, directory)
     osm_pbf = osm_note = None
-    if osm:
-        osm_pbf, osm_note = _osm_extract(
-            geometry, cache_dir=cache_dir, directory=directory
-        )
 
     from transitio.catalog._client import _dataset_entry
 
@@ -2353,6 +2422,22 @@ def fetch(
         candidates = sorted(
             db.search_feeds(aoi=geometry, country_code=country_code), key=_rank
         )
+        if index is not False:
+            count = len(candidates)
+            found = f"{count} feed{'' if count == 1 else 's'}"
+            hint = ""
+            if why == _NO_INDEX:
+                hint = "; transitio.index.refresh() installs the feed index"
+            warnings.warn(
+                f"{why}; {found} from the Mobility Database catalogue by "
+                f"bounding box{hint}",
+                UserWarning,
+                stacklevel=2,
+            )
+        if osm:
+            osm_pbf, osm_note = _osm_extract(
+                geometry, cache_dir=cache_dir, directory=directory
+            )
 
         def take(feed, entry, version, dataset_id, hosted, last=True):
             # ``version`` checked against the feeds delivered so far and
@@ -2641,14 +2726,19 @@ def _osm_stops(area, coords):
 
 
 def _hidden_note(place, hidden):
-    """The ``view_note`` on a place whose default view holds none of its
-    ``hidden`` feeds: the view's categories, the feeds (at most five
-    named) and the tiers that fetch them, local, regional and national when
-    only unknown edges remain."""
+    """The ``view_note`` on a place, or an area, whose default view holds
+    none of its ``hidden`` feeds: the view's categories (for an area, its
+    places'), the feeds (at most five named) and the tiers that fetch them,
+    local, regional and national when only unknown edges remain."""
+    from transitio.index import Area
     from transitio.index.feeds import CATEGORY_ORDER, _default_categories
 
-    shown = _default_categories(place, None, "default", False) or ()
-    categories = ", ".join(c for c in CATEGORY_ORDER if c in shown)
+    if isinstance(place, Area):
+        view, whose = "default view of the area's places", "their"
+    else:
+        shown = _default_categories(place, None, "default", False) or ()
+        categories = ", ".join(c for c in CATEGORY_ORDER if c in shown)
+        view, whose = f"default view ({place.kind}: {categories})", "the place's"
     named = ", ".join(
         f"{feed.feed_id} ({feed.relevance_category})" for feed in hidden[:5]
     )
@@ -2659,8 +2749,8 @@ def _hidden_note(place, hidden):
     tiers = [tier for tier in order if tier in found] or list(order[:3])
     feeds, them = ("feed", "it") if len(hidden) == 1 else ("feeds", "them")
     return (
-        f"default view ({place.kind}: {categories}) holds none of the place's "
-        f"{len(hidden)} {feeds}: {named}; tiers={tiers} fetches {them}"
+        f"{view} holds none of {whose} {len(hidden)} {feeds}: {named}; "
+        f"tiers={tiers} fetches {them}"
     )
 
 
@@ -2753,11 +2843,12 @@ def _fetch_place(
     use_cache,
     budgets,
 ):
-    """The ``fetch(place=...)`` path: the place geometry is the AOI, feeds come
-    from the index by tier, each served by a cached version when one serves
-    the request, else downloaded MDB-then-Atlas (decision I) and then from
-    the MDB hosted copy (:func:`_download_indexed`), and a bundled
-    feed is cropped to the routes its matched tiers select, the drop
+    """The index paths, ``fetch(place=...)`` and ``fetch(aoi=...)`` given an
+    :class:`~transitio.index.Area`: the place geometry, or the area's, is the
+    AOI, feeds come from the index by tier, each served by a cached version
+    when one serves the request, else downloaded MDB-then-Atlas (decision I)
+    and then from the MDB hosted copy (:func:`_download_indexed`), and a
+    bundled feed is cropped to the routes its matched tiers select, the drop
     recorded in ``selections``. A feed whose index window misses ``day`` is
     skipped before download when a probe proves the archive unchanged since
     indexed; ``window_day`` is what the computed window is tested against.
@@ -2767,7 +2858,7 @@ def _fetch_place(
     (:meth:`_Access.redact`). The versions among the delivered feeds are
     settled after the feed loop, then their repeated trips left out
     (:func:`_drop_repeats`), and the OSM extract comes last, for the parts
-    the remaining feeds serve."""
+    of the place the remaining feeds serve, or for the area."""
     from transitio import __version__
     from transitio.catalog import Feed, MobilityDatabase, TransitlandAtlas
     from transitio.catalog._client import _dataset_entry
@@ -2775,6 +2866,7 @@ def _fetch_place(
     from transitio.exceptions import DownloadError, StaleSelectorError
     from transitio.index import (
         DISCOVERY_SEMANTICS_VERSION,
+        Area,
         Place,
         _coerce_index,
         place as resolve_place,
@@ -2783,7 +2875,9 @@ def _fetch_place(
     from transitio.index.places import _as_shape
     from transitio.osm._fetch import _buffered
 
-    if isinstance(place, Place):
+    if isinstance(place, Area):
+        place_obj, resolved_index = place, place._index
+    elif isinstance(place, Place):
         place_obj = place
         resolved_index = place._lookup._index
     else:
@@ -3314,14 +3408,20 @@ def _fetch_place(
 
     osm_pbf = osm_area = osm_note = None
     if osm:
-        parts, coords = _osm_parts(geometry, feeds)
-        osm_area = _buffered(parts, _OSM_BUFFER_M)
+        if isinstance(place, Area):
+            # An area's extract covers the area itself, as on the catalogue path.
+            parts = osm_area = geometry
+            coords = {path: _stop_coords(path) for path in feeds}
+            grown = {}
+        else:
+            parts, coords = _osm_parts(geometry, feeds)
+            osm_area = _buffered(parts, _OSM_BUFFER_M)
+            grown = {
+                "buffer_m": _OSM_BUFFER_M,
+                "must_cover": _osm_stops(osm_area, coords),
+            }
         osm_pbf, osm_note = _osm_extract(
-            parts,
-            buffer_m=_OSM_BUFFER_M,
-            must_cover=_osm_stops(osm_area, coords),
-            cache_dir=cache_dir,
-            directory=directory,
+            parts, cache_dir=cache_dir, directory=directory, **grown
         )
         if osm_pbf is None:
             osm_area = None
@@ -3343,4 +3443,9 @@ def _fetch_place(
         osm_area=osm_area,
         view_note=view_note,
         osm_note=osm_note,
+        places=(
+            [part.place for part in place.parts]
+            if isinstance(place, Area)
+            else [place_obj]
+        ),
     )

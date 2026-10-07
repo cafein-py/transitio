@@ -36,6 +36,10 @@ pip install .
   and `MobilityDatabase.feed` read the public CSV catalogue export, and
   `download_latest` fetches the latest hosted feed zip (an unverified moving
   target).
+- **Feed index** — `transitio.index.refresh()` installs the newest feed
+  index. `fetch(place=...)` needs it, and `fetch(aoi=...)` takes the feeds
+  of the index places covering the area from it; without one, `fetch(aoi=...)`
+  searches the Mobility Database catalogue by bounding box, with a warning.
 - **Feed credentials** — some feeds need a free account with their
   provider. `IndexedFeed.access_instructions()` names the provider, where to
   register and the credential fields it issues. Store them with
@@ -45,8 +49,8 @@ pip install .
   writable by group or others), or set one environment variable per field,
   `TRANSITIO_KEY_<PROVIDER>__<FIELD>` (upper case, `-` as `_`); a variable
   wins over the file. On Windows there is no credentials file and the
-  environment variables are the only store. `fetch(place=...)` sends a
-  feed's credentials to the origin of its access URL alone and keeps them
+  environment variables are the only store. `fetch` sends a feed's
+  credentials to the origin of its access URL alone and keeps them
   out of the reasons, paths, sidecars and reports it writes and out of the
   `httpx` log records; a server that echoes one into a response body puts
   it in the cache, and one echoed into a response header shows in
