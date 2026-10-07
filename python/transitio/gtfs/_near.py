@@ -21,6 +21,9 @@ NEAR_MEAN_SECONDS = 60
 NEAR_UNALIGNED = 2
 # Metres per degree, as _meters counts them.
 _DEGREE = 111_320.0
+# Later stops joined to the grid at once, and pairs aligned at once.
+_ANCHORS_AT_ONCE = 100_000
+_PAIRS_AT_ONCE = 50_000
 
 
 def near_matches(earlier, later, keep=None):
@@ -111,14 +114,23 @@ def _candidates(earlier, later):
 
     grid = cells(earlier).assign(other=np.arange(len(earlier)))
     reach = cells(anchors).assign(row=np.arange(len(anchors)))
-    shifted = pd.concat(
-        [
-            reach.assign(x=reach["x"] + dx, y=reach["y"] + dy, t=reach["t"] + dt)
-            for dx, dy, dt in itertools.product((-1, 0, 1), repeat=3)
-        ],
-        ignore_index=True,
-    )
-    hits = shifted.merge(grid, on=["x", "y", "t", "route", "runs"])
+    steps = list(itertools.product((-1, 0, 1), repeat=3))
+    hits = []
+    for start in range(0, max(len(reach), 1), _ANCHORS_AT_ONCE):
+        part = reach.iloc[start : start + _ANCHORS_AT_ONCE]
+        shifted = pd.concat(
+            [
+                part.assign(
+                    x=part["x"] + dx, y=part["y"] + dy, t=part["t"] + dt, step=n
+                )
+                for n, (dx, dy, dt) in enumerate(steps)
+            ],
+            ignore_index=True,
+        )
+        found = shifted.merge(grid, on=["x", "y", "t", "route", "runs"])
+        hits.append(found[["step", "row", "other"]])
+    # The order one join over every anchor gives.
+    hits = pd.concat(hits, ignore_index=True).sort_values(["step", "row", "other"])
     rows, others = hits["row"].to_numpy(), hits["other"].to_numpy()
     close, _ = _reach(anchors, rows, earlier, others)
     pairs = pd.DataFrame(
@@ -152,6 +164,14 @@ def _aligned(earlier, later, pairs):
     if pairs.empty:
         columns = ["later", "earlier", "position", "later_stop", "earlier_stop"]
         return pairs.assign(unaligned=0), pd.DataFrame(columns=columns)
+    if len(pairs) > _PAIRS_AT_ONCE:
+        parts = [
+            _aligned(
+                earlier, later, pairs[at : at + _PAIRS_AT_ONCE].reset_index(drop=True)
+            )
+            for at in range(0, len(pairs), _PAIRS_AT_ONCE)
+        ]
+        return tuple(pd.concat(found, ignore_index=True) for found in zip(*parts))
     mine, n = _firsts(later, pairs["later"])
     theirs, _ = _firsts(earlier, pairs["earlier"])
     # Each pair's later stop times, then the earlier trip's stop times

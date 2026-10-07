@@ -812,6 +812,23 @@ def test_near_matches(variant, unaligned):
     assert list(aligned["earlier_stop"].fillna("")) == expected
 
 
+def test_near_matches_in_parts_match_at_once(monkeypatch):
+    from transitio.gtfs import _near
+    from transitio.gtfs._schedule import trip_signatures
+
+    runs = [_run(shifts=(shift,)) for shift in (0, 30, 60, 120)]
+    _, stops = trip_signatures(_repeats(_trips(*runs, *runs)).tables, with_stops=True)
+    first = stops["trip_id"].isin(["t1", "t2", "t3", "t4"])
+    whole = _near.near_matches(stops[first], stops[~first])
+    assert len(whole[0]) > 4
+    monkeypatch.setattr(_near, "_ANCHORS_AT_ONCE", 1)
+    monkeypatch.setattr(_near, "_PAIRS_AT_ONCE", 1)
+    in_parts = _near.near_matches(stops[first], stops[~first])
+    for one, other in zip(whole, in_parts):
+        # A part without an aligned stop has an object-dtype earlier_stop.
+        pd.testing.assert_frame_equal(one, other, check_dtype=False)
+
+
 def _calendar(*rows):
     """calendar.txt from ``(service_id, weekday flags from Monday, start,
     end)`` rows."""
