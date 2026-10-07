@@ -1188,6 +1188,16 @@ _MATCHED_COLUMNS = {
 }
 
 
+def _release_arrow_memory():
+    """Give back to the system the memory Arrow's default pool keeps once
+    pandas frees the strings in it, as far as the pool can."""
+    import pyarrow
+
+    release = getattr(pyarrow.default_memory_pool(), "release_unused", None)
+    if release is not None:
+        release()
+
+
 def _repeats(cache, items, keys, budgets, modes, day, duplicate_trips):
     """Per feed of ``items``, in priority order, ``(outcome, made)``: the
     trips left out as repeats, with ``duplicate_trips="drop"`` also near
@@ -1247,7 +1257,9 @@ def _repeats(cache, items, keys, budgets, modes, day, duplicate_trips):
                     # matching only the day's.
                     if day is not None:
                         tables = [_running(read, (day, day)) for read in tables]
+                        _release_arrow_memory()
                 matched = repeated_trips(tables, near=near, day=day)
+                _release_arrow_memory()
             except Exception as error:  # noqa: B902 — every feed keeps its trips
                 return unchanged(error)
             for n in range(len(found), len(items)):
