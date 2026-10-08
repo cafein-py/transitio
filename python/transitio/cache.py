@@ -95,15 +95,16 @@ def _feed_id(folder):
 
 
 def _entries(cache):
-    """``(path, is_feed)`` of what the cache's root holds besides its locks:
+    """``(path, is_feed)`` of what the cache's root holds besides its locks
+    and the downloads being staged:
     each feed's folder, and anything an older transitio left there."""
-    from transitio.catalog._cache import _DIGEST
+    from transitio.catalog._cache import _DIGEST, STAGING
 
     if not cache.root.is_dir() or cache.root.is_symlink():
         return []
     entries = []
     for path in sorted(cache.root.iterdir()):
-        if path.name == ".locks":
+        if path.name in (".locks", STAGING):
             continue
         is_feed = path.name.startswith("id-") and bool(_DIGEST.fullmatch(path.name[3:]))
         entries.append((path, is_feed and path.is_dir() and not path.is_symlink()))

@@ -111,14 +111,49 @@ def download(
     raise DownloadError(message)
 
 
+# Windows refuses a path of this many characters or more unless long paths
+# are switched on, and reports it as a missing file or directory.
+WINDOWS_MAX_PATH = 260
+# The characters ``tempfile.mkstemp`` adds to a partial file's name.
+_PARTIAL_SUFFIX = len(".12345678.part")
+
+
+def _windows():
+    return os.name == "nt"
+
+
+def _too_long(path, error, added=0):
+    """``error``, raised creating a file named ``path`` plus ``added``
+    characters, as an ``OSError`` naming Windows' path limit when that path
+    reaches it there; else ``error``."""
+    length = len(os.path.abspath(path)) + added
+    if not _windows() or length < WINDOWS_MAX_PATH:
+        return error
+    return OSError(
+        errno.ENAMETOOLONG,
+        f"the path {path} is {length} characters long, past the "
+        f"{WINDOWS_MAX_PATH}-character limit Windows sets unless long paths "
+        "are switched on; pass a shorter cache_dir, for example "
+        "cache_dir=Path.home() / 'tc', or have an administrator switch on "
+        "long paths (LongPathsEnabled)",
+    )
+
+
 @contextlib.contextmanager
 def replacing(path):
     """Write ``path`` through a unique partial file beside it, opened for
     binary writing and reading: the partial replaces ``path`` when the block
-    completes and is closed and removed when it fails."""
-    fd, partial = tempfile.mkstemp(
-        dir=path.parent, prefix=path.name + ".", suffix=".part"
-    )
+    completes and is closed and removed when it fails. On Windows, a partial
+    whose path is too long raises an ``OSError`` saying so (:func:`_too_long`)."""
+    try:
+        fd, partial = tempfile.mkstemp(
+            dir=path.parent, prefix=path.name + ".", suffix=".part"
+        )
+    except FileNotFoundError as error:
+        clearer = _too_long(path, error, _PARTIAL_SUFFIX)
+        if clearer is error:
+            raise
+        raise clearer from None
     try:
         # The descriptor is wrapped at once, so a failure closes it rather
         # than leaking it (and lets Windows unlink the partial).
