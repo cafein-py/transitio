@@ -2983,12 +2983,12 @@ def test_delete_rows_drops_its_rows_at_once_and_logs_them_one_by_one(monkeypatch
     assert list(builder.tables["stops.txt"]["stop_id"]) == ["s1", "s3", "s4"]
 
 
-@pytest.mark.parametrize("long_path", [True, False])
-def test_a_download_path_stays_within_windows_limit(tmp_path, monkeypatch, long_path):
+def test_a_download_path_stays_within_windows_limit(tmp_path, monkeypatch):
     # On Windows a fetch failed with "No such file or directory": a download
     # nested the feed's 67-character folder twice under the default cache, a
     # 262-character path, past Windows' 260-character limit.
     import tempfile
+    from pathlib import Path
 
     from transitio import _http, cache as feed_cache
     from transitio.catalog._cache import STAGING, FeedCache, _feed_dir
@@ -3002,19 +3002,26 @@ def test_a_download_path_stays_within_windows_limit(tmp_path, monkeypatch, long_
         # Listing and clearing the cache leave the staging folder alone.
         assert feed_cache.clear(tmp_path) == 0 and folder.is_dir()
         assert feed_cache.info(tmp_path).empty
-    assert not (store.root / STAGING).exists()
+    assert not any((store.root / STAGING).iterdir())
 
     def missing(**kwargs):
         raise FileNotFoundError(2, "No such file or directory")
 
     monkeypatch.setattr(_http, "_windows", lambda: True)
     monkeypatch.setattr(tempfile, "mkstemp", missing)
-    path = tmp_path / ("d" * (300 if long_path else 10)) / "latest.zip"
-    with pytest.raises(OSError) as caught:
-        with _http.replacing(path):
-            pass
-    if long_path:
-        assert "260-character limit" in str(caught.value)
-        assert "cache_dir=Path.home() / 'tc'" in str(caught.value)
-    else:
-        assert type(caught.value) is FileNotFoundError
+    # Windows counts UTF-16 units: 125 astral characters are 250 of them.
+    for name, too_long in (("d" * 300, True), ("\U0001f600" * 125, True), ("d", False)):
+        with pytest.raises(OSError) as caught:
+            with _http.replacing(Path("/" + name) / "latest.zip"):
+                pass
+        if too_long:
+            assert "260-character limit" in str(caught.value)
+            assert "cache_dir=Path.home() / 'tc'" in str(caught.value)
+        else:
+            assert type(caught.value) is FileNotFoundError
+    # A writer that opens the staged path by name fails with its own error.
+    monkeypatch.setattr(_http, "WINDOWS_MAX_PATH", len(str(tmp_path)) + 5)
+    with pytest.raises(OSError, match="character limit") as caught:
+        with _http.staged(tmp_path / "x.osm.pbf") as partial:
+            raise RuntimeError(f"Open failed for '{partial}'")
+    assert isinstance(caught.value.__cause__, RuntimeError)

@@ -122,18 +122,20 @@ def _windows():
     return os.name == "nt"
 
 
-def _too_long(path, error, added=0):
-    """``error``, raised creating a file named ``path`` plus ``added``
-    characters, as an ``OSError`` naming Windows' path limit when that path
-    reaches it there; else ``error``."""
-    length = len(os.path.abspath(path)) + added
-    if not _windows() or length < WINDOWS_MAX_PATH:
-        return error
+def _too_long(path, added=0):
+    """An ``OSError`` naming Windows' path limit when ``path`` plus ``added``
+    characters reaches it there, else None. Windows counts UTF-16 units."""
+    if not _windows():
+        return None
+    units = os.path.abspath(path).encode("utf-16-le", "surrogatepass")
+    length = len(units) // 2 + added
+    if length < WINDOWS_MAX_PATH:
+        return None
     return OSError(
         errno.ENAMETOOLONG,
         f"the path {path} is {length} characters long, past the "
         f"{WINDOWS_MAX_PATH}-character limit Windows sets unless long paths "
-        "are switched on; pass a shorter cache_dir, for example "
+        "are switched on; pass a shorter cache_dir or directory, for example "
         "cache_dir=Path.home() / 'tc', or have an administrator switch on "
         "long paths (LongPathsEnabled)",
     )
@@ -149,9 +151,9 @@ def replacing(path):
         fd, partial = tempfile.mkstemp(
             dir=path.parent, prefix=path.name + ".", suffix=".part"
         )
-    except FileNotFoundError as error:
-        clearer = _too_long(path, error, _PARTIAL_SUFFIX)
-        if clearer is error:
+    except FileNotFoundError:
+        clearer = _too_long(path, _PARTIAL_SUFFIX)
+        if clearer is None:
             raise
         raise clearer from None
     try:
@@ -169,12 +171,20 @@ def replacing(path):
 def staged(path):
     """Like :func:`replacing`, for a writer that opens the file by name: a
     path in a private directory beside ``path``, whose file replaces ``path``
-    when the block completes; the directory is removed either way."""
+    when the block completes; the directory is removed either way. A block
+    that fails without writing a path too long for Windows raises an
+    ``OSError`` saying so (:func:`_too_long`)."""
     with tempfile.TemporaryDirectory(
-        dir=path.parent, prefix=path.name + ".", ignore_cleanup_errors=True
+        dir=path.parent, prefix=".", ignore_cleanup_errors=True
     ) as directory:
         partial = Path(directory) / path.name
-        yield partial
+        try:
+            yield partial
+        except Exception as error:
+            clearer = _too_long(partial)
+            if clearer is None or partial.exists():
+                raise
+            raise clearer from error
         os.replace(partial, path)
 
 

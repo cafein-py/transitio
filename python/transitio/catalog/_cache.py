@@ -506,27 +506,18 @@ class FeedCache:
 
         It sits directly under the cache's shared ``.staging`` folder, with a
         short name: a download's path inside it then stays far below Windows'
-        260-character limit. The shared folder is removed once empty."""
-        for directory in (self.root, self.folder(feed_id)):
+        260-character limit."""
+        for directory in (self.root, self.folder(feed_id), self.root / STAGING):
             _directory(directory)
         folder = self.root / STAGING / uuid.uuid4().hex[:12]
-        while True:
-            _directory(folder.parent)
-            try:
-                folder.mkdir()
-                break
-            except FileNotFoundError:
-                # Another download removed the empty shared folder just now.
-                continue
+        folder.mkdir()
         try:
             yield folder
         finally:
             shutil.rmtree(folder, ignore_errors=True)
-            # Under the feed's lock no other download shares its folder; the
-            # shared one stays while another download uses it.
-            for empty in (folder.parent, self.folder(feed_id)):
-                with contextlib.suppress(OSError):
-                    empty.rmdir()
+            # Under the feed's lock no other download shares its folder.
+            with contextlib.suppress(OSError):
+                self.folder(feed_id).rmdir()
 
     def publish(
         self,
