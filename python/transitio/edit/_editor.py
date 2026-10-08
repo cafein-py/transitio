@@ -372,16 +372,38 @@ class FeedBuilder:
             positions = sorted({operator.index(position) for position in positions})
             if positions and not (0 <= positions[0] and positions[-1] < len(table)):
                 raise ValueError(f"positions out of range for {filename}")
+            if not positions:
+                return self
             table = table.reset_index(drop=True)  # positions ARE labels now
-            # bottom-up, so earlier positions stay valid and undo (which
-            # replays in reverse) re-inserts top-down
-            for position in reversed(positions):
-                # encode first: a payload the log cannot represent must
-                # fail before the row is gone
-                payload = json.dumps(_changes._row_payload(table, position))
-                table = table.drop(index=position).reset_index(drop=True)
-                self.tables[filename] = table
-                self._record("delete", filename, position, "", payload, "")
+            # Logged bottom-up, as if deleted one by one, so earlier positions
+            # stay valid and undo (which replays in reverse) re-inserts
+            # top-down; the rows leave in one drop. Every payload is encoded
+            # first: one the log cannot represent fails before a row is gone.
+            descending = positions[::-1]
+            payloads = [
+                json.dumps(row) for row in table.iloc[descending].to_dict("records")
+            ]
+            # The log first, the table last: a failure on the way leaves both
+            # as they were, never rows gone without their entries.
+            start = len(self._applied)
+            try:
+                for removed, (position, payload) in enumerate(
+                    zip(descending, payloads), start=1
+                ):
+                    self._record(
+                        "delete",
+                        filename,
+                        position,
+                        "",
+                        payload,
+                        "",
+                        row_count=len(table) - removed,
+                    )
+                remaining = table.drop(index=positions).reset_index(drop=True)
+            except BaseException:
+                del self._applied[start:]
+                raise
+            self.tables[filename] = remaining
         return self
 
     def undo(self):

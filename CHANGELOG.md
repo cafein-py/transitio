@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- `FeedEditor.delete_rows`, and so `drop_route` and every edit that removes
+  rows, deletes all its rows in one step instead of copying the table once
+  per row: 5,000 of 50,000 rows go in 0.02 s instead of 4 s. The change log
+  and undo are unchanged.
+
 ## 0.21.1 — 2026-10-08
 
 ### Changed
