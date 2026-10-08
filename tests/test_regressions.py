@@ -2940,3 +2940,44 @@ def test_a_feed_measured_apart_is_not_counted_as_new_service(tmp_path, monkeypat
         "the coverage leaves out 1 feed not compared with the others "
         "(1,400 departures a day)"
     )
+
+
+def test_delete_rows_drops_its_rows_at_once_and_logs_them_one_by_one(monkeypatch):
+    # delete_rows copied the whole table once per deleted row, so dropping a
+    # route's stop_times from a large feed took minutes.
+    import json
+
+    from transitio.edit import FeedBuilder
+    from transitio.edit import _changes
+
+    builder = FeedBuilder()
+    rows = [{"stop_id": f"s{i}", "stop_name": f"Stop {i}"} for i in range(6)]
+    builder.insert_rows("stops.txt", rows)
+    before = builder.tables["stops.txt"].copy()
+    logged = len(builder.changes)
+
+    def failing(*args, **kwargs):
+        if len(builder.changes) > logged:
+            raise RuntimeError("log full")
+        original(*args, **kwargs)
+
+    # A failure while logging leaves the table and the log as they were.
+    original = builder._record
+    monkeypatch.setattr(builder, "_record", failing)
+    with pytest.raises(RuntimeError, match="log full"):
+        builder.delete_rows("stops.txt", [5, 0, 2])
+    monkeypatch.undo()
+    assert builder.tables["stops.txt"].equals(before)
+    assert len(builder.changes) == logged
+
+    builder.delete_rows("stops.txt", [5, 0, 2])
+    assert list(builder.tables["stops.txt"]["stop_id"]) == ["s1", "s3", "s4"]
+    deleted = [c for c in builder.changes if c.kind == "delete"]
+    assert [(c.row, c.row_count) for c in deleted] == [(5, 5), (2, 4), (0, 3)]
+    assert [c.old for c in deleted] == [
+        json.dumps(_changes._row_payload(before, row)) for row in (5, 2, 0)
+    ]
+    assert builder.undo() == "delete_rows"
+    assert builder.tables["stops.txt"].equals(before)
+    assert builder.redo() == "delete_rows"
+    assert list(builder.tables["stops.txt"]["stop_id"]) == ["s1", "s3", "s4"]
