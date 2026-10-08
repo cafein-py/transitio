@@ -38,14 +38,15 @@ def _bar_class():
     return notebook.tqdm, False
 
 
-def bar(desc, total):
-    """A tqdm bar of bytes on stderr described ``desc``, its control
-    characters spaces, ``total`` None when unknown (:func:`_bar_class`)."""
+def bar(desc, total, unit="B"):
+    """A tqdm bar of ``unit`` (bytes by default) on stderr described
+    ``desc``, its control characters spaces, ``total`` None when unknown
+    (:func:`_bar_class`)."""
     tqdm, disable = _bar_class()
     made = tqdm(
         total=total,
         file=sys.stderr,
-        unit="B",
+        unit=unit,
         unit_scale=True,
         unit_divisor=1000,
         leave=True,

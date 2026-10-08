@@ -203,6 +203,7 @@ Editing and building feeds
    FeedEditor.set_headway
    FeedEditor.shift_trip
    FeedEditor.drop_route
+   FeedEditor.drop_routes
    OsmEditor
    OsmEditor.nodes
    OsmEditor.ways

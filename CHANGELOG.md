@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- `FeedEditor.drop_routes(route_ids)` removes many routes and everything that
+  references them as one undoable action, each table in one pass, with a
+  progress bar of the rows removed (`progress=False` turns it off):
+  `editor.drop_routes(routes.loc[is_coach, "route_id"])`.
+
 ### Fixed
 
 - `FeedEditor.delete_rows`, and so `drop_route` and every edit that removes

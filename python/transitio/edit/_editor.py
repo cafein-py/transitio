@@ -1012,27 +1012,49 @@ class FeedEditor(FeedBuilder):
         """Remove a route and everything that references it.
 
         Cascades to trips, stop_times, frequencies, fare_rules,
-        attributions and trip-to-trip transfers; save-time validation
-        flags anything a feed references in less common ways.
+        attributions and trip-to-trip transfers, as :meth:`drop_routes`
+        does; save-time validation flags anything a feed references in less
+        common ways.
         """
-        route_id = str(route_id)
+        return self.drop_routes([route_id], progress=False)
 
-        def _drop(filename, mask):
+    @_as_action("drop_routes")
+    def drop_routes(self, route_ids, *, progress=True):
+        """Remove routes and everything that references them, as one action.
+
+        ``route_ids`` is any iterable of route ids, such as a column of
+        ``routes.txt`` (a single string is one id). As in
+        :meth:`drop_route`, the rows are matched by id: an id without a row in
+        ``routes.txt`` still removes the trips and other rows naming it.
+        Cascades to trips, stop_times, frequencies, fare_rules,
+        route_networks, attributions and trip-to-trip transfers, each table
+        in one pass; save-time validation flags anything a feed references
+        in less common ways. With ``progress`` a bar on stderr counts the
+        rows removed (a widget in Jupyter when ipywidgets is installed);
+        ``progress=False`` prints nothing.
+        """
+        if isinstance(route_ids, str):
+            route_ids = [route_ids]
+        gone_routes = {str(route_id) for route_id in route_ids}
+        removals = []
+
+        def plan(filename, mask):
             positions = [int(p) for p in mask.to_numpy().nonzero()[0]]
             if positions:
-                self.delete_rows(filename, positions)
+                removals.append((filename, positions))
 
         routes = self._table("routes.txt")
-        _drop("routes.txt", routes["route_id"] == route_id)
+        plan("routes.txt", routes["route_id"].isin(gone_routes))
         trips = self.tables.get("trips.txt")
         doomed = set()
         if trips is not None:
-            doomed = set(trips.loc[trips["route_id"] == route_id, "trip_id"])
-            _drop("trips.txt", trips["route_id"] == route_id)
+            on_route = trips["route_id"].isin(gone_routes)
+            doomed = set(trips.loc[on_route, "trip_id"])
+            plan("trips.txt", on_route)
         for filename in ("stop_times.txt", "frequencies.txt"):
             table = self.tables.get(filename)
             if table is not None:
-                _drop(filename, table["trip_id"].isin(doomed))
+                plan(filename, table["trip_id"].isin(doomed))
         for filename, columns in (
             ("fare_rules.txt", ("route_id",)),
             ("route_networks.txt", ("route_id",)),
@@ -1049,7 +1071,28 @@ class FeedEditor(FeedBuilder):
             for column in columns:
                 if column not in table.columns:
                     continue
-                gone = doomed if "trip" in column else {route_id}
+                gone = doomed if "trip" in column else gone_routes
                 gone_mask |= table[column].isin(gone)
-            _drop(filename, gone_mask)
+            plan(filename, gone_mask)
+        total = sum(len(positions) for _, positions in removals)
+        desc = (
+            f"Dropping {len(gone_routes)} route{'' if len(gone_routes) == 1 else 's'}"
+        )
+        bar = None
+        if progress and total:
+            from transitio import _progress
+
+            bar = _progress.bar(desc, total, unit="row")
+            if bar.disable:
+                _progress.say(desc)
+        try:
+            for filename, positions in removals:
+                if bar is not None:
+                    bar.set_description(f"{desc}: {filename}")
+                self.delete_rows(filename, positions)
+                if bar is not None:
+                    bar.update(len(positions))
+        finally:
+            if bar is not None:
+                bar.close()
         return self
