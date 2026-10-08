@@ -147,6 +147,34 @@ def test_editor_drop_route_cascades(tmp_path):
         editor.update_route("r1", route_short_name="x")
 
 
+@pytest.mark.parametrize("progress", [True, False])
+def test_editor_drops_many_routes_as_one_action(tmp_path, capsys, progress):
+    builder = build_minimal()
+    builder.add_route("r2", 3, "Second")
+    builder.add_route("r3", 3, "Third")
+    for route, trip in (("r1", "t1"), ("r2", "t2"), ("r3", "t3")):
+        builder.add_trip(
+            route, "wk", trip, [("s1", "08:00:00", "08:00:00"), ("s2", 29100, 29100)]
+        )
+    source = tmp_path / "source.zip"
+    builder.save(source, reference_date="20260601")
+
+    editor = FeedEditor(source)
+    before = {name: table.copy() for name, table in editor.tables.items()}
+    capsys.readouterr()
+    routes = editor.tables["routes.txt"]
+    editor.drop_routes(
+        routes.loc[routes["route_id"] != "r2", "route_id"], progress=progress
+    )
+    assert list(editor.tables["routes.txt"]["route_id"]) == ["r2"]
+    assert list(editor.tables["trips.txt"]["trip_id"]) == ["t2"]
+    assert set(editor.tables["stop_times.txt"]["trip_id"]) == {"t2"}
+    printed = capsys.readouterr().err
+    assert ("Dropping 2 routes" in printed) == progress
+    assert editor.undo() == "drop_routes"
+    assert all(editor.tables[name].equals(table) for name, table in before.items())
+
+
 def test_editor_preserves_extra_entries(tmp_path):
     builder = build_minimal()
     builder.add_trip(
