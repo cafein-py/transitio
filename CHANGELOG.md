@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+
+- `fetch(feeds=place.recommend(day))` takes the place and the day from the
+  recommendation; another `place`, any `aoi` or a `when` on another day
+  raises `ValueError`.
+
+### Fixed
+
+- `recommend()` and the feed table no longer let a feed running the same
+  lines with fewer departures stand in for all of another feed's
+  departures: at each place a feed is credited with at most its own
+  departures in each mode. Tallinn's own feed was left out for the
+  national feed, which runs its lines with about half the departures.
+- `recommend()` takes feeds only from the group the index measured
+  together. A merged index measures overlap within each build, so two
+  feeds of different builds never name each other; Munich's MVV feed and
+  DELFI were both taken, each said to add half the departures. Feeds
+  measured apart are now not compared, and the note counts them.
+
 ## 0.21.0 — 2026-10-07
 
 ### Added

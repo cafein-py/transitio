@@ -2829,3 +2829,114 @@ def test_munich_takes_one_feed_and_says_why_it_leaves_out_the_rest(
         "  - f-tiny (Tiny): contained in f-bw",
         "  - f-old (MVV (old)): stale when indexed: its timetable ended 2026-07-31",
     ]
+
+
+def test_a_feed_running_the_same_lines_less_often_does_not_replace_it(
+    tmp_path, monkeypatch
+):
+    # Tallinn's own feed was left out: the national feed runs all its lines,
+    # though with about half its departures, and stood in for all of them.
+    import transitio
+    import transitio.index as transitio_index
+    from test_index_views import munich_index
+
+    monkeypatch.setattr(
+        transitio, "__version__", transitio_index.MIN_READER_VERSIONS[11]
+    )
+    feeds = {
+        "f-city": {
+            "name": "City",
+            "modes": {"bus": 1000},
+            "stops": 500,
+            "with": {"f-nat": {"bus": 1.0}},
+        },
+        "f-nat": {
+            "name": "National",
+            "modes": {"bus": 500, "rail": 100},
+            "stops": 400,
+            "with": {"f-city": {"bus": 1.0}},
+        },
+    }
+    place = transitio_index.place("muc", index=munich_index(tmp_path, feeds))
+    assert place.recommend("2026-10-13").feed_ids == ["f-city", "f-nat"]
+    table = place.feeds(categories=None).to_dataframe().set_index("feed_id")
+    assert table.loc["f-city", "repeats"] == "f-nat 50 %"
+
+    # In an area the cap holds place by place: an aggregate's many
+    # departures elsewhere do not stand in for a city feed's where they meet.
+    from index_fixture import covered_feed, write_partitioned_index
+    from test_index_views import AREA_PLACES, _edge
+
+    def served(place_id, feed_id, modes, shares):
+        service = {"stops": 10, "routes": 1, "departures_per_day": sum(modes.values())}
+        record = _edge(place_id, feed_id, "local", "primary", 0.5, service=service)
+        overlap = {"departures": modes, "with": shares}
+        return {**record, "evidence": {"overlap": overlap}}
+
+    edges = [
+        served("c1", "f-city", {"bus": 1000}, {"f-agg": {"bus": 1.0}}),
+        served("c1", "f-agg", {"bus": 100}, {"f-city": {"bus": 1.0}}),
+        served("k2", "f-agg", {"bus": 5000}, {}),
+    ]
+    feeds = [
+        {**covered_feed(feed_id), "home_country": "AA"}
+        for feed_id in ("f-city", "f-agg")
+    ]
+    path = write_partitioned_index(
+        tmp_path / "area", feeds=feeds, places=AREA_PLACES, edges=edges, access={}
+    )
+    index = transitio_index.read_index(path)
+    area = transitio_index.area((2, 0, 2.8, 0.4), index=index)
+    assert sorted(area.recommend("2026-10-13").feed_ids) == ["f-agg", "f-city"]
+
+
+def test_a_feed_measured_apart_is_not_counted_as_new_service(tmp_path, monkeypatch):
+    # The merged index measured MVV's feed in another build than DELFI's, so
+    # neither named the other and MVV was taken as service DELFI lacks; a
+    # tram feed measured with DELFI and sharing no line still adds service.
+    import transitio
+    import transitio.index as transitio_index
+    from test_index_views import munich_index
+
+    monkeypatch.setattr(
+        transitio, "__version__", transitio_index.MIN_READER_VERSIONS[11]
+    )
+
+    def spec(name, modes, stops, compared, shares=None):
+        overlap = {"departures": modes, "with": shares or {}, "compared": compared}
+        return {
+            "name": name,
+            "modes": modes,
+            "stops": stops,
+            "evidence": {"overlap": overlap},
+        }
+
+    feeds = {
+        "f-delfi": spec(
+            "DELFI",
+            {"bus": 900, "rail": 500},
+            5000,
+            ["f-mvg", "f-tram"],
+            {"f-mvg": {"bus": 1.0}},
+        ),
+        "f-mvg": spec(
+            "MVG", {"bus": 400}, 300, ["f-delfi", "f-tram"], {"f-delfi": {"bus": 1.0}}
+        ),
+        "f-tram": spec("Tram", {"tram": 100}, 50, ["f-delfi", "f-mvg"]),
+        "f-mvv": spec("MVV", {"bus": 900, "rail": 500}, 1000, []),
+        # Apart too, but contained in DELFI: left out for that.
+        "f-sub": {**spec("Sub", {"bus": 20}, 10, []), "contained": ["f-delfi"]},
+    }
+    found = transitio_index.place("muc", index=munich_index(tmp_path, feeds)).recommend(
+        "2026-10-13"
+    )
+    assert found.feed_ids == ["f-delfi", "f-tram"]
+    reasons = {c.feed.feed_id: c.reason for c in found.left_out}
+    assert reasons["f-mvv"] == (
+        "not compared: the index measured it apart from the feeds taken"
+    )
+    assert reasons["f-sub"] == "contained in f-delfi"
+    assert found.note == (
+        "the coverage leaves out 1 feed not compared with the others "
+        "(1,400 departures a day)"
+    )

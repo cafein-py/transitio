@@ -14,8 +14,11 @@ place's departures of that, the open one with the fewest stops. It stops
 once the taken feeds cover ``TARGET`` of the departures and
 ``FAMILY_TARGET`` of each family holding at least ``FAMILY_SHARE`` of them,
 when no feed adds ``MIN_GAIN``, or at ``MAX_FEEDS`` feeds; a taken feed
-adding less than ``MIN_GAIN`` beside the others is then dropped. On an
-index without that evidence the feed with the most departures is taken, or
+adding less than ``MIN_GAIN`` beside the others is then dropped. A merged
+index measures overlap within each build only and lists, per block, the
+feeds its build compared (``compared``): the feeds are taken from the
+largest group measured together, and the others are not compared. On an
+index without overlap evidence the feed with the most departures is taken, or
 a smaller one within ``SIZE_TOLERANCE`` of them.
 """
 
@@ -166,6 +169,8 @@ def recommend(target, feeds, when, *, goal=TARGET, max_feeds=MAX_FEEDS):
         else:
             left_out.append(Choice(feed, _with_access(feed, reason), None))
     blocks = {f.feed_id: blocks[f.feed_id] for f in candidates if f.feed_id in blocks}
+    apart = _apart(candidates, blocks)
+    blocks = {i: block for i, block in blocks.items() if i not in apart}
     if not blocks:
         taken, rest, note = _by_departures(candidates)
         left_out = _largest_first(rest) + _largest_first(left_out)
@@ -197,15 +202,17 @@ def recommend(target, feeds, when, *, goal=TARGET, max_feeds=MAX_FEEDS):
             f"the feeds taken cover {_percent(coverage)} of the departures, "
             f"short of {missing}: {why}"
         )
-    uncompared = [f for f in candidates if f.feed_id not in blocks]
+    # A feed contained in or carried by another is left out for that reason,
+    # its departures being that feed's.
+    uncompared = [f for f in candidates if f.feed_id not in blocks and _kept(f) is None]
     if uncompared:
         count = len(uncompared)
         departures = sum(
             _summed_service(f)["departures_per_day"] or 0.0 for f in uncompared
         )
         left = (
-            f"the coverage leaves out {count} feed{'' if count == 1 else 's'} the "
-            f"index records no overlap for ({departures:,.0f} departures a day)"
+            f"the coverage leaves out {count} feed{'' if count == 1 else 's'} not "
+            f"compared with the others ({departures:,.0f} departures a day)"
         )
         note = left if note is None else f"{note}; {left}"
     chosen = [
@@ -222,7 +229,9 @@ def recommend(target, feeds, when, *, goal=TARGET, max_feeds=MAX_FEEDS):
         if block is not None:
             adds = sum(_unrun(block, taken).values()) / total
             reason = reason or _repeats(feed, block, taken, goal, stops)
-        if reason is None and block is None:
+        if reason is None and feed.feed_id in apart:
+            reason = "not compared: the index measured it apart from the feeds taken"
+        elif reason is None and block is None:
             reason = "not compared: the index records no overlap for it"
         elif reason is None and adds < MIN_GAIN:
             reason = f"adds too little: {_percent(adds)} of the place's departures"
@@ -266,6 +275,49 @@ def _size_key(feed, gain):
     (unknown counting as most), more added, then the id."""
     stops = math.inf if feed.stop_count is None else feed.stop_count
     return (feed.access == "key", stops, -gain, feed.feed_id)
+
+
+def _apart(feeds, blocks):
+    """The ids among ``blocks`` outside the group of feeds the index measured
+    together that holds the most departures, the groups joined by the
+    ``compared`` lists of the feeds' overlap blocks; empty when no block
+    carries one or all are measured together."""
+    links = {feed_id: set() for feed_id in blocks}
+    listed = False
+    for feed in feeds:
+        if feed.feed_id not in blocks:
+            continue
+        for edge in feed.edges.values():
+            compared = ((edge.evidence or {}).get("overlap") or {}).get("compared")
+            if not isinstance(compared, list):
+                continue
+            listed = True
+            for other in compared:
+                if other in links and other != feed.feed_id:
+                    links[feed.feed_id].add(other)
+                    links[other].add(feed.feed_id)
+    if not listed:
+        return set()
+    groups, seen = [], set()
+    for start in sorted(blocks):
+        if start in seen:
+            continue
+        group, stack = set(), [start]
+        while stack:
+            feed_id = stack.pop()
+            if feed_id not in group:
+                group.add(feed_id)
+                stack.extend(links[feed_id] - group)
+        seen |= group
+        groups.append(group)
+    if len(groups) < 2:
+        return set()
+
+    def held(group):
+        return sum(_universe({i: blocks[i] for i in group}).values())
+
+    kept = max(groups, key=lambda group: (held(group), sorted(group)))
+    return set(blocks) - kept
 
 
 def _greedy(blocks, universe, by_id, goal, max_feeds):

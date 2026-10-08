@@ -240,6 +240,28 @@ def _rank(feed):
     )
 
 
+def _from_recommendation(feeds, place, aoi, when):
+    """``(place, when)`` for a fetch whose ``feeds`` may be a
+    :class:`~transitio.index.Recommendation`: its place and day, refusing a
+    ``place``, ``aoi`` or ``when`` that differs from them."""
+    from transitio.catalog._models import as_date
+    from transitio.index.recommend import Recommendation
+
+    if not isinstance(feeds, Recommendation):
+        return place, when
+    if aoi is not None or (place is not None and place != feeds.place):
+        raise ValueError(
+            "feeds= is a recommendation, which names its place: pass no place= "
+            "or aoi="
+        )
+    if when is not None and as_date(when) != (feeds.when or _today()):
+        raise ValueError(
+            f"feeds= is a recommendation for {feeds.when or _today()}, "
+            f"not for {as_date(when)}: pass no when="
+        )
+    return feeds.place, feeds.when if when is None else when
+
+
 def _today():
     return datetime.date.today()
 
@@ -2222,8 +2244,12 @@ def fetch(
         and one that starts later or runs on other weekdays stays. An
         unknown window passes the window checks, and a report without a
         ``moment`` for the day passes the day check.
-    feeds : list of str or object with ``feed_ids``, optional
+    feeds : list of str, Recommendation or object with ``feed_ids``, optional
         Fetch only these feeds of the index: a list of feed ids (or one id),
+        a :class:`~transitio.index.Recommendation`, whose place and day the
+        call then takes (``fetch(feeds=place.recommend(day))``; another
+        ``place``, any ``aoi`` or a ``when`` on another day raises
+        ``ValueError``),
         or an object whose ``feed_ids`` attribute lists them. They are
         taken from every relevance category of the place, or of the area's
         places, not only the default view, and ``tiers``, ``exclude`` and
@@ -2478,6 +2504,7 @@ def fetch(
     from transitio.exceptions import DownloadError
     from transitio.osm._fetch import _as_geometry
 
+    place, when = _from_recommendation(feeds, place, aoi, when)
     if (aoi is None) == (place is None):
         raise ValueError("pass exactly one of aoi= or place=")
     if contained not in ("keep", "drop"):
