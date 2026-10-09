@@ -41,13 +41,14 @@ def _bar_class():
 def bar(desc, total, unit="B"):
     """A tqdm bar of ``unit`` (bytes by default) on stderr described
     ``desc``, its control characters spaces, ``total`` None when unknown
-    (:func:`_bar_class`)."""
+    (:func:`_bar_class`). Bytes show scaled (``13.1M``), other units as
+    whole counts."""
     tqdm, disable = _bar_class()
     made = tqdm(
         total=total,
         file=sys.stderr,
         unit=unit,
-        unit_scale=True,
+        unit_scale=unit == "B",
         unit_divisor=1000,
         leave=True,
         mininterval=0.2,

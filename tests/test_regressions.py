@@ -3086,3 +3086,17 @@ def test_a_recommendation_near_full_coverage_says_over_not_about_over():
         "The area's 0 places: take 0 feeds, covering over 99 % of the departures "
         "the index records there, each counted once"
     )
+
+
+def test_a_row_bar_counts_whole_rows(monkeypatch, capsys):
+    # drop_routes' bar read "50.0/100": every bar scaled its counts as bytes.
+    from tqdm import std
+
+    from transitio import _progress
+
+    monkeypatch.setattr(_progress, "_bar_class", lambda: (std.tqdm, False))
+    for unit, shown in (("row", "1200/2000"), ("B", "1.20k/2.00k")):
+        made = _progress.bar("Dropping", 2000, unit=unit)
+        made.update(1200)
+        made.close()
+        assert shown in capsys.readouterr().err
