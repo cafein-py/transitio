@@ -1145,11 +1145,13 @@ def test_the_cache_is_listed_and_cleared_by_age_feed_and_whole(tmp_path):
     assert transitio.cache.clear(tmp_path, older_than=datetime.timedelta(days=1)) > 0
     assert list(transitio.cache.info(tmp_path)["feed_id"]) == ["f-x"]
     assert transitio.cache.clear(tmp_path, feeds=["mdb-7"]) == 0
-    # A folder an older transitio left goes with the rest; the locks stay.
+    # A folder an older transitio left goes with the rest; the locks and the
+    # empty staging folder stay.
     (tmp_path / "gtfs" / "mdb-1").mkdir()
     (tmp_path / "gtfs" / "mdb-1" / "latest.zip").write_bytes(b"old")
     assert transitio.cache.clear(tmp_path) > 0
-    assert [p.name for p in (tmp_path / "gtfs").iterdir()] == [".locks"]
+    left = sorted(p.name for p in (tmp_path / "gtfs").iterdir())
+    assert left == [".locks", ".staging"]
 
 
 def test_clear_waits_for_a_fetch_holding_a_feeds_lock(tmp_path):
