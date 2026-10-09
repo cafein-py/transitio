@@ -452,16 +452,29 @@ def test_a_delivered_feed_is_recognised_by_its_content(
     assert delivered.same_as(again) == [("feed-a", routes)] * same
 
 
-def test_fetch_when_without_token_warns(pipeline_env):
+@pytest.mark.parametrize(
+    ("when", "delivered", "warned"),
+    [("2026-06-01", 1, []), ("2027-03-01", 0, ["mdb-10"])],
+)
+def test_fetch_when_without_token_warns_for_feeds_missing_the_day(
+    pipeline_env, when, delivered, warned
+):
+    # Without a token only the newest copy can be taken; the warning names the
+    # feeds whose newest copy does not run on the day.
     tmp_path, _ = pipeline_env
-    with pytest.warns(UserWarning) as caught:
-        result = fetch(
-            (24.6, 60.1, 25.2, 60.4),
-            when="2026-06-01",
-            directory=tmp_path,
-        )
-    assert any("cannot select historical" in str(w.message) for w in caught)
-    assert len(result.feeds) == 1
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = fetch((24.6, 60.1, 25.2, 60.4), when=when, directory=tmp_path)
+    named = [w for w in caught if "API token" in str(w.message)]
+    messages = [str(w.message) for w in named]
+    assert all(w.filename == __file__ for w in named)
+    assert len(result.feeds) == delivered
+    assert messages == [
+        f"no Mobility Database API token: the newest copies of {feed_id} do not "
+        f"run on {when}; with a token, fetch can pick a dated copy from the "
+        "Mobility Database"
+        for feed_id in warned
+    ]
 
 
 def test_fetch_rejects_unknown_mode(pipeline_env):
@@ -2387,21 +2400,46 @@ def _stub_pbf_and_atlas(monkeypatch, tmp_path, payload):
     return fake_pbf
 
 
-def test_fetch_place_when_without_token_warns(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("mdb", "when", "indexed_end", "warned", "fetched_from"),
+    [
+        ({"mdb_id": "mdb-9"}, "2026-06-01", None, False, "producer"),
+        ({"mdb_id": "mdb-9"}, "2027-03-01", None, True, "producer"),
+        (None, "2027-03-01", None, False, "producer"),  # no dated copy to pick
+        # Skipped before download: the index's window misses the day and the
+        # feed is unchanged since indexed.
+        ({"mdb_id": "mdb-9"}, "2027-03-01", "2026-12-31", True, None),
+    ],
+)
+def test_fetch_place_without_token_warns_for_feeds_missing_the_day(
+    tmp_path, monkeypatch, mdb, when, indexed_end, warned, fetched_from
+):
     monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
-    index = _place_index(
-        tmp_path, {"atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}}}
-    )
+    row = {"atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}}}
+    if indexed_end:
+        from transitio.index.feeds import IndexedFeed
+
+        end = datetime.date.fromisoformat(indexed_end)
+        monkeypatch.setattr(IndexedFeed, "service_end", property(lambda feed: end))
+        monkeypatch.setattr(
+            "transitio.pipeline._fetch._unchanged_since_indexed", lambda *a, **k: True
+        )
+    index = _place_index(tmp_path, {**row, "mdb": mdb} if mdb else row)
     _stub_pbf_and_atlas(monkeypatch, tmp_path, _gtfs_payload())
-    with pytest.warns(UserWarning, match="cannot select"):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         result = fetch(
             place="Q1757",
             index=index,
             directory=tmp_path / "out",
             crop=False,
-            when="2026-06-01",
+            when=when,
         )
-    assert [e["fetched_from"] for e in result.selection] == ["producer"]
+    named = [w for w in caught if "newest copies of f-a do not run" in str(w.message)]
+    assert len(named) == warned
+    # The warning points at the caller of fetch.
+    assert all(w.filename == __file__ for w in named)
+    assert [e["fetched_from"] for e in result.selection] == [fetched_from]
 
 
 def test_fetch_place_with_token_selects_the_covering_dataset(tmp_path, monkeypatch):
