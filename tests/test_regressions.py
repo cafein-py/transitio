@@ -2983,6 +2983,50 @@ def test_delete_rows_drops_its_rows_at_once_and_logs_them_one_by_one(monkeypatch
     assert list(builder.tables["stops.txt"]["stop_id"]) == ["s1", "s3", "s4"]
 
 
+def test_a_download_path_stays_within_windows_limit(tmp_path, monkeypatch):
+    # On Windows a fetch failed with "No such file or directory": a download
+    # nested the feed's 67-character folder twice under the default cache, a
+    # 262-character path, past Windows' 260-character limit.
+    import tempfile
+    from pathlib import Path
+
+    from transitio import _http, cache as feed_cache
+    from transitio.catalog._cache import STAGING, FeedCache, _feed_dir
+
+    store = FeedCache(tmp_path)
+    with store.staging("f-mdb-2904") as folder:
+        assert folder.parent == store.root / STAGING
+        inner = folder / _feed_dir("f-mdb-2904") / "latest.zip.12345678.part"
+        # 114 characters: about 175 under a default Windows cache root.
+        assert len(str(inner.relative_to(store.root))) <= 120
+        # Listing and clearing the cache leave the staging folder alone.
+        assert feed_cache.clear(tmp_path) == 0 and folder.is_dir()
+        assert feed_cache.info(tmp_path).empty
+    assert not any((store.root / STAGING).iterdir())
+
+    def missing(**kwargs):
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(_http, "_windows", lambda: True)
+    monkeypatch.setattr(tempfile, "mkstemp", missing)
+    # Windows counts UTF-16 units: 125 astral characters are 250 of them.
+    for name, too_long in (("d" * 300, True), ("\U0001f600" * 125, True), ("d", False)):
+        with pytest.raises(OSError) as caught:
+            with _http.replacing(Path("/" + name) / "latest.zip"):
+                pass
+        if too_long:
+            assert "260-character limit" in str(caught.value)
+            assert "cache_dir=Path.home() / 'tc'" in str(caught.value)
+        else:
+            assert type(caught.value) is FileNotFoundError
+    # A writer that opens the staged path by name fails with its own error.
+    monkeypatch.setattr(_http, "WINDOWS_MAX_PATH", len(str(tmp_path)) + 5)
+    with pytest.raises(OSError, match="character limit") as caught:
+        with _http.staged(tmp_path / "x.osm.pbf") as partial:
+            raise RuntimeError(f"Open failed for '{partial}'")
+    assert isinstance(caught.value.__cause__, RuntimeError)
+
+
 def test_undo_and_redo_replay_a_run_of_rows_in_one_step(monkeypatch):
     # Undo and redo replayed the rows of delete_rows and insert_rows one at a
     # time, copying the table per row, so undoing drop_routes on a city's

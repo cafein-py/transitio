@@ -62,6 +62,10 @@ _SIDECAR = ".provenance.json"
 _OUTPUT_STEPS = ("cropped", "repaired", "deduplicated")
 
 
+# The folder under the cache's root holding each download's staging folder.
+STAGING = ".staging"
+
+
 def _feed_dir(feed_id):
     """The digest-keyed cache directory for a feed. Paths never key on the id
     itself: Onestop ids are Unicode, can exceed a filesystem's byte limit and
@@ -498,20 +502,22 @@ class FeedCache:
     @contextlib.contextmanager
     def staging(self, feed_id):
         """A fresh folder for the feed's downloads, removed after the block
-        with whatever was not published from it."""
-        staging = self.folder(feed_id) / ".staging"
-        for directory in (self.root, staging.parent, staging):
+        with whatever was not published from it.
+
+        It sits directly under the cache's shared ``.staging`` folder, with a
+        short name: a download's path inside it then stays far below Windows'
+        260-character limit."""
+        for directory in (self.root, self.folder(feed_id), self.root / STAGING):
             _directory(directory)
-        folder = staging / uuid.uuid4().hex
+        folder = self.root / STAGING / uuid.uuid4().hex[:12]
         folder.mkdir()
         try:
             yield folder
         finally:
             shutil.rmtree(folder, ignore_errors=True)
-            # Under the feed's lock no other download shares these folders.
-            for empty in (staging, staging.parent):
-                with contextlib.suppress(OSError):
-                    empty.rmdir()
+            # Under the feed's lock no other download shares its folder.
+            with contextlib.suppress(OSError):
+                self.folder(feed_id).rmdir()
 
     def publish(
         self,
