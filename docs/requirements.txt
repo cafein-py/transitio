@@ -1,9 +1,13 @@
-# Documentation toolchain for Read the Docs (Sphinx + MyST Markdown).
+# Documentation toolchain for Read the Docs (Sphinx + MyST-NB).
 #
 # transitio itself is installed (and compiled) by the Read the Docs build via
 # `.readthedocs.yml` (`python.install` runs `pip install .`), so autodoc
-# imports the real package. Only the Sphinx toolchain is listed here.
+# imports the real package. Only the Sphinx toolchain is listed here. The
+# notebooks are rendered from their stored outputs (execution is disabled in
+# conf.py).
 
 sphinx>=7,<9
-myst-parser>=3,<5
+myst-nb>=1.0,<2
 sphinx-book-theme>=1.1,<2
+# Highlights the notebooks' code cells.
+ipython>=8.0
