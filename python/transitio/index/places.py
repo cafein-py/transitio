@@ -658,16 +658,57 @@ class _NameIndex:
                 ("owner", "ascending"),
             ]
         )
+        columns = ("owner", "text", "source", "norm", "kind", "country")
         hits, seen = [], set()
-        rows = zip(*(part[name].to_pylist() for name in ("owner", "text", "source")))
-        for owner, text, source in rows:
-            if owner in seen:
+        for row in zip(*(part[name].to_pylist() for name in columns)):
+            if row[0] in seen:
                 continue
-            seen.add(owner)
-            hits.append((owner, text, source))
+            seen.add(row[0])
+            hits.append(row)
             if len(hits) == limit:
                 break
+        return [hit[:3] for hit in _city_first(part, hits, limit)]
+
+
+def _city_first(part, hits, limit):
+    """``hits`` with the cities of each metro's country carrying its label put
+    before the first such metro among them, in their query order, as
+    :meth:`_PlaceLookup.resolve` ranks a city over its namesake metros
+    ("Augsburg" the city before the metros named after it), still ``limit``
+    long; ``part`` is the query's sorted rows. A place without a country has
+    no namesake."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    metros = {(h[3], h[5]) for h in hits if h[4] == "metro" and h[5] is not None}
+    if not metros:
         return hits
+    norms = pa.array(sorted({norm for norm, _ in metros}), pa.string())
+    cities = part.filter(
+        pc.and_(pc.equal(part["kind"], "city"), pc.is_in(part["norm"], value_set=norms))
+    )
+    # A city whose labels match several metros goes before each of them.
+    namesakes, seen = defaultdict(list), set()
+    columns = ("owner", "text", "source", "norm", "kind", "country")
+    for row in zip(*(cities[name].to_pylist() for name in columns)):
+        key = (row[3], row[5])
+        if key in metros and (key, row[0]) not in seen:
+            seen.add((key, row[0]))
+            namesakes[key].append(row)
+    if not namesakes:
+        return hits
+    ordered, added = [], set()
+    for hit in hits:
+        if hit[0] in added:
+            continue
+        if hit[4] == "metro":
+            for city in namesakes.pop((hit[3], hit[5]), ()):
+                if city[0] not in added:
+                    ordered.append(city)
+                    added.add(city[0])
+        ordered.append(hit)
+        added.add(hit[0])
+    return ordered[:limit]
 
 
 class _PlaceLookup:
@@ -852,8 +893,20 @@ class _PlaceLookup:
         return scored
 
     def search(self, query, kind=None):
-        scored = self._readings(query, kind)[0][1]
-        return [self.get(place_id) for _, place_id in scored]
+        readings = self._readings(query, kind)
+        found = [self.get(place_id) for _, place_id in readings[0][1]]
+        # The place a name resolves to comes first, as it outranks its rivals
+        # (:meth:`resolve`, from the same readings); none when nothing decides.
+        for name, scored in readings:
+            try:
+                answer = self._answer(query, name, scored)
+            except (AmbiguousPlaceError, PlaceNotFoundError):
+                continue
+            if any(place.id == answer.id for place in found):
+                rest = [place for place in found if place.id != answer.id]
+                return [answer] + rest
+            break
+        return found
 
     def _readings(self, query, kind, definition=None):
         """The readings of the query as ``(name, scored)`` pairs, in the order

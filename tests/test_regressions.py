@@ -3100,3 +3100,50 @@ def test_a_row_bar_counts_whole_rows(monkeypatch, capsys):
         made.update(1200)
         made.close()
         assert shown in capsys.readouterr().err
+
+
+def test_places_and_suggestions_list_the_resolved_city_first():
+    # places("Augsburg") and suggest("augs") listed Augsburg's metros before
+    # the city place("Augsburg") answers.
+    import transitio.index as transitio_index
+    from test_index_resolve import _index, _p
+
+    idx = _index(
+        [
+            _p("Q-aug-m", "metro", "Augsburg", member_ids=["Q-aug"], country_code="DE"),
+            _p("Q-aug", "city", "Augsburg", metro_ids=["Q-aug-m"], country_code="DE"),
+        ]
+    )
+    assert transitio_index.place("Augsburg", index=idx).id == "Q-aug"
+    assert [p.id for p in transitio_index.places("Augsburg", index=idx)] == [
+        "Q-aug",
+        "Q-aug-m",
+    ]
+    assert [s.place.id for s in transitio_index.suggest("augs", index=idx)] == [
+        "Q-aug",
+        "Q-aug-m",
+    ]
+    assert [
+        s.place.id for s in transitio_index.suggest("augs", limit=1, index=idx)
+    ] == ["Q-aug"]
+    # Two cities of the name in the metro's country both go before it.
+    twins = _index(
+        [
+            _p("Q-s-m", "metro", "Sburg", member_ids=["Q-s1"], country_code="US"),
+            _p("Q-s1", "city", "Sburg", metro_ids=["Q-s-m"], country_code="US"),
+            _p("Q-s2", "city", "Sburg", country_code="US"),
+        ]
+    )
+    found = [s.place.id for s in transitio_index.suggest("sbu", index=twins)]
+    assert found[2] == "Q-s-m" and sorted(found[:2]) == ["Q-s1", "Q-s2"]
+    # Places without a country are no namesakes: the metro keeps its rank.
+    nowhere = _index(
+        [
+            _p("Q-x-m", "metro", "Xburg", member_ids=["Q-x"], country_code=None),
+            _p("Q-x", "city", "Xburg", metro_ids=["Q-x-m"], country_code=None),
+        ]
+    )
+    assert [s.place.id for s in transitio_index.suggest("xbu", index=nowhere)] == [
+        "Q-x-m",
+        "Q-x",
+    ]
