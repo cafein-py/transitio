@@ -66,10 +66,6 @@ pub struct RepairResult {
 }
 
 pub fn repair(path: &Path, output: &Path, options: ScanOptions) -> Result<RepairResult, String> {
-    let mut options = options;
-    if options.reference_date.is_none() {
-        options.reference_date = Some(chrono::Utc::now().date_naive());
-    }
     let mut result = scan::scan_with(path, options)?;
     rules::run_rules(&mut result, &options);
     semantics::run_semantics(&mut result, &options);

@@ -26,10 +26,7 @@ pub use scan::{
 
 /// The full current rule set: the structural scan plus the field-format and
 /// referential-integrity tiers.
-pub fn validate(path: &std::path::Path, mut options: ScanOptions) -> Result<ScanResult, String> {
-    if options.reference_date.is_none() {
-        options.reference_date = Some(chrono::Utc::now().date_naive());
-    }
+pub fn validate(path: &std::path::Path, options: ScanOptions) -> Result<ScanResult, String> {
     let mut result = scan::scan_with(path, options)?;
     rules::run_rules(&mut result, &options);
     semantics::run_semantics(&mut result, &options);

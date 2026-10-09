@@ -42,8 +42,8 @@ const TRAILING_BYTES_ROOM: u64 = 64 * 1024;
 const NON_CSV_FILES: &[&str] = &["locations.geojson"];
 
 /// An explicit validation target: a service day, optionally with a
-/// wall-clock time of day in seconds. Unlike `reference_date` it is never
-/// defaulted — the date-targeted checks run only when the caller asked.
+/// wall-clock time of day in seconds. Never defaulted: the date-targeted
+/// checks run only when the caller asked.
 #[derive(Clone, Copy)]
 pub struct Moment {
     pub date: chrono::NaiveDate,
@@ -57,8 +57,8 @@ pub struct ScanOptions {
     pub max_rows: u64,
     pub max_columns: usize,
     pub max_notices_per_file: u64,
-    /// Reference day for expiry checks; `None` disables them. `validate`
-    /// defaults it to the current date.
+    /// Reference day for expiry checks; `None` disables them, so a report
+    /// does not depend on the day it is made.
     pub reference_date: Option<chrono::NaiveDate>,
     /// Target for the date(-time)-targeted service checks.
     pub moment: Option<Moment>,

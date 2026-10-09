@@ -3182,3 +3182,18 @@ def test_a_repair_goes_ahead_past_a_notice_limit_of_kinds_it_does_not_fix(tmp_pa
     assert [n["context"]["suppressedCodes"] for n in capped] == [["new_line_in_value"]]
     result = transitio.repair_feed(source, tmp_path / "out.zip", max_notices_per_file=1)
     assert result["fixes"] == [] and (tmp_path / "out.zip").exists()
+
+
+def test_validation_without_a_study_day_reports_no_expired_service(tmp_path):
+    # Without a reference date, validation and repair judged calendars
+    # against the day they ran, so a feed's notices changed from day to day.
+    files = {name: text.replace("2026", "2020") for name, text in FEED.items()}
+    source = write_zip(tmp_path / "feed.zip", files)
+
+    def expired(notices):
+        return [n for n in notices if n["code"] == "expired_calendar"]
+
+    assert expired(validate_feed(source)["notices"]) == []
+    repaired = repair_feed(source, tmp_path / "repaired.zip")
+    assert expired(repaired["remaining_notices"]) == []
+    assert expired(validate_feed(source, reference_date="20210101")["notices"])

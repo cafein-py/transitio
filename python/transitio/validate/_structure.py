@@ -69,11 +69,13 @@ def validate_feed(
         Row-level notices retained per file (default 10000); further
         occurrences are counted in a ``notice_limit_reached`` notice.
     reference_date : str, optional
-        ``YYYYMMDD`` day for calendar-expiry checks; defaults to today.
-        Passing it explicitly also runs the date-targeted service checks:
-        whether any service is active on the day, whether the day's
-        active-trip count sits far below the feed's own per-day baseline,
-        and whether normally active routes are silent on it.
+        ``YYYYMMDD`` study day. Services whose last running day falls
+        before it are reported as ``expired_calendar``, and the
+        date-targeted service checks run: whether any service is active on
+        the day, whether the day's active-trip count sits far below the
+        feed's own per-day baseline, and whether normally active routes are
+        silent on it. Without it none of these checks run, so the notices
+        do not depend on the day the feed is validated.
     reference_time : str, optional
         ``HH:MM`` or ``HH:MM:SS`` wall-clock time refining the
         date-targeted checks to a moment: trips must actually be
