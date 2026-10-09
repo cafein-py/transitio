@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- `fetch` failed on Windows with "No such file or directory": a download's
+  path in the default cache was about 262 characters long, past the
+  260-character limit Windows sets unless long paths are switched on.
+  Downloads are now staged in a short folder, `<cache_dir>/gtfs/.staging/`,
+  about 90 characters shorter, and an OSM crop's temporary folder no longer
+  repeats the crop's file name. A path that still reaches the limit on
+  Windows raises an error saying so, with the two remedies: a shorter
+  `cache_dir`, or switching on long paths.
+
 ## 0.21.2 — 2026-10-08
 
 ### Added
