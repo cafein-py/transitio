@@ -5,49 +5,6 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
-
-### Added
-
-- `fetch_pbf(progress=...)`: the OpenStreetMap extract download shows a
-  progress bar (a widget in Jupyter), `False` shows nothing and a function
-  is called as `progress(written, total)`. `fetch` shows it with its other
-  downloads and counts its bytes. transitio now requires pyrosm 0.16.0.
-- `fetch` warns when more than half of the delivered feeds' located stops
-  lie outside the OpenStreetMap extract, as for a small area that whole trips
-  run on beyond, and names the two ways out: a larger area, or
-  `crop_feed(..., full_trips_only=True)`.
-
-### Changed
-
-- The documentation's Quickstart is a short walk from a place name to
-  routable data, and a user guide of eight tutorial notebooks, stored with
-  their outputs, covers the rest: finding places, choosing feeds, fetching
-  data, the download cache, working with a GTFS feed, cropping and merging,
-  building scenario feeds, and catalogues and OSM extracts. New sections
-  show how to open any GTFS feed with `FeedEditor`, analyse and edit it,
-  and crop the data of an earlier `fetch` to another area or a date window.
-  `scripts/run_notebooks.py` runs the notebooks and stores their outputs.
-- Without a Mobility Database API token, `fetch` warns only when a feed's
-  newest copy does not run on the requested day, naming the feeds a token
-  could have served with a dated copy, instead of on every call with `when`.
-- `places()` lists the place `place()` answers first, and `suggest()` puts a
-  city before the metros of its country named after it: "Augsburg" gives
-  the city before its three metros.
-- A `notice_limit_reached` notice lists the codes of the notices it left out
-  in `suppressedCodes`.
-
-### Fixed
-
-- `repair_feed` refused a feed when any file had more notices than
-  `max_notices_per_file`, even of kinds it never repairs; Turku's feed was
-  refused for its shapes. It now refuses only when the left-out notices
-  include a kind it repairs.
-- A recommendation's summary said "covering about over 99 %"; it says
-  "covering over 99 %".
-- Progress bars counting rows, such as `drop_routes`', showed "50.0/100";
-  they count whole rows.
-
 ## 0.21.3 — 2026-10-09
 
 ### Fixed
