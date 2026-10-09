@@ -2882,6 +2882,27 @@ def test_osm_parts_are_those_holding_a_delivered_stop(
     assert must_cover == (None if inside is None else shapely.multipoints(inside))
 
 
+@pytest.mark.parametrize(
+    ("outside", "total", "warned"),
+    [(21, 40, True), (20, 40, False), (0, 0, False)],
+)
+def test_most_stops_outside_the_osm_extract_warn(outside, total, warned):
+    from transitio.pipeline._fetch import _warn_outside
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _warn_outside(outside, total, 0, stacklevel=2)
+    assert all(w.filename == __file__ for w in caught)
+    assert [str(w.message).split(":")[0] for w in caught] == (
+        [
+            f"{outside} of the {total} located stops of the delivered feeds "
+            "lie outside the OSM extract"
+        ]
+        if warned
+        else []
+    )
+
+
 _PARTS_NOTE = "OSM area: 1 of 2 parts (247 of 488 km²)"
 
 

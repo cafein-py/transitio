@@ -2834,6 +2834,7 @@ def fetch(
     if osm_pbf is not None:
         coords = {path: _stop_coords(path) for path in feeds}
         counts = _count_outside(record, geometry, coords)
+        _warn_outside(*counts, stacklevel=3)
         osm_note = _osm_note(geometry, geometry, *counts)
     progress.done(record)
     return FetchResult(
@@ -3020,6 +3021,23 @@ def _count_outside(record, area, coords):
         outside += count
         total += len(points)
     return outside, total, unread
+
+
+def _warn_outside(outside, total, unread, stacklevel):
+    """Warn when most of the ``total`` located stops of the delivered feeds,
+    ``outside`` of them, lie beyond the OSM extract; ``stacklevel`` points at
+    the caller of fetch."""
+    if total and outside * 2 > total:
+        warnings.warn(
+            f"{outside:,} of the {total:,} located stops of the delivered feeds "
+            "lie outside the OSM extract: their trips run on beyond the area, and "
+            "routing may find no streets or paths to walk to them. Fetch a "
+            "larger area to cover them, or crop the feeds with "
+            "transitio.crop_feed(..., full_trips_only=True) to keep only the "
+            "trips inside the area",
+            UserWarning,
+            stacklevel=stacklevel,
+        )
 
 
 def _osm_note(geometry, parts, outside=0, total=0, unread=0):
@@ -3729,6 +3747,7 @@ def _fetch_place(
             osm_area = None
         else:
             counts = _count_outside(record, osm_area, coords)
+            _warn_outside(*counts, stacklevel=4)
             osm_note = _osm_note(geometry, parts, *counts)
 
     progress.done(record)
