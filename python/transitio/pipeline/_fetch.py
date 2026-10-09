@@ -395,7 +395,7 @@ class _SkipFeed(Exception):
     when the feed does not run on the requested day."""
 
     def __init__(self, reason, window=None, missed_day=False):
-        super().__init__(reason, window)
+        super().__init__(reason, window, missed_day)
         self.reason = reason
         self.window = window
         self.missed_day = missed_day
