@@ -183,7 +183,7 @@ pub fn crop(
     // crop silently wrong. Sampled notices do not matter, as the crop reads
     // no notices. The cropped feed is validated below.
     let incomplete = result.incomplete.iter().map(String::as_str);
-    if let Some(reason) = scan::refusal(&result.notices, incomplete, &options, false, "crop") {
+    if let Some(reason) = scan::refusal(&result.notices, incomplete, &options, None, "crop") {
         return Err(reason);
     }
     if output
@@ -293,7 +293,7 @@ pub fn crop(
     // report would describe only part of it. Sampled notices stay in the
     // report, whose notice_limit_reached says so.
     let incomplete = validation.incomplete.iter().map(String::as_str);
-    if let Some(reason) = scan::refusal(&validation.notices, incomplete, &options, false, "crop") {
+    if let Some(reason) = scan::refusal(&validation.notices, incomplete, &options, None, "crop") {
         let _ = std::fs::remove_file(&staging);
         return Err(reason);
     }
@@ -506,7 +506,7 @@ fn whole<R: std::io::Read>(
 }
 
 fn unreadable(name: &str, notices: &[crate::notice::Notice], options: &ScanOptions) -> String {
-    scan::refusal(notices, [name], options, false, "crop")
+    scan::refusal(notices, [name], options, None, "crop")
         .unwrap_or_else(|| format!("{name} cannot be read whole; cannot crop this feed"))
 }
 

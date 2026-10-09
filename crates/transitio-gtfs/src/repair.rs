@@ -75,10 +75,12 @@ pub fn repair(path: &Path, output: &Path, options: ScanOptions) -> Result<Repair
     semantics::run_semantics(&mut result, &options);
 
     // Repairing a truncated snapshot would silently rewrite a subset of
-    // the feed as if it were whole, and sampled notices would leave
-    // defects invisibly unrepaired; refuse both.
+    // the feed as if it were whole, and sampling that left out a notice the
+    // repair acts on would leave that defect invisibly unrepaired; refuse
+    // both.
     let incomplete = result.incomplete.iter().map(String::as_str);
-    if let Some(reason) = scan::refusal(&result.notices, incomplete, &options, true, "repair") {
+    let caps = Some(REPAIRED_CODES);
+    if let Some(reason) = scan::refusal(&result.notices, incomplete, &options, caps, "repair") {
         return Err(reason);
     }
 
@@ -143,6 +145,23 @@ pub fn repair(path: &Path, output: &Path, options: ScanOptions) -> Result<Repair
 fn column(table: &Table, name: &str) -> Option<usize> {
     table.headers.iter().position(|h| h == name)
 }
+
+/// Every notice code a pass below acts on: sampling that leaves one out
+/// refuses the repair, as the defect would go unrepaired.
+const REPAIRED_CODES: &[&str] = &[
+    "leading_or_trailing_whitespaces",
+    "unexpected_enum_value",
+    "invalid_integer",
+    "number_out_of_range",
+    "foreign_key_violation",
+    "stop_without_location",
+    "departure_before_arrival",
+    "stop_time_with_arrival_before_previous_departure_time",
+    "duplicate_key",
+    "missing_required_field",
+    "invalid_date",
+    "invalid_time",
+];
 
 /// One fix per file the reader trimmed whitespace in, at its first
 /// trimmed header name or value.
@@ -533,39 +552,70 @@ mod tests {
     use crate::scan::tests::{build_zip, minimal};
 
     #[test]
-    fn a_notice_cap_refuses_the_repair() {
+    fn a_notice_cap_refuses_the_repair_only_past_a_code_it_repairs() {
         let dir = std::env::temp_dir().join(format!("transitio-repair-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut files = minimal();
-        files.retain(|(name, _)| *name != "stops.txt");
-        files.push((
-            "stops.txt",
-            "stop_id,stop_name,stop_lat,stop_lon\n\
-             s1,\"Ka\npi\",60.169,24.931\ns2,\"Ste\nsi\",60.171,24.941\n",
-        ));
-        let source = dir.join("source.zip");
-        std::fs::write(&source, build_zip(&files).into_inner()).unwrap();
         let options = ScanOptions {
             max_notices_per_file: 1,
             reference_date: chrono::NaiveDate::from_ymd_opt(2026, 6, 1),
             ..ScanOptions::default()
         };
+        let with_stops = |stops: &'static str| {
+            let mut files = minimal();
+            files.retain(|(name, _)| *name != "stops.txt");
+            files.push(("stops.txt", stops));
+            let source = dir.join("source.zip");
+            std::fs::write(&source, build_zip(&files).into_inner()).unwrap();
+            source
+        };
         let output = dir.join("repaired.zip");
+        // Line breaks in values, which no pass repairs, past the cap: the
+        // repair goes ahead.
+        let source = with_stops(
+            "stop_id,stop_name,stop_lat,stop_lon\n\
+             s1,\"Ka\npi\",60.169,24.931\ns2,\"Ste\nsi\",60.171,24.941\n",
+        );
+        assert!(repair(&source, &output, options).is_ok());
+        let _ = std::fs::remove_file(&output);
+        // Duplicate stop ids, whose rows the repair drops, past the cap.
+        let source = with_stops(
+            "stop_id,stop_name,stop_lat,stop_lon\n\
+             s1,Kamppi,60.169,24.931\ns2,Steissi,60.171,24.941\n\
+             s2,Steissi,60.172,24.942\ns2,Steissi,60.173,24.943\n",
+        );
         let error = match repair(&source, &output, options) {
             Err(error) => error,
-            Ok(_) => panic!("repaired despite sampled notices"),
+            Ok(_) => panic!("repaired despite left-out duplicate keys"),
         };
         assert_eq!(
             error,
             "stops.txt exceeds max_notices_per_file (1); raise it to repair this feed"
         );
         assert!(!output.exists());
-        // the block overlap cap is not a budget
+        // A cap that does not say what it left out, or says it in a list
+        // that is empty or not of codes, still refuses; the block overlap cap
+        // is not a budget.
+        let unnamed = Notice::new("notice_limit_reached", Severity::Warning)
+            .with("filename", "shapes.txt")
+            .with("suppressedCount", 3);
+        for left_out in [
+            None,
+            Some(serde_json::json!([])),
+            Some(serde_json::json!([1])),
+        ] {
+            let mut notice = unnamed.clone();
+            if let Some(left_out) = left_out {
+                notice = notice.with("suppressedCodes", left_out);
+            }
+            assert!(
+                scan::refusal(&[notice], [], &options, Some(REPAIRED_CODES), "repair").is_some()
+            );
+        }
         let capped = Notice::new("notice_limit_reached", Severity::Warning)
             .with("filename", "trips.txt")
             .with("blockId", "b1");
         assert_eq!(
-            scan::refusal(&[capped], [], &options, true, "repair").as_deref(),
+            scan::refusal(&[capped], [], &options, Some(REPAIRED_CODES), "repair").as_deref(),
             Some(
                 "trips.txt reaches the block overlap check cap that no budget raises; \
                  cannot repair this feed"

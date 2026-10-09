@@ -3147,3 +3147,38 @@ def test_places_and_suggestions_list_the_resolved_city_first():
         "Q-x-m",
         "Q-x",
     ]
+
+
+def test_a_repair_goes_ahead_past_a_notice_limit_of_kinds_it_does_not_fix(tmp_path):
+    # Turku's feed was refused: its shapes.txt had over 10,000 notices of a
+    # kind the repair never touches.
+    import io
+
+    import transitio
+
+    files = {
+        "agency.txt": "agency_id,agency_name,agency_url,agency_timezone\n"
+        "a,A,https://a.example,Europe/Helsinki\n",
+        "stops.txt": 'stop_id,stop_name,stop_lat,stop_lon\ns1,"Ka\npi",60.169,24.931\n'
+        's2,"Ste\nsi",60.171,24.941\n',
+        "routes.txt": "route_id,agency_id,route_short_name,route_type\nr1,a,1,3\n",
+        "trips.txt": "route_id,service_id,trip_id\nr1,wk,t1\n",
+        "stop_times.txt": "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "t1,08:00:00,08:00:00,s1,1\nt1,08:05:00,08:05:00,s2,2\n",
+        "calendar.txt": "service_id,monday,tuesday,wednesday,thursday,friday,"
+        "saturday,sunday,start_date,end_date\nwk,1,1,1,1,1,0,0,20260101,20261231\n",
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, text in files.items():
+            archive.writestr(name, text)
+    source = tmp_path / "feed.zip"
+    source.write_bytes(buffer.getvalue())
+    capped = [
+        n
+        for n in transitio.validate_feed(source, max_notices_per_file=1)["notices"]
+        if n["code"] == "notice_limit_reached"
+    ]
+    assert [n["context"]["suppressedCodes"] for n in capped] == [["new_line_in_value"]]
+    result = transitio.repair_feed(source, tmp_path / "out.zip", max_notices_per_file=1)
+    assert result["fixes"] == [] and (tmp_path / "out.zip").exists()

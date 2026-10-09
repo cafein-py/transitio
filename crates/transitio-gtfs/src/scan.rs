@@ -328,12 +328,13 @@ pub fn scan_reader_streaming<R: Read + Seek>(
 /// file cut short, with every budget it exceeded and that budget's value
 /// ("stops.txt exceeds max_rows (5)", or for the delimiter guard the line
 /// and the guard `max_columns` sets), and with `notice_caps` each file
-/// whose notices were sampled.
+/// whose sampled notices left out one of those codes (or did not record
+/// which they left out).
 pub fn refusal<'a>(
     notices: &[Notice],
     incomplete: impl IntoIterator<Item = &'a str>,
     options: &ScanOptions,
-    notice_caps: bool,
+    notice_caps: Option<&[&str]>,
     verb: &str,
 ) -> Option<String> {
     let mut reasons = BTreeSet::new();
@@ -352,12 +353,24 @@ pub fn refusal<'a>(
                 .and_then(|v| v.as_array())
                 .map(|names| names.iter().filter_map(|n| n.as_str()).collect())
                 .unwrap_or_default(),
-            "notice_limit_reached" if notice_caps => {
+            "notice_limit_reached" if notice_caps.is_some() => {
                 if notice.context.contains_key("blockId") {
                     reasons.insert(format!(
                         "{file} reaches the block overlap check cap that no budget raises"
                     ));
                     raisable = false;
+                    continue;
+                }
+                // Only a list of codes, none of them `notice_caps`, lets the
+                // cap pass; a missing, empty or malformed one is unknown.
+                let codes = notice_caps.unwrap_or_default();
+                let left_out: Option<Vec<&str>> = notice
+                    .context
+                    .get("suppressedCodes")
+                    .and_then(|v| v.as_array())
+                    .filter(|left| !left.is_empty())
+                    .and_then(|left| left.iter().map(|code| code.as_str()).collect());
+                if left_out.is_some_and(|left| !left.iter().any(|code| codes.contains(code))) {
                     continue;
                 }
                 vec!["max_notices_per_file"]
@@ -677,6 +690,8 @@ pub struct TableReader<R: Read> {
     max_notices: u64,
     error_notices: u64,
     warning_notices: u64,
+    // The codes of the row-level notices sampling left out.
+    suppressed: BTreeSet<&'static str>,
     trimmed: Trimmed,
     truncated: bool,
     finished: bool,
@@ -822,6 +837,7 @@ impl<R: Read> TableReader<R> {
             max_notices: options.max_notices_per_file,
             error_notices: 0,
             warning_notices: 0,
+            suppressed: BTreeSet::new(),
             trimmed,
             truncated: false,
             finished: false,
@@ -856,9 +872,14 @@ impl<R: Read> TableReader<R> {
         // balloon the notice list. Errors and warnings have separate quotas
         // so a flood of warnings can never crowd out error notices.
         let max_notices = self.max_notices;
-        let push_sampled = |notices: &mut Vec<Notice>, counter: &mut u64, notice: Notice| {
+        let push_sampled = |notices: &mut Vec<Notice>,
+                            counter: &mut u64,
+                            suppressed: &mut BTreeSet<&'static str>,
+                            notice: Notice| {
             if *counter < max_notices {
                 notices.push(notice);
+            } else {
+                suppressed.insert(notice.code);
             }
             *counter += 1;
         };
@@ -896,7 +917,12 @@ impl<R: Read> TableReader<R> {
                     // Collector model: notice the malformed record and keep
                     // reading; already-parsed rows stay usable.
                     let notice = csv_parsing_failed(self.spec.name, self.csv_row, &error);
-                    push_sampled(notices, &mut self.error_notices, notice);
+                    push_sampled(
+                        notices,
+                        &mut self.error_notices,
+                        &mut self.suppressed,
+                        notice,
+                    );
                     continue;
                 }
                 Ok(record) => record,
@@ -907,7 +933,12 @@ impl<R: Read> TableReader<R> {
                     .with("csvRowNumber", self.csv_row)
                     .with("rowLength", record.len())
                     .with("headerCount", self.headers.len());
-                push_sampled(notices, &mut self.error_notices, notice);
+                push_sampled(
+                    notices,
+                    &mut self.error_notices,
+                    &mut self.suppressed,
+                    notice,
+                );
                 continue;
             }
             let mut trimmed = 0;
@@ -934,14 +965,24 @@ impl<R: Read> TableReader<R> {
                 let notice = Notice::new("empty_row", Severity::Warning)
                     .with("filename", self.spec.name)
                     .with("csvRowNumber", self.csv_row);
-                push_sampled(notices, &mut self.warning_notices, notice);
+                push_sampled(
+                    notices,
+                    &mut self.warning_notices,
+                    &mut self.suppressed,
+                    notice,
+                );
                 continue;
             }
             for (header, field) in self.headers.iter().zip(&fields) {
                 if field.contains('\u{FFFD}') {
                     let notice = invalid_character(self.spec.name, self.csv_row)
                         .with("fieldName", clip(header));
-                    push_sampled(notices, &mut self.error_notices, notice);
+                    push_sampled(
+                        notices,
+                        &mut self.error_notices,
+                        &mut self.suppressed,
+                        notice,
+                    );
                 }
             }
             return Some(Row {
@@ -975,7 +1016,11 @@ impl<R: Read> TableReader<R> {
             notices.push(
                 Notice::new("notice_limit_reached", severity)
                     .with("filename", self.spec.name)
-                    .with("suppressedCount", suppressed_errors + suppressed_warnings),
+                    .with("suppressedCount", suppressed_errors + suppressed_warnings)
+                    .with(
+                        "suppressedCodes",
+                        self.suppressed.iter().copied().collect::<Vec<_>>(),
+                    ),
             );
         }
     }
@@ -1298,7 +1343,8 @@ fn duplicate_key_checks(
             notices.push(
                 Notice::new("notice_limit_reached", Severity::Error)
                     .with("filename", spec.name)
-                    .with("suppressedCount", emitted - options.max_notices_per_file),
+                    .with("suppressedCount", emitted - options.max_notices_per_file)
+                    .with("suppressedCodes", vec!["duplicate_key"]),
             );
         }
     }
@@ -1582,7 +1628,7 @@ pub(crate) mod tests {
             }
             assert_eq!(result.incomplete.contains(file), line.is_some());
             let incomplete = result.incomplete.iter().map(String::as_str);
-            let reason = refusal(&result.notices, incomplete, &options, false, "crop");
+            let reason = refusal(&result.notices, incomplete, &options, None, "crop");
             let Some(line) = line else {
                 assert_eq!(reason, None);
                 continue;
