@@ -3072,3 +3072,17 @@ def test_undo_and_redo_replay_a_run_of_rows_in_one_step(monkeypatch):
     with pytest.raises(ChangeLogDesyncError, match=r"row 3 \(row to delete changed\)"):
         builder.redo()
     assert builder.tables["stops.txt"].equals(edited)
+
+
+def test_a_recommendation_near_full_coverage_says_over_not_about_over():
+    # Turku's summary read "covering about over 99 % of the departures".
+    from types import SimpleNamespace
+
+    from transitio.index.recommend import Recommendation
+
+    area = SimpleNamespace(parts=())
+    found = Recommendation(area, None, [], [], 0.997, {}, "overlap", None)
+    assert str(found).splitlines()[0] == (
+        "The area's 0 places: take 0 feeds, covering over 99 % of the departures "
+        "the index records there, each counted once"
+    )
