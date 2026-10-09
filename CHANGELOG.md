@@ -5,17 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## 0.21.3 — 2026-10-09
 
-### Changed
+### Fixed
 
-- The documentation's Quickstart is a short walk from a place name to
-  routable data, and a user guide of eight tutorial notebooks, stored with
-  their outputs, covers the rest: finding places, choosing feeds, fetching
-  data, the download cache, working with a GTFS feed, cropping and merging,
-  building scenario feeds, and catalogues and OSM extracts. New sections
-  show how to open any GTFS feed with `FeedEditor`, analyse and edit it, and
-  crop the data of an earlier `fetch` to another area or a date window.
+- `fetch` failed on Windows with "No such file or directory": a download's
+  path in the default cache was about 262 characters long, past the
+  260-character limit Windows sets unless long paths are switched on.
+  Downloads are now staged in a short folder, `<cache_dir>/gtfs/.staging/`,
+  about 90 characters shorter, and an OSM crop's temporary folder no longer
+  repeats the crop's file name. A path that still reaches the limit on
+  Windows raises an error saying so, with the two remedies: a shorter
+  `cache_dir`, or switching on long paths.
+- `FeedEditor.undo` and `redo` of an action that removed or added many rows,
+  such as `drop_routes`, replay those rows in one step per table instead of
+  copying the table once per row: undoing the removal of 12 routes (27,416
+  rows) from Turku's feed takes 0.1 s instead of more than 15 minutes. A row
+  changed outside the change log still makes them refuse, naming the row.
 
 ## 0.21.2 — 2026-10-08
 

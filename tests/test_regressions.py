@@ -2981,3 +2981,94 @@ def test_delete_rows_drops_its_rows_at_once_and_logs_them_one_by_one(monkeypatch
     assert builder.tables["stops.txt"].equals(before)
     assert builder.redo() == "delete_rows"
     assert list(builder.tables["stops.txt"]["stop_id"]) == ["s1", "s3", "s4"]
+
+
+def test_a_download_path_stays_within_windows_limit(tmp_path, monkeypatch):
+    # On Windows a fetch failed with "No such file or directory": a download
+    # nested the feed's 67-character folder twice under the default cache, a
+    # 262-character path, past Windows' 260-character limit.
+    import tempfile
+    from pathlib import Path
+
+    from transitio import _http, cache as feed_cache
+    from transitio.catalog._cache import STAGING, FeedCache, _feed_dir
+
+    store = FeedCache(tmp_path)
+    with store.staging("f-mdb-2904") as folder:
+        assert folder.parent == store.root / STAGING
+        inner = folder / _feed_dir("f-mdb-2904") / "latest.zip.12345678.part"
+        # 114 characters: about 175 under a default Windows cache root.
+        assert len(str(inner.relative_to(store.root))) <= 120
+        # Listing and clearing the cache leave the staging folder alone.
+        assert feed_cache.clear(tmp_path) == 0 and folder.is_dir()
+        assert feed_cache.info(tmp_path).empty
+    assert not any((store.root / STAGING).iterdir())
+
+    def missing(**kwargs):
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(_http, "_windows", lambda: True)
+    monkeypatch.setattr(tempfile, "mkstemp", missing)
+    # Windows counts UTF-16 units: 125 astral characters are 250 of them.
+    for name, too_long in (("d" * 300, True), ("\U0001f600" * 125, True), ("d", False)):
+        with pytest.raises(OSError) as caught:
+            with _http.replacing(Path("/" + name) / "latest.zip"):
+                pass
+        if too_long:
+            assert "260-character limit" in str(caught.value)
+            assert "cache_dir=Path.home() / 'tc'" in str(caught.value)
+        else:
+            assert type(caught.value) is FileNotFoundError
+    # A writer that opens the staged path by name fails with its own error.
+    monkeypatch.setattr(_http, "WINDOWS_MAX_PATH", len(str(tmp_path)) + 5)
+    with pytest.raises(OSError, match="character limit") as caught:
+        with _http.staged(tmp_path / "x.osm.pbf") as partial:
+            raise RuntimeError(f"Open failed for '{partial}'")
+    assert isinstance(caught.value.__cause__, RuntimeError)
+
+
+def test_undo_and_redo_replay_a_run_of_rows_in_one_step(monkeypatch):
+    # Undo and redo replayed the rows of delete_rows and insert_rows one at a
+    # time, copying the table per row, so undoing drop_routes on a city's
+    # feed ran for many minutes.
+    from transitio.edit import FeedBuilder
+    from transitio.edit import _changes
+    from transitio.exceptions import ChangeLogDesyncError
+
+    builder = FeedBuilder()
+    builder.insert_rows("stops.txt", [{"stop_id": "first", "stop_name": "First"}])
+    first = builder.tables["stops.txt"].copy()
+    rows = [{"stop_id": f"s{i}", "stop_name": f"Stop {i}"} for i in range(50)]
+    builder.insert_rows("stops.txt", rows)
+    inserted = builder.tables["stops.txt"].copy()
+    builder.delete_rows("stops.txt", range(0, 51, 3))
+    deleted = builder.tables["stops.txt"].copy()
+
+    puts = []
+    put = _changes._TableView.put
+    monkeypatch.setattr(
+        _changes._TableView,
+        "put",
+        lambda view, filename, table: puts.append(filename)
+        or put(view, filename, table),
+    )
+    # Each step writes the table once: restore, remove, restore, remove, restore.
+    for step, label, expected in [
+        (builder.undo, "delete_rows", inserted),
+        (builder.redo, "delete_rows", deleted),
+        (builder.undo, "delete_rows", inserted),
+        (builder.undo, "insert_rows", first),
+        (builder.redo, "insert_rows", inserted),
+    ]:
+        puts.clear()
+        assert step() == label
+        assert builder.tables["stops.txt"].equals(expected)
+        assert puts == ["stops.txt"]
+
+    # A row changed outside the log still refuses, naming that row, and
+    # leaves the table as it was.
+    builder.tables["stops.txt"].iat[3, 1] = "changed"
+    edited = builder.tables["stops.txt"].copy()
+    with pytest.raises(ChangeLogDesyncError, match=r"row 3 \(row to delete changed\)"):
+        builder.redo()
+    assert builder.tables["stops.txt"].equals(edited)

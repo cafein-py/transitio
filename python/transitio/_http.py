@@ -111,14 +111,51 @@ def download(
     raise DownloadError(message)
 
 
+# Windows refuses a path of this many characters or more unless long paths
+# are switched on, and reports it as a missing file or directory.
+WINDOWS_MAX_PATH = 260
+# The characters ``tempfile.mkstemp`` adds to a partial file's name.
+_PARTIAL_SUFFIX = len(".12345678.part")
+
+
+def _windows():
+    return os.name == "nt"
+
+
+def _too_long(path, added=0):
+    """An ``OSError`` naming Windows' path limit when ``path`` plus ``added``
+    characters reaches it there, else None. Windows counts UTF-16 units."""
+    if not _windows():
+        return None
+    units = os.path.abspath(path).encode("utf-16-le", "surrogatepass")
+    length = len(units) // 2 + added
+    if length < WINDOWS_MAX_PATH:
+        return None
+    return OSError(
+        errno.ENAMETOOLONG,
+        f"the path {path} is {length} characters long, past the "
+        f"{WINDOWS_MAX_PATH}-character limit Windows sets unless long paths "
+        "are switched on; pass a shorter cache_dir or directory, for example "
+        "cache_dir=Path.home() / 'tc', or have an administrator switch on "
+        "long paths (LongPathsEnabled)",
+    )
+
+
 @contextlib.contextmanager
 def replacing(path):
     """Write ``path`` through a unique partial file beside it, opened for
     binary writing and reading: the partial replaces ``path`` when the block
-    completes and is closed and removed when it fails."""
-    fd, partial = tempfile.mkstemp(
-        dir=path.parent, prefix=path.name + ".", suffix=".part"
-    )
+    completes and is closed and removed when it fails. On Windows, a partial
+    whose path is too long raises an ``OSError`` saying so (:func:`_too_long`)."""
+    try:
+        fd, partial = tempfile.mkstemp(
+            dir=path.parent, prefix=path.name + ".", suffix=".part"
+        )
+    except FileNotFoundError:
+        clearer = _too_long(path, _PARTIAL_SUFFIX)
+        if clearer is None:
+            raise
+        raise clearer from None
     try:
         # The descriptor is wrapped at once, so a failure closes it rather
         # than leaking it (and lets Windows unlink the partial).
@@ -134,12 +171,20 @@ def replacing(path):
 def staged(path):
     """Like :func:`replacing`, for a writer that opens the file by name: a
     path in a private directory beside ``path``, whose file replaces ``path``
-    when the block completes; the directory is removed either way."""
+    when the block completes; the directory is removed either way. A block
+    that fails without writing a path too long for Windows raises an
+    ``OSError`` saying so (:func:`_too_long`)."""
     with tempfile.TemporaryDirectory(
-        dir=path.parent, prefix=path.name + ".", ignore_cleanup_errors=True
+        dir=path.parent, prefix=".", ignore_cleanup_errors=True
     ) as directory:
         partial = Path(directory) / path.name
-        yield partial
+        try:
+            yield partial
+        except Exception as error:
+            clearer = _too_long(partial)
+            if clearer is None or partial.exists():
+                raise
+            raise clearer from error
         os.replace(partial, path)
 
 

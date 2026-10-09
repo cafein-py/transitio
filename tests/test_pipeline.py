@@ -2672,7 +2672,7 @@ def test_a_place_fetch_keeps_its_download_as_a_cached_version(tmp_path, monkeypa
     assert [(s["fetched_from"], s["index_snapshot"]) for s in sources] == [
         ("producer", index.snapshot_id)
     ] * 2
-    assert not list(cache.rglob(".staging"))
+    assert not any((cache / "gtfs" / ".staging").iterdir())
     # The directory holds the delivered copy; reports describe the first download.
     assert [p.name for p in out.rglob("*.zip")] == ["f-a.zip"]
     origin = [r["summary"]["provenance"] for r in first.reports + second.reports]

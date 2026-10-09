@@ -95,15 +95,16 @@ def _feed_id(folder):
 
 
 def _entries(cache):
-    """``(path, is_feed)`` of what the cache's root holds besides its locks:
+    """``(path, is_feed)`` of what the cache's root holds besides its locks
+    and the downloads being staged:
     each feed's folder, and anything an older transitio left there."""
-    from transitio.catalog._cache import _DIGEST
+    from transitio.catalog._cache import _DIGEST, STAGING
 
     if not cache.root.is_dir() or cache.root.is_symlink():
         return []
     entries = []
     for path in sorted(cache.root.iterdir()):
-        if path.name == ".locks":
+        if path.name in (".locks", STAGING):
             continue
         is_feed = path.name.startswith("id-") and bool(_DIGEST.fullmatch(path.name[3:]))
         entries.append((path, is_feed and path.is_dir() and not path.is_symlink()))
@@ -120,7 +121,8 @@ def info(cache_dir=None):
     ``last_used_at`` (when a call last delivered it, None when none did),
     ``blob_sha256`` (the stored blob its archive is a hard link to, None for
     a copy of its own) and ``shared_with`` (how many other versions share
-    that blob). Anything else in the cache, such as the folders of older
+    that blob). Anything else in the cache besides its locks and the downloads
+    being staged, such as the folders of older
     transitio versions, a version without a readable sidecar or a blob no
     version links to, is one row with ``feed_id`` None and its bytes in
     ``outputs_bytes``. ``attrs["logical_bytes"]`` is the sum of both byte
@@ -242,8 +244,9 @@ def clear(cache_dir=None, older_than=None, feeds=None):
     and the folders older transitio versions left. ``older_than`` (a
     ``datetime.timedelta``) removes only the versions not delivered within
     that time, or never, with what was made of them; ``feeds`` (feed ids)
-    limits the removal to those feeds. The lock files stay, so a fetch running
-    meanwhile keeps its own lock.
+    limits the removal to those feeds. The lock files and the folder downloads
+    are staged in stay, so a fetch running meanwhile keeps its lock and its
+    download.
 
     What the cache holds when the call starts is listed first, and each feed
     is removed under its lock, so a fetch holding one is waited for. A feed a
