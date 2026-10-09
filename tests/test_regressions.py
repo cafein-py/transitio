@@ -2671,7 +2671,7 @@ def test_an_area_fetch_selects_the_feeds_of_the_index_places(tmp_path, monkeypat
     assert [p.id for p in result.places] == ["c"]
     assert result.snapshot == index.snapshot_id
     # The extract covers the area itself, not grown.
-    assert extracts == [(CITY_BBOX, ["cache_dir", "directory"])]
+    assert extracts == [(CITY_BBOX, ["cache_dir", "directory", "progress"])]
     # Mostly in a country without feeds: the catalogue, with a warning.
     mostly_ee = (24.9, 59.7, 25.0, 60.2)
     with pytest.warns(UserWarning) as caught:

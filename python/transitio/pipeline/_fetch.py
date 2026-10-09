@@ -2663,9 +2663,13 @@ def fetch(
             )
         if osm:
             progress.say("Fetching the OSM extract")
-            osm_pbf, osm_note = _osm_extract(
-                geometry, cache_dir=cache_dir, directory=directory
-            )
+            with progress.downloads("Downloading the OpenStreetMap extract"):
+                osm_pbf, osm_note = _osm_extract(
+                    geometry,
+                    cache_dir=cache_dir,
+                    directory=directory,
+                    progress=progress.bar or False,
+                )
 
         def take(feed, entry, version, dataset_id, hosted, last=True):
             # ``version`` checked against the feeds delivered so far and
@@ -3713,9 +3717,14 @@ def _fetch_place(
                 "must_cover": _osm_stops(osm_area, coords),
             }
         progress.say("Fetching the OSM extract")
-        osm_pbf, osm_note = _osm_extract(
-            parts, cache_dir=cache_dir, directory=directory, **grown
-        )
+        with progress.downloads("Downloading the OpenStreetMap extract"):
+            osm_pbf, osm_note = _osm_extract(
+                parts,
+                cache_dir=cache_dir,
+                directory=directory,
+                progress=progress.bar or False,
+                **grown,
+            )
         if osm_pbf is None:
             osm_area = None
         else:
