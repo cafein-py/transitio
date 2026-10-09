@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+
+- The documentation's Quickstart is a short walk from a place name to
+  routable data, and a user guide of eight tutorial notebooks, stored with
+  their outputs, covers the rest: finding places, choosing feeds, fetching
+  data, the download cache, working with a GTFS feed, cropping and merging,
+  building scenario feeds, and catalogues and OSM extracts. New sections
+  show how to open any GTFS feed with `FeedEditor`, analyse and edit it, and
+  crop the data of an earlier `fetch` to another area or a date window.
+
 ## 0.21.2 — 2026-10-08
 
 ### Added

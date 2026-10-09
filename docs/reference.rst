@@ -197,6 +197,9 @@ Editing and building feeds
    FeedBuilder.set_stops
    FeedBuilder.shapes
    FeedBuilder.save
+   FeedBuilder.changes
+   FeedBuilder.undo
+   FeedBuilder.redo
    FeedEditor
    FeedEditor.update_stop
    FeedEditor.update_route
