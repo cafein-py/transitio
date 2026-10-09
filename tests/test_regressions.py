@@ -3008,7 +3008,7 @@ def test_undo_and_redo_replay_a_run_of_rows_in_one_step(monkeypatch):
         lambda view, filename, table: puts.append(filename)
         or put(view, filename, table),
     )
-    # Each step writes the table once: restore, remove, remove, restore.
+    # Each step writes the table once: restore, remove, restore, remove, restore.
     for step, label, expected in [
         (builder.undo, "delete_rows", inserted),
         (builder.redo, "delete_rows", deleted),
@@ -3021,8 +3021,10 @@ def test_undo_and_redo_replay_a_run_of_rows_in_one_step(monkeypatch):
         assert builder.tables["stops.txt"].equals(expected)
         assert puts == ["stops.txt"]
 
-    # A row changed outside the log still refuses, naming that row.
+    # A row changed outside the log still refuses, naming that row, and
+    # leaves the table as it was.
     builder.tables["stops.txt"].iat[3, 1] = "changed"
+    edited = builder.tables["stops.txt"].copy()
     with pytest.raises(ChangeLogDesyncError, match=r"row 3 \(row to delete changed\)"):
         builder.redo()
-    assert builder.tables["stops.txt"].iat[3, 1] == "changed"
+    assert builder.tables["stops.txt"].equals(edited)
