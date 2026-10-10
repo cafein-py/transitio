@@ -5,7 +5,10 @@ whose manifest this reader supports, streams its archive into the cache,
 verifies the size and digest the manifest declares, unpacks it defensively
 into a private staging directory, validates the layout with the reader, and
 only then activates it by one atomic rename into the platformdirs cache — a
-failed or incompatible download leaves the previous snapshot in place.
+failed or incompatible download leaves the previous snapshot in place. From
+schema 12 the archive holds the core tables; each on-demand file is
+downloaded into the snapshot the first time a query needs it, from the
+release its ``release.json`` names.
 :func:`use` selects among installed snapshots for this process only: it
 writes nothing to disk.
 
@@ -18,7 +21,9 @@ that says to run :func:`refresh`.
 
 import contextlib
 import gzip
+import json
 import os
+import re
 import shutil
 import stat
 import tarfile
@@ -37,6 +42,14 @@ __all__ = ["refresh", "use", "installed", "active_index", "cache_root", "SNAPSHO
 SNAPSHOT_ENV = "TRANSITIO_INDEX_SNAPSHOT"
 KEEP = 3
 TIMEOUT = 60.0
+# Beside snapshot.json from schema 12: the release the snapshot came from,
+# whose assets its on-demand files are downloaded from.
+RELEASE_FILE = "release.json"
+DOWNLOAD_HOST = "https://github.com"
+# A GitHub ``owner/name``, the only repository a release.json may name.
+_REPOSITORY = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/(?!\.\.?$)[A-Za-z0-9._-]+"
+)
 
 # Per-member ceilings for an archive being unpacked, matching the reader's;
 # a member over its ceiling is refused before a byte of it is written.
@@ -91,14 +104,16 @@ class _Bounded:
 
 
 # Process-local: the selection use() made (with the cache it lives in and
-# the shared lock that keeps it from pruning) and the handle it resolves to,
-# an index holding its own lock.
+# the shared lock that keeps it from pruning), the handle it resolves to,
+# an index holding its own lock, and the transport the last refresh was
+# given, which on-demand downloads use too.
 _state = {
     "selection": None,
     "selection_root": None,
     "selection_lock": None,
     "handle": None,
     "handle_key": None,
+    "transport": None,
 }
 
 
@@ -114,17 +129,23 @@ def _snapshots(root):
     return root / "snapshots"
 
 
-def _read_snapshot(path):
-    """A snapshot's ``snapshot.json`` as a dict, or None when unreadable."""
-    from transitio.index import SNAPSHOT_FILE, _MAX_SNAPSHOT_BYTES, _read_regular
-    import json
+def _read_json(file):
+    """The JSON object in ``file``, a bounded regular file, or None when it
+    cannot be read as one."""
+    from transitio.index import _MAX_SNAPSHOT_BYTES, _read_regular
 
     try:
-        data = _read_regular(path / SNAPSHOT_FILE, _MAX_SNAPSHOT_BYTES)
-        snapshot = json.loads(data.decode("utf-8"))
+        found = json.loads(_read_regular(file, _MAX_SNAPSHOT_BYTES).decode("utf-8"))
     except (OSError, ValueError, TransitioError):
         return None
-    return snapshot if isinstance(snapshot, dict) else None
+    return found if isinstance(found, dict) else None
+
+
+def _read_snapshot(path):
+    """A snapshot's ``snapshot.json`` as a dict, or None when unreadable."""
+    from transitio.index import SNAPSHOT_FILE
+
+    return _read_json(path / SNAPSHOT_FILE)
 
 
 def _reparse_point(path):
@@ -172,18 +193,26 @@ def _verified(root, snapshot_id):
     )
 
 
-def _whole_members(path):
+def _whole_members(path, *, bundled=False):
     """Every release member present at ``path`` as a bounded regular file
     (never a symlink or an over-large one) -- the licence ``NOTICE`` among
     them, since it is authoritative for the snapshot. The members are the
     snapshot's own (a schema-7 snapshot lists its partitions), so the
-    snapshot is read first."""
+    snapshot is read first. From schema 12 an installed snapshot also needs
+    a ``release.json`` listing its on-demand files as released, which are
+    downloaded when first used; a ``bundled`` one, which no release backs,
+    every on-demand file instead."""
     snapshot = _read_snapshot(path)
     if snapshot is None:
         return False
     try:
         names = contract.members(snapshot)
+        parts = contract.on_demand(snapshot)
     except ValueError:
+        return False
+    if bundled:
+        names += parts
+    elif parts and not _released(snapshot, _read_json(path / RELEASE_FILE)):
         return False
     for name in names:
         try:
@@ -195,6 +224,63 @@ def _whole_members(path):
         ):
             return False
     return True
+
+
+def _part_entry(snapshot, member, entry):
+    """Whether ``entry`` describes the on-demand ``member`` of ``snapshot``
+    as released: its asset's name, and the size and digest the snapshot
+    lists."""
+    partition, _, file = member.partition("/")
+    table = file.removesuffix(".parquet")
+    listed = snapshot["partitions"][partition][table]
+    name = contract.part_asset_name(snapshot["snapshot_id"], partition, table)
+    return (
+        isinstance(entry, dict)
+        and isinstance(listed, dict)
+        and entry.get("name") == name
+        and isinstance(entry.get("sha256"), str)
+        and entry["sha256"] == listed.get("sha256")
+        and type(entry.get("bytes")) is int
+        and 0 < entry["bytes"] <= _member_limit(member)
+        and entry["bytes"] == listed.get("bytes")
+    )
+
+
+def _lists_parts(snapshot, parts):
+    """Whether ``parts`` (a release manifest's, or ``release.json``'s) lists
+    exactly the on-demand files of ``snapshot``, each as released."""
+    expected = contract.on_demand(snapshot)
+    return (
+        isinstance(parts, dict)
+        and sorted(parts) == expected
+        and all(_part_entry(snapshot, member, parts[member]) for member in expected)
+    )
+
+
+def _release_record(repository, snapshot_id, parts):
+    """The ``release.json`` of a snapshot released by ``repository``: its
+    tag, the URL its assets download from, and the on-demand ``parts``."""
+    tag = contract.release_tag(snapshot_id)
+    return {
+        "repository": repository,
+        "tag": tag,
+        "url": f"{DOWNLOAD_HOST}/{repository}/releases/download/{tag}/",
+        "parts": parts,
+    }
+
+
+def _released(snapshot, record):
+    """Whether ``record`` is the ``release.json`` of ``snapshot``: a GitHub
+    repository's release under the snapshot's own tag and download URL,
+    listing exactly its on-demand files as released."""
+    repository = record.get("repository") if isinstance(record, dict) else None
+    return (
+        isinstance(repository, str)
+        and _REPOSITORY.fullmatch(repository) is not None
+        and record
+        == _release_record(repository, snapshot["snapshot_id"], record.get("parts"))
+        and _lists_parts(snapshot, record["parts"])
+    )
 
 
 def installed(*, cache_dir=None):
@@ -307,13 +393,76 @@ def _load(root, snapshot_id):
 
 
 def _fetch_part(index, partition, table):
-    """Provide the on-demand ``table`` of ``partition`` that the directory
-    of ``index`` lacks; an index directory must carry its own, so this
-    refuses."""
+    """Download the on-demand ``table`` of ``partition`` that the directory
+    of ``index`` lacks (:func:`_download_part`), with a progress bar; a
+    failed download says how to fetch every on-demand file in advance."""
     from transitio.index import _TABLE_FILES
 
-    file = index._path / partition / _TABLE_FILES[table]
-    raise TransitioError(f"{file}: missing; the index directory does not carry it")
+    member = f"{partition}/{_TABLE_FILES[table]}"
+    try:
+        _download_part(index._path, index.snapshot, member, _state["transport"])
+    except DownloadError as error:
+        raise TransitioError(
+            f"{error}; transitio.index.refresh(everything=True) downloads every "
+            "on-demand file in advance"
+        ) from error
+
+
+def _download_part(path, snapshot, member, transport, progress=True):
+    """Download the on-demand ``member`` of the snapshot at ``path`` from
+    the release its ``release.json`` names, through a private file beside
+    it that replaces it only once its size and digest match what both that
+    and the snapshot list. A directory without a ``release.json`` listing
+    the file must carry its own, so this refuses."""
+    from transitio.index import _partition_directory
+
+    file = path / member
+    record = _read_json(path / RELEASE_FILE) or {}
+    parts = record.get("parts")
+    entry = parts.get(member) if isinstance(parts, dict) else None
+    if entry is None:
+        raise TransitioError(f"{file}: missing; the index directory does not carry it")
+    if not _released(snapshot, record):
+        raise TransitioError(
+            f"{file}: release.json does not describe the snapshot's release"
+        )
+    # Checked again before writing, so the file lands in the partition's own
+    # directory and not through a link put there since the index was read.
+    _partition_directory(path, member.partition("/")[0])
+    report = None
+    if progress:
+        report = _progress.Download(
+            f"Downloading {member} of feed index snapshot {snapshot['snapshot_id']}"
+        )
+    try:
+        with (
+            _http.client(
+                timeout=TIMEOUT, follow_redirects=True, transport=transport
+            ) as client,
+            _http.staged(file) as partial,
+        ):
+            digest = _http.download(
+                client,
+                record["url"] + entry["name"],
+                partial,
+                limit=entry["bytes"],
+                progress=report,
+            )
+            if partial.stat().st_size != entry["bytes"] or digest != entry["sha256"]:
+                raise DownloadError(
+                    "the download does not match the size and digest its snapshot "
+                    "lists"
+                )
+    except DownloadError as error:
+        raise DownloadError(f"{file}: {error}") from error
+    except OSError:
+        # Another download put the file in place first (Windows refuses to
+        # replace it while it is open); that copy is checked when it is read.
+        if not os.path.lexists(file):
+            raise
+    finally:
+        if report is not None:
+            report.close()
 
 
 def _bundled_root():
@@ -336,9 +485,10 @@ def _bundled():
     except (ImportError, TypeError, OSError):
         return None
     # Whole like an installed snapshot -- every member present, the licence
-    # NOTICE included -- with a readable places-and-edges index; a partial
+    # NOTICE included, and every on-demand file, as nothing is downloaded
+    # into package data -- with a readable places-and-edges index; a partial
     # bundle is no more use than an uninstalled one.
-    if not _whole_members(root):
+    if not _whole_members(root, bundled=True):
         return None
     try:
         index = read_index(root)
@@ -476,11 +626,13 @@ def _installing(root):
         yield
 
 
-def _install(root, snapshot_id, archive):
+def _install(root, snapshot_id, archive, record=None):
     """Unpack the archive at ``archive``, validate and activate its snapshot
     under the cache lock; the previous one stays whole whatever fails. A
     target that another refresh completed meanwhile is accepted once it reads
-    back whole; a damaged one is set aside and replaced."""
+    back whole; a damaged one is set aside and replaced. From schema 12
+    ``record``, kept as ``release.json``, must list the snapshot's on-demand
+    files as released."""
     from transitio.index import read_index
 
     snapshots = _snapshots(root)
@@ -499,6 +651,15 @@ def _install(root, snapshot_id, archive):
             )
         if index.places is None or index.edges is None:
             raise DownloadError("the snapshot lacks its places or edges table")
+        if contract.on_demand(index.snapshot):
+            if not _released(index.snapshot, record):
+                raise DownloadError(
+                    "the release's manifest does not list the snapshot's on-demand "
+                    "files as released"
+                )
+            (staging / RELEASE_FILE).write_text(
+                json.dumps(record, indent=2, sort_keys=True), encoding="utf-8"
+            )
         # read_index never reads NOTICE, so an archive with an empty licence
         # NOTICE reads back fine; the wholeness check keeps it from activating.
         if not _whole_members(staging):
@@ -562,10 +723,11 @@ def _download(release, manifest, directory, transport, progress):
     """Stream the release's archive into ``directory`` and check it against
     the size and digest its manifest declares; return its path."""
     snapshot_id = manifest["snapshot_id"]
+    name = contract.archive_name(snapshot_id)
+    if manifest["schema_version"] >= 12:
+        name = contract.core_archive_name(snapshot_id)
     assets = {a.get("name"): a for a in release.get("assets") or ()}
-    url = (assets.get(contract.archive_name(snapshot_id)) or {}).get(
-        "browser_download_url"
-    )
+    url = (assets.get(name) or {}).get("browser_download_url")
     declared = manifest.get("archive") or {}
     expected = declared.get("sha256")
     size = declared.get("bytes")
@@ -580,7 +742,7 @@ def _download(release, manifest, directory, transport, progress):
             f"release {release.get('tag_name')} does not declare a verifiable "
             "archive"
         )
-    archive = directory / contract.archive_name(snapshot_id)
+    archive = directory / name
     report = None
     if progress:
         report = _progress.Download(f"Downloading feed index snapshot {snapshot_id}")
@@ -601,6 +763,19 @@ def _download(release, manifest, directory, transport, progress):
     return archive
 
 
+def _download_everything(root, snapshot_id, transport, progress):
+    """Download every on-demand file the installed snapshot lacks, then read
+    it whole (:func:`~transitio.index.check_index`)."""
+    from transitio.index import check_index
+
+    path = _snapshots(root) / snapshot_id
+    snapshot = _read_snapshot(path)
+    for member in contract.on_demand(snapshot):
+        if not os.path.lexists(path / member):
+            _download_part(path, snapshot, member, transport, progress)
+    check_index(path)
+
+
 def refresh(
     *,
     repository=contract.DEFAULT_REPOSITORY,
@@ -609,25 +784,39 @@ def refresh(
     transport=None,
     keep=KEEP,
     progress=True,
+    everything=False,
 ):
     """Install the newest published snapshot this reader supports.
 
-    The archive, about 420 MB, is streamed to a private directory in the
-    cache and unpacked from there; an installed snapshot takes about 550 MB,
-    so about 1 GB must be free while a refresh runs. A progress bar for the
-    download (a widget in Jupyter when ipywidgets is installed) and a line
-    for the unpacking go to stderr; ``progress=False`` prints nothing.
+    The archive is streamed to a private directory in the cache and
+    unpacked from there. Before schema 12 it holds the whole snapshot:
+    about 420 MB, which takes about 550 MB installed, so about 1 GB must be
+    free while a refresh runs. From schema 12 it holds the core tables
+    only; a partition's place boundaries and edge details are downloaded
+    into the snapshot the first time a query needs them, each checked
+    against the size and digest the snapshot lists, and kept for later and
+    offline use. With ``everything=True`` every one of them the snapshot
+    lacks is downloaded now, also when the snapshot was installed already,
+    and the snapshot is then read whole with
+    :func:`~transitio.index.check_index`. A progress bar for each download
+    (a widget in Jupyter when ipywidgets is installed) and a line for the
+    unpacking go to stderr; ``progress=False`` prints nothing.
 
     Returns a summary: the snapshot id, whether it was newly ``installed``
     (a damaged install is replaced), the releases ``skipped`` (newer but
     incompatible, or incomplete), the older snapshots ``removed`` to keep
     the cache at ``keep`` and any ``leftover`` tombstone that could not be
     deleted. Raises :class:`~transitio.exceptions.DownloadError`
-    when the listing is unreachable or the archive fails verification, and
+    when the listing is unreachable or a download fails verification, and
     :class:`~transitio.exceptions.IncompatibleIndexError` when no listed
-    release is one this transitio reads; the active snapshot stays.
+    release is one this transitio reads or, with ``everything=True``, the
+    snapshot fails a check. A failed install leaves the active snapshot in
+    place; with ``everything=True`` the snapshot is installed before its
+    on-demand files are downloaded, so it stays installed with those that
+    arrived.
     """
     root = cache_root(cache_dir)
+    _state["transport"] = transport
     with _client(api_url, transport) as client:
         try:
             releases = contract.list_releases(client, repository)
@@ -665,11 +854,21 @@ def refresh(
                     )
                 if progress:
                     _progress.say(f"Unpacking and checking snapshot {snapshot_id}")
-                _install(root, snapshot_id, archive)
+                record = _release_record(repository, snapshot_id, manifest.get("parts"))
+                _install(root, snapshot_id, archive, record)
             removed, leftover = _prune(root, keep, {snapshot_id, _pinned(cache_dir)[1]})
+            # Held while the on-demand files arrive, so no other refresh
+            # prunes the snapshot meanwhile.
+            lease = _hold(root, snapshot_id) if everything else None
     # The next query resolves afresh: a newer snapshot may now be active.
     _state["handle"] = None
     _state["handle_key"] = None
+    if everything:
+        try:
+            _download_everything(root, snapshot_id, transport, progress)
+        finally:
+            if lease is not None:
+                lease.close()
     return {
         "snapshot_id": snapshot_id,
         "installed": not already,

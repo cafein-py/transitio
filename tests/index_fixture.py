@@ -833,17 +833,25 @@ def manifest_bytes(**fields):
 
 def pack(directory):
     """The release assets of the index at ``directory``, in the contract's
-    shape: the archive of its members (the core archive from schema 12), the
-    archive's checksum and the manifest a client reads before downloading
-    anything."""
+    shape: the archive of its members, the archive's checksum and the
+    manifest a client reads before downloading anything; from schema 12 the
+    core archive, and each on-demand file an asset of its own that the
+    manifest lists under ``parts``."""
     snapshot = json.loads((directory / reader.SNAPSHOT_FILE).read_bytes())
     members = [
         (name, (directory / name).read_bytes()) for name in contract.members(snapshot)
     ]
     snapshot_id = snapshot["snapshot_id"]
     name = contract.archive_name(snapshot_id)
+    parts = {}
     if snapshot["schema_version"] >= 12:
         name = contract.core_archive_name(snapshot_id)
+        for member in contract.on_demand(snapshot):
+            partition, table = member.removesuffix(".parquet").split("/")
+            parts[member] = (
+                contract.part_asset_name(snapshot_id, partition, table),
+                (directory / member).read_bytes(),
+            )
     archive = _archive(members)
     manifest = {
         "snapshot_id": snapshot_id,
@@ -856,12 +864,18 @@ def pack(directory):
         "archive": {"name": name, "sha256": _sha256(archive), "bytes": len(archive)},
         "members": {member: _sha256(data) for member, data in members},
     }
+    if parts:
+        manifest["parts"] = {
+            member: {"name": asset, "sha256": _sha256(data), "bytes": len(data)}
+            for member, (asset, data) in parts.items()
+        }
     return {
         name: archive,
         name + contract.CHECKSUM_SUFFIX: f"{_sha256(archive)}  {name}\n".encode(),
         contract.MANIFEST_NAME: (
             json.dumps(manifest, indent=2, sort_keys=True) + "\n"
         ).encode(),
+        **dict(parts.values()),
     }
 
 
@@ -903,6 +917,7 @@ class FakeGitHub:
         self.clock = 0
         self.published = 0
         self.latest = None
+        self.requests = []
 
     def transport(self):
         return httpx.MockTransport(self.handle)
@@ -954,8 +969,16 @@ class FakeGitHub:
         return asset
 
     def handle(self, request):
+        self.requests.append(request.url)
         authed = "Authorization" in request.headers
         path = request.url.path
+        if request.url.host == "github.com":
+            # A release asset's public URL redirects to the object store.
+            assert not authed
+            tag, name = path.split("/releases/download/", 1)[1].split("/", 1)
+            return httpx.Response(
+                302, headers={"Location": f"{DOWNLOADS}/{tag}/{name}"}
+            )
         if path.startswith("/repos/old/r/"):
             # A transferred repository: GitHub answers with its new home.
             location = f"{API}/repos/o/r/" + path[len("/repos/old/r/") :]
