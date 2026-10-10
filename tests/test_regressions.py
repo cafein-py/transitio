@@ -3523,3 +3523,14 @@ def test_place_queries_read_an_index_path_once_until_its_manifest_changes(
     manifest.symlink_to(moved)
     with pytest.raises(IncompatibleIndexError):
         transitio_index.place("Helsinki", index=path)
+
+
+@pytest.mark.parametrize("day", [None, "20260601"])
+def test_a_crops_report_is_the_validation_of_its_output(tmp_path, day):
+    # fetch validated every cropped feed again after the crop had validated
+    # it; the crop's report now stands in for that validation.
+    source = write_zip(tmp_path / "feed.zip", FEED)
+    output = tmp_path / "cropped.zip"
+    options = {} if day is None else {"reference_date": day}
+    report = crop_feed(source, output, aoi=CITY_BBOX, **options)
+    assert report["validation"] == validate_feed(output, **options)
