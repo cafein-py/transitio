@@ -41,6 +41,23 @@ _ALIASES = {
 }
 
 
+def _add_stops(builder, stops):
+    """Add ``(stop_id, name, lat, lon)`` stops in one insert."""
+    with builder.action("add_stop"):
+        builder._append_rows(
+            "stops.txt",
+            [
+                {
+                    "stop_id": stop_id,
+                    "stop_name": name,
+                    "stop_lat": lat,
+                    "stop_lon": lon,
+                }
+                for stop_id, name, lat, lon in stops
+            ],
+        )
+
+
 def _value(row, column, default=None):
     value = row.get(column)
     if value is None:
@@ -261,8 +278,7 @@ def build_feed(
     builder.add_agency("agency", agency_name, agency_url, timezone)
 
     if stop_rows is not None:
-        for stop_id, name, lat, lon in stop_rows:
-            builder.add_stop(stop_id, name, lat, lon)
+        _add_stops(builder, stop_rows)
 
     for (index, row), geometry in zip(routes.iterrows(), routes.geometry):
         if geometry is None or geometry.geom_type != "LineString":
@@ -365,12 +381,14 @@ def build_feed(
             ]
         else:
             sequence = []
+            generated = []
             for position, (lat, lon, meters) in enumerate(
                 _stops_along(points, cumulative, stop_spacing)
             ):
                 stop_id = f"{route_id}-stop-{position + 1}"
-                builder.add_stop(stop_id, stop_id, lat, lon)
+                generated.append((stop_id, stop_id, lat, lon))
                 sequence.append((stop_id, run_seconds * meters / total_m))
+            _add_stops(builder, generated)
 
         windows = []
         if periods:

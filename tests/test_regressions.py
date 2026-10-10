@@ -3197,3 +3197,34 @@ def test_validation_without_a_study_day_reports_no_expired_service(tmp_path):
     repaired = repair_feed(source, tmp_path / "repaired.zip")
     assert expired(repaired["remaining_notices"]) == []
     assert expired(validate_feed(source, reference_date="20210101")["notices"])
+
+
+def test_shapes_trips_and_built_stops_are_added_in_one_insert(tmp_path, monkeypatch):
+    # add_shape, add_trip and build_feed inserted their rows one at a time,
+    # each copying the whole table: a 4,000-point shape took 25 s.
+    import geopandas as gpd
+    from shapely.geometry import LineString
+
+    from transitio.edit import FeedBuilder, build_feed
+
+    inserts = []
+    insert_rows = FeedBuilder.insert_rows
+
+    def counting(self, filename, rows, **kwargs):
+        rows = list(rows)
+        inserts.append((filename, len(rows)))
+        return insert_rows(self, filename, rows, **kwargs)
+
+    monkeypatch.setattr(FeedBuilder, "insert_rows", counting)
+    builder = FeedBuilder()
+    builder.add_shape("s", [(60.0, 24.0), (60.1, 24.1), (60.2, 24.2)])
+    builder.add_trip("r", "wk", "t", [("a", 0, 0), ("b", 600, 600), ("c", 1200, 1200)])
+    assert inserts == [("shapes.txt", 3), ("trips.txt", 1), ("stop_times.txt", 3)]
+    inserts.clear()
+    line = LineString([(24.90, 60.16), (24.93, 60.17), (24.96, 60.18)])
+    routes = gpd.GeoDataFrame(
+        [{"route_id": "r1", "headway_min": 10}], geometry=[line], crs="EPSG:4326"
+    )
+    build_feed(routes, tmp_path / "built.zip", timezone="Europe/Helsinki", check=False)
+    stops = [count for filename, count in inserts if filename == "stops.txt"]
+    assert len(stops) == 1 and stops[0] > 2

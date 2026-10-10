@@ -540,9 +540,7 @@ class FeedBuilder:
                     total += _haversine_m(points[sequence - 2], (lat, lon))
                 row["shape_dist_traveled"] = f"{total:.1f}"
             rows.append(row)
-        for row in rows:
-            self._append("shapes.txt", row)
-        return self
+        return self._append_rows("shapes.txt", rows)
 
     @_as_action("add_trip")
     def add_trip(
@@ -577,9 +575,7 @@ class FeedBuilder:
                 **fields,
             },
         )
-        for row in rows:
-            self._append("stop_times.txt", row)
-        return self
+        return self._append_rows("stop_times.txt", rows)
 
     @_as_action("add_frequency_trip")
     def add_frequency_trip(
