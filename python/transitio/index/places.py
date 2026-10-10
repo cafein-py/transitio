@@ -338,7 +338,12 @@ class Place:
 
     @property
     def geometry(self):
-        return self._record.get("geometry")
+        """The place's boundary, a shapely geometry in lon/lat, or None; from
+        schema 12 read from its partition's boundaries on first use."""
+        index = getattr(self._lookup, "_index", None)
+        if "geometry" in self._record or index is None:
+            return self._record.get("geometry")
+        return index._boundaries([self.id], [self.country_code])[0]
 
     @property
     def centre(self):
@@ -899,7 +904,21 @@ class _PlaceLookup:
         from transitio.osm._fetch import _areas_km2
 
         places = self._index.places
-        rows = places.sindex.query(geometry, predicate="intersects")
+        lazy = "geometry" not in places.columns
+        if lazy:
+            # Schema 12: the places whose bounding box meets the area's; their
+            # boundaries are read below, for the places kept.
+            xmin, ymin, xmax, ymax = (
+                places[["xmin", "ymin", "xmax", "ymax"]]
+                .to_numpy(dtype=float, na_value=np.nan)
+                .T
+            )
+            west, south, east, north = geometry.bounds
+            rows = np.flatnonzero(
+                (xmin <= east) & (xmax >= west) & (ymin <= north) & (ymax >= south)
+            )
+        else:
+            rows = places.sindex.query(geometry, predicate="intersects")
         ids = places["place_id"].to_numpy()[rows]
         kinds = places["kind"].to_numpy()[rows]
         if country is not None:
@@ -911,7 +930,15 @@ class _PlaceLookup:
         land = kinds == "country"
         keep = candidate | land
         rows, ids, candidate, land = rows[keep], ids[keep], candidate[keep], land[keep]
-        geoms = places.geometry.to_numpy()[rows]
+        if lazy:
+            codes = places["country_code"].to_numpy()[rows]
+            geoms = self._index._boundaries(ids, codes)
+            meets = shapely.intersects(geoms, geometry)
+            ids, candidate, land, geoms = (
+                kept[meets] for kept in (ids, candidate, land, geoms)
+            )
+        else:
+            geoms = places.geometry.to_numpy()[rows]
         clips = shapely.intersection(geoms, geometry)
         aoi = np.array([geometry], dtype=object)
         sizes = _areas_km2(np.concatenate([geoms[candidate], clips[candidate], aoi]))

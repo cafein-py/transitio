@@ -1,5 +1,6 @@
 """Schema 7: a partitioned index read whole, per country, and its links."""
 
+import gc
 import hashlib
 import json
 
@@ -7,17 +8,19 @@ import pytest
 
 pytest.importorskip("geopandas")
 
+import numpy as np  # noqa: E402
 import pandas  # noqa: E402
 import pyarrow as pa  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
 import shapely  # noqa: E402
 import transitio  # noqa: E402
 from transitio import index as reader  # noqa: E402
-from transitio.exceptions import IncompatibleIndexError  # noqa: E402
+from transitio.exceptions import IncompatibleIndexError, TransitioError  # noqa: E402
 from transitio.index import _refresh, release as contract  # noqa: E402
 from test_index_boundaries import BOUNDARIES  # noqa: E402
 from index_fixture import (  # noqa: E402
     SNAPSHOT_ID,
+    SUMMARY_KEYS,
     covered_feed,
     edge,
     pack,
@@ -699,17 +702,59 @@ def _split_index(directory, **kw):
     )
 
 
-def test_a_schema_12_index_reads_as_its_schema_11_twin(tmp_path, monkeypatch):
+def _evidence(index, name):
+    """Each matched edge of the place's feeds: its evidence, selector and
+    summary."""
+    found = reader.place(name, index=index).feeds(categories=None, international=True)
+    return {
+        (feed.feed_id, tier): (edge.evidence, edge.selector, edge.summary)
+        for feed in found
+        for tier, edge in feed.edges.items()
+    }
+
+
+def test_a_schema_12_index_reads_its_on_demand_tables_when_used(tmp_path, monkeypatch):
     monkeypatch.setattr(transitio, "__version__", reader.MIN_READER_VERSIONS[12])
     eleven = reader.read_index(_split_index(tmp_path / "11", access={}))
-    twelve = reader.read_index(_split_index(tmp_path / "12", split=True))
-    assert twelve.schema_version == 12
+    directory = _split_index(tmp_path / "12", split=True).resolve()
+    twelve = reader.read_index(directory)
+    finland = reader.read_index(directory, country="FI")
+    assert twelve.schema_version == 12 and reader.check_index(directory) is None
+    # The core frames are schema 11's less the on-demand columns; read whole,
+    # as check_index reads them, they are schema 11's.
+    snapshot = json.loads((directory / "snapshot.json").read_text())
+    whole = reader._read_partitioned(directory, snapshot, 12, None, whole=True)
     for table in ("places", "edges", "links"):
         old, new = getattr(eleven, table), getattr(twelve, table)
-        assert sorted(new.columns) == sorted(old.columns)
-        pandas.testing.assert_frame_equal(new[old.columns], old)
-    wkb = [shapely.to_wkb(i.places.geometry.to_numpy()) for i in (eleven, twelve)]
-    assert wkb[0].tolist() == wkb[1].tolist()
+        joined = getattr(whole, table)
+        assert sorted(joined.columns) == sorted(old.columns)
+        pandas.testing.assert_frame_equal(joined[old.columns], old)
+        core = [column for column in old.columns if column in new.columns]
+        pandas.testing.assert_frame_equal(new[core], pandas.DataFrame(old[core]))
+    # A boundary is read from its partition when first asked for.
+    names = ["Helsinki", "Turku", "Tallinn", "esp"]
+    shapes = [
+        [reader.place(n, index=i).geometry for n in names] for i in (eleven, twelve)
+    ]
+    wkb = [shapely.to_wkb(np.array(found, dtype=object)).tolist() for found in shapes]
+    assert wkb[0] == wkb[1] and wkb[0][3] is None
+    assert reader.place("Helsinki", index=finland).geometry == shapes[0][0]
+    assert set(finland._partition_tables) == {("FI", "boundaries")}
+    box = shapely.box(22.0, 59.0, 27.0, 62.0)
+    for country in (None, "EE"):
+        found = [reader.area(box, country=country, index=i) for i in (eleven, twelve)]
+        parts = [[tuple(p) for p in area.parts] for area in found]
+        assert parts[0] == parts[1] and parts[0]
+        assert found[0].coverage == found[1].coverage
+    # Edges: evidence and selectors from the details, a domestic edge's from
+    # its country's, a cross-border one's from the links.
+    for name in ("Helsinki", "Turku"):
+        expected = _evidence(eleven, name)
+        assert _evidence(twelve, name) == expected == _evidence(finland, name)
+        for evidence, _, summary in expected.values():
+            evidence = evidence or {}
+            assert summary == {k: evidence[k] for k in SUMMARY_KEYS if k in evidence}
+    assert expected[("f-hsl", "regional")][1] == {"route_id": ["r1"]}
     for wrong in (pa.string(), pa.float32()):
         with pytest.raises(IncompatibleIndexError, match="'xmin' is .*, not float64"):
             reader._check_types(pa.schema([("xmin", wrong)]), "places", "places")
@@ -848,7 +893,7 @@ def test_a_schema_12_index_is_refused_when_its_parts_disagree(
     directory = _split_index(tmp_path / "index", split=True)
     mutate(directory)
     with pytest.raises(IncompatibleIndexError, match=refusal):
-        reader.read_index(directory)
+        reader.check_index(directory)
 
 
 def test_a_schema_12_release_packs_its_core(tmp_path, monkeypatch):
@@ -894,3 +939,53 @@ def test_a_schema_12_release_packs_its_core(tmp_path, monkeypatch):
         with pytest.raises(ValueError, match="without"):
             contract.members(snapshot)
         snapshot["partitions"][partition][table] = {}
+
+
+def test_a_schema_12_index_answers_from_its_core_alone(tmp_path, monkeypatch):
+    monkeypatch.setattr(transitio, "__version__", reader.MIN_READER_VERSIONS[12])
+    directory = _split_index(tmp_path / "index", split=True)
+    for table in ("boundaries", "details"):
+        for file in directory.glob(f"*/{table}.parquet"):
+            file.unlink()
+    index = reader.read_index(directory)
+    helsinki = reader.place("Helsinki", index=index)
+    assert reader.places("Helsinki", index=index) == [helsinki]
+    assert reader.suggest("hel", index=index)[0].place == helsinki
+    feeds = helsinki.feeds()
+    assert feeds.to_dataframe()["share_of_place"].tolist() == [0.9]
+    assert helsinki.recommend().to_dataframe()["feed_id"].tolist() == ["f-hsl"]
+    # An on-demand table the directory lacks is named when it is needed.
+    with pytest.raises(TransitioError, match="FI.boundaries.parquet: missing; the"):
+        helsinki.geometry
+    with pytest.raises(TransitioError, match="does not carry it"):
+        feeds[0].edges["local"].evidence
+
+
+def test_an_installed_snapshot_stays_while_anything_read_from_it_lives(
+    tmp_path, monkeypatch
+):
+    pytest.importorskip("fcntl")  # without shared locks nothing is pruned
+    monkeypatch.setattr(transitio, "__version__", reader.MIN_READER_VERSIONS[12])
+    monkeypatch.setattr(_refresh, "_state", {key: None for key in _refresh._state})
+    root = tmp_path / "cache"
+    old, new = f"{1:016x}", f"{2:016x}"
+    for snapshot_id in (old, new):
+        directory = root / "snapshots" / snapshot_id
+        _split_index(directory, split=True, snapshot_id=snapshot_id)
+
+    def held():
+        # Read through the selection, which is then cleared: only the
+        # place keeps the snapshot.
+        _refresh.use(old, cache_dir=root)
+        helsinki = reader.place("Helsinki")
+        _refresh.use(None)
+        return helsinki
+
+    helsinki = held()
+    assert _refresh._prune(root, 1, set()) == ([], [])
+    geometry = helsinki.geometry
+    evidence = helsinki.feeds()[0].edges["local"].evidence
+    assert geometry == BOUNDARIES[0] and evidence == DETAILED_EDGES[0]["evidence"]
+    del helsinki
+    gc.collect()
+    assert _refresh._prune(root, 1, set()) == ([old], [])

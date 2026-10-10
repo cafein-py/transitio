@@ -55,6 +55,7 @@ __all__ = [
     "Selector",
     "Suggestion",
     "read_index",
+    "check_index",
     "load",
     "links",
     "area",
@@ -349,6 +350,7 @@ _ON_DEMAND = {
         ["summary"],
     ),
 }
+_ON_DEMAND_TABLES = frozenset(extra for extra, *_ in _ON_DEMAND.values())
 # The Arrow types of the columns schema 11 and 12 add, and of the keys that
 # join a schema-12 table with its on-demand partner; an all-null column
 # passes.
@@ -534,6 +536,9 @@ def _read_regular(path, limit):
         os.close(handle)
 
 
+_UNREAD = object()  # a partition table not yet read
+
+
 class Index:
     """A resolved index: its manifest, feeds, and (if present) places and edges.
 
@@ -543,7 +548,10 @@ class Index:
     ``realtime`` is the GTFS-RT companion table of schema 8 (the whole
     index's, or the country's), None before it. ``access_providers`` is the
     schema-11 table of the providers that issue feed credentials, None
-    before it.
+    before it. A schema-12 index read from disk holds the core tables:
+    places with their bounding boxes and edges with their ``summary``; a
+    partition's boundaries and details are read on first use
+    (:meth:`boundaries_in`, :meth:`details_in`) and kept.
     """
 
     def __init__(
@@ -569,7 +577,12 @@ class Index:
         self.country = country
         self._path = None if path is None else Path(path)
         self._partition_tables = {}
+        self._tables_lock = threading.Lock()
         self._providers = None
+        # Schema 12: the partition each row of ``edges`` was read from.
+        self._edge_partitions = None
+        # The shared lock on an installed snapshot, held while the index lives.
+        self._lease = None
 
     @property
     def partitions(self):
@@ -577,17 +590,78 @@ class Index:
         return self.snapshot.get("partitions") or {}
 
     def _partition_table(self, partition, table):
-        """One partition table read from disk once and kept for the index's
-        lifetime; None when the partition lists no such table."""
+        """One partition table read from disk once, whichever thread asks
+        first, and kept for the index's lifetime; None when the partition
+        lists no such table."""
         key = (partition, table)
-        if key not in self._partition_tables:
-            if self._path is None or table not in self.partitions.get(partition, {}):
-                self._partition_tables[key] = None
-            else:
-                self._partition_tables[key] = _read_partition_table(
-                    self._path, self.snapshot, partition, table
+        found = self._partition_tables.get(key, _UNREAD)
+        if found is _UNREAD:
+            with self._tables_lock:
+                if key not in self._partition_tables:
+                    self._partition_tables[key] = self._read_table(partition, table)
+                found = self._partition_tables[key]
+        return found
+
+    def _read_table(self, partition, table):
+        """One partition table from disk; an on-demand table the directory
+        lacks is asked for first. Boundaries come as a GeoSeries by place
+        id, details indexed by place id, feed id and tier."""
+        if self._path is None or table not in self.partitions.get(partition, {}):
+            return None
+        file = self._path / partition / _TABLE_FILES[table]
+        if table in _ON_DEMAND_TABLES and not os.path.lexists(file):
+            from transitio.index._refresh import _fetch_part
+
+            _fetch_part(self, partition, table)
+        frame = _read_partition_table(self._path, self.snapshot, partition, table)
+        if table not in _ON_DEMAND_TABLES:
+            return frame
+        keys = _ON_DEMAND["edges"][1] if table == "details" else "place_id"
+        frame = frame.set_index(keys)
+        if not frame.index.is_unique:
+            raise IncompatibleIndexError(f"{file}: a key repeats")
+        if table == "boundaries":
+            import geopandas
+
+            return geopandas.GeoSeries(frame["geometry"], crs="EPSG:4326")
+        return frame
+
+    def boundaries_in(self, partition):
+        """The place boundaries of one country partition of a schema-12
+        index, a GeoSeries indexed by place id, read once and kept; None
+        when the partition lists none (before schema 12 the boundaries are
+        the places table's ``geometry``)."""
+        return self._partition_table(partition, "boundaries")
+
+    def details_in(self, partition):
+        """The full evidence, selectors and curation of the edges of one
+        partition of a schema-12 index (``links`` for the cross-border
+        ones), indexed by place id, feed id and tier, read once and kept;
+        None when the partition lists none."""
+        return self._partition_table(partition, "details")
+
+    def _boundaries(self, place_ids, partitions):
+        """The boundaries of ``place_ids``, each read from its partition in
+        ``partitions``, as an object array; refused when a partition holds
+        no boundary for one of them."""
+        import numpy as np
+
+        place_ids = np.asarray(place_ids, dtype=object)
+        partitions = np.asarray(partitions, dtype=object)
+        shapes = np.empty(len(place_ids), dtype=object)
+        for partition in dict.fromkeys(partitions.tolist()):
+            here = partitions == partition
+            table = self.boundaries_in(partition)
+            rows = np.full(here.sum(), -1)
+            if table is not None:
+                rows = table.index.get_indexer(place_ids[here])
+            if (rows < 0).any():
+                missing = place_ids[here][rows < 0][0]
+                raise IncompatibleIndexError(
+                    f"partition {partition!r} holds no boundary for place {missing!r}"
                 )
-        return self._partition_tables[key]
+            shapes[here] = table.to_numpy()[rows]
+        return shapes
 
     def feeds_in(self, partition):
         """The feeds table of one partition of a schema-7 index read from
@@ -672,8 +746,10 @@ def read_index(path, *, country=None):
     links whose place lies in it. ``country`` is refused for an older schema.
     A schema-8 index also carries its GTFS-RT companions in ``realtime``
     (joined, or the country's own). A schema-12 index keeps place boundaries
-    and the edges' evidence, selectors and curation in on-demand tables;
-    they are read with the core ones and joined back into the same frames.
+    and the edges' evidence, selectors and curation in on-demand tables:
+    only the core tables are read here, and a partition's on-demand ones
+    when first needed (:attr:`Place.geometry`, :func:`area`, an edge's
+    ``evidence`` or ``selector``); :func:`check_index` reads them all.
 
     ``pandas`` (and its ``pyarrow`` Parquet engine, a required dependency) reads
     ``feeds.parquet``. The manifest is read first, so an incompatible snapshot
@@ -850,7 +926,7 @@ def _partitions(snapshot, path):
     if version < 8:
         known.discard("realtime")
     if version < 12:
-        known -= {extra for extra, *_ in _ON_DEMAND.values()}
+        known -= _ON_DEMAND_TABLES
     for name, tables in listing.items():
         if not isinstance(name, str) or not _PARTITION_NAME.fullmatch(name):
             raise IncompatibleIndexError(
@@ -911,12 +987,13 @@ def _partition_directory(path, partition):
     return directory
 
 
-def _read_partition_table(path, snapshot, partition, table):
+def _read_partition_table(path, snapshot, partition, table, whole=False):
     """One partition table, checked against its digest, columns and snapshot.
-    From schema 12 places and edges are joined with their on-demand
-    boundaries and details, one row each, into the frames of schema 11."""
+    From schema 12, with ``whole``, places and edges are joined with their
+    on-demand boundaries and details, one row each, into the frames of
+    schema 11."""
     frame = _read_partition_file(path, snapshot, partition, table)
-    if snapshot["schema_version"] < 12 or table not in _ON_DEMAND:
+    if not whole or snapshot["schema_version"] < 12 or table not in _ON_DEMAND:
         return frame
     import pandas
 
@@ -1020,8 +1097,12 @@ def _concat(frames, geo=False):
     return joined
 
 
-def _read_partitioned(path, snapshot, version, country):
-    """A schema-7 index: every partition joined, or one country's."""
+def _read_partitioned(path, snapshot, version, country, whole=False):
+    """A schema-7 index: every partition joined, or one country's; from
+    schema 12 the core tables, with ``whole`` their on-demand partners
+    joined in."""
+    import pandas
+
     listing = _partitions(snapshot, path)
     if country is not None:
         if country not in listing or country in (
@@ -1033,13 +1114,17 @@ def _read_partitioned(path, snapshot, version, country):
     else:
         chosen = [name for name in sorted(listing) if name != LINKS_PARTITION]
     tables = {"feeds": [], "realtime": [], "places": [], "edges": []}
+    counts = {}  # the edges rows of each partition, in order
     for name in chosen:
         for table in tables:
             if table in listing[name]:
-                tables[table].append(_read_partition_table(path, snapshot, name, table))
+                frame = _read_partition_table(path, snapshot, name, table, whole)
+                tables[table].append(frame)
+                if table == "edges":
+                    counts[name] = len(frame)
     links = None
     if "edges" in listing.get(LINKS_PARTITION, {}):
-        links = _read_partition_table(path, snapshot, LINKS_PARTITION, "edges")
+        links = _read_partition_table(path, snapshot, LINKS_PARTITION, "edges", whole)
         if country is not None:
             places = tables["places"]
             here = set(places[0]["place_id"]) if places else set()
@@ -1049,13 +1134,9 @@ def _read_partitioned(path, snapshot, version, country):
         if country is None:
             raise IncompatibleIndexError(f"{path}: the index carries no feeds table")
         # A country served only through links has places but no home feeds.
-        import pandas
-
         feeds = pandas.DataFrame(columns=sorted(_FEEDS_COLUMNS[version]))
     realtime = _concat(tables["realtime"])
     if realtime is None and version >= 8:
-        import pandas
-
         # Schema 8 with no companions here: an empty table, not None.
         realtime = pandas.DataFrame(columns=sorted(_REALTIME_COLUMNS))
     edges = _concat(tables["edges"])
@@ -1063,10 +1144,11 @@ def _read_partitioned(path, snapshot, version, country):
         # The flat view: the domestic edges and the cross-border ones together.
         flat_links = links.drop(columns=["feed_partition"])
         edges = _concat([edges, flat_links] if edges is not None else [flat_links])
-    return Index(
+        counts[LINKS_PARTITION] = len(flat_links)
+    index = Index(
         snapshot,
         feeds,
-        _concat(tables["places"], geo=True),
+        _concat(tables["places"], geo=version < 12 or whole),
         edges,
         links=links,
         country=country,
@@ -1074,6 +1156,12 @@ def _read_partitioned(path, snapshot, version, country):
         realtime=realtime,
         access_providers=_read_access_providers(path, snapshot, version),
     )
+    if version >= 12 and not whole and edges is not None:
+        import numpy
+
+        codes = numpy.repeat(numpy.arange(len(counts)), list(counts.values()))
+        index._edge_partitions = pandas.Categorical.from_codes(codes, list(counts))
+    return index
 
 
 def load(path, *, country=None):
@@ -1095,7 +1183,26 @@ def links(path):
     listing = _partitions(snapshot, path)
     if "edges" not in listing.get(LINKS_PARTITION, {}):
         return None
-    return _read_partition_table(path, snapshot, LINKS_PARTITION, "edges")
+    return _read_partition_table(path, snapshot, LINKS_PARTITION, "edges", True)
+
+
+def check_index(path):
+    """Read every table of the index at ``path`` with every check, or raise
+    :class:`~transitio.exceptions.IncompatibleIndexError` at the first
+    problem; returns None.
+
+    Beyond what :func:`read_index` reads, a schema-12 index's on-demand
+    tables are read too: each file's size, digest, columns, rows and
+    snapshot are checked, each place must have one boundaries row and each
+    edge one details row, with none left over, and every boundary is
+    decoded."""
+    path = Path(path).resolve()
+    snapshot = _read_manifest(path)
+    version = snapshot["schema_version"]
+    if version < 12:
+        read_index(path)
+    else:
+        _read_partitioned(path, snapshot, version, None, whole=True)
 
 
 # Version components are bounded: the manifest is an untrusted input and an

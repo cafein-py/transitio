@@ -23,6 +23,7 @@ import shutil
 import stat
 import tarfile
 import tempfile
+import weakref
 from pathlib import Path
 
 import platformdirs
@@ -89,15 +90,15 @@ class _Bounded:
         return data
 
 
-# Process-local: the selection use() made (with the cache it lives in), the
-# handle it resolves to, and the shared locks that keep both from pruning.
+# Process-local: the selection use() made (with the cache it lives in and
+# the shared lock that keeps it from pruning) and the handle it resolves to,
+# an index holding its own lock.
 _state = {
     "selection": None,
     "selection_root": None,
     "selection_lock": None,
     "handle": None,
     "handle_key": None,
-    "handle_lock": None,
 }
 
 
@@ -258,7 +259,6 @@ def use(snapshot=None, *, cache_dir=None):
                 "transitio.index.refresh()"
             )
     _release("selection_lock")
-    _release("handle_lock")
     _state["selection"] = snapshot
     _state["selection_root"] = None if snapshot is None else root
     _state["selection_lock"] = lock
@@ -276,7 +276,8 @@ def _pinned(cache_dir=None):
 
 def _load(root, snapshot_id):
     """The snapshot read under its shared lock, or None when it is not (or
-    no longer) installed; the lock travels with the handle."""
+    no longer) installed. The index holds the lock until it is collected,
+    so nothing read from it loses its snapshot to a prune."""
     from transitio.index import read_index
 
     lock = _hold(root, snapshot_id)
@@ -294,12 +295,25 @@ def _load(root, snapshot_id):
         # pin the caller's error says to refresh.
         if lock is not None:
             lock.close()
-        return None, None
+        return None
     except BaseException:
         if lock is not None:
             lock.close()
         raise
-    return index, lock
+    if lock is not None:
+        index._lease = lock
+        weakref.finalize(index, lock.close)
+    return index
+
+
+def _fetch_part(index, partition, table):
+    """Provide the on-demand ``table`` of ``partition`` that the directory
+    of ``index`` lacks; an index directory must carry its own, so this
+    refuses."""
+    from transitio.index import _TABLE_FILES
+
+    file = index._path / partition / _TABLE_FILES[table]
+    raise TransitioError(f"{file}: missing; the index directory does not carry it")
 
 
 def _bundled_root():
@@ -312,32 +326,32 @@ def _bundled_root():
 
 
 def _bundled():
-    """The index bundled in the wheel as ``(Index, None)``, or ``(None, None)``
-    when none was shipped or it cannot be read or is incompatible. It carries
-    no lock: it is read-only package data that no refresh prunes."""
+    """The index bundled in the wheel, or None when none was shipped or it
+    cannot be read or is incompatible. It carries no lock: it is read-only
+    package data that no refresh prunes."""
     from transitio.index import read_index
 
     try:
         root = _bundled_root()
     except (ImportError, TypeError, OSError):
-        return None, None
+        return None
     # Whole like an installed snapshot -- every member present, the licence
     # NOTICE included -- with a readable places-and-edges index; a partial
     # bundle is no more use than an uninstalled one.
     if not _whole_members(root):
-        return None, None
+        return None
     try:
         index = read_index(root)
     except (TransitioError, ValueError, OSError):
-        return None, None
+        return None
     # Licensed like a released snapshot: a development build can be whole yet
     # carry ``licensed: false``, which the release publisher refuses, so the
     # wheel must not activate one either.
     if index.places is None or index.edges is None:
-        return None, None
+        return None
     if index.snapshot.get("licensed") is not True:
-        return None, None
-    return index, None
+        return None
+    return index
 
 
 def active_index(*, cache_dir=None):
@@ -357,34 +371,30 @@ def active_index(*, cache_dir=None):
         if pinned is None and key[2] == "auto":
             return _state["handle"]
     if pinned is not None:
-        index, lock = _load(root, pinned)
-        if index is None:
-            index, lock = _bundled()
-            if index is not None and index.snapshot_id != pinned:
-                index, lock = None, None
+        index = _load(root, pinned) or _bundled()
+        if index is not None and index.snapshot_id != pinned:
+            index = None
         if index is None:
             raise TransitioError(
                 f"snapshot {pinned} is not installed; run transitio.index.refresh()"
             )
     else:
-        index = lock = None
+        index = None
         for snapshot_id, snapshot in installed(cache_dir=root):
             if not contract.compatible(snapshot)[0]:
                 continue
-            index, lock = _load(root, snapshot_id)
+            index = _load(root, snapshot_id)
             if index is not None:
                 break
         if index is None:
-            index, lock = _bundled()
+            index = _bundled()
         if index is None:
             raise TransitioError(
                 "no compatible feed index snapshot is installed; run "
                 "transitio.index.refresh()"
             )
-    _release("handle_lock")
     _state["handle"] = index
     _state["handle_key"] = (str(root), index.snapshot_id, "pin" if pinned else "auto")
-    _state["handle_lock"] = lock
     return index
 
 
@@ -658,7 +668,6 @@ def refresh(
                 _install(root, snapshot_id, archive)
             removed, leftover = _prune(root, keep, {snapshot_id, _pinned(cache_dir)[1]})
     # The next query resolves afresh: a newer snapshot may now be active.
-    _release("handle_lock")
     _state["handle"] = None
     _state["handle_key"] = None
     return {

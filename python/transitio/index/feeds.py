@@ -25,6 +25,8 @@ import datetime
 import json
 import math
 
+from transitio.exceptions import IncompatibleIndexError
+
 __all__ = [
     "AccessProvider",
     "IndexedFeed",
@@ -165,10 +167,26 @@ _FAMILIES = {"tram": "rail", "subway": "rail", "rail": "rail"}
 _STALE_DAYS = 30
 
 
-class TierEdge:
-    """One membership edge, as the query matched it."""
+# The evidence keys the reader ranks and explains feeds by; a schema-12 edge
+# carries them in its core ``summary``.
+_SUMMARY_KEYS = (
+    "share_of_place",
+    "share_basis",
+    "stale_when_indexed",
+    "carried_by",
+    "overlap",
+)
 
-    def __init__(self, record):
+
+class TierEdge:
+    """One membership edge, as the query matched it.
+
+    ``summary`` holds the evidence keys the reader ranks by. On a schema-12
+    index ``evidence`` and ``selector`` are read from the details of the
+    edge's partition (``_partition`` in its record) on first use.
+    """
+
+    def __init__(self, record, index=None):
         self.place_id = record["place_id"]
         self.tier = record["tier"]
         self.tier_confidence = float(record["tier_confidence"])
@@ -177,17 +195,51 @@ class TierEdge:
         self.selector_state = record["selector_state"]
         self.classification_fingerprint = record.get("classification_fingerprint")
         self.fingerprint_kind = record.get("fingerprint_kind")
-        self.selector = _parse(record.get("selector"))
-        self.evidence = _parse(record.get("evidence"))
+        self._key = (record["place_id"], record["feed_id"], record["tier"])
+        self._index = index
+        self._partition = record.get("_partition")
+        self._details = None
+        if "evidence" in record:
+            evidence = _parse(record.get("evidence"))
+            self._details = (evidence, _parse(record.get("selector")))
+            evidence = evidence or {}
+            self.summary = {k: evidence[k] for k in _SUMMARY_KEYS if k in evidence}
+        else:
+            self.summary = _parse(record.get("summary")) or {}
         self.service = ServiceLevel(_parse(record.get("service")))
         # Schema 7: the rank stage's relevance; None on an older index.
         self.relevance_category = _scalar(record.get("relevance_category"))
         self.relevance = _relevance(record.get("relevance"))
         # The feed's share of the place's service, as the rank stage
         # recorded it; None when unknown.
-        self.share_of_place = _relevance((self.evidence or {}).get("share_of_place"))
+        self.share_of_place = _relevance(self.summary.get("share_of_place"))
         cross = record.get("cross_border")
         self.cross_border = None if cross is None or cross != cross else bool(cross)
+
+    @property
+    def evidence(self):
+        """The edge's evidence as the build recorded it, a dict, or None."""
+        return self._read_details()[0]
+
+    @property
+    def selector(self):
+        """The edge's route selector as the build recorded it, or None."""
+        return self._read_details()[1]
+
+    def _read_details(self):
+        if self._details is None:
+            table = None
+            if self._index is not None:
+                table = self._index.details_in(self._partition)
+            at = -1 if table is None else table.index.get_indexer([self._key])[0]
+            if at < 0:
+                raise IncompatibleIndexError(
+                    f"partition {self._partition!r} holds no details for the edge "
+                    f"{self._key!r}"
+                )
+            row = table.iloc[at]
+            self._details = (_parse(row["evidence"]), _parse(row["selector"]))
+        return self._details
 
     def __repr__(self):
         return (
@@ -565,7 +617,7 @@ class IndexedFeed:
         days before the index crawled it, as a ``datetime.date``; None
         otherwise."""
         for edge in self.edges.values():
-            ended = _day((edge.evidence or {}).get("stale_when_indexed"))
+            ended = _day(edge.summary.get("stale_when_indexed"))
             if ended is not None:
                 return ended
         crawled = self.last_crawled
@@ -584,7 +636,7 @@ class IndexedFeed:
         records it."""
         departures, run, found = {}, {}, False
         for edge in self.edges.values():
-            block = (edge.evidence or {}).get("overlap")
+            block = edge.summary.get("overlap")
             if not isinstance(block, dict):
                 continue
             found = True
@@ -822,7 +874,7 @@ def _family_blocks(feeds):
     by_place = {}
     for feed in feeds:
         for edge in feed.edges.values():
-            block = (edge.evidence or {}).get("overlap")
+            block = edge.summary.get("overlap")
             if not isinstance(block, dict):
                 continue
             here = by_place.setdefault(edge.place_id, {})
@@ -936,7 +988,7 @@ def _ranking_reason(feed, repeats):
     if feed.relevance_category is not None:
         reason = f"{feed.relevance_category} ({reason})"
     if feed.share_of_place is not None:
-        bases = {(e.evidence or {}).get("share_basis") for e in feed.edges.values()}
+        bases = {e.summary.get("share_basis") for e in feed.edges.values()}
         basis = "stops" if bases == {"stops"} else "departures"
         share = _percent(feed.share_of_place)
         reason += f": {share} of the {basis} summed over the place's feeds"
@@ -952,7 +1004,7 @@ def _ranking_reason(feed, repeats):
     return "; ".join([reason] + [note for note in notes if note])
 
 
-def _matched(edges, tiers, exclude, on_unknown, categories=None):
+def _matched(edges, tiers, exclude, on_unknown, categories=None, index=None):
     """The edges of one feed the query matches, keyed by tier."""
     matched = {}
     for edge in edges:
@@ -965,7 +1017,7 @@ def _matched(edges, tiers, exclude, on_unknown, categories=None):
             continue
         if categories is not None and edge.get("relevance_category") not in categories:
             continue
-        matched.setdefault(edge["tier"], TierEdge(edge))
+        matched.setdefault(edge["tier"], TierEdge(edge, index))
     return matched
 
 
@@ -1036,8 +1088,10 @@ def _link_edges(index, place_ids):
     not carry in its edges, with the rows of the feeds they name."""
     if index.links is None or index.country is None:
         return [], {}
+    from transitio.index import LINKS_PARTITION
+
     links = index.links[index.links["place_id"].isin(place_ids)]
-    records = links.to_dict("records")
+    records = links.assign(_partition=LINKS_PARTITION).to_dict("records")
     rows = {}
     for partition in sorted({r["feed_partition"] for r in records}):
         for row in index.feeds_in(partition).to_dict("records"):
@@ -1122,7 +1176,11 @@ def _feeds_for_places(
     ids = [place.id for place in places]
     records = []
     if index.edges is not None:
-        records = index.edges[index.edges["place_id"].isin(ids)].to_dict("records")
+        here = index.edges["place_id"].isin(ids).to_numpy()
+        selected = index.edges[here]
+        if index._edge_partitions is not None:
+            selected = selected.assign(_partition=index._edge_partitions[here])
+        records = selected.to_dict("records")
     if ranked and not international:
         records = [e for e in records if not e.get("cross_border")]
     rows = {}
@@ -1153,7 +1211,7 @@ def _feeds_for_places(
         matched = {}
         for place_id in ids:
             edges = by_feed[feed_id].get(place_id, ())
-            query = (tiers, exclude, on_unknown, wanted[place_id])
+            query = (tiers, exclude, on_unknown, wanted[place_id], index)
             for tier, edge in _matched(edges, *query).items():
                 matched[(place_id, tier)] = edge
         if not matched:
