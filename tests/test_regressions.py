@@ -3534,3 +3534,69 @@ def test_a_crops_report_is_the_validation_of_its_output(tmp_path, day):
     options = {} if day is None else {"reference_date": day}
     report = crop_feed(source, output, aoi=CITY_BBOX, **options)
     assert report["validation"] == validate_feed(output, **options)
+
+
+@pytest.mark.parametrize("blocks", [False, True])
+def test_trips_listed_per_date_are_matched_through_their_days(blocks):
+    # In a feed listing each trip once per date, every later copy tried all
+    # the earlier copies of its trip, one by one: 86 s for 100 trips over a
+    # year. Twelve dates give each later copy more partners than are tried
+    # one by one.
+    import pandas as pd
+
+    from transitio.gtfs._duplicates import repeated_trips
+
+    def feed(prefix, dates, extra=()):
+        trips = [
+            (f"{prefix}{n}{half}", f"d{n}", f"k{n}" if blocks else "")
+            for n in dates
+            for half in "ab"
+        ]
+        trips += [(trip_id, f"d{n}", "") for trip_id, n in extra]
+        times = [
+            (trip_id, f"0{8 + (trip_id[-1] == 'b')}:{minute}:00", stop, sequence)
+            for trip_id, _, _ in trips
+            for sequence, (stop, minute) in enumerate((("s1", "00"), ("s2", "10")))
+        ]
+        return {
+            "stops.txt": pd.DataFrame(
+                {
+                    "stop_id": ["s1", "s2"],
+                    "stop_lat": ["60.1", "60.11"],
+                    "stop_lon": "24.9",
+                }
+            ),
+            "routes.txt": pd.DataFrame(
+                {"route_id": ["r"], "route_short_name": ["1"], "route_type": ["3"]}
+            ),
+            "trips.txt": pd.DataFrame(
+                trips, columns=["trip_id", "service_id", "block_id"]
+            ).assign(route_id="r"),
+            "stop_times.txt": pd.DataFrame(
+                [(t, at, at, stop, str(seq)) for t, at, stop, seq in times],
+                columns=[
+                    "trip_id",
+                    "arrival_time",
+                    "departure_time",
+                    "stop_id",
+                    "stop_sequence",
+                ],
+            ),
+            "calendar_dates.txt": pd.DataFrame(
+                {
+                    "service_id": [f"d{n}" for n in range(1, 14)],
+                    "date": [f"202601{n:02d}" for n in range(1, 14)],
+                    "exception_type": "1",
+                }
+            ),
+        }
+
+    earlier = feed("t", range(1, 13))
+    later = feed("u", range(1, 14), extra=[("x1a", 1)])
+    gone, of, _ = repeated_trips([earlier, later])[1]
+    # Each earlier copy covers one later copy on its date. Unblocked trips go
+    # first, so with blocks x1a takes t1a's date and block k1 is kept.
+    first = 2 if blocks else 1
+    expected = {f"u{n}{half}" for n in range(first, 13) for half in "ab"}
+    assert gone == (expected | {"x1a"} if blocks else expected)
+    assert of == [0]
