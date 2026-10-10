@@ -3641,7 +3641,8 @@ def test_filling_and_clearing_the_cache_sweep_its_blobs_once(tmp_path, monkeypat
 
 def test_dangling_parents_and_agencies_are_cleared_where_the_rules_allow(tmp_path):
     # Repair found the row of each dangling parent_station or agency_id by
-    # reading the whole table, so the time grew with the square of the rows.
+    # reading the whole table, so the time grew with the square of the rows,
+    # and it dropped the rows it had cleared: the feed lost its only route.
     files = {
         "agency.txt": (
             "agency_id,agency_name,agency_url,agency_timezone\n"
@@ -3675,3 +3676,9 @@ def test_dangling_parents_and_agencies_are_cleared_where_the_rules_allow(tmp_pat
         ("stops.txt", 4, "parent_station"),
         ("routes.txt", 2, "agency_id"),
     ]
+    dropped = [
+        (fix["filename"], fix["csvRowNumber"])
+        for fix in result["fixes"]
+        if fix["action"] == "drop_entity"
+    ]
+    assert dropped == [("stops.txt", 3)]
