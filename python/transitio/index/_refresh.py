@@ -46,6 +46,8 @@ _MEMBER_LIMITS = {
     "realtime.parquet": 512 * 1024 * 1024,
     "places.parquet": 512 * 1024 * 1024,
     "edges.parquet": 512 * 1024 * 1024,
+    "boundaries.parquet": 512 * 1024 * 1024,
+    "details.parquet": 512 * 1024 * 1024,
     "access_providers.parquet": 8 * 1024 * 1024,
 }
 

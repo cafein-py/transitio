@@ -22,7 +22,7 @@ import shapely
 
 import transitio
 import transitio.index as reader
-from transitio.index import release as contract
+from transitio.index import _boundaries, release as contract
 
 API = "https://api.example"
 UPLOADS = "https://uploads.example"
@@ -472,6 +472,39 @@ PLACES_SCHEMA_11 = PLACES_SCHEMA_9.insert(
 PLACES_SCHEMA_11 = PLACES_SCHEMA_11.insert(
     PLACES_SCHEMA_11.get_field_index("geometry"), pa.field("population", pa.int64())
 )
+# Schema 12: places carry their boundary's bounding box, the boundaries
+# their own table; edges carry a summary of their evidence, the evidence,
+# selector and curation their own details table.
+BBOX_COLUMNS = ("xmin", "ymin", "xmax", "ymax")
+DETAIL_COLUMNS = (
+    "evidence",
+    "selector",
+    "merged_evidence",
+    "curation",
+    "curation_history",
+    "rehomed_from",
+)
+SUMMARY_KEYS = (
+    "share_of_place",
+    "share_basis",
+    "stale_when_indexed",
+    "carried_by",
+    "overlap",
+)
+PLACES_SCHEMA_12 = pa.schema(
+    [field for field in PLACES_SCHEMA_11 if field.name != "geometry"]
+    + [pa.field(name, pa.float64()) for name in BBOX_COLUMNS]
+)
+EDGES_SCHEMA_12 = pa.schema(
+    [field for field in EDGES_SCHEMA_7 if field.name not in DETAIL_COLUMNS]
+    + [pa.field("summary", pa.string())]
+)
+LINKS_SCHEMA_12 = EDGES_SCHEMA_12.append(pa.field("feed_partition", pa.string()))
+DETAILS_SCHEMA = pa.schema(
+    [EDGES_SCHEMA.field(name) for name in ("place_id", "feed_id", "tier")]
+    + [EDGES_SCHEMA.field(name) for name in DETAIL_COLUMNS]
+    + [pa.field("snapshot", pa.string())]
+)
 ACCESS_PROVIDERS_SCHEMA = pa.schema(
     [
         ("provider_id", pa.string()),
@@ -576,6 +609,34 @@ def _edge_row_7(record, snapshot_id, partition=None):
     return row
 
 
+def _split(tables):
+    """Schema 12: a partition's place boundaries moved into its boundaries
+    rows, leaving each place its bounding box, and its edges' evidence,
+    selectors and curation into its details rows, leaving a summary."""
+    for row in tables.get("places", ()):
+        geometry = row.pop("geometry")
+        shape = None if geometry is None else shapely.from_wkb(geometry)
+        bounds = [None] * 4 if shape is None else shapely.bounds(shape).tolist()
+        row.update(zip(BBOX_COLUMNS, bounds))
+        tables.setdefault("boundaries", []).append(
+            {"place_id": row["place_id"], "geometry": shape}
+        )
+    for row in tables.get("edges", ()):
+        details = {name: row.pop(name) for name in DETAIL_COLUMNS}
+        evidence = json.loads(details["evidence"] or "{}")
+        summary = {key: evidence[key] for key in SUMMARY_KEYS if key in evidence}
+        row["summary"] = _json_block(summary or None)
+        tables.setdefault("details", []).append(
+            {
+                "place_id": row["place_id"],
+                "feed_id": row["feed_id"],
+                "tier": row["tier"],
+                **details,
+                "snapshot": row["snapshot"],
+            }
+        )
+
+
 def _counts(feeds, places, edges, realtime, home, version):
     """The manifest counts: from schema 8 the companions too, linked when
     their static feed is one of the index's."""
@@ -604,6 +665,7 @@ def write_partitioned_index(
     validity=None,
     contained=None,
     access=None,
+    split=False,
 ):
     """Write a schema-7 index under ``directory``: feeds by ``home_country``
     (``international`` without one), places by ``country_code``, edges under
@@ -619,9 +681,13 @@ def write_partitioned_index(
     With ``access`` (``{"providers": [provider records]}``) a schema-11
     index: the feeds' access columns taken from their records (``access``
     ``"open"`` unless given), the providers table at the root with its
-    digest in the manifest, and each place's ``centre``."""
+    digest in the manifest, and each place's ``centre``. With ``split`` a
+    schema-12 index: places and edges split into their core tables and the
+    on-demand boundaries and details, every table listed with its size."""
     directory.mkdir(parents=True, exist_ok=True)
     version = PARTITIONED_SCHEMA_VERSION if realtime is None else 8
+    if split:
+        access = access or {"providers": []}
     if access is not None:
         contained = contained or {}
     if contained is not None:
@@ -633,6 +699,8 @@ def write_partitioned_index(
         version = 10
     if access is not None:
         version = 11
+    if split:
+        version = 12
     home = {feed["feed_id"]: feed.get("home_country") for feed in feeds}
     country = {place["place_id"]: place["country_code"] for place in places}
     companions = {}
@@ -691,8 +759,20 @@ def write_partitioned_index(
     for partition, tables in sorted(parts.items()):
         (directory / partition).mkdir(exist_ok=True)
         listing[partition] = {}
+        if version >= 12:
+            _split(tables)
         for table, rows in tables.items():
-            if table == "feeds":
+            if table == "boundaries":
+                data = _boundaries.encode(
+                    [row["place_id"] for row in rows],
+                    [row["geometry"] for row in rows],
+                    snapshot_id,
+                )
+            elif table == "details":
+                data = _parquet(rows, DETAILS_SCHEMA)
+            elif table == "places" and version >= 12:
+                data = _parquet(rows, PLACES_SCHEMA_12)
+            elif table == "feeds":
                 schema = {
                     7: FEEDS_SCHEMA_7,
                     8: FEEDS_SCHEMA_8,
@@ -709,9 +789,14 @@ def write_partitioned_index(
                 data = _parquet(rows, schema.with_metadata({b"geo": geo}))
             else:
                 schema = LINKS_SCHEMA_7 if partition == "links" else EDGES_SCHEMA_7
+                if version >= 12:
+                    links = partition == "links"
+                    schema = LINKS_SCHEMA_12 if links else EDGES_SCHEMA_12
                 data = _parquet(rows, schema)
             (directory / partition / f"{table}.parquet").write_bytes(data)
             listing[partition][table] = {"rows": len(rows), "sha256": _sha256(data)}
+            if version >= 12:
+                listing[partition][table]["bytes"] = len(data)
     manifest = {
         "schema_version": version,
         "discovery_semantics_version": reader.DISCOVERY_SEMANTICS_VERSION,
@@ -748,14 +833,17 @@ def manifest_bytes(**fields):
 
 def pack(directory):
     """The release assets of the index at ``directory``, in the contract's
-    shape: the archive of its members, the archive's checksum and the
-    manifest a client reads before downloading anything."""
+    shape: the archive of its members (the core archive from schema 12), the
+    archive's checksum and the manifest a client reads before downloading
+    anything."""
     snapshot = json.loads((directory / reader.SNAPSHOT_FILE).read_bytes())
     members = [
         (name, (directory / name).read_bytes()) for name in contract.members(snapshot)
     ]
     snapshot_id = snapshot["snapshot_id"]
     name = contract.archive_name(snapshot_id)
+    if snapshot["schema_version"] >= 12:
+        name = contract.core_archive_name(snapshot_id)
     archive = _archive(members)
     manifest = {
         "snapshot_id": snapshot_id,

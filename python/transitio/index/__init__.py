@@ -26,6 +26,7 @@ import stat
 from pathlib import Path
 
 from transitio.exceptions import IncompatibleIndexError, PlaceNotFoundError
+from transitio.index import _boundaries
 from transitio.index.feeds import (
     AccessProvider,
     IndexedFeed,
@@ -71,7 +72,7 @@ __all__ = [
 
 # The index schema versions this reader understands. A snapshot outside the set
 # is refused rather than read against columns that may have moved.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({4, 5, 6, 7, 8, 9, 10, 11})
+SUPPORTED_SCHEMA_VERSIONS = frozenset({4, 5, 6, 7, 8, 9, 10, 11, 12})
 
 # The oldest transitio that reads each schema version: what a snapshot records
 # as its reader floor, fixed per schema rather than taken from the build.
@@ -80,7 +81,8 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset({4, 5, 6, 7, 8, 9, 10, 11})
 # Schema 7 (partitions), 8 (the GTFS-RT companion table) and 9 (feed service
 # spans and place validity) ship together; schema 10 (the feeds a feed
 # lies within) first in 0.15.0; schema 11 (feed access details and place
-# centres) first in 0.19.0.
+# centres) first in 0.19.0; schema 12 (core and on-demand tables) first in
+# 0.24.0.
 MIN_READER_VERSIONS = {
     4: "0.11.0",
     5: "0.11.0",
@@ -90,6 +92,7 @@ MIN_READER_VERSIONS = {
     9: "0.12.0",
     10: "0.15.0",
     11: "0.19.0",
+    12: "0.24.0",
 }
 
 # Bumped whenever name resolution, ranking or filtering changes: the snapshot
@@ -111,6 +114,11 @@ ACCESS_PROVIDERS_FILE = "access_providers.parquet"
 # Schema 8 adds ``realtime.parquet`` beside a partition's feeds: the GTFS-RT
 # companions of its static feeds, keyed by ``static_feed_id``; the
 # ``international`` partition also holds the companions without one.
+# Schema 12 moves the place boundaries into ``boundaries.parquet`` and the
+# edges' full evidence, selectors and curation into ``details.parquet``,
+# tables read on demand beside the core ones.
+BOUNDARIES_FILE = "boundaries.parquet"
+DETAILS_FILE = "details.parquet"
 INTERNATIONAL_PARTITION = "international"
 LINKS_PARTITION = "links"
 _TABLE_FILES = {
@@ -118,6 +126,8 @@ _TABLE_FILES = {
     "realtime": REALTIME_FILE,
     "places": PLACES_FILE,
     "edges": EDGES_FILE,
+    "boundaries": BOUNDARIES_FILE,
+    "details": DETAILS_FILE,
 }
 _PARTITION_NAME = re.compile(r"[A-Z]{2}|international|links")
 # The tables each partition kind may carry; a country partition any of
@@ -125,7 +135,7 @@ _PARTITION_NAME = re.compile(r"[A-Z]{2}|international|links")
 # may hold, is refused before anything is read.
 _PARTITION_TABLES = {
     INTERNATIONAL_PARTITION: {"feeds", "realtime"},
-    LINKS_PARTITION: {"edges"},
+    LINKS_PARTITION: {"edges", "details"},
 }
 _MAX_PARTITIONS = 300
 
@@ -307,11 +317,57 @@ _EDGES_COLUMNS_BY_VERSION[8] = _EDGES_COLUMNS_BY_VERSION[7]
 _EDGES_COLUMNS_BY_VERSION[9] = _EDGES_COLUMNS_BY_VERSION[7]
 _EDGES_COLUMNS_BY_VERSION[10] = _EDGES_COLUMNS_BY_VERSION[7]
 _EDGES_COLUMNS_BY_VERSION[11] = _EDGES_COLUMNS_BY_VERSION[7]
-_LINKS_COLUMNS = _EDGES_COLUMNS_BY_VERSION[7] | {"feed_partition"}
-# The Arrow types of the columns schema 11 adds; an all-null column passes.
-_SCHEMA_11_TYPES = {
+# Schema 12: places carry their boundary's bounding box in place of the
+# boundary, and edges a ``summary`` of the evidence keys the reader ranks by
+# in place of the details.
+_BBOX_COLUMNS = ("xmin", "ymin", "xmax", "ymax")
+_DETAIL_COLUMNS = (
+    "evidence",
+    "selector",
+    "merged_evidence",
+    "curation",
+    "curation_history",
+    "rehomed_from",
+)
+_FEEDS_COLUMNS[12] = _FEEDS_COLUMNS[11]
+_PLACES_COLUMNS[12] = (_PLACES_COLUMNS[11] - {"geometry"}) | set(_BBOX_COLUMNS)
+_EDGES_COLUMNS_BY_VERSION[12] = (
+    _EDGES_COLUMNS_BY_VERSION[11] - set(_DETAIL_COLUMNS)
+) | {"summary"}
+_BOUNDARIES_COLUMNS = frozenset({"place_id", "geometry", "polygon", "snapshot"})
+_DETAILS_COLUMNS = frozenset(
+    {"place_id", "feed_id", "tier", *_DETAIL_COLUMNS, "snapshot"}
+)
+# Each core table extended on demand: its partner, the join keys, the
+# columns taken from the partner and those the core alone carries.
+_ON_DEMAND = {
+    "places": ("boundaries", ["place_id"], ["geometry"], list(_BBOX_COLUMNS)),
+    "edges": (
+        "details",
+        ["place_id", "feed_id", "tier"],
+        list(_DETAIL_COLUMNS),
+        ["summary"],
+    ),
+}
+# The Arrow types of the columns schema 11 and 12 add, and of the keys that
+# join a schema-12 table with its on-demand partner; an all-null column
+# passes.
+_EDGE_KEYS = dict.fromkeys(("place_id", "feed_id", "tier"), "string")
+_COLUMN_TYPES = {
     "feeds": dict.fromkeys(_FEEDS_COLUMNS[11] - _FEEDS_COLUMNS[10], "string"),
-    "places": {"centre": "binary", "population": "integer"},
+    "places": {
+        "place_id": "string",
+        "centre": "binary",
+        "population": "integer",
+        **dict.fromkeys(_BBOX_COLUMNS, "float64"),
+    },
+    "boundaries": {"place_id": "string", "polygon": "bool"},
+    "edges": {**_EDGE_KEYS, "summary": "string"},
+    "details": {
+        **_EDGE_KEYS,
+        **dict.fromkeys(_DETAIL_COLUMNS, "string"),
+        "rehomed_from": "list of strings",
+    },
     "access_providers": {
         **dict.fromkeys(_ACCESS_PROVIDERS_COLUMNS, "string"),
         "credential_fields": "list of strings",
@@ -365,17 +421,18 @@ def _load_table(read, data, path, table):
 
 
 def _check_types(schema, path, table):
-    """Refuse a schema-11 column stored as another Arrow type."""
+    """Refuse a column schema 11 or 12 adds stored as another Arrow type."""
     import pyarrow as pa
 
     accepts = {
         "string": (pa.types.is_string, pa.types.is_large_string),
         "binary": (pa.types.is_binary, pa.types.is_large_binary),
         "bool": (pa.types.is_boolean,),
+        "float64": (pa.types.is_float64,),
         "integer": (pa.types.is_integer,),
         "list of strings": (pa.types.is_list, pa.types.is_large_list),
     }
-    for name, expected in _SCHEMA_11_TYPES.get(table, {}).items():
+    for name, expected in _COLUMN_TYPES.get(table, {}).items():
         index = schema.get_field_index(name)  # -1 when absent or repeated
         found = None if index < 0 else schema.field(index).type
         if found is None or pa.types.is_null(found):
@@ -390,18 +447,20 @@ def _check_types(schema, path, table):
 
 
 def _check_centres(places, path):
-    """Refuse a schema-11 place centre that is not a WKB Point."""
+    """The schema-11 place centres as points, refused unless each is a WKB
+    Point."""
     import geopandas
 
     centres = places["centre"]
     try:
         if centres.dtype.name != "geometry":
-            centres = geopandas.GeoSeries.from_wkb(centres)
+            centres = geopandas.GeoSeries.from_wkb(centres, crs="EPSG:4326")
     except Exception as error:
         raise IncompatibleIndexError(f"{path}: a place centre is not WKB ({error})")
     kinds = geopandas.GeoSeries(centres).geom_type
     if (kinds.notna() & (kinds != "Point")).any():
         raise IncompatibleIndexError(f"{path}: a place centre is not a Point")
+    return centres
 
 
 def _check_columns(frame, expected, path, version, table):
@@ -612,7 +671,9 @@ def read_index(path, *, country=None):
     result holds that partition's feeds, places and domestic edges, and the
     links whose place lies in it. ``country`` is refused for an older schema.
     A schema-8 index also carries its GTFS-RT companions in ``realtime``
-    (joined, or the country's own).
+    (joined, or the country's own). A schema-12 index keeps place boundaries
+    and the edges' evidence, selectors and curation in on-demand tables;
+    they are read with the core ones and joined back into the same frames.
 
     ``pandas`` (and its ``pyarrow`` Parquet engine, a required dependency) reads
     ``feeds.parquet``. The manifest is read first, so an incompatible snapshot
@@ -781,11 +842,15 @@ def _partitions(snapshot, path):
             "partitions"
         )
     rows = {table: 0 for table in _TABLE_FILES}
-    # The realtime table arrives with schema 8; an older snapshot listing
-    # one is outside its layout.
+    # The realtime table arrives with schema 8 and the on-demand tables, with
+    # each table's size, with schema 12; an older snapshot listing one is
+    # outside its layout.
+    version = snapshot["schema_version"]
     known = set(_TABLE_FILES)
-    if snapshot["schema_version"] < 8:
+    if version < 8:
         known.discard("realtime")
+    if version < 12:
+        known -= {extra for extra, *_ in _ON_DEMAND.values()}
     for name, tables in listing.items():
         if not isinstance(name, str) or not _PARTITION_NAME.fullmatch(name):
             raise IncompatibleIndexError(
@@ -802,6 +867,7 @@ def _partitions(snapshot, path):
                 and isinstance(entry.get("rows"), int)
                 and not isinstance(entry.get("rows"), bool)
                 and entry["rows"] >= 0
+                and (version < 12 or _positive_int(entry.get("bytes")))
                 for table, entry in tables.items()
             )
         ):
@@ -809,6 +875,12 @@ def _partitions(snapshot, path):
                 f"{path / SNAPSHOT_FILE}: partition {name!r} lists tables outside "
                 "the layout"
             )
+        for core, (extra, *_) in _ON_DEMAND.items() if version >= 12 else ():
+            if (core in tables) != (extra in tables):
+                raise IncompatibleIndexError(
+                    f"{path / SNAPSHOT_FILE}: partition {name!r} lists {core} and "
+                    f"{extra} apart"
+                )
         for table, entry in tables.items():
             rows[table] += entry["rows"]
     if any(total > _MAX_TABLE_ROWS for total in rows.values()):
@@ -817,6 +889,10 @@ def _partitions(snapshot, path):
             f"{_MAX_TABLE_ROWS} rows of one table"
         )
     return listing
+
+
+def _positive_int(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 def _partition_directory(path, partition):
@@ -836,7 +912,44 @@ def _partition_directory(path, partition):
 
 
 def _read_partition_table(path, snapshot, partition, table):
-    """One partition table, checked against its digest, columns and snapshot."""
+    """One partition table, checked against its digest, columns and snapshot.
+    From schema 12 places and edges are joined with their on-demand
+    boundaries and details, one row each, into the frames of schema 11."""
+    frame = _read_partition_file(path, snapshot, partition, table)
+    if snapshot["schema_version"] < 12 or table not in _ON_DEMAND:
+        return frame
+    import pandas
+
+    extra, keys, taken, dropped = _ON_DEMAND[table]
+    file = path / partition / _TABLE_FILES[extra]
+    partner = _read_partition_file(path, snapshot, partition, extra)
+    # The key columns are typed as strings when read; a null key names nothing.
+    if frame[keys].isna().any().any() or partner[keys].isna().any().any():
+        raise IncompatibleIndexError(f"{file}: a {table} or {extra} key is null")
+    try:
+        joined = frame.drop(columns=dropped).merge(
+            partner[keys + taken],
+            on=keys,
+            how="left",
+            validate="one_to_one",
+            indicator=True,
+        )
+    except pandas.errors.MergeError:
+        raise IncompatibleIndexError(f"{file}: a key repeats in {table} or {extra}")
+    if len(partner) != len(frame) or (joined.pop("_merge") != "both").any():
+        raise IncompatibleIndexError(
+            f"{file}: its rows do not match the {table} rows one to one"
+        )
+    if table == "places":
+        import geopandas
+
+        joined = geopandas.GeoDataFrame(joined, geometry="geometry", crs="EPSG:4326")
+    return joined
+
+
+def _read_partition_file(path, snapshot, partition, table):
+    """One partition file, checked against its size, digest, columns and
+    snapshot."""
     import pandas
 
     version = snapshot["schema_version"]
@@ -847,27 +960,44 @@ def _read_partition_table(path, snapshot, partition, table):
         "feeds": _MAX_FEEDS_BYTES,
         "realtime": _MAX_FEEDS_BYTES,
         "places": _MAX_PLACES_BYTES,
+        "boundaries": _MAX_PLACES_BYTES,
     }
     data = _read_regular(file, limits.get(table, _MAX_EDGES_BYTES))
+    if version >= 12 and len(data) != entry["bytes"]:
+        raise IncompatibleIndexError(
+            f"{file}: {len(data)} bytes where the snapshot lists {entry['bytes']}"
+        )
     if hashlib.sha256(data).hexdigest() != entry["sha256"]:
         raise IncompatibleIndexError(f"{file}: does not match the snapshot's sha256")
-    if table == "places":
+    if table == "places" and version < 12:
         import geopandas
 
         frame = _load_table(geopandas.read_parquet, data, file, table)
-        columns = _PLACES_COLUMNS[version]
-        if version >= 11 and "centre" in frame.columns:
-            _check_centres(frame, file)
+    elif table == "boundaries":
+        import pyarrow.parquet
+
+        def read(source):
+            return _boundaries.decode(pyarrow.parquet.read_table(source))
+
+        frame = _load_table(read, data, file, table)
     else:
         frame = _load_table(pandas.read_parquet, data, file, table)
-        if table == "feeds":
-            columns = _FEEDS_COLUMNS[version]
-        elif table == "realtime":
-            columns = _REALTIME_COLUMNS
-        elif partition == LINKS_PARTITION:
-            columns = _LINKS_COLUMNS
-        else:
-            columns = _EDGES_COLUMNS_BY_VERSION[version]
+    if table == "places":
+        columns = _PLACES_COLUMNS[version]
+        if version >= 11 and "centre" in frame.columns:
+            frame["centre"] = _check_centres(frame, file)
+    elif table == "feeds":
+        columns = _FEEDS_COLUMNS[version]
+    elif table == "realtime":
+        columns = _REALTIME_COLUMNS
+    elif table == "boundaries":
+        columns = _BOUNDARIES_COLUMNS
+    elif table == "details":
+        columns = _DETAILS_COLUMNS
+    elif partition == LINKS_PARTITION:
+        columns = _EDGES_COLUMNS_BY_VERSION[version] | {"feed_partition"}
+    else:
+        columns = _EDGES_COLUMNS_BY_VERSION[version]
     _check_columns(frame, columns, file, version, table)
     _check_snapshot_column(frame, snapshot, file, table)
     if len(frame) != entry["rows"]:
@@ -956,7 +1086,8 @@ def links(path):
     """The cross-border edge table of the schema-7 index at ``path`` — every
     edge whose feed has no home country or whose place lies outside it, with
     ``feed_partition`` naming the partition holding the feed — or None when
-    the index has none. Only the manifest and the links table are read."""
+    the index has none. Only the manifest and the links table (from schema
+    12 with its details) are read."""
     path = Path(path).resolve()
     snapshot = _read_manifest(path)
     if snapshot["schema_version"] < 7:
