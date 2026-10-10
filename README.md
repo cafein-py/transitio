@@ -1,168 +1,18 @@
-# transitio
+# transitio: Transit feeds in and out
 
-AOI-driven OSM and GTFS acquisition, validation and repair — companion to
-[pyrosm](https://github.com/HTenkanen/pyrosm) and cafein. transitio moves the
-raw ingredients of routing — OSM extracts and GTFS timetables — from the open
-data ecosystem to your area of interest, validated and repaired, ready for
-cafein to brew into routing results.
+**Find the right public transport feeds for any city, validated and ready for
+editing.**
 
-**Status: early development.** Acquisition (Mobility Database catalog, the
-feed index + OSM extracts), GTFS validation, repair and cropping are in place,
-tied together by the one-call `transitio.fetch` pipeline.
+Give transitio a city, and it looks up the GTFS feeds that serve it in its
+feed index, a catalogue of the world's public transport feeds and the places
+they serve. It recommends which feeds to use and says why it leaves out the
+others, then downloads them, crops them to the city and validates them. It
+also downloads the OpenStreetMap data to route on. The feeds and the extract
+go straight to [cafein](https://github.com/cafein-py/cafein) for routing, and
+the extract opens in [pyrosm](https://github.com/HTenkanen/pyrosm) for the
+street network.
 
-The feed index that `transitio.index` reads is built in a separate repository,
-[transitio-dev/transitio-index](https://github.com/transitio-dev/transitio-index).
-
-## Quick example
-
-```python
-import transitio
-
-# One call: OSM extract + validated GTFS feeds for an area of interest.
-result = transitio.fetch(helsinki_polygon)        # any shapely geometry,
-                                                   # bbox tuple or place name
-result.osm_pbf     # cropped OSM extract (path)
-result.feeds       # downloaded, cropped and validated GTFS feeds (paths)
-result.reports     # per-feed merged validation reports
-result.skipped     # (feed id, reason) for anything left out
-
-net = result.to_cafein()   # routable cafein.TransportNetwork
-osm = result.to_pyrosm()   # pyrosm.OSM reader over the extract
-```
-
-`fetch` shows its progress on stderr, a bar per download (a widget in
-Jupyter with `pip install "transitio[notebook]"`, which adds ipywidgets);
-`progress=False` turns it off.
-
-`fetch` accepts `when="2026-09-01"` to pick the dataset versions covering a
-service day (needs a free Mobility Database API token, passed as
-`refresh_token=` or via the `MOBILITY_API_REFRESH_TOKEN` environment
-variable), `modes=["rail", "tram"]` to keep only feeds serving given modes,
-`repair=True` to repair feeds after the crop, `osm=False` to skip the OSM
-extract when only the timetables are needed, and `crop=False` to keep feeds
-whole. With a token, GTFS downloads are catalogued dataset versions verified
-against catalog checksums; without one, the latest hosted zips are fetched
-as-is — unverified moving targets.
-
-With the feed index installed (below), `fetch` takes the feeds of the index
-places that cover the area, when they cover at least half of its land, and
-`result.places` lists those places. Otherwise it searches the Mobility
-Database catalogue for feeds whose bounding box meets the area's, and a
-warning gives the reason and the number of feeds before anything is
-downloaded; `index=False` searches the catalogue without the index or a
-warning.
-
-### Feeds for a place
-
-The feed index lists the feeds serving each place, by the tier of service
-they run there: `local`, `regional`, `national` or `international`. Install
-it once, then fetch a place's feeds by tier:
-
-```python
-import transitio
-
-transitio.index.refresh()            # once: install the newest feed index
-
-augsburg = transitio.place("Augsburg")
-result = transitio.fetch(
-    place=augsburg,
-    tiers=["local", "regional"],     # leave out long-distance services
-    osm=False,                       # timetables only
-)
-transitio.merge_feeds(result.feeds, "augsburg.gtfs.zip", check=False)
-```
-
-The first refresh downloads about 420 MB (about 35 s at 100 Mbit/s, 3
-minutes at 20 Mbit/s) and takes about 10 s more to unpack and check it; it
-prints its progress to stderr unless called with `progress=False`. A
-snapshot takes about 550 MB on disk, and the cache keeps the newest three
-plus a pinned one, up to about 2.2 GB; a refresh needs about 1 GB free
-while it runs.
-
-Each feed is cropped to the place's boundary; a national feed such as
-Germany's is streamed through the crop, so it fits in memory bounded by the
-area. `merge_feeds` writes one feed from the cropped ones; with
-`check=False` it keeps the file when the validator reports errors, which
-the returned report lists. A bare name resolves to the city before the
-metros named after it. Where different places share a name and none clearly
-leads, as for London in the UK and in Canada, `place` raises
-`AmbiguousPlaceError`; a qualifier names the region or country that holds
-the place, as in `"London, Ontario"` or `"City of London, UK"`, `kind="city"`
-(or `"metro"`, `"region"`, `"country"`) restricts the scope, and a Wikidata
-id picks one place. A metro delineated under several definitions resolves
-to one of them, by the order functional urban area, metropolitan
-statistical area, metropolitan region, FAO city-region, though a city's own
-metros (those in its country) keep every definition; `definition=` names
-one instead. A partial name raises
-`PlaceNotFoundError`, which lists the places it partly matches;
-`transitio.suggest` completes names.
-
-### Inferring missing route shapes
-
-Many feeds ship without `shapes.txt`, leaving every consumer to draw
-straight lines between stops. `infer_shapes` fills that gap from an OSM
-extract — matching OSM route relations where they exist, map matching
-over tram, rail and bus-drivable networks where they do not — and
-writes a feed carrying real alignments:
-
-```python
-report = transitio.infer_shapes(
-    "feed.zip", "shaped.zip", pbf, strictness="strict"
-)
-report["written"]     # shapes written
-report["shapes"]      # per shape: method, matched OSM relation, score
-report["skipped"]     # per refused pattern: the stage that refused it
-```
-
-How much inference is acceptable is yours to choose. `"strict"` (the
-default) writes only unambiguous matches; `"relaxed"` and
-`"permissive"` trade certainty for coverage, which is the trade worth
-making where a feed has no shapes at all and the alternative is a
-straight line. Every shape is validated against the pattern's own stops
-before it is written — each stop must lie on the alignment, in order —
-so no level writes a shape the feed's own data contradicts.
-
-On the Helsinki tram fixture with the feed's shapes withheld, the
-levels measured (`scripts/validate_shapes.py`):
-
-| level | shapes written | median length error | worst offset |
-| ----- | -------------- | ------------------- | ------------ |
-| strict | 35/80 | 0.9% | 42 m |
-| relaxed | 40/80 | 0.9% | 34 m |
-| permissive | 43/80 | 0.9% | 184 m |
-
-Helsinki's OSM data is unusually good; expect a worse trade where it is
-not, and keep the report.
-
-### Lower-level access
-
-Each pipeline stage is available on its own:
-
-```python
-db = transitio.MobilityDatabase()
-
-feeds = db.search_feeds(aoi=helsinki_polygon)
-dataset = db.dataset_for(feeds[0], when="2026-09-01")
-path = db.download(dataset)                        # cached, checksum-verified
-report = db.validation_report(dataset)             # hosted canonical-validator report
-
-pbf = transitio.fetch_pbf(helsinki_polygon)       # cropped OSM extract
-validation = transitio.validate_feed(path)        # canonical-code notices
-transitio.repair_feed(path, "repaired.zip")       # gtfstidy-contract repair
-transitio.crop_feed(path, "cropped.zip", aoi=helsinki_polygon)
-```
-
-## Documentation
-
-The Sphinx site lives in `docs/`. Building it needs transitio itself
-installed (autodoc imports the real package) plus the Sphinx toolchain:
-
-```
-pip install . -r docs/requirements.txt
-sphinx-build -b html docs docs/_build/html
-```
-
-The hosted version lives at https://transitio.readthedocs.io.
+**Status:** early development.
 
 ## Installation
 
@@ -170,10 +20,103 @@ The hosted version lives at https://transitio.readthedocs.io.
 pip install transitio
 ```
 
-Binary wheels cover Linux, macOS and Windows. Building from source instead
-requires a Rust toolchain (`pip install .`).
-`pip install "transitio[notebook]"` also installs ipywidgets, so the
-download progress bars show as widgets in Jupyter.
+Wheels cover Linux, macOS and Windows; building from source needs a Rust
+toolchain (`pip install .`). `pip install "transitio[notebook]"` also
+installs ipywidgets, so the download progress bars show as widgets in
+Jupyter. `result.to_cafein()` needs [cafein](https://github.com/cafein-py/cafein)
+as well (`pip install cafein`).
+
+## Example
+
+```python
+import transitio
+
+transitio.index.refresh()             # once: install the feed index
+
+turku = transitio.place("Turku")
+rec = turku.recommend()               # which feeds to use, and why
+result = transitio.fetch(feeds=rec)   # download, crop and validate
+
+result.paths                          # the feed files
+result.osm_pbf                        # the OpenStreetMap extract
+network = result.to_cafein()          # a network to route on (needs cafein)
+```
+
+## What transitio does
+
+- **Finds places and their feeds.** Look up a city, metro area, region or
+  country by name and list the feeds that serve it, local to international
+  ([Finding places](https://transitio.readthedocs.io/en/latest/finding_places.html)).
+- **Chooses the feeds to use.** `recommend()` takes the feeds that carry a
+  place's service and says why it leaves the others out
+  ([Choosing feeds](https://transitio.readthedocs.io/en/latest/choosing_feeds.html)).
+- **Fetches the data.** Download the feeds for a place, a box or any polygon,
+  cropped to it, and an OpenStreetMap extract of the area
+  ([Fetching data](https://transitio.readthedocs.io/en/latest/fetching_data.html)).
+- **Reuses its downloads.** Every download is kept in a cache, so running the
+  same analysis again delivers the same feeds, offline too
+  ([The download cache](https://transitio.readthedocs.io/en/latest/download_cache.html)).
+- **Checks, repairs and edits feeds.** Validate any GTFS feed with the notice
+  codes of the canonical GTFS validator, repair the defects that can be fixed
+  without changing the trips riders see, and edit a feed with undo and redo
+  ([Working with a GTFS feed](https://transitio.readthedocs.io/en/latest/working_with_feeds.html)).
+- **Crops and merges feeds.** Cut a feed to an area or a date range, merge
+  several feeds into one, or replace a feed's broken trips with those of
+  another
+  ([Cropping and merging feeds](https://transitio.readthedocs.io/en/latest/cropping_and_merging.html)).
+- **Builds scenario feeds.** Turn routes drawn in a GIS tool, with their
+  headways, into a GTFS feed
+  ([Building scenario feeds](https://transitio.readthedocs.io/en/latest/building_feeds.html)).
+- **Searches the catalogues.** Query the Mobility Database and download
+  OpenStreetMap extracts directly
+  ([Catalogues and OSM extracts](https://transitio.readthedocs.io/en/latest/catalogues.html)).
+- **Draws missing route shapes.** `infer_shapes` draws the shapes a feed
+  lacks from OpenStreetMap (below).
+
+## Drawing missing route shapes
+
+Many feeds have no `shapes.txt`, so their routes show as straight lines
+between stops. `infer_shapes` draws the shapes from an OpenStreetMap extract:
+it follows the OpenStreetMap route relations where they exist, and matches
+each route's stops to the tram, rail or road network where they do not.
+
+```python
+report = transitio.infer_shapes(
+    "feed.zip", "shaped.zip", pbf, strictness="strict"
+)
+report["written"]     # shapes written
+report["shapes"]      # per shape: method, matched OSM relation, score
+report["skipped"]     # per refused pattern: the step that refused it
+```
+
+`strictness` sets how much guessing to accept: `"strict"` (the default)
+writes only unambiguous matches, while `"relaxed"` and `"permissive"` write
+more shapes with less certainty. Before a shape is written, the pattern's
+own stops must lie along it in order. With the shapes of Helsinki's tram
+feed withheld, the three levels gave (`scripts/validate_shapes.py`):
+
+| level | shapes written | median length error | worst offset |
+| ----- | -------------- | ------------------- | ------------ |
+| strict | 35/80 | 0.9% | 42 m |
+| relaxed | 40/80 | 0.9% | 34 m |
+| permissive | 43/80 | 0.9% | 184 m |
+
+Helsinki's OpenStreetMap data is unusually complete; elsewhere, expect fewer
+and less exact shapes.
+
+## Documentation
+
+The documentation, with the Quickstart, the tutorials and the API reference,
+is at https://transitio.readthedocs.io. To build it locally, install
+transitio and the Sphinx toolchain:
+
+```
+pip install . -r docs/requirements.txt
+sphinx-build -b html docs docs/_build/html
+```
+
+The feed index is built in a separate repository,
+[transitio-dev/transitio-index](https://github.com/transitio-dev/transitio-index).
 
 ## License
 
