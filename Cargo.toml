@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/transitio-gtfs", "crates/transitio-py"]
 
 [workspace.package]
-version = "0.21.3"
+version = "0.22.0"
 edition = "2021"
 license = "MIT"
 
