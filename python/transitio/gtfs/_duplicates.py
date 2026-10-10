@@ -242,7 +242,8 @@ class _Allocation:
         self.signatures = signatures
         self.retained = {}  # signature -> retained codes, by input, trip id
         # later code -> the retained codes it may repeat, by input, trip id:
-        # those of its signature, else those it nearly repeats
+        # those of its signature, else those it nearly repeats; the later
+        # trips of one signature share theirs
         self.partners = {}
         self.near = set()  # later codes partnered by near repeats
         self.blocks = []  # retained blocks' codes, by input, block_id
@@ -252,19 +253,28 @@ class _Allocation:
     def pair(self, codes):
         """Partner each later trip of ``codes`` with the retained trips of
         its signature; returns those without any."""
-        unpaired = []
+        unpaired, shared = [], {}
         for code in codes:
-            partners = self.retained.get(self.signatures[code])
-            if partners:
-                self.partners[code] = list(partners)
-            else:
+            signature = self.signatures[code]
+            if signature not in shared:
+                retained = self.retained.get(signature)
+                shared[signature] = _Partners(retained) if retained else None
+            if shared[signature] is None:
                 unpaired.append(code)
+            else:
+                self.partners[code] = shared[signature]
         return unpaired
 
     def pair_near(self, later, earlier):
         """Partner each ``later`` trip with the ``earlier`` one beside it."""
+        found = {}
         for code, partner in sorted(zip(later.tolist(), earlier.tolist())):
-            self.partners.setdefault(code, []).append(partner)
+            found.setdefault(code, []).append(partner)
+        for code, partners in found.items():
+            before = self.partners.get(code)
+            self.partners[code] = _Partners(
+                [*(before.codes if before else ()), *partners]
+            )
             self.near.add(code)
 
     def _runs(self, code):
@@ -286,6 +296,26 @@ class _Allocation:
             free &= ~taken[at]
         return np.where(free, at, -1)
 
+    def _running(self, partners, wanted):
+        """Those of ``partners`` running on any day of ``wanted``, in order;
+        the others cover none of its days."""
+        codes = partners.codes
+        if len(codes) <= _FEW_PARTNERS:
+            return codes
+        if partners.days is None:
+            services = self.trip_services[list(codes)]
+            first = self.bounds[services]
+            count = np.where(services < 0, 0, self.bounds[services + 1] - first)
+            rows = np.repeat(np.arange(len(codes)), count)
+            step = np.arange(len(rows)) - np.repeat(np.cumsum(count) - count, count)
+            days = self.days[np.repeat(first, count) + step]
+            order = np.lexsort((rows, days))
+            partners.days, partners.rows = days[order], rows[order]
+        low = np.searchsorted(partners.days, wanted, "left")
+        count = np.searchsorted(partners.days, wanted, "right") - low
+        at = np.repeat(low - (np.cumsum(count) - count), count) + np.arange(count.sum())
+        return [codes[row] for row in np.unique(partners.rows[at]).tolist()]
+
     def _take(self, code, at):
         taken = self.used.setdefault(code, np.zeros(len(self._runs(code)), dtype=bool))
         taken[at] = True
@@ -303,7 +333,7 @@ class _Allocation:
     def _trip(self, code):
         wanted = self._runs(code)
         owners = units = np.full(len(wanted), -1)
-        for earlier in self.partners[code]:
+        for earlier in self._running(self.partners[code], wanted):
             free = self._free(wanted, earlier)
             take = (owners < 0) & (free >= 0)
             owners, units = np.where(take, earlier, owners), np.where(take, free, units)
@@ -315,10 +345,25 @@ class _Allocation:
         return {(code, int(earlier)) for earlier in owned}
 
     def _block(self, codes):
-        partners = [set(self.partners[code]) for code in codes]
-        # Candidate blocks go by input, then by their first partner.
-        candidates = (self.block_of.get(code) for code in self.partners[codes[0]])
-        for index in dict.fromkeys(index for index in candidates if index is not None):
+        partners = [self.partners[code].members for code in codes]
+        # Candidate blocks go by input, then by their first partner; only a
+        # block with a partner running on one of the first trip's days can
+        # cover it.
+        first = self.partners[codes[0]]
+        candidates = {
+            self.block_of[earlier]
+            for earlier in self._running(first, self._runs(codes[0]))
+            if earlier in self.block_of
+        }
+        position = first.position
+        for index in sorted(
+            candidates,
+            key=lambda index: min(
+                position[earlier]
+                for earlier in self.blocks[index]
+                if earlier in position
+            ),
+        ):
             # Per later trip, the block's partners that have capacity on
             # all its days.
             options = []
@@ -348,6 +393,35 @@ class _Allocation:
             if len(members) > 1:
                 self.block_of.update(dict.fromkeys(members, len(self.blocks)))
                 self.blocks.append(members)
+
+
+_FEW_PARTNERS = 8  # partners few enough to try each without the day index
+
+
+class _Partners:
+    """The retained codes later trips may repeat, in order, with what is
+    looked up in them built on first use."""
+
+    def __init__(self, codes):
+        self.codes = tuple(codes)
+        # Every partner's days, sorted, and which partner each is.
+        self.days = self.rows = None
+        self._members = self._position = None
+
+    @property
+    def members(self):
+        if self._members is None:
+            self._members = frozenset(self.codes)
+        return self._members
+
+    @property
+    def position(self):
+        """Each code's first position."""
+        if self._position is None:
+            self._position = {}
+            for at, code in enumerate(self.codes):
+                self._position.setdefault(code, at)
+        return self._position
 
 
 def _one_to_one(options):
