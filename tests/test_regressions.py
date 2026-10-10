@@ -3333,3 +3333,42 @@ def test_osm_editor_ways_follow_members_after_batched_edits():
             assert geometry is None
         else:
             assert shapely.equals_exact(geometry, want, tolerance=0)
+
+
+def test_undo_and_redo_replay_several_deletions_in_one_action_in_steps(
+    tmp_path, monkeypatch
+):
+    # Two delete_rows calls in one action, made top-down, broke the run the
+    # replay takes in one step, so every row was replayed with a table copy:
+    # 20 trips of Turku's feed took 15 s to redo.
+    import pandas as pd
+
+    from transitio.edit import FeedEditor
+    from transitio.edit import _changes
+
+    editor = FeedEditor(write_zip(tmp_path / "feed.zip", FEED))
+    before = editor.tables["stop_times.txt"].copy()
+    with editor.action("drop two trips"):
+        for trip in ("t-in", "t-out"):
+            times = editor.tables["stop_times.txt"]
+            rows = (times["trip_id"] == trip).to_numpy().nonzero()[0]
+            editor.delete_rows("stop_times.txt", rows)
+    after = editor.tables["stop_times.txt"].copy()
+    assert after.empty
+
+    one_by_one = []
+    for name in ("_revert", "_reapply"):
+        apply = getattr(_changes, name)
+        monkeypatch.setattr(
+            _changes,
+            name,
+            lambda view, entry, apply=apply: (
+                one_by_one.append(entry),
+                apply(view, entry),
+            ),
+        )
+    editor.undo()
+    pd.testing.assert_frame_equal(editor.tables["stop_times.txt"], before)
+    editor.redo()
+    pd.testing.assert_frame_equal(editor.tables["stop_times.txt"], after)
+    assert one_by_one == []
