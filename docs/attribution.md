@@ -1,11 +1,11 @@
 # Attribution and licensing
 
-transitio itself is licensed under the MIT License. The languages of each
+`transitio` itself is licensed under the MIT License. The languages of each
 country, which place lookup reads, come from the
 [Unicode CLDR](https://cldr.unicode.org/) 47, © Unicode, Inc., under the
 [Unicode License v3](https://www.unicode.org/license.txt).
 
-The feed index that transitio installs with {func}`transitio.index.refresh`
+The feed index that `transitio` installs with {func}`transitio.index.refresh`
 is *derived data*, compiled from several open sources. Release wheels ship
 without an index; `refresh` downloads a snapshot published by
 [transitio-index](https://github.com/transitio-dev/transitio-index).
@@ -78,11 +78,11 @@ per-snapshot `NOTICE` records the licence judged for each feed.
 
 ## Time-zone boundaries
 
-transitio looks up the time zone at a feed's stops with
+`transitio` looks up the time zone at a feed's stops with
 [tzfpy](https://github.com/ringsaturn/tzfpy) (MIT), for instance to leave out
 a feed whose `agency_timezone` differs from the others' in a merge. tzfpy's
 boundary data comes from
 [timezone-boundary-builder](https://github.com/evansiroky/timezone-boundary-builder),
 under the [Open Database License (ODbL 1.0)](https://opendatacommons.org/licenses/odbl/1-0/),
 and is derived from OpenStreetMap, © OpenStreetMap contributors. It ships in
-tzfpy's package; transitio ships none of it.
+tzfpy's package; `transitio` ships none of it.
