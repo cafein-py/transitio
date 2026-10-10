@@ -3197,3 +3197,481 @@ def test_validation_without_a_study_day_reports_no_expired_service(tmp_path):
     repaired = repair_feed(source, tmp_path / "repaired.zip")
     assert expired(repaired["remaining_notices"]) == []
     assert expired(validate_feed(source, reference_date="20210101")["notices"])
+
+
+def test_shapes_trips_and_built_stops_are_added_in_one_insert(tmp_path, monkeypatch):
+    # add_shape, add_trip and build_feed inserted their rows one at a time,
+    # each copying the whole table: a 4,000-point shape took 25 s.
+    import geopandas as gpd
+    from shapely.geometry import LineString
+
+    from transitio.edit import FeedBuilder, build_feed
+
+    inserts = []
+    insert_rows = FeedBuilder.insert_rows
+
+    def counting(self, filename, rows, **kwargs):
+        rows = list(rows)
+        inserts.append((filename, len(rows)))
+        return insert_rows(self, filename, rows, **kwargs)
+
+    monkeypatch.setattr(FeedBuilder, "insert_rows", counting)
+    builder = FeedBuilder()
+    builder.add_shape("s", [(60.0, 24.0), (60.1, 24.1), (60.2, 24.2)])
+    builder.add_trip("r", "wk", "t", [("a", 0, 0), ("b", 600, 600), ("c", 1200, 1200)])
+    assert inserts == [("shapes.txt", 3), ("trips.txt", 1), ("stop_times.txt", 3)]
+    inserts.clear()
+    line = LineString([(24.90, 60.16), (24.93, 60.17), (24.96, 60.18)])
+    routes = gpd.GeoDataFrame(
+        [{"route_id": "r1", "headway_min": 10}], geometry=[line], crs="EPSG:4326"
+    )
+    build_feed(routes, tmp_path / "built.zip", timezone="Europe/Helsinki", check=False)
+    stops = [count for filename, count in inserts if filename == "stops.txt"]
+    assert len(stops) == 1 and stops[0] > 2
+
+
+def test_snapping_loads_an_extract_once_until_it_changes(tmp_path, monkeypatch):
+    # snap_to_network parsed the extract and built its network on every
+    # call: 15 s per snap on Helsinki, once per route in build_feed.
+    import os
+    import shutil
+
+    pytest.importorskip("networkx")
+    pyrosm = pytest.importorskip("pyrosm")
+    from transitio.edit import OsmEditor, snap_to_network
+
+    pbf = tmp_path / "test.osm.pbf"
+    shutil.copy(pyrosm.get_data("test_pbf"), pbf)
+    nodes = OsmEditor(pbf, network_type="driving").nodes
+    waypoints = [(p.y, p.x) for p in nodes.geometry.iloc[[0, 5]]]
+    loads, touch_while_loading = [], []
+    get_network = pyrosm.OSM.get_network
+
+    def touch():
+        stat = os.stat(pbf)
+        os.utime(pbf, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
+
+    def counting(self, *args, **kwargs):
+        loads.append(kwargs.get("network_type"))
+        result = get_network(self, *args, **kwargs)
+        if touch_while_loading:
+            touch()
+        return result
+
+    monkeypatch.setattr(pyrosm.OSM, "get_network", counting)
+    first = snap_to_network(waypoints, pbf)
+    assert snap_to_network(waypoints, pbf).equals(first)
+    assert len(loads) == 1
+    touch()
+    snap_to_network(waypoints, pbf)
+    assert len(loads) == 2
+    # A file rewritten while it loads is not kept under its old identity.
+    touch()
+    touch_while_loading.append(True)
+    snap_to_network(waypoints, pbf)
+    touch_while_loading.clear()
+    snap_to_network(waypoints, pbf)
+    snap_to_network(waypoints, pbf)
+    assert loads == ["driving"] * 4
+
+
+def test_osm_editor_ways_follow_members_after_batched_edits():
+    # Deleting a node, checking a way's members and drawing the ways view
+    # each walked the whole network in Python (1.3 s, 0.2 s and 5.2 s on
+    # Helsinki); the view now builds every way's line in one pass.
+    import shapely
+    from shapely.geometry import LineString, MultiLineString
+
+    pyrosm = pytest.importorskip("pyrosm")
+    from transitio.edit import OsmEditor
+
+    editor = OsmEditor(pyrosm.get_data("test_pbf"), network_type="driving")
+    ways = editor._ways
+    long_way = next(i for i, members in enumerate(ways["nodes"]) if len(members) > 4)
+    members = list(ways.at[long_way, "nodes"])
+    editor.delete_node(members[1])
+    ids = [editor.add_node(26.94 + i * 1e-4, 60.48) for i in range(3)]
+    assert len(editor._pending_nodes) == 3
+    editor.add_way(ids + [members[0]], highway="service")
+    assert editor._pending_nodes == []
+    # A member outside the extract splits a line; one located member is none.
+    ways = editor._ways
+    other = 1 if long_way == 0 else 0
+    remaining = list(ways.at[long_way, "nodes"])
+    ways.at[long_way, "nodes"] = remaining[:2] + [987654321] + remaining[2:]
+    ways.at[other, "nodes"] = [remaining[0], 987654322]
+
+    coords = {
+        int(row.id): (row.geometry.x, row.geometry.y)
+        for row in editor.nodes.itertuples()
+        if row.geometry is not None
+    }
+
+    def expected(way_members):
+        runs, current = [], []
+        for node_id in way_members:
+            if node_id in coords:
+                current.append(coords[node_id])
+                continue
+            if len(current) > 1:
+                runs.append(current)
+            current = []
+        if len(current) > 1:
+            runs.append(current)
+        if not runs:
+            return None
+        if len(runs) == 1:
+            return LineString(runs[0])
+        return MultiLineString([LineString(run) for run in runs])
+
+    view = editor.ways
+    assert view.geometry.iloc[other] is None
+    assert view.geometry.iloc[long_way].geom_type == "MultiLineString"
+    for way_members, geometry in zip(view["nodes"], view.geometry):
+        want = expected(way_members)
+        if want is None:
+            assert geometry is None
+        else:
+            assert shapely.equals_exact(geometry, want, tolerance=0)
+
+
+def test_undo_and_redo_replay_several_deletions_in_one_action_in_steps(
+    tmp_path, monkeypatch
+):
+    # Two delete_rows calls in one action, made top-down, broke the run the
+    # replay takes in one step, so every row was replayed with a table copy:
+    # 20 trips of Turku's feed took 15 s to redo.
+    import pandas as pd
+
+    from transitio.edit import FeedEditor
+    from transitio.edit import _changes
+
+    editor = FeedEditor(write_zip(tmp_path / "feed.zip", FEED))
+    before = editor.tables["stop_times.txt"].copy()
+    with editor.action("drop two trips"):
+        for trip in ("t-in", "t-out"):
+            times = editor.tables["stop_times.txt"]
+            rows = (times["trip_id"] == trip).to_numpy().nonzero()[0]
+            editor.delete_rows("stop_times.txt", rows)
+    after = editor.tables["stop_times.txt"].copy()
+    assert after.empty
+
+    one_by_one = []
+    for name in ("_revert", "_reapply"):
+        apply = getattr(_changes, name)
+        monkeypatch.setattr(
+            _changes,
+            name,
+            lambda view, entry, apply=apply: (
+                one_by_one.append(entry),
+                apply(view, entry),
+            ),
+        )
+    editor.undo()
+    pd.testing.assert_frame_equal(editor.tables["stop_times.txt"], before)
+    editor.redo()
+    pd.testing.assert_frame_equal(editor.tables["stop_times.txt"], after)
+    assert one_by_one == []
+
+
+def test_patching_goes_ahead_past_a_notice_limit_of_warnings(tmp_path):
+    # patch_feed refused any feed whose validation hit a notice limit,
+    # though it acts only on ERRORs: Turku's feed was refused for warnings
+    # about its shapes.
+    from transitio.gtfs import patch_feed
+
+    calendar = (
+        "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+        "start_date,end_date\nwk,1,1,1,1,1,1,1,20260101,20261231\n"
+    )
+    agency = (
+        "agency_id,agency_name,agency_url,agency_timezone\n"
+        "a,City Transit,https://city.example,Europe/Helsinki\n"
+    )
+    stops = "stop_id,stop_name,stop_lat,stop_lon\n{0}1,{1},60.169,24.931\n"
+    stops += "{0}2,{2},60.171,24.941\n"
+    base = {
+        "agency.txt": agency,
+        # Line breaks in both names: two warnings, one past the limit.
+        "stops.txt": stops.format("b", '"Kam\nppi"', '"Stei\nssi"'),
+        "routes.txt": "route_id,agency_id,route_short_name,route_type\nr,a,1,3\n",
+        "calendar.txt": calendar,
+        "trips.txt": "route_id,service_id,trip_id\nr,wk,t1\n",
+        # The second stop is reached before the first is left: an ERROR.
+        "stop_times.txt": "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "t1,08:00:00,08:00:00,b1,1\nt1,07:00:00,07:00:00,b2,2\n",
+    }
+    donor = dict(
+        base,
+        **{
+            "stops.txt": stops.format("d", '"Kam\nppi"', '"Stei\nssi"'),
+            "trips.txt": "route_id,service_id,trip_id\nr,wk,d1\n",
+            "stop_times.txt": "trip_id,arrival_time,departure_time,stop_id,"
+            "stop_sequence\nd1,08:00:30,08:00:30,d1,1\nd1,08:05:00,08:05:00,d2,2\n",
+        },
+    )
+    report = patch_feed(
+        write_zip(tmp_path / "base.zip", base),
+        write_zip(tmp_path / "donor.zip", donor),
+        tmp_path / "out.zip",
+        check=False,
+        max_notices_per_file=1,
+    )
+    replaced = [p for p in report["patches"] if p["action"] == "replace_trip"]
+    assert [p["tripId"] for p in replaced] == ["t1"]
+
+
+def test_name_queries_read_a_label_index_with_the_same_matches(tmp_path):
+    # Every place() call compared the name with all 1.2 M labels (0.15 s per
+    # call); the label index must find the same exact, prefix and word
+    # matches.
+    from index_fixture import PLACES, place, write_index
+
+    from transitio import index as transitio_index
+
+    places_module = sys.modules["transitio.index.places"]
+    more = [
+        place("Q-bb", "city", name="Baden-Baden", names={"en": "Baden Baden spa"}),
+        place("Q-sj", "city", name="San Jose", names={"es": "San José"}),
+        place("Q-sjm", "metro", name="San Jose metropolitan area"),
+        place("Q-sc", "region", name="Santa Clara County", aliases=["San Clara"]),
+        place("Q-hr", "region", name="Helsinki sub-region"),
+    ]
+    written = write_index(tmp_path / "index", places=PLACES + more)
+    lookup = transitio_index._lookup_for(transitio_index.read_index(written))
+    normalize = places_module._normalize
+
+    def scanned(query, kind=None):
+        query_norm, found = normalize(query), []
+        words = set(query_norm.split())
+        for place_id, labels in lookup._labels.items():
+            if kind is not None and lookup._records[place_id]["kind"] != kind:
+                continue
+            tiers = [
+                (
+                    places_module._EXACT
+                    if norm == query_norm
+                    else (
+                        places_module._PREFIX
+                        if query_norm and norm.startswith(query_norm)
+                        else (
+                            places_module._SUBSET
+                            if words and words <= set(tokens)
+                            else 0
+                        )
+                    )
+                )
+                for norm, tokens in labels
+            ]
+            if max(tiers, default=0):
+                found.append((max(tiers), place_id))
+        return sorted(
+            found,
+            key=lambda item: (
+                -item[0],
+                places_module._KIND_ORDER.get(lookup._records[item[1]]["kind"], 9),
+                -lookup._feed_count(item[1]),
+                item[1],
+            ),
+        )
+
+    labels = {norm for owned in lookup._labels.values() for norm, _ in owned}
+    queries = set(labels) | {norm[:3] for norm in labels} | {"", "x", "z q"}
+    queries |= {word for norm in labels for word in norm.split()}
+    queries |= {"baden baden", "san jose area", "jose san"}
+    for query in sorted(queries):
+        for kind in (None, "city"):
+            assert lookup._candidates(query, kind) == scanned(query, kind), query
+
+
+def test_place_queries_read_an_index_path_once_until_its_manifest_changes(
+    tmp_path, monkeypatch
+):
+    # index=<path> read and indexed the snapshot again on every call.
+    import os
+
+    from index_fixture import write_index
+
+    from transitio.exceptions import IncompatibleIndexError
+
+    from transitio import index as transitio_index
+
+    path = write_index(tmp_path / "index")
+    reads = []
+    read_index = transitio_index.read_index
+
+    def counting(where, **kwargs):
+        reads.append(where)
+        return read_index(where, **kwargs)
+
+    monkeypatch.setattr(transitio_index, "read_index", counting)
+    first = transitio_index.place("Helsinki", index=path)
+    assert transitio_index.place("Helsingfors", index=path) is not None
+    assert first.id == "Q1757" and len(reads) == 1
+    # A same-size rewrite with the old mtime restored is a changed manifest.
+    manifest = path / "snapshot.json"
+    before = manifest.stat()
+    text = manifest.read_text()
+    assert "2026-09-01T00:00" in text
+    manifest.write_text(text.replace("2026-09-01T00:00", "2026-09-02T00:00"))
+    os.utime(manifest, ns=(before.st_atime_ns, before.st_mtime_ns))
+    transitio_index.place("Helsinki", index=path)
+    assert len(reads) == 2
+    # A manifest replaced by a symlink is refused, not served from the cache.
+    moved = tmp_path / "moved.json"
+    manifest.rename(moved)
+    manifest.symlink_to(moved)
+    with pytest.raises(IncompatibleIndexError):
+        transitio_index.place("Helsinki", index=path)
+
+
+@pytest.mark.parametrize("day", [None, "20260601"])
+def test_a_crops_report_is_the_validation_of_its_output(tmp_path, day):
+    # fetch validated every cropped feed again after the crop had validated
+    # it; the crop's report now stands in for that validation.
+    source = write_zip(tmp_path / "feed.zip", FEED)
+    output = tmp_path / "cropped.zip"
+    options = {} if day is None else {"reference_date": day}
+    report = crop_feed(source, output, aoi=CITY_BBOX, **options)
+    assert report["validation"] == validate_feed(output, **options)
+
+
+@pytest.mark.parametrize("blocks", [False, True])
+def test_trips_listed_per_date_are_matched_through_their_days(blocks):
+    # In a feed listing each trip once per date, every later copy tried all
+    # the earlier copies of its trip, one by one: 86 s for 100 trips over a
+    # year. Twelve dates give each later copy more partners than are tried
+    # one by one.
+    import pandas as pd
+
+    from transitio.gtfs._duplicates import repeated_trips
+
+    def feed(prefix, dates, extra=()):
+        trips = [
+            (f"{prefix}{n}{half}", f"d{n}", f"k{n}" if blocks else "")
+            for n in dates
+            for half in "ab"
+        ]
+        trips += [(trip_id, f"d{n}", "") for trip_id, n in extra]
+        times = [
+            (trip_id, f"0{8 + (trip_id[-1] == 'b')}:{minute}:00", stop, sequence)
+            for trip_id, _, _ in trips
+            for sequence, (stop, minute) in enumerate((("s1", "00"), ("s2", "10")))
+        ]
+        return {
+            "stops.txt": pd.DataFrame(
+                {
+                    "stop_id": ["s1", "s2"],
+                    "stop_lat": ["60.1", "60.11"],
+                    "stop_lon": "24.9",
+                }
+            ),
+            "routes.txt": pd.DataFrame(
+                {"route_id": ["r"], "route_short_name": ["1"], "route_type": ["3"]}
+            ),
+            "trips.txt": pd.DataFrame(
+                trips, columns=["trip_id", "service_id", "block_id"]
+            ).assign(route_id="r"),
+            "stop_times.txt": pd.DataFrame(
+                [(t, at, at, stop, str(seq)) for t, at, stop, seq in times],
+                columns=[
+                    "trip_id",
+                    "arrival_time",
+                    "departure_time",
+                    "stop_id",
+                    "stop_sequence",
+                ],
+            ),
+            "calendar_dates.txt": pd.DataFrame(
+                {
+                    "service_id": [f"d{n}" for n in range(1, 14)],
+                    "date": [f"202601{n:02d}" for n in range(1, 14)],
+                    "exception_type": "1",
+                }
+            ),
+        }
+
+    earlier = feed("t", range(1, 13))
+    later = feed("u", range(1, 14), extra=[("x1a", 1)])
+    gone, of, _ = repeated_trips([earlier, later])[1]
+    # Each earlier copy covers one later copy on its date. Unblocked trips go
+    # first, so with blocks x1a takes t1a's date and block k1 is kept.
+    first = 2 if blocks else 1
+    expected = {f"u{n}{half}" for n in range(first, 13) for half in "ab"}
+    assert gone == (expected | {"x1a"} if blocks else expected)
+    assert of == [0]
+
+
+def test_filling_and_clearing_the_cache_sweep_its_blobs_once(tmp_path, monkeypatch):
+    # Every download, and every feed or version clearing removed, listed and
+    # checked every blob: filling a cache with 3,000 feeds took 42 s and
+    # clearing it 38 s.
+    import datetime
+
+    import transitio.cache
+    from transitio._http import sha256_file
+    from transitio.catalog import _cache
+
+    sweeps, swept = [], _cache.FeedCache._swept
+
+    def counting(self):
+        sweeps.append(self)
+        return swept(self)
+
+    monkeypatch.setattr(_cache.FeedCache, "_swept", counting)
+    cache, blobs = _cache.FeedCache(tmp_path), tmp_path / "gtfs" / "blobs"
+    used = "2026-01-01T00:00:00+00:00"
+    for older_than in (datetime.timedelta(0), None):
+        for n in range(3):
+            with cache.staging(f"f{n}") as staging, cache.lock(f"f{n}"):
+                staged = staging / "download.zip"
+                with zipfile.ZipFile(staged, "w") as archive:
+                    archive.writestr("agency.txt", f"agency_id\n{n}\n")
+                source = {
+                    "source_url": f"https://example.org/{n}",
+                    "retrieved_at": used,
+                }
+                cache.publish(f"f{n}", staged, sha256_file(staged), {}, source)
+        assert not sweeps
+        assert transitio.cache.clear(tmp_path, older_than=older_than) > 0
+        assert len(sweeps) == 1
+        assert not blobs.exists() or not list(blobs.iterdir())
+        sweeps.clear()
+
+
+def test_dangling_parents_and_agencies_are_cleared_where_the_rules_allow(tmp_path):
+    # Repair found the row of each dangling parent_station or agency_id by
+    # reading the whole table, so the time grew with the square of the rows.
+    files = {
+        "agency.txt": (
+            "agency_id,agency_name,agency_url,agency_timezone\n"
+            "hsl,HSL,https://hsl.fi,Europe/Helsinki\n"
+        ),
+        "stops.txt": (
+            "stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station\n"
+            "s1,Kamppi,60.169,24.931,0,gone\n"
+            "e1,Entrance,60.170,24.935,2,gone\n"
+            "s2,Steissi,60.171,24.941,,gone\n"
+            "s3,Rautatientori,60.172,24.942,0,\n"
+        ),
+        "routes.txt": "route_id,agency_id,route_short_name,route_type\nr1,ghost,1,3\n",
+        "trips.txt": "route_id,service_id,trip_id\nr1,wk,t1\n",
+        "stop_times.txt": (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "t1,08:00:00,08:00:00,s1,1\n"
+            "t1,08:05:00,08:05:00,s2,2\n"
+        ),
+        "calendar.txt": FEED["calendar.txt"],
+    }
+    result = repair_feed(write_zip(tmp_path / "feed.zip", files), tmp_path / "out.zip")
+    cleared = [
+        (fix["filename"], fix["csvRowNumber"], fix["field"])
+        for fix in result["fixes"]
+        if fix["action"] == "clear_reference"
+    ]
+    # An entrance needs its parent; a single-agency feed's routes do not.
+    assert cleared == [
+        ("stops.txt", 2, "parent_station"),
+        ("stops.txt", 4, "parent_station"),
+        ("routes.txt", 2, "agency_id"),
+    ]

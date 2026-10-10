@@ -1034,14 +1034,39 @@ def _check_reader_range(snapshot, path):
 
 def _coerce_index(index):
     """The index a query reads: the one given (an :class:`Index` or a path),
-    else the active installed snapshot, resolved lazily."""
+    else the active installed snapshot, resolved lazily. An index read from
+    a path is kept for the next query of that path, until its manifest
+    changes."""
     if index is None:
         from transitio.index._refresh import active_index
 
         return active_index()
     if isinstance(index, Index):
         return index
-    return read_index(index)
+    path = Path(index).resolve()
+
+    def identity():
+        # The manifest's bytes name the snapshot, its tables' digests included;
+        # one that cannot be read safely leaves the refusal to read_index.
+        try:
+            data = _read_regular(path / SNAPSHOT_FILE, _MAX_SNAPSHOT_BYTES)
+            manifest = json.loads(data.decode("utf-8"))
+        except (IncompatibleIndexError, ValueError):
+            return None, None
+        return (str(path), hashlib.sha256(data).hexdigest()), manifest
+
+    key, manifest = identity()
+    if key is None:
+        return read_index(path)
+    with _LOOKUP_LOCK:
+        if _READ_INDEXES.get("key") == key:
+            return _READ_INDEXES["index"]
+    read = read_index(path)
+    # Kept only when it was read from that very manifest, still in place.
+    if read.snapshot == manifest and identity()[0] == key:
+        with _LOOKUP_LOCK:
+            _READ_INDEXES.update(key=key, index=read)
+    return read
 
 
 def _feed_count_for(index):
@@ -1062,6 +1087,7 @@ def _feed_count_for(index):
 
 # One lookup per index, whichever thread asks first.
 _LOOKUP_LOCK = threading.Lock()
+_READ_INDEXES = {}  # the index last read from a path, with its manifest key
 
 
 def _lookup_for(index):

@@ -2,7 +2,113 @@
 
 from __future__ import annotations
 
+import json
 import os
+import threading
+from collections import OrderedDict
+
+# Prepared networks by extract and filter, so snapping route after route, or
+# request after request, loads an extract once. A rewritten file (another
+# inode, mtime or size) is another key; the two most recent are kept. A key
+# being built has its own lock, so concurrent requests for it build it once.
+_NETWORKS = OrderedDict()
+_NETWORKS_LOCK = threading.Lock()
+_BUILDING = {}
+_KEEP = 2
+
+
+class _Network:
+    """An extract's routing graph with a nearest-node index."""
+
+    def __init__(self, pbf, network_type, custom_filter, filter_type, name=None):
+        from pyproj import Transformer
+        from pyrosm import OSM
+        from shapely.geometry import Point
+        from shapely.strtree import STRtree
+
+        osm = OSM(os.fspath(pbf))
+        if custom_filter is not None:
+            # network_type "all" + a keep-filter restricts the network to
+            # exactly the matching ways (unlike a bare custom_filter, which
+            # pyrosm unions with the network_type base).
+            nodes, edges = osm.get_network(
+                nodes=True,
+                network_type="all",
+                custom_filter=custom_filter,
+                filter_type=filter_type,
+            )
+            described = f"custom_filter {custom_filter}"
+        else:
+            nodes, edges = osm.get_network(nodes=True, network_type=network_type)
+            described = f"{network_type} network"
+        if nodes is None or edges is None or nodes.empty or edges.empty:
+            raise ValueError(f"no {described} in {pbf if name is None else name}")
+        self.graph = osm.to_graph(nodes, edges, graph_type="networkx")
+
+        # Nearest-node search in a locally metric, antimeridian-safe frame:
+        # an azimuthal equidistant projection centered on the network.
+        center_lon = float(nodes["lon"].iloc[0])
+        center_lat = float(nodes["lat"].iloc[0])
+        self.project = Transformer.from_crs(
+            "EPSG:4326",
+            f"+proj=aeqd +lat_0={center_lat} +lon_0={center_lon} +datum=WGS84",
+            always_xy=True,
+        ).transform
+        xs, ys = self.project(nodes["lon"].to_numpy(), nodes["lat"].to_numpy())
+        self.tree = STRtree([Point(x, y) for x, y in zip(xs, ys)])
+        self.ids = nodes["id"].to_numpy()
+
+
+def _network(pbf, network_type, custom_filter, filter_type):
+    """The prepared network of ``pbf``, loaded once per file and filter."""
+    try:
+        path = os.path.realpath(pbf)
+        stat = os.stat(path)
+    except OSError:
+        return _Network(pbf, network_type, custom_filter, filter_type)
+    if custom_filter is not None:
+        selection = (
+            json.dumps(custom_filter, sort_keys=True, default=str),
+            filter_type,
+        )
+    else:
+        selection = (network_type,)
+    identity = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+    key = (path, identity, selection)
+    with _NETWORKS_LOCK:
+        network = _NETWORKS.get(key)
+        if network is not None:
+            _NETWORKS.move_to_end(key)
+            return network
+        building = _BUILDING.setdefault(key, threading.Lock())
+    with building:
+        with _NETWORKS_LOCK:
+            network = _NETWORKS.get(key)
+            if network is not None:
+                _NETWORKS.move_to_end(key)
+                return network
+        try:
+            network = _Network(path, network_type, custom_filter, filter_type, pbf)
+            # A file rewritten while it loaded is not kept under its old
+            # identity.
+            try:
+                after = os.stat(path)
+            except OSError:
+                after = None
+            with _NETWORKS_LOCK:
+                if after is not None and identity == (
+                    after.st_ino,
+                    after.st_mtime_ns,
+                    after.st_size,
+                ):
+                    _NETWORKS[key] = network
+                    _NETWORKS.move_to_end(key)
+                    while len(_NETWORKS) > _KEEP:
+                        _NETWORKS.popitem(last=False)
+        finally:
+            with _NETWORKS_LOCK:
+                _BUILDING.pop(key, None)
+    return network
 
 
 def snap_to_network(
@@ -49,7 +155,9 @@ def snap_to_network(
     Snapping tram or rail routes needs an extract that actually contains
     the ``railway`` ways (some cropped extracts drop them); without a
     ``custom_filter`` the driving network carries street-running trams
-    but not dedicated rails.
+    but not dedicated rails. The network is loaded once per extract and
+    filter and reused by later calls; an extract rewritten since is loaded
+    again.
     """
     try:
         import networkx as nx
@@ -57,47 +165,19 @@ def snap_to_network(
         raise ImportError(
             "snap_to_network requires networkx; install transitio[snap]"
         ) from error
-    from pyrosm import OSM
     from shapely.geometry import LineString, Point
-    from shapely.strtree import STRtree
 
     waypoints = list(waypoints)
     if len(waypoints) < 2:
         raise ValueError("need at least two waypoints")
 
-    from pyproj import Transformer
-
-    osm = OSM(os.fspath(pbf))
-    if custom_filter is not None:
-        # network_type "all" + a keep-filter restricts the network to
-        # exactly the matching ways (unlike a bare custom_filter, which
-        # pyrosm unions with the network_type base).
-        nodes, edges = osm.get_network(
-            nodes=True,
-            network_type="all",
-            custom_filter=custom_filter,
-            filter_type=filter_type,
-        )
-        described = f"custom_filter {custom_filter}"
-    else:
-        nodes, edges = osm.get_network(nodes=True, network_type=network_type)
-        described = f"{network_type} network"
-    if nodes is None or edges is None or nodes.empty or edges.empty:
-        raise ValueError(f"no {described} in {pbf}")
-    graph = osm.to_graph(nodes, edges, graph_type="networkx")
-
-    # Nearest-node search in a locally metric, antimeridian-safe frame:
-    # an azimuthal equidistant projection centered on the network.
-    center_lon = float(nodes["lon"].iloc[0])
-    center_lat = float(nodes["lat"].iloc[0])
-    project = Transformer.from_crs(
-        "EPSG:4326",
-        f"+proj=aeqd +lat_0={center_lat} +lon_0={center_lon} +datum=WGS84",
-        always_xy=True,
-    ).transform
-    xs, ys = project(nodes["lon"].to_numpy(), nodes["lat"].to_numpy())
-    tree = STRtree([Point(x, y) for x, y in zip(xs, ys)])
-    ids = nodes["id"].to_numpy()
+    network = _network(pbf, network_type, custom_filter, filter_type)
+    graph, project, tree, ids = (
+        network.graph,
+        network.project,
+        network.tree,
+        network.ids,
+    )
 
     snapped = [ids[tree.nearest(Point(*project(lon, lat)))] for lat, lon in waypoints]
 

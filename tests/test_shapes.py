@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 from transitio.shapes import LEVELS, PERMISSIVE, STRICT, infer_shapes
-from transitio.shapes import _levels
+from transitio.shapes import _infer, _levels
 
 
 def read_table(feed, name, coerce_na=True):
@@ -256,6 +256,34 @@ def test_resolve_rejects_nonsense():
         _levels.resolve(object())
     assert _levels.resolve(STRICT) is STRICT
     assert _levels.resolve("permissive") is PERMISSIVE
+
+
+@pytest.mark.parametrize(
+    "lonlat",
+    [
+        [(22.25, 60.45), (22.3, 60.47)],
+        [(5.0, 10.0), (7.0, 12.0)],  # the centre on a zone edge
+        [(-170.0, 0.0)],
+        [(10.0, 84.0)],
+        [(10.0, 84.0001)],
+        [(10.0, -80.0)],
+        [(10.0, -80.0001)],
+        [(180.0, -30.0)],
+    ],
+)
+def test_pattern_zone_is_the_geopandas_utm_estimate(lonlat):
+    import geopandas as gpd
+
+    lons, lats = np.array(lonlat, dtype=float).T
+    try:
+        expected = (
+            gpd.GeoSeries(gpd.points_from_xy(lons, lats), crs="EPSG:4326")
+            .estimate_utm_crs()
+            .to_epsg()
+        )
+    except RuntimeError:
+        expected = None
+    assert _infer._utm_zone(np.column_stack([lats, lons])) == expected
 
 
 def test_output_must_differ_from_the_input(shapeless, transit_pbf):

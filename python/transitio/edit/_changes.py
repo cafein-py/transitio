@@ -322,22 +322,29 @@ def _restore_run(table, run, offset, field):
 
 def _replay(view, entries, one, runs):
     """Apply ``entries`` in order with ``one``. Consecutive entries of a kind
-    in ``runs`` on one table, such as the rows one ``delete_rows`` logged, go
-    in one step when they can; otherwise, and for any other entry, ``one``
-    applies each, raising where the log no longer matches."""
+    in ``runs`` on one table whose rows move one way, such as the rows one
+    ``delete_rows`` logged, go in one step when they can; several such calls
+    in one action make one step each. Otherwise, and for any other entry,
+    ``one`` applies each, raising where the log no longer matches."""
     i = 0
     while i < len(entries):
         entry = entries[i]
         j = i + 1
         if entry.kind in runs:
-            while j < len(entries) and (entries[j].kind, entries[j].file) == (
-                entry.kind,
-                entry.file,
+            descending = runs[entry.kind][3]
+            while (
+                j < len(entries)
+                and (entries[j].kind, entries[j].file) == (entry.kind, entry.file)
+                and (
+                    entries[j].row < entries[j - 1].row
+                    if descending
+                    else entries[j].row > entries[j - 1].row
+                )
             ):
                 j += 1
         table = view.get(entry.file)
         if j - i > 1 and table is not None:
-            step, offset, field = runs[entry.kind]
+            step, offset, field, _ = runs[entry.kind]
             done = step(table, entries[i:j], offset, field)
             if done is not None:
                 view.put(entry.file, done)
@@ -351,7 +358,10 @@ def _replay(view, entries, one, runs):
 def apply_inverse(tables, entries):
     """Revert ``entries`` (one action, in log order) or raise untouched."""
     view = _TableView(tables)
-    runs = {"insert": (_remove_run, 0, "new"), "delete": (_restore_run, 0, "old")}
+    runs = {
+        "insert": (_remove_run, 0, "new", True),
+        "delete": (_restore_run, 0, "old", False),
+    }
     _replay(view, list(reversed(entries)), _revert, runs)
     view.commit()
 
@@ -359,7 +369,10 @@ def apply_inverse(tables, entries):
 def apply_forward(tables, entries):
     """Reapply ``entries`` (one action, in log order) or raise untouched."""
     view = _TableView(tables)
-    runs = {"delete": (_remove_run, 1, "old"), "insert": (_restore_run, -1, "new")}
+    runs = {
+        "delete": (_remove_run, 1, "old", True),
+        "insert": (_restore_run, -1, "new", False),
+    }
     _replay(view, list(entries), _reapply, runs)
     view.commit()
 

@@ -14,7 +14,7 @@ use crate::output::ZipOutput;
 use crate::scan::{
     DelimiterGuard, NoTable, Row, ScanOptions, ScanResult, Table, TableReader, MAX_RECORD_BYTES,
 };
-use crate::{rules, scan, schema, semantics};
+use crate::{readiness, rules, scan, schema, semantics};
 
 /// Tables read from the archive row by row rather than parsed whole: the
 /// ones a national feed makes far larger than memory. Everything kept
@@ -280,8 +280,11 @@ pub fn crop(
     };
     let validation = match scan::scan_with(&staging, options) {
         Ok(mut validation) => {
+            // The checks `validate` runs, so the crop's report stands in for
+            // a validation of the output.
             rules::run_rules(&mut validation, &options);
             semantics::run_semantics(&mut validation, &options);
+            readiness::run_readiness(&mut validation, &options);
             validation
         }
         Err(error) => {

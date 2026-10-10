@@ -138,8 +138,10 @@ def crop_feed(
     dict
         ``{"row_counts": ..., "source_routes": [...] or None,
         "source_notices": [...], "remaining_notices": [...],
-        "service_window": ..., "dropped_rows": [...]}`` for the cropped
-        feed. ``source_routes`` is the distinct ``route_id`` values in the
+        "service_window": ..., "dropped_rows": [...], "validation": ...}``
+        for the cropped feed, ``validation`` being the cropped feed's
+        :func:`~transitio.validate.validate_feed` report under the same
+        options. ``source_routes`` is the distinct ``route_id`` values in the
         source routes.txt (before the crop), or ``None`` without routes.txt,
         so a caller can tell what a ``routes`` filter dropped.
         ``source_notices`` holds one ``leading_or_trailing_whitespaces``

@@ -204,6 +204,20 @@ def _normalize(text):
     return " ".join("".join(kept).split())
 
 
+def _memo_normalize():
+    """``_normalize`` remembering its results, for one pass over many labels:
+    a name repeats across a place's languages and across places."""
+    seen = {}
+
+    def normalize(text):
+        norm = seen.get(text)
+        if norm is None:
+            norm = seen[text] = _normalize(text)
+        return norm
+
+    return normalize
+
+
 @functools.cache
 def _country_languages():
     """``{country code: base language codes}``: each country's official, de
@@ -557,6 +571,74 @@ def _labels_of(record):
         yield text, "alias", _ALIAS
 
 
+class _LabelIndex:
+    """Every place's normalised labels, sorted, and every word of them, sorted,
+    so a name query finds its exact, prefix and word matches by binary search
+    instead of comparing itself with each label."""
+
+    def __init__(self, labels):
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        self._owner, self._norm, words, rows = [], [], [], []
+        for place_id, place_labels in labels.items():
+            for norm, tokens in place_labels:
+                row = len(self._norm)
+                self._owner.append(place_id)
+                self._norm.append(norm)
+                for token in set(tokens):
+                    words.append(token)
+                    rows.append(row)
+        by_norm = pc.sort_indices(pa.array(self._norm, pa.string()))
+        self._by_norm = by_norm.to_numpy()
+        self._sorted_norms = pa.array(self._norm, pa.string()).take(by_norm)
+        by_word = pc.sort_indices(pa.array(words, pa.string()))
+        self._sorted_words = pa.array(words, pa.string()).take(by_word)
+        self._word_rows = pa.array(rows, pa.int64()).take(by_word).to_numpy()
+
+    @staticmethod
+    def _lower_bound(values, key):
+        """The first position in sorted ``values`` at or after ``key``."""
+        low, high = 0, len(values)
+        while low < high:
+            middle = (low + high) // 2
+            if values[middle].as_py() < key:
+                low = middle + 1
+            else:
+                high = middle
+        return low
+
+    def _span(self, values, low_key, high_key):
+        return self._lower_bound(values, low_key), self._lower_bound(values, high_key)
+
+    def tiers(self, query_norm, query_tokens):
+        """``{place_id: tier}``: a place's best match among its labels, an
+        exact label, a label starting with the query, or one holding all of
+        its words."""
+        found = {}
+        if query_norm:
+            low, high = self._span(self._sorted_norms, query_norm, query_norm + _AFTER)
+            exact_end = self._lower_bound(self._sorted_norms, query_norm + "\x00")
+            for position in range(low, high):
+                owner = self._owner[self._by_norm[position]]
+                tier = _EXACT if position < exact_end else _PREFIX
+                if found.get(owner, 0) < tier:
+                    found[owner] = tier
+        wanted = set(query_tokens)
+        if wanted:
+            spans = [
+                self._span(self._sorted_words, word, word + "\x00") for word in wanted
+            ]
+            low, high = min(spans, key=lambda span: span[1] - span[0])
+            for row in self._word_rows[low:high].tolist():
+                owner = self._owner[row]
+                if found.get(owner, 0) >= _SUBSET:
+                    continue
+                if wanted <= set(self._norm[row].split()):
+                    found[owner] = _SUBSET
+        return found
+
+
 class _NameIndex:
     """Every label of every place, normalised and sorted, for prefix queries.
 
@@ -585,10 +667,11 @@ class _NameIndex:
                 "feeds",
             )
         }
+        normalize = _memo_normalize()
         for place_id, record in records.items():
             seen = {}
             for text, source, rank in _labels_of(record):
-                norm = _normalize(text)
+                norm = normalize(text)
                 if norm and (norm not in seen or rank < seen[norm][2]):
                     seen[norm] = (text, source, rank)
             count = feed_count(place_id)
@@ -724,9 +807,12 @@ class _PlaceLookup:
         self._definitions = set()  # the metro definitions the index holds
         self._name_index = None  # built on the first suggestion, under the lock
         self._name_lock = threading.Lock()
+        self._label_index = None  # built on the first name query, under the lock
+        self._label_lock = threading.Lock()
         # A former id or a QID the place carries resolves to it; a real id
         # always wins over an alias of another place.
         self._aliases = {}
+        normalize = _memo_normalize()
         for record in places.to_dict("records"):
             record["names"] = _as_dict(record.get("names"))
             for key in ("aliases", "metro_ids", "member_ids", "former_ids"):
@@ -749,7 +835,7 @@ class _PlaceLookup:
             if qid is not None and qid not in qids:
                 record["concordances"]["wikidata"] = [qid, *qids]
             self._records[place_id] = record
-            self._labels[place_id] = self._normalized_labels(record)
+            self._labels[place_id] = self._normalized_labels(record, normalize)
             if record["parent_id"]:
                 self._children[record["parent_id"]].append(place_id)
             if record["kind"] == "country" and record["country_code"]:
@@ -775,11 +861,11 @@ class _PlaceLookup:
         return {_normalize(text) for text in [record["name"], *own]}
 
     @staticmethod
-    def _normalized_labels(record):
+    def _normalized_labels(record, normalize=_normalize):
         raw = [record["name"], *record["names"].values(), *record["aliases"]]
         labels = {}
         for text in raw:
-            norm = _normalize(text)
+            norm = normalize(text)
             if norm:
                 labels[norm] = tuple(norm.split())
         return list(labels.items())
@@ -857,31 +943,20 @@ class _PlaceLookup:
         parts = [AreaPart(self.get(pid), *share[pid], pid in whole) for pid in chosen]
         return Area(geometry, country, parts, coverage, self._index)
 
-    def _tier(self, query_norm, query_tokens, labels):
-        best = 0
-        query_set = set(query_tokens)
-        for label_norm, label_tokens in labels:
-            if label_norm == query_norm:
-                return _EXACT
-            if query_norm and label_norm.startswith(query_norm):
-                best = max(best, _PREFIX)
-            elif query_set and query_set <= set(label_tokens):
-                best = max(best, _SUBSET)
-        return best
-
     def _candidates(self, query, kind=None, definition=None):
         query_norm = _normalize(query)
-        query_tokens = query_norm.split()
+        with self._label_lock:
+            if self._label_index is None:
+                self._label_index = _LabelIndex(self._labels)
+        tiers = self._label_index.tiers(query_norm, query_norm.split())
         scored = []
-        for place_id, labels in self._labels.items():
+        for place_id, tier in tiers.items():
             record = self._records[place_id]
             if kind is not None and record["kind"] != kind:
                 continue
             if definition is not None and record["source_subtype"] != definition:
                 continue
-            tier = self._tier(query_norm, query_tokens, labels)
-            if tier:
-                scored.append((tier, place_id))
+            scored.append((tier, place_id))
         scored.sort(
             key=lambda item: (
                 -item[0],

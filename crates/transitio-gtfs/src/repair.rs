@@ -5,7 +5,7 @@
 //! structured fix record naming the notice that motivated it. Semantically
 //! ambiguous data is dropped or left alone, never reconstructed.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use serde::Serialize;
@@ -350,6 +350,8 @@ fn conditional_reference_repairs(
         .get("agency.txt")
         .map(|t| t.rows.len() <= 1)
         .unwrap_or(true);
+    // Each table's row positions by CSV row, built once per table.
+    let mut positions: HashMap<String, HashMap<u64, Vec<usize>>> = HashMap::new();
     for (file, field, csv_row) in dangling {
         let Some(table) = result.tables.get_mut(&file) else {
             continue;
@@ -358,10 +360,15 @@ fn conditional_reference_repairs(
         else {
             continue;
         };
-        for row in &mut table.rows {
-            if row.csv_row != csv_row {
-                continue;
+        let at = positions.entry(file.clone()).or_insert_with(|| {
+            let mut at: HashMap<u64, Vec<usize>> = HashMap::new();
+            for (position, row) in table.rows.iter().enumerate() {
+                at.entry(row.csv_row).or_default().push(position);
             }
+            at
+        });
+        for &position in at.get(&csv_row).map(Vec::as_slice).unwrap_or(&[]) {
+            let row = &mut table.rows[position];
             let clearable = if field == "parent_station" {
                 let location_type = location_index.map(|i| row.fields[i].trim()).unwrap_or("");
                 matches!(location_type, "" | "0" | "1")

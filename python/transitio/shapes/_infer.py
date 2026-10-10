@@ -30,6 +30,7 @@ How much uncertainty is acceptable is the caller's, through
 import collections
 import dataclasses
 import datetime
+import functools
 import json
 import os
 import pathlib
@@ -38,7 +39,6 @@ import stat
 import tempfile
 import zipfile
 
-import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pyproj
@@ -788,17 +788,13 @@ class _Inference:
         return self._streets
 
     def _set_projection(self, latlon):
-        try:
-            crs = gpd.GeoSeries(
-                gpd.points_from_xy(latlon[:, 1], latlon[:, 0]), crs="EPSG:4326"
-            ).estimate_utm_crs()
-        except RuntimeError:
+        code = _utm_zone(latlon)
+        if code is None:
             return False
-        key = crs.to_epsg() or crs.to_wkt()
-        if self._crs != key:
-            self._crs = key
+        if self._crs != code:
+            self._crs = code
             self._transformer = pyproj.Transformer.from_crs(
-                "EPSG:4326", crs, always_xy=True
+                "EPSG:4326", f"EPSG:{code}", always_xy=True
             )
         return True
 
@@ -808,6 +804,31 @@ class _Inference:
 
 
 _UNSET = object()
+
+
+@functools.cache
+def _utm_zones():
+    """Every WGS 84 UTM zone as ``(epsg, west, south, east, north)``, in the
+    PROJ database's order."""
+    from pyproj.database import query_utm_crs_info
+
+    return [
+        (int(info.code), *info.area_of_use.bounds)
+        for info in query_utm_crs_info(datum_name="WGS 84")
+    ]
+
+
+def _utm_zone(latlon):
+    """The EPSG code of the UTM zone holding the centre of the bounds of
+    ``latlon`` (``[lat, lon]`` rows), as geopandas' ``estimate_utm_crs``
+    picks it but without its database query per call; None outside every
+    zone."""
+    lon = np.mean([latlon[:, 1].min(), latlon[:, 1].max()])
+    lat = np.mean([latlon[:, 0].min(), latlon[:, 0].max()])
+    for code, west, south, east, north in _utm_zones():
+        if west <= lon <= east and south <= lat <= north:
+            return code
+    return None
 
 
 def _dominant_stage(diagnostics):

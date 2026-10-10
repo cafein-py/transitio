@@ -282,15 +282,16 @@ def clear(cache_dir=None, older_than=None, feeds=None):
             continue
         if wanted is not None and path.name not in wanted:
             continue
+        # The blobs a removal frees are swept once, at the end.
         with cache.locked(path.name):
             feed_id = _feed_id(path)
             if cutoff is None or feed_id is None:
-                freed += cache.remove(path)
+                freed += cache.remove(path, sweep=False)
                 continue
             before = _unshared(path)
             for version in cache.versions(feed_id):
                 if not _used_since(version.sidecar.get("last_used_at"), cutoff):
-                    freed += cache.delete(version)
+                    cache.delete(version, sweep=False)
             freed += before - _unshared(path)
     blobs = cache.root / "blobs"
     if (

@@ -306,13 +306,14 @@ def test_refusals(tmp_path):
 
 
 def test_reliability_refusal_beats_check_false(tmp_path):
+    # Two unparseable latitudes: the limit leaves an ERROR out.
     sampled = dict(
         BASE,
         **{
             "stops.txt": (
                 "stop_id,stop_name,stop_lat,stop_lon\n"
-                'bs1,"Kam\nppi",60.169,24.931\n'
-                'bs2,"Stei\nssi",60.171,24.941\n'
+                "bs1,Kamppi,north,24.931\n"
+                "bs2,Steissi,south,24.941\n"
             )
         },
     )
@@ -490,8 +491,8 @@ def test_reliability_refusal_covers_donor_and_final_stages(tmp_path):
         **{
             "stops.txt": (
                 "stop_id,stop_name,stop_lat,stop_lon\n"
-                'ds1,"Kam\nppi",60.169,24.931\n'
-                'ds2,"Stei\nssi",60.171,24.941\n'
+                "ds1,Kamppi,north,24.931\n"
+                "ds2,Steissi,south,24.941\n"
             )
         },
     )
@@ -789,6 +790,71 @@ def test_stop_match_distance_thresholds():
     # One blank name: the tighter proximity-only rule applies.
     assert _stops_match((named, here), ("", shifted(20))) is True
     assert _stops_match((named, here), ("", shifted(30))) is False
+    # At the radii themselves the relation follows the scalar haversine.
+    from transitio.edit._editor import _haversine_m
+
+    for radius, other in ((100.0, named), (25.0, "")):
+        for step in range(-40, 41):
+            there = shifted(radius + step * 1e-8)
+            inside = _haversine_m(here, there) <= radius
+            assert _stops_match((named, here), (other, there)) is inside
+
+
+def test_candidate_window_includes_both_tolerance_bounds():
+    import pandas as pd
+
+    from transitio.gtfs._patch import PATCH_TIME_TOLERANCE_S, _FeedModel, _route_key
+
+    departures = {
+        "a-low": "07:59:00",
+        "b-under": "07:58:59",
+        "c-mid": "08:00:30",
+        "d-over": "08:01:01",
+        "\U0010ffffz": "08:01:00",
+    }
+    tables = {
+        "routes.txt": pd.DataFrame(
+            [{"route_id": "r", "agency_id": "a", "route_short_name": "1"}], dtype=str
+        ),
+        "trips.txt": pd.DataFrame(
+            [{"route_id": "r", "trip_id": trip} for trip in departures], dtype=str
+        ),
+        "stop_times.txt": pd.DataFrame(
+            [
+                {"trip_id": trip, "departure_time": time, "stop_sequence": "1"}
+                for trip, time in departures.items()
+            ],
+            dtype=str,
+        ),
+    }
+    model = _FeedModel(tables)
+    index = ("a", _route_key(model.routes["r"]))
+    window = model.candidates_departing(index, 8 * 3600, PATCH_TIME_TOLERANCE_S)
+    assert window == ["a-low", "c-mid", "\U0010ffffz"]
+
+
+def test_similarity_is_the_lcs_share_of_matching_stops():
+    import random
+
+    from transitio.gtfs._patch import _similarity, _stops_match, _WorkBudget
+
+    stops = [("a", (60.17, 24.94)), ("b", (60.18, 24.95)), ("", (60.19, 24.96))]
+    stops += [None, ("a", (60.1702, 24.94))]  # unlocatable; "a" again 22 m on
+    generator = random.Random(7)
+    for _ in range(200):
+        base = generator.choices(stops, k=generator.randint(1, 9))
+        donor = generator.choices(stops, k=generator.randint(1, 9))
+        previous = [0] * (len(donor) + 1)
+        for base_key in base:
+            current = [0]
+            for j, donor_key in enumerate(donor, 1):
+                if _stops_match(base_key, donor_key):
+                    current.append(previous[j - 1] + 1)
+                else:
+                    current.append(max(previous[j], current[j - 1]))
+            previous = current
+        expected = previous[-1] / max(len(base), len(donor))
+        assert _similarity(base, donor, _WorkBudget()) == expected
 
 
 def test_padded_donor_ids_are_trimmed_through_the_closure(tmp_path):

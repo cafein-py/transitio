@@ -121,6 +121,7 @@ class OsmEditor:
         ways = ways.drop(columns=["u", "v", "length"], errors="ignore").reset_index(
             drop=True
         )
+        self._pending_nodes = []  # added nodes not yet in the node table
         self._nodes = nodes.reset_index(drop=True)
         self._ways = ways
         self._deletions = set()
@@ -145,6 +146,26 @@ class OsmEditor:
         )
         self._next_new_id = min(-1, lowest - 1)
 
+    # -- the node table ----------------------------------------------------
+
+    @property
+    def _nodes(self):
+        # Nodes added one at a time join the table in one concat when it is
+        # next read, so a way drawn through many new nodes copies it once.
+        if self._pending_nodes:
+            import geopandas as gpd
+            import pandas as pd
+
+            rows, points = zip(*self._pending_nodes)
+            self._pending_nodes = []
+            new = gpd.GeoDataFrame(list(rows), geometry=list(points), crs="EPSG:4326")
+            self._node_table = pd.concat([self._node_table, new], ignore_index=True)
+        return self._node_table
+
+    @_nodes.setter
+    def _nodes(self, frame):
+        self._node_table = frame
+
     # -- ids ---------------------------------------------------------------
 
     def _alloc_id(self):
@@ -160,13 +181,6 @@ class OsmEditor:
             raise ValueError(
                 f"cannot set reserved column(s) as tags: {sorted(reserved)}"
             )
-
-    def _node_coords(self):
-        return {
-            int(row.id): (row.geometry.x, row.geometry.y)
-            for row in self._nodes.itertuples()
-            if row.geometry is not None
-        }
 
     # -- views -------------------------------------------------------------
 
@@ -192,11 +206,7 @@ class OsmEditor:
         """
         import geopandas as gpd
 
-        coords = self._node_coords()
-        geometry = [
-            self._geometry_from_members(members, coords)
-            for members in self._ways["nodes"]
-        ]
+        geometry = self._way_geometries()
         frame = self._ways.drop(columns=["geometry"], errors="ignore").copy()
         # .copy() shares the mutable member lists and tag dicts; own them.
         frame["nodes"] = [list(members) for members in frame["nodes"]]
@@ -206,36 +216,68 @@ class OsmEditor:
             ]
         return gpd.GeoDataFrame(frame, geometry=geometry, crs="EPSG:4326")
 
-    @staticmethod
-    def _geometry_from_members(members, coords):
+    def _way_geometries(self):
         # Contiguous runs of in-extract members become the geometry; a gap
         # (a member with no coordinate) breaks the run so non-adjacent nodes
-        # are never bridged into a fabricated segment.
-        from shapely.geometry import LineString, MultiLineString
+        # are never bridged into a fabricated segment. All ways at once:
+        # members are flattened, located by id, and cut into runs.
+        import itertools
 
-        runs, current = [], []
-        for node_id in members:
-            if node_id in coords:
-                current.append(coords[node_id])
-                continue
-            if len(current) > 1:
-                runs.append(current)
-            current = []
-        if len(current) > 1:
-            runs.append(current)
-        if not runs:
-            return None
-        if len(runs) == 1:
-            return LineString(runs[0])
-        return MultiLineString([LineString(run) for run in runs])
+        import numpy as np
+        import pandas as pd
+        import shapely
 
-    def _known_node_ids(self):
-        # Every id the network can legitimately reference: loaded nodes plus
-        # members already carried by ways (including out-of-extract ones).
-        known = {int(node_id) for node_id in self._nodes["id"]}
+        members = self._ways["nodes"]
+        count = len(members)
+        lengths = np.fromiter((len(m) for m in members), dtype=np.int64, count=count)
+        flat = np.fromiter(
+            itertools.chain.from_iterable(members),
+            dtype=np.int64,
+            count=int(lengths.sum()),
+        )
+        way = np.repeat(np.arange(count), lengths)
+        nodes = self._nodes
+        located = nodes[nodes["geometry"].notna()].drop_duplicates(
+            subset="id", keep="last"
+        )
+        points = located["geometry"].to_numpy()
+        position = pd.Index(located["id"].astype("int64")).get_indexer(flat)
+        present = position >= 0
+        start = present.copy()
+        start[1:] &= (way[1:] != way[:-1]) | ~present[:-1]
+        run = (np.cumsum(start) - 1)[present]
+        position, way = position[present], way[present]
+        geometry = np.full(count, None, dtype=object)
+        if not len(run):
+            return list(geometry)
+        keep = (np.bincount(run) >= 2)[run]
+        run, position, way = run[keep], position[keep], way[keep]
+        if not len(run):
+            return list(geometry)
+        first, run = np.unique(run, return_index=True, return_inverse=True)[1:]
+        coordinates = np.column_stack(
+            [shapely.get_x(points[position]), shapely.get_y(points[position])]
+        )
+        lines = shapely.linestrings(coordinates, indices=run)
+        run_way = way[first]
+        single = np.bincount(run_way, minlength=count)[run_way] == 1
+        geometry[run_way[single]] = lines[single]
+        if not single.all():
+            owners, owner = np.unique(run_way[~single], return_inverse=True)
+            geometry[owners] = shapely.multilinestrings(lines[~single], indices=owner)
+        return list(geometry)
+
+    def _unknown_ids(self, node_ids):
+        # The ids the network cannot reference: neither a loaded node nor a
+        # member a way already carries (an out-of-extract member).
+        unknown = set(node_ids)
+        loaded = self._nodes["id"]
+        unknown -= {int(node_id) for node_id in loaded[loaded.isin(unknown)]}
         for members in self._ways["nodes"]:
-            known.update(members)
-        return known
+            if not unknown:
+                break
+            unknown.difference_update(members)
+        return unknown
 
     # -- node edits --------------------------------------------------------
 
@@ -259,15 +301,12 @@ class OsmEditor:
 
     def add_node(self, lon, lat, **tags):
         """Add a new node at ``(lon, lat)``; returns its (negative) id."""
-        import geopandas as gpd
-        import pandas as pd
         from shapely.geometry import Point
 
         self._check_tags(tags)
         node_id = self._alloc_id()
         row = {"id": node_id, "osm_type": "node", **tags}
-        new = gpd.GeoDataFrame([row], geometry=[Point(lon, lat)], crs="EPSG:4326")
-        self._nodes = pd.concat([self._nodes, new], ignore_index=True)
+        self._pending_nodes.append((row, Point(lon, lat)))
         self._network_dirty = True
         return node_id
 
@@ -292,10 +331,13 @@ class OsmEditor:
         # Keep the in-memory topology consistent: no way may keep a reference
         # to a removed node (a dangling provisional id would break the save).
         drop = []
-        for index in self._ways.index:
+        incident = [
+            index
+            for index, members in zip(self._ways.index, self._ways["nodes"])
+            if node_id in members
+        ]
+        for index in incident:
             members = self._ways.at[index, "nodes"]
-            if node_id not in members:
-                continue
             remaining = [n for n in members if n != node_id]
             if len(remaining) < 2 and self._ways.at[index, "id"] in self._provisional:
                 self._provisional.discard(self._ways.at[index, "id"])
@@ -347,7 +389,7 @@ class OsmEditor:
         members = [int(n) for n in node_ids]
         if len(members) < 2:
             raise ValueError("a way needs at least two nodes")
-        unknown = set(members) - self._known_node_ids()
+        unknown = self._unknown_ids(members)
         if unknown:
             raise ValueError(f"unknown node id(s): {sorted(unknown)}")
         return members
@@ -366,10 +408,11 @@ class OsmEditor:
         # Keep the in-memory network equal to what save/snap produce: drop the
         # deleted way's nodes that no remaining way references (write_pbf's
         # on_orphan_node='remove'). Shared nodes stay.
-        still_used = set()
+        orphans = {int(node_id) for node_id in candidate_ids}
         for members in self._ways["nodes"]:
-            still_used.update(members)
-        orphans = {int(node_id) for node_id in candidate_ids} - still_used
+            if not orphans:
+                break
+            orphans.difference_update(members)
         if not orphans:
             return
         mask = self._nodes["id"].isin(orphans)

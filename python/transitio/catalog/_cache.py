@@ -382,9 +382,9 @@ class FeedCache:
             return
         with self._blobs() as folder:
             blob = folder / f"{digest}.zip"
-            made = False
+            made = put_aside = False
             if not (_regular(blob) and _http.sha256_file(blob) == digest):
-                self._quarantine(blob)
+                put_aside = self._quarantine(blob)
                 os.replace(staged, blob)
                 os.chmod(blob, 0o444)
                 made = True
@@ -398,8 +398,9 @@ class FeedCache:
                     os.replace(link, target)
                 finally:
                     _unlink(link)
-            # A damaged blob put aside may have had its last link.
-            self._swept()
+            if put_aside:
+                # The damaged blob may have had its last link.
+                self._swept()
 
     def _relink(self, version):
         """Link a damaged ``version`` to its blob again when the blob is
@@ -433,9 +434,12 @@ class FeedCache:
             return True
 
     def _quarantine(self, blob):
-        """Rename a damaged blob out of the way of a new one."""
+        """Rename a damaged blob out of the way of a new one; returns whether
+        there was one."""
         if blob.exists() or blob.is_symlink():
             os.replace(blob, blob.with_name(f"{blob.stem}.{uuid.uuid4().hex}.damaged"))
+            return True
+        return False
 
     def sweep(self, prune=False):
         """Remove the blobs no feed's version links to any more, and with
@@ -466,14 +470,14 @@ class FeedCache:
                     freed += info.st_size
         return freed
 
-    def remove(self, path):
+    def remove(self, path, sweep=True):
         """Remove the file or folder ``path`` of the cache under the blob
-        lock, with the blobs it held the last links to; returns the bytes
-        freed."""
+        lock, with the blobs it held the last links to unless ``sweep`` is
+        false, which leaves them to :meth:`sweep`; returns the bytes freed."""
         with self._blob_lock():
             before = _unshared(path)
             _unlink(path)
-            return before - _unshared(path) + self._swept()
+            return before - _unshared(path) + (self._swept() if sweep else 0)
 
     def download(self, client, url, feed_id, record, fetched_from, **options):
         """Download ``url`` with ``client`` into staging and publish it
@@ -605,9 +609,10 @@ class FeedCache:
 
         self.update(version, change)
 
-    def delete(self, version):
+    def delete(self, version, sweep=True):
         """Remove a version's archive, sidecar and the outputs made of it;
-        returns the bytes the blobs it held the last links to freed."""
+        returns the bytes the blobs it held the last links to freed. Without
+        ``sweep`` those blobs are left to :meth:`sweep`, and 0 is returned."""
         outputs = version.path.parent / "outputs"
         records = version.sidecar.get("cache", {}).get("outputs", {})
         for key, record in records.items() if not outputs.is_symlink() else ():
@@ -620,7 +625,7 @@ class FeedCache:
         _unlink(version.path.with_suffix(_SIDECAR))
         with self._blob_lock():
             _unlink(version.path)
-            return self._swept()
+            return self._swept() if sweep else 0
 
     def deliver(self, version, target, provenance=None):
         """A writable copy of ``version`` at ``target`` beside a sidecar of

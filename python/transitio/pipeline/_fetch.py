@@ -449,11 +449,18 @@ def _process_feed(
     """
     from transitio.validate import validate_feed
 
-    made = key = None
+    made = key = transform = None
     if outputs is not None:
         cache, version = outputs
         key = _output_key(version, geometry, routes, crop, repair, budgets)
         made = _stored_output(version, key)
+        if not repair:
+            # A crop does not depend on the day; its validation does.
+            transform = _output_key(
+                version, geometry, routes, crop, repair, _day_free(budgets)
+            )
+            if made is None:
+                made = _reused_output(cache, version, key, transform)
     if made is None:
         if progress is not None:
             progress.processing(crop or routes is not None, repair)
@@ -472,7 +479,7 @@ def _process_feed(
             routes=routes,
         )
         if outputs is not None:
-            _store_output(cache, version, key, made)
+            _store_output(cache, version, key, made, transform)
     path = made["path"]
     if modes is not None:
         served = _feed_modes(path)
@@ -483,7 +490,7 @@ def _process_feed(
     if "validation" not in made:
         made["validation"] = validate_feed(path, **budgets)
         if outputs is not None:
-            _store_output(cache, version, key, made)
+            _store_output(cache, version, key, made, transform)
     validation = made["validation"]
     start, end = _service_window(validation)
     window = _window(start, end)
@@ -582,6 +589,8 @@ def _transformed(
         # reported with the feed.
         made["source_notices"] = report["source_notices"]
         made["dropped"] = report["dropped_rows"]
+        if not repair:
+            made["validation"] = report["validation"]
         path = _read_only(cropped)
     # The crop comes first, so the repair works on the area's feed rather
     # than on the whole source.
@@ -612,6 +621,60 @@ def _output_key(version, geometry, routes, crop, repair, budgets):
         repair=repair,
         budgets=budgets,
     )
+
+
+def _day_free(budgets):
+    """``budgets`` without the day: what a crop's output does not depend on."""
+    return {
+        name: value
+        for name, value in budgets.items()
+        if name not in ("reference_date", "reference_time")
+    }
+
+
+def _reused_output(cache, version, key, transform):
+    """What processing made of ``version`` for another day under the same
+    ``transform`` key, stored under ``key`` without its validation, the file
+    linked rather than copied; None when there is none."""
+    from transitio import _http
+    from transitio.catalog._cache import _OUTPUT_STEPS
+
+    records = version.sidecar["cache"].get("outputs", {})
+    for other, record in sorted(records.items()):
+        if other == key or record.get("transform") != transform:
+            continue
+        made = _stored_output(version, other)
+        if made is None:
+            continue
+        made = {name: value for name, value in made.items() if name != "validation"}
+        source = made["path"]
+        if source != version.path:
+            step = next(
+                (s for s in _OUTPUT_STEPS if source.name == f"{other}-{s}.zip"), None
+            )
+            if step is None:
+                continue
+            target = source.parent / f"{key}-{step}.zip"
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(target)
+            try:
+                os.link(source, target)
+            except FileExistsError:
+                continue
+            except OSError:
+                with open(source, "rb") as copied, _http.replacing(target) as out:
+                    shutil.copyfileobj(copied, out)
+                _read_only(target)
+            # The source was checked before the link: a file swapped in since
+            # would not be the output its stored results describe.
+            if _http.sha256_file(target) != record["sha256"]:
+                with contextlib.suppress(OSError):
+                    os.unlink(target)
+                continue
+            made["path"] = target
+        _store_output(cache, version, key, made, transform)
+        return made
+    return None
 
 
 def _stored_output(version, key):
@@ -654,7 +717,7 @@ def _stored_output(version, key):
     return made
 
 
-def _store_output(cache, version, key, made):
+def _store_output(cache, version, key, made, transform=None):
     """Store with ``version`` what processing ``made`` of it under ``key``,
     the validation once it ran: the results beside the output in the
     version's ``outputs`` folder, and the output's name and SHA-256 in its
@@ -683,6 +746,9 @@ def _store_output(cache, version, key, made):
         results["validation"] = made["validation"]
     _write_provenance(folder / f"{key}.json", results)
     record["results_sha256"] = _http.sha256_file(folder / f"{key}.json")
+    if transform is not None:
+        # The key of the same output on any other day, for reuse.
+        record["transform"] = transform
 
     def change(sidecar):
         sidecar["cache"].setdefault("outputs", {})[key] = record

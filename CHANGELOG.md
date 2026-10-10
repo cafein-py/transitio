@@ -7,13 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- `crop_feed`'s report carries `validation`, the cropped feed's
+  `validate_feed` report under the same options.
+
 ### Changed
 
+- Several functions are faster on large inputs, with the same results:
+  - `FeedBuilder.add_shape`, `FeedBuilder.add_trip` and `build_feed` insert
+    their rows in one step: a 4,000-point shape is added in 0.02 s instead of
+    25 s, and a 20-route scenario feed builds in 0.4 s instead of over five
+    minutes.
+  - `snap_to_network` and `OsmEditor.snap` build an extract's street network
+    once per process and reuse it until the file changes, and `OsmEditor`'s
+    node edits and ways do less work per call: deleting a node of Helsinki's
+    extract takes 0.07 s instead of 1.3 s.
+  - `undo()` and `redo()` replay an action that deleted rows in several
+    places in steps instead of row by row: redoing the removal of 20 trips
+    takes 0.2 s instead of 15 s.
+  - `patch_feed` finds candidate trips and matching stops through indexes:
+    2,000 broken trips are patched in 10 s instead of 40 s.
+  - `place()` and the other name queries look names up in an index of the
+    places' labels, and a query given `index=<path>` reuses the index it read
+    until the snapshot's manifest changes: twenty `place()` calls take 3 ms
+    instead of 2.9 s.
+  - `fetch` reuses a feed's crop for another study day and validates each
+    cropped feed once: a new day takes 4.8 s instead of 6.2 s for Turku.
+  - `infer_shapes` picks each stop pattern's UTM zone without a database
+    query, about 19 ms less per pattern.
+  - Finding repeated trips (`merge_feeds`, `merge_tables`, `fetch`) tries
+    only the earlier trips that run on a later trip's days: two copies of a
+    feed listing 100 trips once per date over a year take 4.8 s instead of
+    86 s.
+  - Filling and clearing the download cache check its shared files once
+    instead of after every download or removal: clearing 3,000 cached feeds
+    takes 2.3 s instead of 38 s.
+  - `repair_feed` finds the rows of dangling `parent_station` and
+    `agency_id` references by index: 249,150 such stops are repaired in 16 s
+    instead of 33 s.
+  - `merge_feeds(check=True)` writes the inputs it validates again with the
+    fastest compression.
 - The documentation formats the library name as code, spells out GTFS, and
   explains looking up places, choosing feeds, fetching data and the download
   cache as short rules with examples. The installation page gives each
   optional piece its own section, and the Building scenario feeds guide
   defines a scenario feed.
+
+### Fixed
+
+- `patch_feed` refused a feed whenever a file had more notices than
+  `max_notices_per_file`, as Turku's feed did with the default limits; it
+  now refuses only when the notices left out may include errors.
 
 ## 0.22.0 — 2026-10-10
 
