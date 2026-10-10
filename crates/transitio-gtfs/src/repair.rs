@@ -45,6 +45,11 @@ const CLEARABLE_REFERENCES: &[(&str, &str)] = &[
     ("stop_times.txt", "drop_off_booking_rule_id"),
 ];
 
+/// Dangling references in these child fields are cleared or doom their row
+/// by the row's own values (see `conditional_reference_repairs`).
+const CONDITIONAL_REFERENCES: &[(&str, &str)] =
+    &[("stops.txt", "parent_station"), ("routes.txt", "agency_id")];
+
 #[derive(Serialize, Debug)]
 pub struct Fix {
     pub action: &'static str,
@@ -259,7 +264,7 @@ fn drop_entities_pass(result: &mut ScanResult, fixes: &mut Vec<Fix>) {
                         .entry((file.to_string(), field.to_string()))
                         .or_default()
                         .insert(row);
-                } else {
+                } else if !CONDITIONAL_REFERENCES.contains(&(file, field)) {
                     doomed.entry(file.to_string()).or_default().insert(row);
                 }
             }
@@ -333,9 +338,7 @@ fn conditional_reference_repairs(
             let file = n.context.get("childFilename")?.as_str()?;
             let field = n.context.get("childFieldName")?.as_str()?;
             let row = n.context.get("csvRowNumber")?.as_u64()?;
-            if (file, field) == ("stops.txt", "parent_station")
-                || (file, field) == ("routes.txt", "agency_id")
-            {
+            if CONDITIONAL_REFERENCES.contains(&(file, field)) {
                 Some((file.to_string(), field.to_string(), row))
             } else {
                 None

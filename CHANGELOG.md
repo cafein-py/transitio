@@ -59,6 +59,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `patch_feed` refused a feed whenever a file had more notices than
   `max_notices_per_file`, as Turku's feed did with the default limits; it
   now refuses only when the notices left out may include errors.
+- `repair_feed` cleared a stop's dangling `parent_station` when its location
+  type needs no parent, and a route's dangling `agency_id` in a single-agency
+  feed, and then dropped the stop or route anyway, with the trips and stop
+  times that depended on it. It now keeps them.
 
 ## 0.22.0 — 2026-10-10
 
