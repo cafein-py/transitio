@@ -3637,3 +3637,41 @@ def test_filling_and_clearing_the_cache_sweep_its_blobs_once(tmp_path, monkeypat
         assert len(sweeps) == 1
         assert not blobs.exists() or not list(blobs.iterdir())
         sweeps.clear()
+
+
+def test_dangling_parents_and_agencies_are_cleared_where_the_rules_allow(tmp_path):
+    # Repair found the row of each dangling parent_station or agency_id by
+    # reading the whole table, so the time grew with the square of the rows.
+    files = {
+        "agency.txt": (
+            "agency_id,agency_name,agency_url,agency_timezone\n"
+            "hsl,HSL,https://hsl.fi,Europe/Helsinki\n"
+        ),
+        "stops.txt": (
+            "stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station\n"
+            "s1,Kamppi,60.169,24.931,0,gone\n"
+            "e1,Entrance,60.170,24.935,2,gone\n"
+            "s2,Steissi,60.171,24.941,,gone\n"
+            "s3,Rautatientori,60.172,24.942,0,\n"
+        ),
+        "routes.txt": "route_id,agency_id,route_short_name,route_type\nr1,ghost,1,3\n",
+        "trips.txt": "route_id,service_id,trip_id\nr1,wk,t1\n",
+        "stop_times.txt": (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "t1,08:00:00,08:00:00,s1,1\n"
+            "t1,08:05:00,08:05:00,s2,2\n"
+        ),
+        "calendar.txt": FEED["calendar.txt"],
+    }
+    result = repair_feed(write_zip(tmp_path / "feed.zip", files), tmp_path / "out.zip")
+    cleared = [
+        (fix["filename"], fix["csvRowNumber"], fix["field"])
+        for fix in result["fixes"]
+        if fix["action"] == "clear_reference"
+    ]
+    # An entrance needs its parent; a single-agency feed's routes do not.
+    assert cleared == [
+        ("stops.txt", 2, "parent_station"),
+        ("stops.txt", 4, "parent_station"),
+        ("routes.txt", 2, "agency_id"),
+    ]
