@@ -3228,3 +3228,108 @@ def test_shapes_trips_and_built_stops_are_added_in_one_insert(tmp_path, monkeypa
     build_feed(routes, tmp_path / "built.zip", timezone="Europe/Helsinki", check=False)
     stops = [count for filename, count in inserts if filename == "stops.txt"]
     assert len(stops) == 1 and stops[0] > 2
+
+
+def test_snapping_loads_an_extract_once_until_it_changes(tmp_path, monkeypatch):
+    # snap_to_network parsed the extract and built its network on every
+    # call: 15 s per snap on Helsinki, once per route in build_feed.
+    import os
+    import shutil
+
+    pytest.importorskip("networkx")
+    pyrosm = pytest.importorskip("pyrosm")
+    from transitio.edit import OsmEditor, snap_to_network
+
+    pbf = tmp_path / "test.osm.pbf"
+    shutil.copy(pyrosm.get_data("test_pbf"), pbf)
+    nodes = OsmEditor(pbf, network_type="driving").nodes
+    waypoints = [(p.y, p.x) for p in nodes.geometry.iloc[[0, 5]]]
+    loads, touch_while_loading = [], []
+    get_network = pyrosm.OSM.get_network
+
+    def touch():
+        stat = os.stat(pbf)
+        os.utime(pbf, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
+
+    def counting(self, *args, **kwargs):
+        loads.append(kwargs.get("network_type"))
+        result = get_network(self, *args, **kwargs)
+        if touch_while_loading:
+            touch()
+        return result
+
+    monkeypatch.setattr(pyrosm.OSM, "get_network", counting)
+    first = snap_to_network(waypoints, pbf)
+    assert snap_to_network(waypoints, pbf).equals(first)
+    assert len(loads) == 1
+    touch()
+    snap_to_network(waypoints, pbf)
+    assert len(loads) == 2
+    # A file rewritten while it loads is not kept under its old identity.
+    touch()
+    touch_while_loading.append(True)
+    snap_to_network(waypoints, pbf)
+    touch_while_loading.clear()
+    snap_to_network(waypoints, pbf)
+    snap_to_network(waypoints, pbf)
+    assert loads == ["driving"] * 4
+
+
+def test_osm_editor_ways_follow_members_after_batched_edits():
+    # Deleting a node, checking a way's members and drawing the ways view
+    # each walked the whole network in Python (1.3 s, 0.2 s and 5.2 s on
+    # Helsinki); the view now builds every way's line in one pass.
+    import shapely
+    from shapely.geometry import LineString, MultiLineString
+
+    pyrosm = pytest.importorskip("pyrosm")
+    from transitio.edit import OsmEditor
+
+    editor = OsmEditor(pyrosm.get_data("test_pbf"), network_type="driving")
+    ways = editor._ways
+    long_way = next(i for i, members in enumerate(ways["nodes"]) if len(members) > 4)
+    members = list(ways.at[long_way, "nodes"])
+    editor.delete_node(members[1])
+    ids = [editor.add_node(26.94 + i * 1e-4, 60.48) for i in range(3)]
+    assert len(editor._pending_nodes) == 3
+    editor.add_way(ids + [members[0]], highway="service")
+    assert editor._pending_nodes == []
+    # A member outside the extract splits a line; one located member is none.
+    ways = editor._ways
+    other = 1 if long_way == 0 else 0
+    remaining = list(ways.at[long_way, "nodes"])
+    ways.at[long_way, "nodes"] = remaining[:2] + [987654321] + remaining[2:]
+    ways.at[other, "nodes"] = [remaining[0], 987654322]
+
+    coords = {
+        int(row.id): (row.geometry.x, row.geometry.y)
+        for row in editor.nodes.itertuples()
+        if row.geometry is not None
+    }
+
+    def expected(way_members):
+        runs, current = [], []
+        for node_id in way_members:
+            if node_id in coords:
+                current.append(coords[node_id])
+                continue
+            if len(current) > 1:
+                runs.append(current)
+            current = []
+        if len(current) > 1:
+            runs.append(current)
+        if not runs:
+            return None
+        if len(runs) == 1:
+            return LineString(runs[0])
+        return MultiLineString([LineString(run) for run in runs])
+
+    view = editor.ways
+    assert view.geometry.iloc[other] is None
+    assert view.geometry.iloc[long_way].geom_type == "MultiLineString"
+    for way_members, geometry in zip(view["nodes"], view.geometry):
+        want = expected(way_members)
+        if want is None:
+            assert geometry is None
+        else:
+            assert shapely.equals_exact(geometry, want, tolerance=0)
