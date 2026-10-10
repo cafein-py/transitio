@@ -125,6 +125,9 @@ pub fn repair(path: &Path, output: &Path, options: ScanOptions) -> Result<Repair
         Some((path, &result.unparsed_entries)),
         &staging,
     )?;
+    // The source feed is not needed past this point: freeing it before the
+    // output is read back keeps one parsed feed in memory, not two.
+    drop(result);
 
     // The returned validation describes the REPAIRED feed, so callers see
     // exactly which notices remain.
@@ -224,7 +227,7 @@ fn default_value_pass(result: &mut ScanResult, fixes: &mut Vec<Fix>) {
             let Some(trigger) = flagged.get(&key) else {
                 continue;
             };
-            let old = std::mem::replace(&mut row.fields[index], default.to_string());
+            let old = row.set(index, default);
             fixes.push(Fix {
                 action: "default_value",
                 filename: file.to_string(),
@@ -302,7 +305,7 @@ fn drop_entities_pass(result: &mut ScanResult, fixes: &mut Vec<Fix>) {
         };
         for row in &mut table.rows {
             if rows.contains(&row.csv_row) {
-                let old = std::mem::take(&mut row.fields[index]);
+                let old = row.set(index, "");
                 fixes.push(Fix {
                     action: "clear_reference",
                     filename: file.clone(),
@@ -373,13 +376,13 @@ fn conditional_reference_repairs(
         for &position in at.get(&csv_row).map(Vec::as_slice).unwrap_or(&[]) {
             let row = &mut table.rows[position];
             let clearable = if field == "parent_station" {
-                let location_type = location_index.map(|i| row.fields[i].trim()).unwrap_or("");
+                let location_type = location_index.map(|i| row.field(i).trim()).unwrap_or("");
                 matches!(location_type, "" | "0" | "1")
             } else {
                 single_agency
             };
             if clearable {
-                let old = std::mem::take(&mut row.fields[index]);
+                let old = row.set(index, "");
                 fixes.push(Fix {
                     action: "clear_reference",
                     filename: file.clone(),
@@ -442,12 +445,12 @@ fn cascade(result: &mut ScanResult, fixes: &mut Vec<Fix>) {
         changed |= retain_rows(result, fixes, "stop_times.txt", |table, row| {
             let stop_ok = column(table, "stop_id")
                 .map(|i| {
-                    let id = row.fields[i].as_str();
+                    let id = row.field(i);
                     id.is_empty() || stops.contains(id)
                 })
                 .unwrap_or(true);
             let trip_ok = column(table, "trip_id")
-                .map(|i| trips.contains(row.fields[i].as_str()))
+                .map(|i| trips.contains(row.field(i)))
                 .unwrap_or(false);
             stop_ok && trip_ok
         });
@@ -457,16 +460,14 @@ fn cascade(result: &mut ScanResult, fixes: &mut Vec<Fix>) {
         if let Some(stop_times) = result.tables.get("stop_times.txt") {
             if let Some(i) = column(stop_times, "trip_id") {
                 for row in &stop_times.rows {
-                    *usage.entry(row.fields[i].clone()).or_insert(0) += 1;
+                    *usage.entry(row.field(i).to_string()).or_insert(0) += 1;
                 }
             }
         }
         changed |= retain_rows(result, fixes, "trips.txt", |table, row| {
-            let trip_id = column(table, "trip_id")
-                .map(|i| row.fields[i].as_str())
-                .unwrap_or("");
+            let trip_id = column(table, "trip_id").map(|i| row.field(i)).unwrap_or("");
             let route_ok = column(table, "route_id")
-                .map(|i| routes.contains(row.fields[i].as_str()))
+                .map(|i| routes.contains(row.field(i)))
                 .unwrap_or(false);
             route_ok && usage.get(trip_id).copied().unwrap_or(0) >= 2
         });
@@ -474,7 +475,7 @@ fn cascade(result: &mut ScanResult, fixes: &mut Vec<Fix>) {
         let trips_after: HashSet<String> = collect_ids(result, "trips.txt", "trip_id");
         changed |= retain_rows(result, fixes, "frequencies.txt", |table, row| {
             column(table, "trip_id")
-                .map(|i| trips_after.contains(row.fields[i].as_str()))
+                .map(|i| trips_after.contains(row.field(i)))
                 .unwrap_or(false)
         });
         // Transfers and pathways whose load-bearing stop references were
@@ -484,7 +485,7 @@ fn cascade(result: &mut ScanResult, fixes: &mut Vec<Fix>) {
                 ["from_stop_id", "to_stop_id"].iter().all(|name| {
                     column(table, name)
                         .map(|i| {
-                            let id = row.fields[i].as_str();
+                            let id = row.field(i);
                             id.is_empty() || stops.contains(id)
                         })
                         .unwrap_or(true)
@@ -507,7 +508,7 @@ fn collect_ids(result: &ScanResult, file: &str, field: &str) -> HashSet<String> 
                 table
                     .rows
                     .iter()
-                    .map(|row| row.fields[i].clone())
+                    .map(|row| row.field(i).to_string())
                     .filter(|id| !id.is_empty())
                     .collect()
             })

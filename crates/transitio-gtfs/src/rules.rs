@@ -171,7 +171,7 @@ fn field_rules(name: &str, table: &Table, samplers: &mut Samplers, notices: &mut
     for row in &table.rows {
         for (index, column) in columns.iter().enumerate() {
             let Some(column) = column else { continue };
-            let value = row.fields[index].as_str();
+            let value = row.field(index);
             if value.is_empty() {
                 if column.required {
                     sampler.push(
@@ -427,7 +427,7 @@ fn column_index(table: &Table, name: &str) -> Option<usize> {
 
 fn value<'t>(table: &'t Table, row: &'t crate::scan::Row, name: &str) -> &'t str {
     column_index(table, name)
-        .map(|i| row.fields[i].as_str())
+        .map(|i| row.field(i))
         .unwrap_or("")
 }
 
@@ -698,7 +698,7 @@ fn reference_rules(
                     table
                         .rows
                         .iter()
-                        .map(|row| row.fields[index].clone())
+                        .map(|row| row.field(index).to_string())
                         .filter(|id| !id.is_empty())
                         .collect()
                 })
@@ -934,7 +934,7 @@ fn foreign_key_check(
         return;
     };
     for row in &table.rows {
-        let id = row.fields[index].as_str();
+        let id = row.field(index);
         if id.is_empty() || parents.contains(id) {
             continue;
         }

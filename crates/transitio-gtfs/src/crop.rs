@@ -204,7 +204,7 @@ pub fn crop(
             table
                 .rows
                 .iter()
-                .map(|row| row.fields[i].clone())
+                .map(|row| row.field(i).to_string())
                 .collect::<std::collections::BTreeSet<String>>()
                 .into_iter()
                 .collect()
@@ -547,8 +547,8 @@ fn inside_stops(
                         .rows
                         .iter()
                         .filter_map(|row| {
-                            let latitude: f64 = row.fields[lat].trim().parse().ok()?;
-                            let longitude: f64 = row.fields[lon].trim().parse().ok()?;
+                            let latitude: f64 = row.field(lat).trim().parse().ok()?;
+                            let longitude: f64 = row.field(lon).trim().parse().ok()?;
                             let in_box = latitude >= miny
                                 && latitude <= maxy
                                 && longitude >= minx
@@ -556,7 +556,7 @@ fn inside_stops(
                             let inside = in_box
                                 && parts
                                     .is_none_or(|parts| inside_polygon(longitude, latitude, parts));
-                            inside.then(|| row.fields[id].clone())
+                            inside.then(|| row.field(id).to_string())
                         })
                         .collect(),
                 )
@@ -615,8 +615,8 @@ fn trips_touching(
     };
     let mut notices = Vec::new();
     while let Some(row) = reader.next_row(&mut notices) {
-        if inside.contains(&row.fields[stop]) {
-            touched.insert(row.fields[trip].clone());
+        if inside.contains(row.field(stop)) {
+            touched.insert(row.field(trip).to_string());
         }
     }
     whole(&reader, "stop_times.txt", &notices, options)?;
@@ -631,8 +631,8 @@ fn trips_touching(
         let mut notices = Vec::new();
         let mut partly_outside = HashSet::new();
         while let Some(row) = reader.next_row(&mut notices) {
-            if !inside.contains(&row.fields[stop]) && touched.contains(&row.fields[trip]) {
-                partly_outside.insert(row.fields[trip].clone());
+            if !inside.contains(row.field(stop)) && touched.contains(row.field(trip)) {
+                partly_outside.insert(row.field(trip).to_string());
             }
         }
         whole(&reader, "stop_times.txt", &notices, options)?;
@@ -668,43 +668,37 @@ fn select_trips(
     let mut notices = Vec::new();
     while let Some(row) = reader.next_row(&mut notices) {
         if let Some(routes) = &crop_options.routes {
-            let route = route_index.map(|i| row.fields[i].as_str()).unwrap_or("");
+            let route = route_index.map(|i| row.field(i)).unwrap_or("");
             if !routes.contains(route) {
                 continue;
             }
         }
         if let Some(excluded) = &crop_options.exclude_trips {
-            if excluded.contains(&row.fields[trip_index]) {
+            if excluded.contains(row.field(trip_index)) {
                 continue;
             }
         }
         if let Some(active) = active {
-            let service = service_index.map(|i| row.fields[i].as_str()).unwrap_or("");
+            let service = service_index.map(|i| row.field(i)).unwrap_or("");
             if !active.contains(service) {
                 continue;
             }
         }
         if let Some(touched) = touched {
-            if !touched.contains(&row.fields[trip_index]) {
+            if !touched.contains(row.field(trip_index)) {
                 continue;
             }
         }
         if route_index.is_some_and(|i| {
-            dropped.dangles(
-                "trips.txt",
-                "route_id",
-                "routes.txt",
-                routes,
-                &row.fields[i],
-            )
+            dropped.dangles("trips.txt", "route_id", "routes.txt", routes, row.field(i))
         }) {
             continue;
         }
-        let trip = &row.fields[trip_index];
+        let trip = row.field(trip_index);
         if let Some(&first) = kept.get(trip) {
             // An exact repeat is left out; any other is ambiguous, and with no
             // row cap on trips.txt a way to grow the kept table without bound.
-            if rows[first].fields != row.fields {
+            if !rows[first].same_fields(&row) {
                 return Err(format!(
                     "trips.txt repeats trip_id {trip:?}; an ambiguous feed cannot be cropped"
                 ));
@@ -712,11 +706,8 @@ fn select_trips(
             dropped.count("duplicate_key", "trips.txt", "trip_id", None, trip);
             continue;
         }
-        kept.insert(trip.clone(), rows.len());
-        rows.push(Row {
-            csv_row: row.csv_row,
-            fields: row.fields,
-        });
+        kept.insert(trip.to_string(), rows.len());
+        rows.push(row);
     }
     whole(&reader, "trips.txt", &notices, options)?;
     source_notices.extend(whitespace(&notices));
@@ -816,8 +807,7 @@ fn write_cropped(
             let shape = position(&headers, "shape_id");
             let mut notices = Vec::new();
             let rows = std::iter::from_fn(|| reader.next_row(&mut notices))
-                .filter(|row| shape.is_some_and(|i| kept_shapes.contains(&row.fields[i])))
-                .map(|row| row.fields);
+                .filter(|row| shape.is_some_and(|i| kept_shapes.contains(row.field(i))));
             let count = zip.rows("shapes.txt", &headers, rows)?;
             whole(&reader, "shapes.txt", &notices, options)?;
             source_notices.extend(whitespace(&notices));
@@ -873,17 +863,17 @@ fn write_stop_times(
         // Only defined groups are recorded, so the sets stay within the
         // loaded location_groups.txt.
         let group = group
-            .map(|i| &row.fields[i])
-            .filter(|g| groups.is_some_and(|known| known.contains(g.as_str())));
+            .map(|i| row.field(i))
+            .filter(|g| groups.is_some_and(|known| known.contains(g)));
         if let Some(g) = group {
             if !served.named_location_groups.contains(g) {
-                served.named_location_groups.insert(g.clone());
+                served.named_location_groups.insert(g.to_string());
             }
         }
-        let id = row.fields[trip?].as_str();
+        let id = row.field(trip?);
         let (seen, lost) = tally.get_mut(id)?;
         *seen += 1;
-        let value = stop.map(|i| &row.fields[i]);
+        let value = stop.map(|i| row.field(i));
         if value
             .is_some_and(|v| dropped.dangles("stop_times.txt", "stop_id", "stops.txt", stops, v))
         {
@@ -894,12 +884,12 @@ fn write_stop_times(
             return None;
         }
         if let Some(v) = value {
-            served.stops.insert(v.clone());
+            served.stops.insert(v.to_string());
         }
         if let Some(g) = group {
-            served.location_groups.insert(g.clone());
+            served.location_groups.insert(g.to_string());
         }
-        Some(row.fields)
+        Some(row)
     });
     let count = zip.rows("stop_times.txt", &headers, rows)?;
     whole(&reader, "stop_times.txt", &notices, options)?;
@@ -939,8 +929,8 @@ fn retain(
             let parents: HashSet<String> = stops
                 .rows
                 .iter()
-                .filter(|row| kept_stops.contains(&row.fields[id]))
-                .map(|row| row.fields[parent].clone())
+                .filter(|row| kept_stops.contains(row.field(id)))
+                .map(|row| row.field(parent).to_string())
                 .filter(|p| !p.is_empty())
                 .collect();
             kept_stops.extend(parents);
@@ -968,13 +958,13 @@ fn retain(
             let e = column(calendar, "end_date");
             for row in &mut calendar.rows {
                 if let Some(i) = s {
-                    if row.fields[i].as_str() < start.as_str() {
-                        row.fields[i] = start.clone();
+                    if row.field(i) < start.as_str() {
+                        row.set(i, &start);
                     }
                 }
                 if let Some(i) = e {
-                    if row.fields[i].as_str() > end.as_str() {
-                        row.fields[i] = end.clone();
+                    if row.field(i) > end.as_str() {
+                        row.set(i, &end);
                     }
                 }
             }
@@ -982,13 +972,13 @@ fn retain(
             // empty interval; the service survives only through its
             // calendar_dates additions, so the row itself must go.
             if let (Some(i), Some(j)) = (s, e) {
-                calendar.rows.retain(|row| row.fields[i] <= row.fields[j]);
+                calendar.rows.retain(|row| row.field(i) <= row.field(j));
             }
         }
         if let Some(dates) = result.tables.get_mut("calendar_dates.txt") {
             if let Some(i) = column(dates, "date") {
                 dates.rows.retain(|row| {
-                    let date = row.fields[i].trim();
+                    let date = row.field(i).trim();
                     date >= start.as_str() && date <= end.as_str()
                 });
             }
@@ -1006,7 +996,7 @@ fn retain(
             [from, to].iter().all(|index| {
                 index
                     .map(|i| {
-                        let id = row.fields[i].as_str();
+                        let id = row.field(i);
                         id.is_empty() || kept_stops.contains(id)
                     })
                     .unwrap_or(true)
@@ -1026,7 +1016,7 @@ fn retain(
             continue;
         };
         table.rows.retain(|row| {
-            let id = row.fields[i].as_str();
+            let id = row.field(i);
             id.is_empty() || parents.contains(id)
         });
     }
@@ -1036,13 +1026,13 @@ fn retain(
         attributions.rows.retain(|row| {
             let route_ok = route
                 .map(|i| {
-                    let id = row.fields[i].as_str();
+                    let id = row.field(i);
                     id.is_empty() || kept_routes.contains(id)
                 })
                 .unwrap_or(true);
             let trip_ok = trip
                 .map(|i| {
-                    let id = row.fields[i].as_str();
+                    let id = row.field(i);
                     id.is_empty() || kept_trips.contains(id)
                 })
                 .unwrap_or(true);
@@ -1053,7 +1043,7 @@ fn retain(
         if let Some(i) = column(networks, "route_id") {
             networks
                 .rows
-                .retain(|row| kept_routes.contains(&row.fields[i]));
+                .retain(|row| kept_routes.contains(row.field(i)));
         }
     }
     prune_definitions(result, &named, served.location_groups);
@@ -1063,7 +1053,7 @@ fn retain(
             if !kept_agencies.is_empty() {
                 agency
                     .rows
-                    .retain(|row| kept_agencies.contains(&row.fields[id]));
+                    .retain(|row| kept_agencies.contains(row.field(id)));
             }
         }
     }
@@ -1072,7 +1062,7 @@ fn retain(
         if let Some(attributions) = result.tables.get_mut("attributions.txt") {
             if let Some(i) = column(attributions, "agency_id") {
                 attributions.rows.retain(|row| {
-                    let id = row.fields[i].as_str();
+                    let id = row.field(i);
                     id.is_empty() || kept_agencies.contains(id)
                 });
             }
@@ -1151,7 +1141,7 @@ fn prune_definitions(
         };
         let (before, after) = (&named[file], &still[file]);
         table.rows.retain(|row| {
-            let id = &row.fields[i];
+            let id = row.field(i);
             !before.contains(id) || after.contains(id)
         });
     }
@@ -1168,9 +1158,7 @@ fn retain_fares(
     kept_agencies: &HashSet<String>,
 ) {
     fn value(row: &Row, index: Option<usize>) -> Option<&str> {
-        index
-            .map(|i| row.fields[i].as_str())
-            .filter(|id| !id.is_empty())
+        index.map(|i| row.field(i)).filter(|id| !id.is_empty())
     }
     let kept_zones = referenced(result, "stops.txt", "zone_id");
     let mut dropped: HashSet<String> = HashSet::new();
@@ -1185,7 +1173,7 @@ fn retain_fares(
                         .filter(|row| {
                             value(row, agency).is_some_and(|a| !kept_agencies.contains(a))
                         })
-                        .map(|row| row.fields[id].clone()),
+                        .map(|row| row.field(id).to_string()),
                 );
             }
         }
@@ -1244,7 +1232,7 @@ fn retain_fares(
     if !dropped.is_empty() {
         if let Some(fares) = result.tables.get_mut("fare_attributes.txt") {
             if let Some(id) = column(fares, "fare_id") {
-                fares.rows.retain(|row| !dropped.contains(&row.fields[id]));
+                fares.rows.retain(|row| !dropped.contains(row.field(id)));
             }
         }
     }
@@ -1264,7 +1252,7 @@ fn ids<'a>(result: &'a ScanResult, file: &str, field: &str) -> Option<HashSet<&'
         table
             .rows
             .iter()
-            .map(|row| row.fields[i].as_str())
+            .map(|row| row.field(i))
             .filter(|id| !id.is_empty())
             .collect()
     })
@@ -1277,7 +1265,7 @@ fn keep_rows(result: &mut ScanResult, file: &str, field: &str, kept: &HashSet<St
     let Some(index) = column(table, field) else {
         return;
     };
-    table.rows.retain(|row| kept.contains(&row.fields[index]));
+    table.rows.retain(|row| kept.contains(row.field(index)));
 }
 
 #[cfg(test)]
