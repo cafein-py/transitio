@@ -1,17 +1,22 @@
-# transitio: Transit feeds in and out
+# transitio: Transit feeds in and out, ready for routing
 
 **Find the right public transport feeds for any city, validated and ready for
-editing.**
+routing or editing.**
 
-Give transitio a city, and it searches its feed index for the GTFS feeds that
-serve that city. The index is a catalogue of the world's public transport
-feeds and the places they serve. transitio recommends which feeds to use and
-explains why it leaves out the others. It then downloads those feeds, crops
-them to the city and validates them. It also downloads the OpenStreetMap data
-used for routing. The feeds and the extract can be passed directly to
-[cafein](https://github.com/cafein-py/cafein) for routing. The extract can
-also be opened in [pyrosm](https://github.com/HTenkanen/pyrosm) for the street
-network.
+`transitio` is a Python library that helps you to find public transport feeds
+serving a given city and prepares them for routing. `transitio`'s feed index
+catalogues the world's public transport feeds in GTFS format and the places
+they serve (currently listing approximately 150,000 places). The General
+Transit Feed Specification (GTFS) is the standard format for public transport
+timetables, used by thousands of transport authorities across the world. With
+`transitio`, you can get recommendations on which feeds to use for a given
+city (and time) and an explanation of why certain feeds should be left out.
+`transitio` then helps you to download the recommended feeds, crop them to the
+given area and validate them to avoid using broken or defective feeds. With
+`transitio`, you can also download
+[OpenStreetMap](https://www.openstreetmap.org/) data for the same area (using
+[pyrosm](https://github.com/HTenkanen/pyrosm) under the hood) if you want to
+do multimodal routing that combines public transport and walking.
 
 **Status:** early development.
 
@@ -44,37 +49,37 @@ result.osm_pbf                        # the OpenStreetMap extract
 network = result.to_cafein()          # a network to route on (needs cafein)
 ```
 
-## What transitio does
+## What can you do with transitio?
 
-- **Finds places and their feeds.** Look up a city, metro area, region or
+- **Find places and their feeds.** Look up a city, metro area, region or
   country by name and list the feeds that serve it, from local to
   international
   ([Finding places](https://transitio.readthedocs.io/en/latest/finding_places.html)).
-- **Chooses the feeds to use.** `recommend()` considers the feeds that serve a
+- **Choose the feeds to use.** `recommend()` considers the feeds that serve a
   place, selects which to use and explains why it leaves the others out
   ([Choosing feeds](https://transitio.readthedocs.io/en/latest/choosing_feeds.html)).
-- **Fetches the data.** Download the feeds for a place, a box or any polygon
+- **Fetch the data.** Download the feeds for a place, a box or any polygon
   and crop them to that area. Also download an OpenStreetMap extract of the
   area
   ([Fetching data](https://transitio.readthedocs.io/en/latest/fetching_data.html)).
-- **Reuses its downloads.** Every feed that `fetch` downloads is kept in a
+- **Reuse downloads.** Every feed that `fetch` downloads is kept in a
   cache. This lets the same analysis use the same feeds again, even offline
   ([The download cache](https://transitio.readthedocs.io/en/latest/download_cache.html)).
-- **Checks, repairs and edits feeds.** Validate any GTFS feed with the notice
+- **Check, repair and edit feeds.** Validate any GTFS feed with the notice
   codes of the canonical GTFS validator. Repair defects that can be fixed
   without changing the trips riders see. Edit a feed with undo and redo
   ([Working with a GTFS feed](https://transitio.readthedocs.io/en/latest/working_with_feeds.html)).
-- **Crops and merges feeds.** Cut a feed to an area or a date range, merge
+- **Crop and merge feeds.** Cut a feed to an area or a date range, merge
   several feeds into one, or replace a feed's broken trips with those of
   another
   ([Cropping and merging feeds](https://transitio.readthedocs.io/en/latest/cropping_and_merging.html)).
-- **Builds scenario feeds.** Turn routes drawn in a GIS tool and their
+- **Build scenario feeds.** Turn routes drawn in a GIS tool and their
   headways (how often they run) into a GTFS feed
   ([Building scenario feeds](https://transitio.readthedocs.io/en/latest/building_feeds.html)).
-- **Searches the catalogues.** Query the Mobility Database and download
+- **Search the catalogues.** Query the Mobility Database and download
   OpenStreetMap extracts directly
   ([Catalogues and OSM extracts](https://transitio.readthedocs.io/en/latest/catalogues.html)).
-- **Draws missing route shapes.** `infer_shapes` draws the shapes a feed
+- **Draw missing route shapes.** `infer_shapes` draws the shapes a feed
   lacks from OpenStreetMap (below).
 
 ## Drawing missing route shapes
