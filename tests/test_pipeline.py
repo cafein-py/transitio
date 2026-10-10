@@ -159,7 +159,7 @@ def _zip(tables, compression=zipfile.ZIP_DEFLATED):
     return buffer.getvalue()
 
 
-def _area_fetch(monkeypatch, tmp_path, second, **options):
+def _area_fetch(monkeypatch, tmp_path, second, reference_date="20260601", **options):
     """An area fetch over two hosted feeds, mdb-10 serving ``GTFS`` and mdb-11
     the zip bytes ``second``; ``options`` go to :func:`fetch`."""
     from transitio.catalog._client import MobilityDatabase
@@ -185,7 +185,7 @@ def _area_fetch(monkeypatch, tmp_path, second, **options):
             (24.6, 60.1, 25.2, 60.4),
             directory=tmp_path / "out",
             cache_dir=tmp_path / "cache",
-            reference_date="20260601",
+            reference_date=reference_date,
             **options,
         )
 
@@ -335,7 +335,9 @@ def test_a_repeated_fetch_reuses_what_processing_made(pipeline_env, monkeypatch)
         monkeypatch.setattr(module, name, counted)
     other = _zip(PARTIAL)
     first = _area_fetch(monkeypatch, tmp_path, other)
-    made = ["crop_feed"] * 3 + ["repeated_trips"] + ["validate_feed"] * 3
+    # A crop's own report validates its output; the feed left without its
+    # repeated trips is validated.
+    made = ["crop_feed"] * 3 + ["repeated_trips", "validate_feed"]
     assert sorted(calls) == made
     assert [e["note"] for e in first.selection] == [
         None,
@@ -346,7 +348,7 @@ def test_a_repeated_fetch_reuses_what_processing_made(pipeline_env, monkeypatch)
     # without matching, cropping or validating.
     first.feeds[0].write_bytes(b"")
     again = _area_fetch(monkeypatch, tmp_path, other)
-    assert len(calls) == 7
+    assert len(calls) == 5
     assert _timeless(first.reports) == _timeless(again.reports)
     assert first.repairs == again.repairs
     assert [e["note"] for e in again.selection] == [e["note"] for e in first.selection]
@@ -355,7 +357,15 @@ def test_a_repeated_fetch_reuses_what_processing_made(pipeline_env, monkeypatch)
     output.chmod(0o644)
     output.write_bytes(b"changed")
     _area_fetch(monkeypatch, tmp_path, other)
-    assert sorted(calls[7:]) == ["crop_feed", "validate_feed"]
+    assert sorted(calls[5:]) == ["crop_feed"]
+    # Another day reuses the crops and validates them for that day; only
+    # the cut of the day's repeated trips is a crop.
+    before = len(calls)
+    _area_fetch(monkeypatch, tmp_path, other, reference_date="20260602")
+    assert (
+        sorted(calls[before:])
+        == ["crop_feed", "repeated_trips"] + ["validate_feed"] * 3
+    )
     # A version deleted for an unreadable sidecar leaves no outputs behind.
     from transitio.catalog._cache import FeedCache
 

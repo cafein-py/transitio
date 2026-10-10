@@ -24,6 +24,23 @@ fn parse_clock_time(value: &str) -> Option<u32> {
     Some(hours * 3600 + minutes * 60 + seconds)
 }
 
+/// The validation report of a scanned feed, as `scan_feed` returns it.
+fn validation_report(result: &transitio_gtfs::ScanResult) -> serde_json::Value {
+    let mut row_counts = serde_json::Map::new();
+    for (name, table) in &result.tables {
+        row_counts.insert(name.clone(), serde_json::Value::from(table.rows.len()));
+    }
+    serde_json::json!({
+        "notices": result.notices,
+        "row_counts": row_counts,
+        "service_window": result.service_window,
+        "readiness": result.readiness,
+        "moment": result.moment,
+        "incomplete": result.incomplete,
+        "stop_bounds": stop_bounds(result),
+    })
+}
+
 /// Stop bounds from the already-budgeted stops table: [min_lon,
 /// min_lat, max_lon, max_lat], skipping non-finite coordinates. None
 /// when no finite coordinate exists or stops.txt is incomplete —
@@ -122,20 +139,7 @@ fn scan_feed(
     // without the GIL; only the result crosses back into Python.
     py.allow_threads(move || {
         let result = transitio_gtfs::validate(&path, options)?;
-        let mut row_counts = serde_json::Map::new();
-        for (name, table) in &result.tables {
-            row_counts.insert(name.clone(), serde_json::Value::from(table.rows.len()));
-        }
-        let report = serde_json::json!({
-            "notices": result.notices,
-            "row_counts": row_counts,
-            "service_window": result.service_window,
-            "readiness": result.readiness,
-            "moment": result.moment,
-            "incomplete": result.incomplete,
-            "stop_bounds": stop_bounds(&result),
-        });
-        Ok(report.to_string())
+        Ok(validation_report(&result).to_string())
     })
     .map_err(|e: String| PyIOError::new_err(e))
 }
@@ -263,6 +267,7 @@ fn crop_feed(
             "remaining_notices": result.validation.notices,
             "service_window": result.validation.service_window,
             "dropped_rows": result.dropped_rows,
+            "validation": validation_report(&result.validation),
         });
         Ok(report.to_string())
     })
