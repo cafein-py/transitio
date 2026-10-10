@@ -62,6 +62,10 @@ html_theme_options = {
     "path_to_docs": "docs/",
     "use_edit_page_button": True,
     "use_repository_button": True,
+    # Without it pydata-sphinx-theme adds its navbar, whose hidden menu button
+    # takes the click handlers of the book theme's, so the menu never opens
+    # on narrow screens.
+    "navbar_persistent": [],
 }
 
 master_doc = "index"
