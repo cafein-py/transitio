@@ -125,6 +125,9 @@ pub fn repair(path: &Path, output: &Path, options: ScanOptions) -> Result<Repair
         Some((path, &result.unparsed_entries)),
         &staging,
     )?;
+    // The source feed is not needed past this point: freeing it before the
+    // output is read back keeps one parsed feed in memory, not two.
+    drop(result);
 
     // The returned validation describes the REPAIRED feed, so callers see
     // exactly which notices remain.
