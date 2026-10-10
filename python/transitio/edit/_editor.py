@@ -763,19 +763,7 @@ class FeedBuilder:
         for target in (path, staging):
             if target.is_symlink():
                 raise ValueError(f"{target} is a symlink; refusing to follow it")
-        unsafe = [name for name in self.tables if not _safe_entry_name(name)]
-        if unsafe:
-            raise ValueError(f"unsafe table names: {unsafe}")
-        with zipfile.ZipFile(staging, "w", zipfile.ZIP_DEFLATED) as archive:
-            for filename, table in self.tables.items():
-                with archive.open(filename, "w") as handle:
-                    wrapper = io.TextIOWrapper(handle, encoding="utf-8", newline="")
-                    table.to_csv(wrapper, index=False, lineterminator="\n")
-                    wrapper.flush()
-                    wrapper.detach()
-            for filename, content in self._extra_entries.items():
-                if _safe_entry_name(filename) and filename not in self.tables:
-                    archive.writestr(filename, content)
+        self._write(staging)
 
         # Validate the staging bytes, then publish that exact artifact.
         try:
@@ -851,6 +839,25 @@ class FeedBuilder:
                 error.report = report
                 raise error
         return report
+
+    def _write(self, path, compresslevel=None):
+        """Write the tables and the other entries to the zip ``path``;
+        ``compresslevel`` is zlib's, default when None."""
+        unsafe = [name for name in self.tables if not _safe_entry_name(name)]
+        if unsafe:
+            raise ValueError(f"unsafe table names: {unsafe}")
+        with zipfile.ZipFile(
+            path, "w", zipfile.ZIP_DEFLATED, compresslevel=compresslevel
+        ) as archive:
+            for filename, table in self.tables.items():
+                with archive.open(filename, "w") as handle:
+                    wrapper = io.TextIOWrapper(handle, encoding="utf-8", newline="")
+                    table.to_csv(wrapper, index=False, lineterminator="\n")
+                    wrapper.flush()
+                    wrapper.detach()
+            for filename, content in self._extra_entries.items():
+                if _safe_entry_name(filename) and filename not in self.tables:
+                    archive.writestr(filename, content)
 
 
 class FeedEditor(FeedBuilder):
