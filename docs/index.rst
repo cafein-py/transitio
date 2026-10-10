@@ -67,7 +67,7 @@ What can you do with transitio?
 License
 -------
 
-transitio is licensed under the MIT license. The feeds and OpenStreetMap data
+``transitio`` is licensed under the MIT license. The feeds and OpenStreetMap data
 it downloads keep their own licenses. OpenStreetMap data is available under
 the `Open Database License <https://www.openstreetmap.org/copyright>`__. See
 :doc:`attribution`.

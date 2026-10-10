@@ -6,7 +6,7 @@ API reference
 :func:`~transitio.fetch` is the main entry point: it runs the whole
 acquisition pipeline for an area of interest or an indexed place and returns
 a :class:`~transitio.FetchResult`. Every stage is also available on its own —
-the feed index, the catalog clients, the OSM fetcher, and the
+the feed index, the catalogue clients, the OpenStreetMap fetcher, and the
 validate/repair/crop functions.
 
 The pipeline
@@ -145,8 +145,8 @@ the cache holds.
    info
    clear
 
-The feed catalogs
------------------
+The feed catalogues
+-------------------
 
 .. currentmodule:: transitio
 
@@ -170,8 +170,8 @@ The feed catalogs
    TransitlandAtlas.close
    AtlasFeed
 
-OSM extracts and route shapes
------------------------------
+OpenStreetMap extracts and route shapes
+---------------------------------------
 
 .. autosummary::
    :toctree: api/

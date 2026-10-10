@@ -1,6 +1,6 @@
 # Installation
 
-transitio requires Python >= 3.10.
+`transitio` requires Python 3.10 or newer.
 
 ## From PyPI
 

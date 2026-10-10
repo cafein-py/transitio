@@ -118,7 +118,7 @@ and less accurate shapes.
 
 The documentation is available at https://transitio.readthedocs.io and
 includes the Quickstart, the tutorials and the API reference. To build it
-locally, install transitio and the Sphinx toolchain:
+locally, install `transitio` and the Sphinx toolchain:
 
 ```
 pip install . -r docs/requirements.txt
