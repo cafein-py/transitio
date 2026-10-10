@@ -3372,3 +3372,50 @@ def test_undo_and_redo_replay_several_deletions_in_one_action_in_steps(
     editor.redo()
     pd.testing.assert_frame_equal(editor.tables["stop_times.txt"], after)
     assert one_by_one == []
+
+
+def test_patching_goes_ahead_past_a_notice_limit_of_warnings(tmp_path):
+    # patch_feed refused any feed whose validation hit a notice limit,
+    # though it acts only on ERRORs: Turku's feed was refused for warnings
+    # about its shapes.
+    from transitio.gtfs import patch_feed
+
+    calendar = (
+        "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+        "start_date,end_date\nwk,1,1,1,1,1,1,1,20260101,20261231\n"
+    )
+    agency = (
+        "agency_id,agency_name,agency_url,agency_timezone\n"
+        "a,City Transit,https://city.example,Europe/Helsinki\n"
+    )
+    stops = "stop_id,stop_name,stop_lat,stop_lon\n{0}1,{1},60.169,24.931\n"
+    stops += "{0}2,{2},60.171,24.941\n"
+    base = {
+        "agency.txt": agency,
+        # Line breaks in both names: two warnings, one past the limit.
+        "stops.txt": stops.format("b", '"Kam\nppi"', '"Stei\nssi"'),
+        "routes.txt": "route_id,agency_id,route_short_name,route_type\nr,a,1,3\n",
+        "calendar.txt": calendar,
+        "trips.txt": "route_id,service_id,trip_id\nr,wk,t1\n",
+        # The second stop is reached before the first is left: an ERROR.
+        "stop_times.txt": "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "t1,08:00:00,08:00:00,b1,1\nt1,07:00:00,07:00:00,b2,2\n",
+    }
+    donor = dict(
+        base,
+        **{
+            "stops.txt": stops.format("d", '"Kam\nppi"', '"Stei\nssi"'),
+            "trips.txt": "route_id,service_id,trip_id\nr,wk,d1\n",
+            "stop_times.txt": "trip_id,arrival_time,departure_time,stop_id,"
+            "stop_sequence\nd1,08:00:30,08:00:30,d1,1\nd1,08:05:00,08:05:00,d2,2\n",
+        },
+    )
+    report = patch_feed(
+        write_zip(tmp_path / "base.zip", base),
+        write_zip(tmp_path / "donor.zip", donor),
+        tmp_path / "out.zip",
+        check=False,
+        max_notices_per_file=1,
+    )
+    replaced = [p for p in report["patches"] if p["action"] == "replace_trip"]
+    assert [p["tripId"] for p in replaced] == ["t1"]

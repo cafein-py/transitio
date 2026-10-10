@@ -94,8 +94,9 @@ def patch_feed(base, donor, output, *, when=None, check=True, **budgets):
         Raise :class:`transitio.exceptions.PatchError` when the
         patched output still validates with ERROR notices (the file is
         still written, like ``InvalidFeedError``). The reliability
-        refusal — sampled or truncated validation at any stage — ALWAYS
-        applies, regardless of ``check``.
+        refusal — a truncated validation at any stage, or a notice limit
+        that may have left ERROR notices out — ALWAYS applies, regardless
+        of ``check``.
     **budgets
         The ``validate_feed`` budget keyword arguments.
 
@@ -296,8 +297,8 @@ def _as_ymd(when):
 
 
 def _require_reliable(validation, label, PatchError, notices="notices", report=None):
-    codes = {n["code"] for n in validation.get(notices, [])}
-    if "notice_limit_reached" in codes or validation.get("incomplete"):
+    found = validation.get(notices, [])
+    if _errors_hidden(found) or validation.get("incomplete"):
         error = PatchError(
             f"{label} validation is sampled or truncated; absence of an "
             "ERROR is not evidence there — raise the limits to patch"
@@ -305,6 +306,22 @@ def _require_reliable(validation, label, PatchError, notices="notices", report=N
         if report is not None:
             error.report = report
         raise error
+
+
+def _errors_hidden(notices):
+    """Whether a notice limit may have left ERROR notices out: patching
+    acts on ERRORs, so a limit that left out only codes the kept notices
+    show as warnings or infos hides nothing it needs."""
+    severity = {n["code"]: n["severity"] for n in notices}
+    for notice in notices:
+        if notice["code"] != "notice_limit_reached":
+            continue
+        codes = notice.get("context", {}).get("suppressedCodes")
+        if not isinstance(codes, list) or not codes:
+            return True
+        if any(severity.get(code) not in ("WARNING", "INFO") for code in codes):
+            return True
+    return False
 
 
 def _error_ids(validation, field):
@@ -438,60 +455,99 @@ def _pair_agencies(base_tables, donor_tables, patches):
     return pairs
 
 
+def _records(table):
+    """The rows of ``table`` as dicts, read once rather than as Series."""
+    return [] if table is None else table.to_dict("records")
+
+
+class _TripStopTimes:
+    """Each trip's stop_ids in stop_sequence order, and the trips whose
+    rows cannot be ordered, found in one vectorised pass over stop_times."""
+
+    def __init__(self, table):
+        import numpy as np
+        import pandas as pd
+
+        self.unmatchable = set()
+        self._table = table
+        self._indices = {}
+        if table is None or table.empty:
+            return
+        count = len(table)
+
+        def column(name):
+            if name in table.columns:
+                return table[name].astype(str)
+            return pd.Series([""] * count, index=table.index, dtype=object)
+
+        trips = column("trip_id").to_numpy(dtype=object)
+        raw = column("stop_sequence").str.strip()
+        # The length bound keeps int() under CPython's digit limit, which
+        # would otherwise raise on an absurdly long field.
+        valid = raw.str.fullmatch(r"[0-9]{1,18}").fillna(False).to_numpy(dtype=bool)
+        sequence = np.zeros(count, dtype=np.int64)
+        sequence[valid] = raw[valid].astype("int64").to_numpy()
+        frame = pd.DataFrame(
+            {"trip": trips, "sequence": sequence, "position": np.arange(count)}
+        )
+        repeated = np.zeros(count, dtype=bool)
+        repeated[valid] = (
+            frame[valid].duplicated(["trip", "sequence"], keep="first").to_numpy()
+        )
+        bad = ~valid | repeated
+        self.unmatchable = set(frame.loc[bad, "trip"])
+        kept = frame[~bad].sort_values(["trip", "sequence"], kind="stable")
+        self._positions = kept["position"].to_numpy()
+        self._stop_ids = column("stop_id").to_numpy(dtype=object)[self._positions]
+        self._indices = kept.reset_index(drop=True).groupby("trip", sort=False).indices
+
+    def stop_ids(self, trip_id):
+        index = self._indices.get(trip_id)
+        return [] if index is None else self._stop_ids[index].tolist()
+
+    def first(self, trip_id, column):
+        """``column`` of a trip's first row, without building its rows."""
+        index = self._indices.get(trip_id)
+        if index is None or column not in self._table.columns:
+            return None if index is None else ""
+        return str(self._table[column].iat[self._positions[index[0]]])
+
+
 class _FeedModel:
     """Indexed string-table views the matcher and closure walk share."""
 
     def __init__(self, tables):
-        import pandas as pd
-
         self.tables = tables
-        empty = pd.DataFrame()
-        trips = tables.get("trips.txt", empty)
         self.trips = {
             str(row.get("trip_id", "")): row
-            for _, row in trips.iterrows()
+            for row in _records(tables.get("trips.txt"))
             if str(row.get("trip_id", "")).strip()
         }
-        self.stop_times = {}
+        self.stop_times = _TripStopTimes(tables.get("stop_times.txt"))
         #: Trips whose stop_times cannot be ordered with confidence.
         #: Dropping their bad rows would shorten the sequence and let a
         #: partial match clear the similarity floor, so they never match.
-        self.unmatchable = set()
-        seen_sequences = {}
-        for _, row in tables.get("stop_times.txt", empty).iterrows():
-            trip = str(row.get("trip_id", ""))
-            raw = str(row.get("stop_sequence", "")).strip()
-            # The length bound keeps int() under CPython's digit limit,
-            # which would otherwise raise on an absurdly long field.
-            if not (raw.isascii() and raw.isdigit() and len(raw) <= 18):
-                self.unmatchable.add(trip)
-                continue
-            seq = int(raw)
-            if seq in seen_sequences.setdefault(trip, set()):
-                self.unmatchable.add(trip)
-                continue
-            seen_sequences[trip].add(seq)
-            self.stop_times.setdefault(trip, []).append((seq, row))
-        for rows in self.stop_times.values():
-            rows.sort(key=lambda pair: pair[0])
+        self.unmatchable = self.stop_times.unmatchable
         self.stops = {
             str(row.get("stop_id", "")): row
-            for _, row in tables.get("stops.txt", empty).iterrows()
+            for row in _records(tables.get("stops.txt"))
         }
         self.routes = {
             str(row.get("route_id", "")): row
-            for _, row in tables.get("routes.txt", empty).iterrows()
+            for row in _records(tables.get("routes.txt"))
         }
         self.frequencies = {}
-        for _, row in tables.get("frequencies.txt", empty).iterrows():
+        for row in _records(tables.get("frequencies.txt")):
             self.frequencies.setdefault(str(row.get("trip_id", "")), []).append(row)
         self._trip_keys = {}
+        self._departures = {}
+        self._by_departure = {}
         #: trip_id -> donor-health verdict, memoised per call.
         self.health = {}
         # route_id -> network_ids, built once: the closure walk runs
         # per candidate and would otherwise rescan the whole table.
         self.route_network_ids = {}
-        for _, row in tables.get("route_networks.txt", empty).iterrows():
+        for row in _records(tables.get("route_networks.txt")):
             network = str(row.get("network_id", ""))
             if network.strip():
                 self.route_network_ids.setdefault(
@@ -514,10 +570,26 @@ class _FeedModel:
         for trips_here in self.candidates.values():
             trips_here.sort()
 
+    def candidates_departing(self, index, departure, tolerance):
+        """The candidates under ``index`` whose first departure lies within
+        ``tolerance`` seconds of ``departure``, in trip id order."""
+        import bisect
+
+        timed = self._by_departure.get(index)
+        if timed is None:
+            timed = sorted(
+                (seconds, trip_id)
+                for trip_id in self.candidates.get(index, ())
+                if (seconds := self.first_departure(trip_id)) is not None
+            )
+            self._by_departure[index] = timed
+        low = bisect.bisect_left(timed, (departure - tolerance,))
+        # Departures are whole seconds: the next one bounds the window.
+        high = bisect.bisect_left(timed, (departure + tolerance + 1,))
+        return sorted(trip_id for _, trip_id in timed[low:high])
+
     def stop_sequence(self, trip_id):
-        return [
-            str(row.get("stop_id", "")) for _, row in self.stop_times.get(trip_id, [])
-        ]
+        return self.stop_times.stop_ids(trip_id)
 
     def trip_keys(self, trip_id):
         """Stop keys of a trip, memoised: candidates repeat across
@@ -536,11 +608,12 @@ class _FeedModel:
         another's start, the second assumes a dwell that GTFS does not
         state.
         """
-        rows = self.stop_times.get(trip_id)
-        if not rows or trip_id in self.unmatchable:
+        if trip_id in self.unmatchable:
             return None
-        _, row = rows[0]
-        return _seconds(str(row.get("departure_time", "")))
+        if trip_id not in self._departures:
+            first = self.stop_times.first(trip_id, "departure_time")
+            self._departures[trip_id] = None if first is None else _seconds(first)
+        return self._departures[trip_id]
 
     def stop_key(self, stop_id):
         import math
@@ -586,21 +659,58 @@ def _seconds(value):
     return hours * 3600 + minutes * 60 + seconds
 
 
-def _stops_match(base_key, donor_key):
-    """The one canonical cross-feed stop relation: name + proximity;
-    ids are feed-local and never compared."""
+def _match_masks(base_keys, donor_keys):
+    """For each base stop key, a bitmask of the donor positions it matches.
+
+    The one canonical cross-feed stop relation: name + proximity; ids are
+    feed-local and never compared. Where either name is blank, only the
+    tighter proximity rule can vouch for identity.
+    """
+    import numpy as np
+
     from transitio.edit._editor import _haversine_m
 
-    if base_key is None or donor_key is None:
-        return False
-    base_name, base_position = base_key
-    donor_name, donor_position = donor_key
-    distance = _haversine_m(base_position, donor_position)
-    if base_name and donor_name:
-        return base_name == donor_name and distance <= PATCH_STOP_RADIUS_M
-    # Either side blank: the name check is unavailable, so only the
-    # tighter proximity rule can vouch for identity.
-    return distance <= PATCH_BLANK_NAME_RADIUS_M
+    located = np.array([key is not None for key in donor_keys])
+    names = np.array([key[0] if key is not None else "" for key in donor_keys])
+    lat = np.radians([key[1][0] if key is not None else 0.0 for key in donor_keys])
+    lon = np.radians([key[1][1] if key is not None else 0.0 for key in donor_keys])
+    masks = []
+    for key in base_keys:
+        if key is None:
+            masks.append(0)
+            continue
+        name, (base_lat, base_lon) = key
+        base_lat, base_lon = np.radians(base_lat), np.radians(base_lon)
+        h = (
+            np.sin((lat - base_lat) / 2) ** 2
+            + np.cos(base_lat) * np.cos(lat) * np.sin((lon - base_lon) / 2) ** 2
+        )
+        distance = 2 * 6371008.8 * np.arcsin(np.sqrt(h))
+        # Near a radius the vectorised trigonometry may round differently
+        # from the scalar haversine, so those pairs are measured with it.
+        near = located & (
+            (np.abs(distance - PATCH_STOP_RADIUS_M) < 1e-6)
+            | (np.abs(distance - PATCH_BLANK_NAME_RADIUS_M) < 1e-6)
+        )
+        for position in np.flatnonzero(near).tolist():
+            distance[position] = _haversine_m(key[1], donor_keys[position][1])
+        if name:
+            match = np.where(
+                names != "",
+                (names == name) & (distance <= PATCH_STOP_RADIUS_M),
+                distance <= PATCH_BLANK_NAME_RADIUS_M,
+            )
+        else:
+            match = distance <= PATCH_BLANK_NAME_RADIUS_M
+        # Bit j is donor position j.
+        bits = np.packbits(match & located, bitorder="little")
+        masks.append(int.from_bytes(bits.tobytes(), "little"))
+    return masks
+
+
+def _stops_match(base_key, donor_key):
+    """Whether two stop keys name the same stop (see :func:`_match_masks`)."""
+    return _match_masks([base_key], [donor_key]) == [1]
 
 
 def _similarity(base_keys, donor_keys, budget):
@@ -614,16 +724,15 @@ def _similarity(base_keys, donor_keys, budget):
         return 0.0
     if not budget.take(len(base_keys) * len(donor_keys)):
         return None
-    previous = [0] * (len(donor_keys) + 1)
-    for base_key in base_keys:
-        current = [0]
-        for j, donor_key in enumerate(donor_keys, 1):
-            if _stops_match(base_key, donor_key):
-                current.append(previous[j - 1] + 1)
-            else:
-                current.append(max(previous[j], current[j - 1]))
-        previous = current
-    return previous[-1] / max(len(base_keys), len(donor_keys))
+    # Bit-parallel LCS length (Hyyro): bit j of ``v`` is cleared once
+    # donor position j ends a longest common subsequence so far.
+    full = (1 << len(donor_keys)) - 1
+    v = full
+    for mask in _match_masks(base_keys, donor_keys):
+        u = v & mask
+        v = ((v + u) | (v - u)) & full
+    common = len(donor_keys) - bin(v).count("1")
+    return common / max(len(base_keys), len(donor_keys))
 
 
 def _route_key(row):
@@ -650,20 +759,21 @@ def _match_trip(trip_id, base_model, donor_model, pairs, donor_bad, taken, budge
         return entry
     # The route match is a candidate-narrowing pre-filter: several
     # matching donor routes pool their trips under one index key.
-    candidates = donor_model.candidates.get((donor_agency, _route_key(base_route)))
-    if not candidates:
+    index = (donor_agency, _route_key(base_route))
+    if not donor_model.candidates.get(index):
         return entry
 
     base_departure = base_model.first_departure(trip_id)
     base_keys = base_model.trip_keys(trip_id)
     scored = []
     exhausted_at = None
-    for donor_trip in candidates:  # the index keeps them sorted
-        donor_departure = donor_model.first_departure(donor_trip)
-        if base_departure is None or donor_departure is None:
-            continue
-        if abs(base_departure - donor_departure) > PATCH_TIME_TOLERANCE_S:
-            continue
+    if base_departure is None:
+        candidates = []
+    else:
+        candidates = donor_model.candidates_departing(
+            index, base_departure, PATCH_TIME_TOLERANCE_S
+        )
+    for donor_trip in candidates:
         share = _similarity(base_keys, donor_model.trip_keys(donor_trip), budget)
         if share is None:
             exhausted_at = donor_trip
@@ -725,9 +835,7 @@ def _closure_ids(donor_model, trip_id):
         ids["services"].add(service_id)
     if shape_id.strip():
         ids["shapes"].add(shape_id)
-    stack = [
-        str(r.get("stop_id", "")) for _, r in donor_model.stop_times.get(trip_id, [])
-    ]
+    stack = donor_model.stop_sequence(trip_id)
     while stack:
         stop_id = stack.pop()
         if not stop_id.strip() or stop_id in ids["stops"]:
