@@ -2,11 +2,12 @@
 //! and archive entries copied through verbatim, in whatever order the
 //! caller produces them.
 
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::io::Seek;
 use std::path::Path;
 
-use crate::scan::Table;
+use crate::scan::{Row, Table};
 
 /// A feed zip under construction. Entries are written as they come, so a
 /// table far larger than memory can be streamed row by row between the
@@ -28,11 +29,7 @@ impl ZipOutput {
 
     /// Write a parsed table with RFC 4180 quoting.
     pub(crate) fn table(&mut self, name: &str, table: &Table) -> Result<usize, String> {
-        self.rows(
-            name,
-            &table.headers,
-            table.rows.iter().map(|row| row.fields.as_slice()),
-        )
+        self.rows(name, &table.headers, &table.rows)
     }
 
     /// Write a CSV entry row by row; the row count written is returned.
@@ -44,7 +41,7 @@ impl ZipOutput {
     ) -> Result<usize, String>
     where
         I: IntoIterator,
-        I::Item: AsRef<[String]>,
+        I::Item: Borrow<Row>,
     {
         self.writer
             .start_file(name, zip::write::SimpleFileOptions::default())
@@ -57,7 +54,7 @@ impl ZipOutput {
                 .map_err(|e| format!("cannot write {name} header: {e}"))?;
             for row in rows {
                 csv_writer
-                    .write_record(row.as_ref())
+                    .write_record(row.borrow().fields())
                     .map_err(|e| format!("cannot write {name} row: {e}"))?;
                 count += 1;
             }
@@ -171,7 +168,7 @@ mod tests {
     use std::io::Write;
 
     use super::*;
-    use crate::scan::{scan_reader, Row};
+    use crate::scan::scan_reader;
 
     fn table(headers: &[&str], rows: &[&[&str]]) -> Table {
         Table {
@@ -179,10 +176,7 @@ mod tests {
             rows: rows
                 .iter()
                 .enumerate()
-                .map(|(i, fields)| Row {
-                    csv_row: i as u64 + 2,
-                    fields: fields.iter().map(|f| f.to_string()).collect(),
-                })
+                .map(|(i, fields)| Row::new(i as u64 + 2, fields.iter()))
                 .collect(),
         }
     }
@@ -214,13 +208,16 @@ mod tests {
         assert_eq!(zip.table("stops.txt", &stops).unwrap(), 1);
         // rows arriving one by one, as a stream would deliver them
         let streamed = (0..3).map(|i| {
-            vec![
-                format!("t{i}"),
-                "a".to_string(),
-                format!("08:0{i}:00"),
-                format!("08:0{i}:00"),
-                "1".to_string(),
-            ]
+            Row::new(
+                i + 2,
+                [
+                    format!("t{i}"),
+                    "a".to_string(),
+                    format!("08:0{i}:00"),
+                    format!("08:0{i}:00"),
+                    "1".to_string(),
+                ],
+            )
         });
         let headers: Vec<String> = [
             "trip_id",
@@ -242,12 +239,9 @@ mod tests {
         zip.finish().unwrap();
 
         let result = scan_reader(std::fs::File::open(&output).unwrap()).unwrap();
-        assert_eq!(
-            result.tables["stops.txt"].rows[0].fields[1],
-            "Alpha, quoted"
-        );
+        assert_eq!(result.tables["stops.txt"].rows[0].field(1), "Alpha, quoted");
         assert_eq!(result.tables["stop_times.txt"].rows.len(), 3);
-        assert_eq!(result.tables["stop_times.txt"].rows[2].fields[0], "t2");
+        assert_eq!(result.tables["stop_times.txt"].rows[2].field(0), "t2");
         // the written table is not shadowed by the source's copy, and the
         // traversal name never arrives
         let mut archive = zip::ZipArchive::new(std::fs::File::open(&output).unwrap()).unwrap();

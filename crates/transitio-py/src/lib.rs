@@ -55,8 +55,8 @@ fn stop_bounds(result: &transitio_gtfs::ScanResult) -> Option<[f64; 4]> {
     let mut bounds: Option<[f64; 4]> = None;
     for row in &table.rows {
         let (Ok(lat), Ok(lon)) = (
-            row.fields[lat].trim().parse::<f64>(),
-            row.fields[lon].trim().parse::<f64>(),
+            row.field(lat).trim().parse::<f64>(),
+            row.field(lon).trim().parse::<f64>(),
         ) else {
             continue;
         };

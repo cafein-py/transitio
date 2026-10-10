@@ -101,9 +101,7 @@ fn column(table: &Table, name: &str) -> Option<usize> {
 }
 
 fn cell<'t>(table: &'t Table, row: &'t Row, name: &str) -> &'t str {
-    column(table, name)
-        .map(|i| row.fields[i].as_str())
-        .unwrap_or("")
+    column(table, name).map(|i| row.field(i)).unwrap_or("")
 }
 
 fn haversine(a: (f64, f64), b: (f64, f64)) -> f64 {

@@ -78,10 +78,58 @@ impl Default for ScanOptions {
     }
 }
 
-/// One data row with its 1-based CSV row number (header row is 1).
+/// One data row with its 1-based CSV row number (header row is 1). Its
+/// fields' text is held in one buffer, with where each field ends, rather
+/// than as a string per field.
 pub struct Row {
     pub csv_row: u64,
-    pub fields: Vec<String>,
+    text: Box<str>,
+    ends: Box<[usize]>,
+}
+
+impl Row {
+    pub fn new<S: AsRef<str>>(csv_row: u64, fields: impl IntoIterator<Item = S>) -> Row {
+        let mut text = String::new();
+        let mut ends = Vec::new();
+        for field in fields {
+            text.push_str(field.as_ref());
+            ends.push(text.len());
+        }
+        Row {
+            csv_row,
+            text: text.into_boxed_str(),
+            ends: ends.into_boxed_slice(),
+        }
+    }
+
+    /// The value of field `index`.
+    pub fn field(&self, index: usize) -> &str {
+        let start = if index == 0 { 0 } else { self.ends[index - 1] };
+        &self.text[start..self.ends[index]]
+    }
+
+    /// The values of every field, in order.
+    pub fn fields(&self) -> impl ExactSizeIterator<Item = &str> + '_ {
+        (0..self.ends.len()).map(|index| self.field(index))
+    }
+
+    /// Whether `other` holds the same values in the same fields.
+    pub fn same_fields(&self, other: &Row) -> bool {
+        self.ends == other.ends && self.text == other.text
+    }
+
+    /// Replace the value of field `index` with `value`; returns the old one.
+    pub fn set(&mut self, index: usize, value: &str) -> String {
+        let old = self.field(index).to_string();
+        let changed = Row::new(
+            self.csv_row,
+            self.fields()
+                .enumerate()
+                .map(|(i, field)| if i == index { value } else { field }),
+        );
+        *self = changed;
+        old
+    }
 }
 
 /// One parsed file: headers plus the rows that survived the structural
@@ -943,25 +991,24 @@ impl<R: Read> TableReader<R> {
             }
             let mut trimmed = 0;
             let mut first = None;
-            let fields: Vec<String> = record
-                .iter()
-                .enumerate()
-                .map(|(index, field)| {
-                    let written = String::from_utf8_lossy(field);
-                    let value = written.trim_matches(is_space);
-                    if value.len() != written.len() {
-                        trimmed += 1;
-                        first.get_or_insert(index);
-                    }
-                    value.to_string()
-                })
-                .collect();
+            let mut text = String::new();
+            let mut ends = Vec::with_capacity(record.len());
+            for (index, field) in record.iter().enumerate() {
+                let written = String::from_utf8_lossy(field);
+                let value = written.trim_matches(is_space);
+                if value.len() != written.len() {
+                    trimmed += 1;
+                    first.get_or_insert(index);
+                }
+                text.push_str(value);
+                ends.push(text.len());
+            }
             if let Some(index) = first {
                 let written = String::from_utf8_lossy(&record[index]);
                 self.trimmed
                     .note(trimmed, self.csv_row, &self.headers[index], &written);
             }
-            if fields.iter().all(|field| field.is_empty()) {
+            if text.is_empty() {
                 let notice = Notice::new("empty_row", Severity::Warning)
                     .with("filename", self.spec.name)
                     .with("csvRowNumber", self.csv_row);
@@ -973,7 +1020,12 @@ impl<R: Read> TableReader<R> {
                 );
                 continue;
             }
-            for (header, field) in self.headers.iter().zip(&fields) {
+            let row = Row {
+                csv_row: self.csv_row,
+                text: text.into_boxed_str(),
+                ends: ends.into_boxed_slice(),
+            };
+            for (header, field) in self.headers.iter().zip(row.fields()) {
                 if field.contains('\u{FFFD}') {
                     let notice = invalid_character(self.spec.name, self.csv_row)
                         .with("fieldName", clip(header));
@@ -985,10 +1037,7 @@ impl<R: Read> TableReader<R> {
                     );
                 }
             }
-            return Some(Row {
-                csv_row: self.csv_row,
-                fields,
-            });
+            return Some(row);
         }
     }
 
@@ -1306,7 +1355,7 @@ fn duplicate_key_checks(
         let mut seen: HashMap<Vec<&str>, u64> = HashMap::new();
         let mut emitted = 0u64;
         for row in &table.rows {
-            let mut key: Vec<&str> = required.iter().map(|&i| row.fields[i].as_str()).collect();
+            let mut key: Vec<&str> = required.iter().map(|&i| row.field(i)).collect();
             // Rows whose required key components are all blank carry no
             // identity (e.g. optional attribution_id left empty) and are
             // exempt from the uniqueness check.
@@ -1316,7 +1365,7 @@ fn duplicate_key_checks(
             key.extend(
                 optional
                     .iter()
-                    .map(|index| index.map_or("", |i| row.fields[i].as_str())),
+                    .map(|index| index.map_or("", |i| row.field(i))),
             );
             match seen.entry(key) {
                 Entry::Occupied(entry) => {
@@ -1355,6 +1404,23 @@ pub(crate) mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    #[test]
+    fn a_row_reads_and_replaces_its_values() {
+        let mut row = Row::new(2, ["", "Töölö", "", "60.1"]);
+        assert_eq!(row.fields().collect::<Vec<_>>(), ["", "Töölö", "", "60.1"]);
+        assert_eq!(row.field(1), "Töölö");
+        for (index, value) in [(0, "s1"), (1, ""), (3, "60.25")] {
+            let old = row.field(index).to_string();
+            assert_eq!(row.set(index, value), old);
+            assert_eq!(row.field(index), value);
+        }
+        assert_eq!(row.fields().collect::<Vec<_>>(), ["s1", "", "", "60.25"]);
+        assert_eq!(row.csv_row, 2);
+        // The same text split differently is not the same row.
+        assert!(row.same_fields(&Row::new(9, ["s1", "", "", "60.25"])));
+        assert!(!row.same_fields(&Row::new(2, ["s", "1", "", "60.25"])));
+    }
 
     fn zip_with(files: &[(&str, &[u8])]) -> Cursor<Vec<u8>> {
         zip_written(files, zip::write::SimpleFileOptions::default(), false)
@@ -1621,10 +1687,10 @@ pub(crate) mod tests {
             let found: Vec<&str> = notices.iter().map(|n| n.code).collect();
             assert_eq!(found, expected, "{file} under {max_columns}");
             let rows = result.tables.get(file).map_or(&[][..], |table| &table.rows);
-            let ids: Vec<&str> = rows.iter().map(|row| row.fields[0].as_str()).collect();
+            let ids: Vec<&str> = rows.iter().map(|row| row.field(0)).collect();
             assert_eq!(ids, kept, "{file} under {max_columns}");
             if file == "areas.txt" {
-                assert_eq!(rows[0].fields[1], format!("POLYGON(({commas}))"));
+                assert_eq!(rows[0].field(1), format!("POLYGON(({commas}))"));
             }
             assert_eq!(result.incomplete.contains(file), line.is_some());
             let incomplete = result.incomplete.iter().map(String::as_str);
@@ -1727,7 +1793,10 @@ pub(crate) mod tests {
         let rows = &result.tables["stops.txt"].rows;
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[1].csv_row, 3);
-        assert_eq!(rows[1].fields, ["s2", "\u{FFFD}\u{FFFD}"]);
+        assert_eq!(
+            rows[1].fields().collect::<Vec<_>>(),
+            ["s2", "\u{FFFD}\u{FFFD}"]
+        );
         let found: Vec<(u64, &str)> = result
             .notices
             .iter()
@@ -1954,7 +2023,8 @@ pub(crate) mod tests {
         for (bytes, fields, codes, expected) in cases {
             let options = ScanOptions::default();
             let streamed = stream(bytes.as_bytes(), &options, options.max_rows);
-            assert_eq!(streamed.rows[0].fields[..4], fields, "{bytes:?}");
+            let first: Vec<&str> = streamed.rows[0].fields().take(4).collect();
+            assert_eq!(first, fields, "{bytes:?}");
             assert_eq!(notice_codes(&streamed.notices), codes, "{bytes:?}");
             let found = streamed
                 .notices
@@ -2005,7 +2075,7 @@ pub(crate) mod tests {
             assert_eq!(streamed.rows.len(), table.rows.len());
             for (streamed, collected) in streamed.rows.iter().zip(&table.rows) {
                 assert_eq!(streamed.csv_row, collected.csv_row);
-                assert_eq!(streamed.fields, collected.fields);
+                assert!(streamed.same_fields(collected));
             }
             // code, severity and context alike
             assert_eq!(
@@ -2193,7 +2263,7 @@ pub(crate) mod tests {
         assert!(!streamed.truncated);
         assert_eq!(streamed.headers[0], "x,\ny");
         assert_eq!(streamed.rows.len(), 2);
-        assert_eq!(streamed.rows[0].fields[2], "Alpha, the \"first\"\nstop");
+        assert_eq!(streamed.rows[0].field(2), "Alpha, the \"first\"\nstop");
         assert!(streamed.notices.is_empty());
     }
 

@@ -48,6 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     instead of 33 s.
   - `merge_feeds(check=True)` writes the inputs it validates again with the
     fastest compression.
+- Validating, repairing and cropping a feed take less memory, with the same
+  results: the Rust core holds each row's values in one buffer instead of a
+  string per value, and `repair_feed` frees the parsed source feed before it
+  reads its output back. For Helsinki's 515 MB feed, `validate_feed` peaks at
+  2.1 GB instead of 3.5 GB, and `repair_feed` at 2.3 GB instead of 6.3 GB.
 - The documentation formats the library name as code, spells out GTFS, and
   explains looking up places, choosing feeds, fetching data and the download
   cache as short rules with examples. The installation page gives each
