@@ -3419,3 +3419,107 @@ def test_patching_goes_ahead_past_a_notice_limit_of_warnings(tmp_path):
     )
     replaced = [p for p in report["patches"] if p["action"] == "replace_trip"]
     assert [p["tripId"] for p in replaced] == ["t1"]
+
+
+def test_name_queries_read_a_label_index_with_the_same_matches(tmp_path):
+    # Every place() call compared the name with all 1.2 M labels (0.15 s per
+    # call); the label index must find the same exact, prefix and word
+    # matches.
+    from index_fixture import PLACES, place, write_index
+
+    from transitio import index as transitio_index
+
+    places_module = sys.modules["transitio.index.places"]
+    more = [
+        place("Q-bb", "city", name="Baden-Baden", names={"en": "Baden Baden spa"}),
+        place("Q-sj", "city", name="San Jose", names={"es": "San José"}),
+        place("Q-sjm", "metro", name="San Jose metropolitan area"),
+        place("Q-sc", "region", name="Santa Clara County", aliases=["San Clara"]),
+        place("Q-hr", "region", name="Helsinki sub-region"),
+    ]
+    written = write_index(tmp_path / "index", places=PLACES + more)
+    lookup = transitio_index._lookup_for(transitio_index.read_index(written))
+    normalize = places_module._normalize
+
+    def scanned(query, kind=None):
+        query_norm, found = normalize(query), []
+        words = set(query_norm.split())
+        for place_id, labels in lookup._labels.items():
+            if kind is not None and lookup._records[place_id]["kind"] != kind:
+                continue
+            tiers = [
+                (
+                    places_module._EXACT
+                    if norm == query_norm
+                    else (
+                        places_module._PREFIX
+                        if query_norm and norm.startswith(query_norm)
+                        else (
+                            places_module._SUBSET
+                            if words and words <= set(tokens)
+                            else 0
+                        )
+                    )
+                )
+                for norm, tokens in labels
+            ]
+            if max(tiers, default=0):
+                found.append((max(tiers), place_id))
+        return sorted(
+            found,
+            key=lambda item: (
+                -item[0],
+                places_module._KIND_ORDER.get(lookup._records[item[1]]["kind"], 9),
+                -lookup._feed_count(item[1]),
+                item[1],
+            ),
+        )
+
+    labels = {norm for owned in lookup._labels.values() for norm, _ in owned}
+    queries = set(labels) | {norm[:3] for norm in labels} | {"", "x", "z q"}
+    queries |= {word for norm in labels for word in norm.split()}
+    queries |= {"baden baden", "san jose area", "jose san"}
+    for query in sorted(queries):
+        for kind in (None, "city"):
+            assert lookup._candidates(query, kind) == scanned(query, kind), query
+
+
+def test_place_queries_read_an_index_path_once_until_its_manifest_changes(
+    tmp_path, monkeypatch
+):
+    # index=<path> read and indexed the snapshot again on every call.
+    import os
+
+    from index_fixture import write_index
+
+    from transitio.exceptions import IncompatibleIndexError
+
+    from transitio import index as transitio_index
+
+    path = write_index(tmp_path / "index")
+    reads = []
+    read_index = transitio_index.read_index
+
+    def counting(where, **kwargs):
+        reads.append(where)
+        return read_index(where, **kwargs)
+
+    monkeypatch.setattr(transitio_index, "read_index", counting)
+    first = transitio_index.place("Helsinki", index=path)
+    assert transitio_index.place("Helsingfors", index=path) is not None
+    assert first.id == "Q1757" and len(reads) == 1
+    # A same-size rewrite with the old mtime restored is a changed manifest.
+    manifest = path / "snapshot.json"
+    before = manifest.stat()
+    text = manifest.read_text()
+    assert "2026-09-01T00:00" in text
+    manifest.write_text(text.replace("2026-09-01T00:00", "2026-09-02T00:00"))
+    os.utime(manifest, ns=(before.st_atime_ns, before.st_mtime_ns))
+    transitio_index.place("Helsinki", index=path)
+    assert len(reads) == 2
+    # A manifest replaced by a symlink is refused, not served from the cache.
+    moved = tmp_path / "moved.json"
+    manifest.rename(moved)
+    manifest.symlink_to(moved)
+    with pytest.raises(IncompatibleIndexError):
+        transitio_index.place("Helsinki", index=path)
