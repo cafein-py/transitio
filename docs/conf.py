@@ -27,7 +27,8 @@ extensions = [
     "sphinx.ext.autosummary",
     # NumPy-style docstrings.
     "sphinx.ext.napoleon",
-    "myst_parser",
+    # Markdown pages and the tutorial notebooks.
+    "myst_nb",
 ]
 
 # Generate the per-object stub pages referenced by the autosummary tables.
@@ -43,8 +44,12 @@ autosummary_filename_map = {
 # Markdown pages.
 myst_enable_extensions = ["colon_fence"]
 
+# Render the notebooks from their stored outputs; they are run locally,
+# never at build time.
+nb_execution_mode = "off"
+
 templates_path = ["_templates"]
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "**.ipynb_checkpoints"]
 
 # -- HTML output -------------------------------------------------------------
 

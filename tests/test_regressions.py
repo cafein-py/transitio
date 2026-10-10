@@ -2671,7 +2671,7 @@ def test_an_area_fetch_selects_the_feeds_of_the_index_places(tmp_path, monkeypat
     assert [p.id for p in result.places] == ["c"]
     assert result.snapshot == index.snapshot_id
     # The extract covers the area itself, not grown.
-    assert extracts == [(CITY_BBOX, ["cache_dir", "directory"])]
+    assert extracts == [(CITY_BBOX, ["cache_dir", "directory", "progress"])]
     # Mostly in a country without feeds: the catalogue, with a warning.
     mostly_ee = (24.9, 59.7, 25.0, 60.2)
     with pytest.warns(UserWarning) as caught:
@@ -3072,3 +3072,128 @@ def test_undo_and_redo_replay_a_run_of_rows_in_one_step(monkeypatch):
     with pytest.raises(ChangeLogDesyncError, match=r"row 3 \(row to delete changed\)"):
         builder.redo()
     assert builder.tables["stops.txt"].equals(edited)
+
+
+def test_a_recommendation_near_full_coverage_says_over_not_about_over():
+    # Turku's summary read "covering about over 99 % of the departures".
+    from types import SimpleNamespace
+
+    from transitio.index.recommend import Recommendation
+
+    area = SimpleNamespace(parts=())
+    found = Recommendation(area, None, [], [], 0.997, {}, "overlap", None)
+    assert str(found).splitlines()[0] == (
+        "The area's 0 places: take 0 feeds, covering over 99 % of the departures "
+        "the index records there, each counted once"
+    )
+
+
+def test_a_row_bar_counts_whole_rows(monkeypatch, capsys):
+    # drop_routes' bar read "50.0/100": every bar scaled its counts as bytes.
+    from tqdm import std
+
+    from transitio import _progress
+
+    monkeypatch.setattr(_progress, "_bar_class", lambda: (std.tqdm, False))
+    for unit, shown in (("row", "1200/2000"), ("B", "1.20k/2.00k")):
+        made = _progress.bar("Dropping", 2000, unit=unit)
+        made.update(1200)
+        made.close()
+        assert shown in capsys.readouterr().err
+
+
+def test_places_and_suggestions_list_the_resolved_city_first():
+    # places("Augsburg") and suggest("augs") listed Augsburg's metros before
+    # the city place("Augsburg") answers.
+    import transitio.index as transitio_index
+    from test_index_resolve import _index, _p
+
+    idx = _index(
+        [
+            _p("Q-aug-m", "metro", "Augsburg", member_ids=["Q-aug"], country_code="DE"),
+            _p("Q-aug", "city", "Augsburg", metro_ids=["Q-aug-m"], country_code="DE"),
+        ]
+    )
+    assert transitio_index.place("Augsburg", index=idx).id == "Q-aug"
+    assert [p.id for p in transitio_index.places("Augsburg", index=idx)] == [
+        "Q-aug",
+        "Q-aug-m",
+    ]
+    assert [s.place.id for s in transitio_index.suggest("augs", index=idx)] == [
+        "Q-aug",
+        "Q-aug-m",
+    ]
+    assert [
+        s.place.id for s in transitio_index.suggest("augs", limit=1, index=idx)
+    ] == ["Q-aug"]
+    # Two cities of the name in the metro's country both go before it.
+    twins = _index(
+        [
+            _p("Q-s-m", "metro", "Sburg", member_ids=["Q-s1"], country_code="US"),
+            _p("Q-s1", "city", "Sburg", metro_ids=["Q-s-m"], country_code="US"),
+            _p("Q-s2", "city", "Sburg", country_code="US"),
+        ]
+    )
+    found = [s.place.id for s in transitio_index.suggest("sbu", index=twins)]
+    assert found[2] == "Q-s-m" and sorted(found[:2]) == ["Q-s1", "Q-s2"]
+    # Places without a country are no namesakes: the metro keeps its rank.
+    nowhere = _index(
+        [
+            _p("Q-x-m", "metro", "Xburg", member_ids=["Q-x"], country_code=None),
+            _p("Q-x", "city", "Xburg", metro_ids=["Q-x-m"], country_code=None),
+        ]
+    )
+    assert [s.place.id for s in transitio_index.suggest("xbu", index=nowhere)] == [
+        "Q-x-m",
+        "Q-x",
+    ]
+
+
+def test_a_repair_goes_ahead_past_a_notice_limit_of_kinds_it_does_not_fix(tmp_path):
+    # Turku's feed was refused: its shapes.txt had over 10,000 notices of a
+    # kind the repair never touches.
+    import io
+
+    import transitio
+
+    files = {
+        "agency.txt": "agency_id,agency_name,agency_url,agency_timezone\n"
+        "a,A,https://a.example,Europe/Helsinki\n",
+        "stops.txt": 'stop_id,stop_name,stop_lat,stop_lon\ns1,"Ka\npi",60.169,24.931\n'
+        's2,"Ste\nsi",60.171,24.941\n',
+        "routes.txt": "route_id,agency_id,route_short_name,route_type\nr1,a,1,3\n",
+        "trips.txt": "route_id,service_id,trip_id\nr1,wk,t1\n",
+        "stop_times.txt": "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "t1,08:00:00,08:00:00,s1,1\nt1,08:05:00,08:05:00,s2,2\n",
+        "calendar.txt": "service_id,monday,tuesday,wednesday,thursday,friday,"
+        "saturday,sunday,start_date,end_date\nwk,1,1,1,1,1,0,0,20260101,20261231\n",
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, text in files.items():
+            archive.writestr(name, text)
+    source = tmp_path / "feed.zip"
+    source.write_bytes(buffer.getvalue())
+    capped = [
+        n
+        for n in transitio.validate_feed(source, max_notices_per_file=1)["notices"]
+        if n["code"] == "notice_limit_reached"
+    ]
+    assert [n["context"]["suppressedCodes"] for n in capped] == [["new_line_in_value"]]
+    result = transitio.repair_feed(source, tmp_path / "out.zip", max_notices_per_file=1)
+    assert result["fixes"] == [] and (tmp_path / "out.zip").exists()
+
+
+def test_validation_without_a_study_day_reports_no_expired_service(tmp_path):
+    # Without a reference date, validation and repair judged calendars
+    # against the day they ran, so a feed's notices changed from day to day.
+    files = {name: text.replace("2026", "2020") for name, text in FEED.items()}
+    source = write_zip(tmp_path / "feed.zip", files)
+
+    def expired(notices):
+        return [n for n in notices if n["code"] == "expired_calendar"]
+
+    assert expired(validate_feed(source)["notices"]) == []
+    repaired = repair_feed(source, tmp_path / "repaired.zip")
+    assert expired(repaired["remaining_notices"]) == []
+    assert expired(validate_feed(source, reference_date="20210101")["notices"])

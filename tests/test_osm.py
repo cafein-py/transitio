@@ -418,3 +418,37 @@ def test_as_geometry_validation():
         _as_geometry((25.2, 60.4, 24.6, 60.1))
     with pytest.raises(ValueError):
         _as_geometry(12345)
+
+
+def test_fetch_pbf_reports_the_extract_download(
+    tmp_path, area_extract, monkeypatch, capsys
+):
+    # The extract download shows as transitio's bar, says nothing with
+    # progress=False, and calls a function with (written, total).
+    import pyrosm
+    from tqdm import std
+
+    from transitio import _progress
+
+    stub = pyrosm.get_data_by_area
+
+    def downloading(area, progress=True, **kwargs):
+        if callable(progress):
+            progress(500, 1000)
+            progress(1000, 1000)
+        return stub(area, progress=progress, **kwargs)
+
+    monkeypatch.setattr(pyrosm, "get_data_by_area", downloading)
+    monkeypatch.setattr(_progress, "_bar_class", lambda: (std.tqdm, False))
+    seen = []
+    cases = [
+        (True, ["Downloading the OpenStreetMap extract", "1.00k/1.00k"]),
+        (False, []),
+        (lambda written, total: seen.append((written, total)), []),
+    ]
+    for n, (progress, shown) in enumerate(cases):
+        fetch_pbf(HELSINKI_BBOX, cache_dir=tmp_path / str(n), progress=progress)
+        err = capsys.readouterr().err
+        assert all(text in err for text in shown) if shown else err == ""
+    assert [call["progress"] is False for call in area_extract] == [False, True, False]
+    assert seen == [(500, 1000), (1000, 1000)]

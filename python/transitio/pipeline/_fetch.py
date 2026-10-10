@@ -391,12 +391,14 @@ def _skipped(selection):
 
 class _SkipFeed(Exception):
     """A per-feed reason to skip, carried out of the shared processing with
-    the feed's computed service window when it was validated."""
+    the feed's computed service window when it was validated; ``missed_day``
+    when the feed does not run on the requested day."""
 
-    def __init__(self, reason, window=None):
-        super().__init__(reason, window)
+    def __init__(self, reason, window=None, missed_day=False):
+        super().__init__(reason, window, missed_day)
         self.reason = reason
         self.window = window
+        self.missed_day = missed_day
 
     def __str__(self):
         return self.reason
@@ -493,8 +495,29 @@ def _process_feed(
         if reason is None and study and _idle(validation, day):
             reason = f"no service on {day.isoformat()}"
         if reason is not None:
-            raise _SkipFeed(reason, window)
+            raise _SkipFeed(reason, window, missed_day=True)
     return path, _report(made, hosted, provenance), made, key, window
+
+
+def _warn_undated(feed_ids, day, stacklevel):
+    """Warn that, without a Mobility Database API token, the newest copies of
+    ``feed_ids`` were taken and do not run on ``day``: a token lets fetch pick
+    the dated copy that does. ``stacklevel`` points at the caller of fetch."""
+    if feed_ids:
+        warnings.warn(
+            "no Mobility Database API token: the newest copies of "
+            f"{', '.join(feed_ids)} do not run on {day.isoformat()}; with a token, "
+            "fetch can pick a dated copy from the Mobility Database",
+            UserWarning,
+            stacklevel=stacklevel,
+        )
+
+
+def _mdb_id(feed):
+    """The Mobility Database id of the indexed ``feed``, or None."""
+    from transitio.index.feeds import _parse
+
+    return (_parse(feed._row.get("mdb")) or {}).get("mdb_id")
 
 
 def _report(made, hosted, provenance):
@@ -2617,14 +2640,9 @@ def fetch(
         modes=None if modes is None else sorted(modes),
         budgets=budgets,
     )
+    undated = []
     with MobilityDatabase(refresh_token, cache_dir=cache_dir) as db:
-        if when is not None and not db._refresh_token:
-            warnings.warn(
-                "no Mobility Database API token: 'when' cannot select "
-                "historical datasets, using the latest hosted datasets",
-                UserWarning,
-                stacklevel=2,
-            )
+        tokenless = when is not None and not db._refresh_token
         # Without a token the search reads the catalogue export, downloaded
         # when the cached copy is missing or a day old.
         with progress.downloads("Downloading the Mobility Database catalogue"):
@@ -2645,9 +2663,13 @@ def fetch(
             )
         if osm:
             progress.say("Fetching the OSM extract")
-            osm_pbf, osm_note = _osm_extract(
-                geometry, cache_dir=cache_dir, directory=directory
-            )
+            with progress.downloads("Downloading the OpenStreetMap extract"):
+                osm_pbf, osm_note = _osm_extract(
+                    geometry,
+                    cache_dir=cache_dir,
+                    directory=directory,
+                    progress=progress.bar or False,
+                )
 
         def take(feed, entry, version, dataset_id, hosted, last=True):
             # ``version`` checked against the feeds delivered so far and
@@ -2682,6 +2704,8 @@ def fetch(
             except _SkipFeed as skip:
                 if not last:
                     return "rejected"
+                if tokenless and skip.missed_day:
+                    undated.append(feed.id)
                 _skip(entry, skip.reason, feed_window=skip.window)
                 return "skipped"
             except Exception as error:  # noqa: B902 — isolate per-feed failures
@@ -2794,6 +2818,7 @@ def fetch(
                 _hosted(db, cache, version, dataset_id),
             )
 
+    _warn_undated(undated, day, stacklevel=3)
     repeats = dict(budgets=budgets, modes=modes, day=day if study else None)
     repeats["duplicate_trips"] = duplicate_trips
     _drop_repeats(
@@ -2809,6 +2834,7 @@ def fetch(
     if osm_pbf is not None:
         coords = {path: _stop_coords(path) for path in feeds}
         counts = _count_outside(record, geometry, coords)
+        _warn_outside(*counts, stacklevel=3)
         osm_note = _osm_note(geometry, geometry, *counts)
     progress.done(record)
     return FetchResult(
@@ -2997,6 +3023,23 @@ def _count_outside(record, area, coords):
     return outside, total, unread
 
 
+def _warn_outside(outside, total, unread, stacklevel):
+    """Warn when most of the ``total`` located stops of the delivered feeds,
+    ``outside`` of them, lie beyond the OSM extract; ``stacklevel`` points at
+    the caller of fetch."""
+    if total and outside * 2 > total:
+        warnings.warn(
+            f"{outside:,} of the {total:,} located stops of the delivered feeds "
+            "lie outside the OSM extract: their trips run on beyond the area, and "
+            "routing may find no streets or paths to walk to them. Fetch a "
+            "larger area to cover them, or crop the feeds with "
+            "transitio.crop_feed(..., full_trips_only=True) to keep only the "
+            "trips inside the area",
+            UserWarning,
+            stacklevel=stacklevel,
+        )
+
+
 def _osm_note(geometry, parts, outside=0, total=0, unread=0):
     """The ``osm_note`` on the OSM area: the parts of ``geometry``
     that ``parts`` leaves out, and the ``outside`` of ``total`` located
@@ -3093,7 +3136,7 @@ def _fetch_place(
         _coerce_index,
         place as resolve_place,
     )
-    from transitio.index.feeds import _hosted_url, _parse
+    from transitio.index.feeds import _hosted_url
     from transitio.index.places import _as_shape
     from transitio.osm._fetch import _buffered
 
@@ -3155,6 +3198,14 @@ def _fetch_place(
         for feed_id, (access, _) in decided.items()
         if access is not None
     }
+
+    def datable(feed):
+        # Whether a token would let fetch pick a dated copy of the feed: one
+        # the Mobility Database lists, read without credentials (with them,
+        # fetch takes no dataset version).
+        access = decided.get(feed.feed_id, (None, None))[0]
+        return tokenless and access is None and _mdb_id(feed) is not None
+
     feeds, reports, repairs, selections, record = [], [], [], [], []
     delivered = _Delivered()
     delivered_ids, processed = [], []
@@ -3163,6 +3214,9 @@ def _fetch_place(
     # or the feed whose content it repeats), those delivered cut to routes,
     # and whether a container's probe proved it unchanged before download.
     carriers, cropped, current, protected = {}, set(), {}, set()
+    # Feeds with a dated copy in the Mobility Database whose newest copy
+    # does not run on the day, while no token can pick the dated one.
+    undated, tokenless = [], False
     container_ids = {c for feed in kept for c in feed.contained_in}
     probes, services, budget = {}, {}, budgets.get("max_total_bytes")
 
@@ -3292,6 +3346,8 @@ def _fetch_place(
         except _SkipFeed as skip:
             if not last:
                 return "rejected"
+            if skip.missed_day and datable(feed):
+                undated.append(feed.feed_id)
             _skip(entry, skip.reason, feed_window=skip.window)
             if selection is not None:
                 selections.append(selection)
@@ -3387,13 +3443,7 @@ def _fetch_place(
         tempfile.TemporaryDirectory(dir=cache.root) as scratch,
     ):
         archives = _Archives(scratch)
-        if when is not None and not db._refresh_token:
-            warnings.warn(
-                "no Mobility Database API token: 'when' cannot select "
-                "historical datasets, using the latest hosted datasets",
-                UserWarning,
-                stacklevel=2,
-            )
+        tokenless = when is not None and not db._refresh_token
 
         def unchanged(feed):
             # One probe per feed, shared by the date and containment rules.
@@ -3411,6 +3461,8 @@ def _fetch_place(
             missed = _misses(feed.service_start, feed.service_end, day, study)
             if expired == "skip" and missed and unchanged(feed):
                 _skip(entry, f"{missed}; unchanged since indexed")
+                if datable(feed):
+                    undated.append(feed.feed_id)
                 return True
             return False
 
@@ -3532,7 +3584,7 @@ def _fetch_place(
             # A protected feed with credentials skips the dataset versions:
             # its fallback is the hosted copy alone.
             if db._refresh_token and access is None:
-                mdb_id = (_parse(feed._row.get("mdb")) or {}).get("mdb_id")
+                mdb_id = _mdb_id(feed)
                 if mdb_id:
                     try:
                         mdb_feed = Feed.from_api({"id": mdb_id})
@@ -3627,6 +3679,7 @@ def _fetch_place(
             entry["cache"] = "downloaded" if use_cache else "refreshed"
             take(feed, entry, version, notes, dataset_id, hosted, key)
 
+    _warn_undated(undated, day, stacklevel=4)
     removed = _settle_versions(record, services, protected, day if study else None)
     # A feed is delivered once the versions are settled and it stays.
     for n, (feed_id, item) in enumerate(zip(delivered_ids, processed)):
@@ -3682,13 +3735,19 @@ def _fetch_place(
                 "must_cover": _osm_stops(osm_area, coords),
             }
         progress.say("Fetching the OSM extract")
-        osm_pbf, osm_note = _osm_extract(
-            parts, cache_dir=cache_dir, directory=directory, **grown
-        )
+        with progress.downloads("Downloading the OpenStreetMap extract"):
+            osm_pbf, osm_note = _osm_extract(
+                parts,
+                cache_dir=cache_dir,
+                directory=directory,
+                progress=progress.bar or False,
+                **grown,
+            )
         if osm_pbf is None:
             osm_area = None
         else:
             counts = _count_outside(record, osm_area, coords)
+            _warn_outside(*counts, stacklevel=4)
             osm_note = _osm_note(geometry, parts, *counts)
 
     progress.done(record)

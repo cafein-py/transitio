@@ -17,7 +17,7 @@ import shapely
 from shapely.geometry import box
 from shapely.geometry.base import BaseGeometry
 
-from transitio import _http
+from transitio import _http, _progress
 from transitio.exceptions import DownloadError, ExtractNotFoundError
 
 
@@ -109,11 +109,11 @@ def _area_km2(geometry):
     return float(_areas_km2([geometry])[0])
 
 
-def _extract(geometry, update, directory, must_cover, output_path=None):
+def _extract(geometry, update, directory, must_cover, output_path=None, progress=False):
     """pyrosm's smallest extract, or smaller set of extracts merged into one,
     that covers ``must_cover`` (else ``geometry``), downloaded into
-    ``directory``; with ``output_path`` it is cropped there to the envelope
-    of ``geometry``."""
+    ``directory`` with pyrosm's ``progress``; with ``output_path`` it is
+    cropped there to the envelope of ``geometry``."""
     from pyrosm import get_data_by_area
     from pyrosm.exceptions import ExtractDownloadError
     from pyrosm.exceptions import ExtractNotFoundError as NoExtract
@@ -128,6 +128,7 @@ def _extract(geometry, update, directory, must_cover, output_path=None):
             directory=str(directory),
             strategy="smallest_total",
             must_cover=must_cover,
+            progress=progress,
         )
     except NoExtract as error:
         raise ExtractNotFoundError(str(error)) from error
@@ -271,6 +272,7 @@ def fetch_pbf(
     directory=None,
     cache_dir=None,
     update=False,
+    progress=True,
 ):
     """Download (and by default crop) the smallest OSM data covering an AOI.
 
@@ -356,6 +358,11 @@ def fetch_pbf(
     update : bool, default False
         Re-download the extracts and refresh the provider indexes and sizes,
         even when a cached copy exists.
+    progress : bool or callable, default True
+        A bar on stderr for each extract downloaded (a widget in Jupyter when
+        ipywidgets is installed); ``False`` shows nothing, and a function is
+        called as ``progress(written, total)`` after each chunk. A cached
+        extract downloads nothing and shows nothing.
 
     Returns
     -------
@@ -410,17 +417,31 @@ def fetch_pbf(
         if crop and target.exists() and sidecar.exists() and not update:
             _add_bounds(sidecar)
             return target
+        own = None
         try:
+            if progress is True:
+                own = progress = _progress.Download(
+                    "Downloading the OpenStreetMap extract"
+                )
             if crop:
                 with _http.staged(target) as partial:
                     extract = _extract(
-                        geometry, update, source_dir, must_cover, str(partial)
+                        geometry,
+                        update,
+                        source_dir,
+                        must_cover,
+                        str(partial),
+                        progress=progress,
                     )
                     sidecar.unlink(missing_ok=True)
             else:
-                extract = _extract(geometry, update, source_dir, must_cover)
+                extract = _extract(
+                    geometry, update, source_dir, must_cover, progress=progress
+                )
                 target = Path(extract.path)
         finally:
+            if own is not None:
+                own.close()
             if update or not crop:
                 # pyrosm may have replaced extracts even when it then failed.
                 _drop_stale_sidecars(source_dir)

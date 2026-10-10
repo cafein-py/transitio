@@ -3,7 +3,7 @@
 //! canonical gtfs-validator naming; the rule roadmap and verification
 //! status live in plans/validation-rules.md.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::fields::{self, FieldKind};
 use crate::notice::{Notice, Severity};
@@ -66,6 +66,8 @@ pub(crate) struct Sampler {
     cap: u64,
     errors: u64,
     warnings: u64,
+    // The codes of the notices past the cap.
+    suppressed: BTreeSet<&'static str>,
 }
 
 impl Sampler {
@@ -74,6 +76,7 @@ impl Sampler {
             cap,
             errors: 0,
             warnings: 0,
+            suppressed: BTreeSet::new(),
         }
     }
 
@@ -85,6 +88,8 @@ impl Sampler {
         };
         if *counter < self.cap {
             notices.push(notice);
+        } else {
+            self.suppressed.insert(notice.code);
         }
         *counter += 1;
     }
@@ -101,7 +106,11 @@ impl Sampler {
             notices.push(
                 Notice::new("notice_limit_reached", severity)
                     .with("filename", filename.to_string())
-                    .with("suppressedCount", suppressed_errors + suppressed_warnings),
+                    .with("suppressedCount", suppressed_errors + suppressed_warnings)
+                    .with(
+                        "suppressedCodes",
+                        self.suppressed.into_iter().collect::<Vec<_>>(),
+                    ),
             );
         }
     }

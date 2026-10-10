@@ -65,7 +65,20 @@ License <https://www.openstreetmap.org/copyright>`__.
     :maxdepth: 1
 
     installation
-    quickstart
+    quickstart.ipynb
+
+.. toctree::
+    :caption: User guide
+    :maxdepth: 1
+
+    finding_places.ipynb
+    choosing_feeds.ipynb
+    fetching_data.ipynb
+    download_cache.ipynb
+    working_with_feeds.ipynb
+    cropping_and_merging.ipynb
+    building_feeds.ipynb
+    catalogues.ipynb
 
 .. toctree::
     :caption: API reference

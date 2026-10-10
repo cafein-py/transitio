@@ -112,10 +112,13 @@ class Recommendation:
             lines = [": ".join([head, self.note] + taken)]
         else:
             count = len(self.taken)
+            share = _percent(self.coverage)
+            # "over 99 %" is a bound already, not an estimate.
+            share = share if share.startswith("over") else f"about {share}"
             lines = [
                 f"{head}: take {count} feed{'' if count == 1 else 's'}, covering "
-                f"about {_percent(self.coverage)} of the departures the index "
-                "records there, each counted once"
+                f"{share} of the departures the index records there, each "
+                "counted once"
             ]
             lines += [f"  {self.note}"] if self.note else []
             lines += [f"  + {_named(c.feed)}: {c.reason}" for c in self.taken]

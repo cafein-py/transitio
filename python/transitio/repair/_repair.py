@@ -45,8 +45,10 @@ def repair_feed(path, output, **options):
     ------
     OSError
         If the feed cannot be read, exceeds the scan budgets (repairing a
-        truncated snapshot would silently lose data), or the output cannot
-        be written.
+        truncated snapshot would silently lose data), leaves out past
+        ``max_notices_per_file`` a notice of a kind the repair fixes (that
+        defect would stay), or the output cannot be written. Notices of
+        other kinds past the limit do not stop the repair.
     """
     from transitio import _core
 
