@@ -1,68 +1,81 @@
-transitio -- AOI-driven OSM and GTFS acquisition
-==================================================
+transitio: Transit feeds in and out, ready for routing
+======================================================
 
-**transitio** is a Python library that selects and prepares the raw
-ingredients of public-transport routing -- `OpenStreetMap
-<https://www.openstreetmap.org/>`__ extracts and `GTFS <https://gtfs.org/>`__
-timetables -- for an arbitrary **area of interest**. It is the companion to
-`pyrosm <https://pyrosm.readthedocs.io/>`__ and
-`cafein <https://github.com/cafein-py/cafein>`__: transitio moves the raw
-ingredients of routing from the open data ecosystem to your area of interest,
-ready for cafein to brew into routing results.
+**Find the right public transport feeds for any city, validated and ready for
+routing or editing.**
 
-One call does the whole run:
+``transitio`` is a Python library that helps you to find public transport
+feeds serving a given city and prepares them for routing. ``transitio``'s feed
+index catalogues the world's public transport feeds in GTFS format and the
+places they serve (currently listing approximately 150,000 places). The
+General Transit Feed Specification (GTFS) is the standard format for public
+transport timetables, used by thousands of transport authorities across the
+world. With ``transitio``, you can get recommendations on which feeds to use
+for a given city (and time) and an explanation of why certain feeds should be
+left out. ``transitio`` then helps you to download the recommended feeds, crop
+them to the given area and validate them to avoid using broken or defective
+feeds. With ``transitio``, you can also download `OpenStreetMap
+<https://www.openstreetmap.org/>`__ data for the same area (using `pyrosm
+<https://pyrosm.readthedocs.io/>`__ under the hood) if you want to do
+multimodal routing that combines public transport and walking.
 
 .. code-block:: python
 
     import transitio
 
-    result = transitio.fetch("Helsinki")   # geometry, bbox tuple or place name
+    transitio.index.refresh()             # once: install the feed index
 
-    result.osm_pbf     # cropped OSM extract (path)
-    result.feeds       # downloaded, cropped and validated GTFS feeds (paths)
-    result.reports     # per-feed merged validation reports
-    result.skipped     # (feed id, reason) for anything left out
+    turku = transitio.place("Turku")
+    rec = turku.recommend()               # which feeds to use, and why
+    result = transitio.fetch(feeds=rec)   # download, crop and validate
 
-    net = result.to_cafein()   # routable cafein.TransportNetwork
-    osm = result.to_pyrosm()   # pyrosm.OSM reader over the extract
+    result.paths                          # the feed files
+    result.osm_pbf                        # the OpenStreetMap extract
+    network = result.to_cafein()          # a network to route on (needs cafein)
 
-What can I do with transitio?
-------------------------------
+Start with :doc:`installation` and the :doc:`quickstart`.
 
-- discover the GTFS feeds overlapping an area through the `Mobility Database
-  <https://mobilitydatabase.org/>`__ catalog, with or without an API token
-- pick the dataset version whose service range covers a given day, and
-  download it with checksum verification and a provenance sidecar
-- download the smallest single OpenStreetMap extract that contains the area,
-  from Geofabrik, BBBike or Movisda, and crop it to the area's bounding box
-  (via pyrosm)
-- validate GTFS feeds with a fast Rust core emitting the canonical
-  `gtfs-validator <https://github.com/MobilityData/gtfs-validator>`__ notice
-  codes, merged with the hosted canonical report where one exists
-- repair fixable defects under the `gtfstidy
-  <https://github.com/patrickbr/gtfstidy>`__ contract -- semantic equivalence
-  from the passenger's perspective, every fix logged
-- crop feeds spatially to the AOI and temporally to a service window, with
-  referential consistency maintained across all tables
-- hand the results straight to cafein or pyrosm
+What can you do with transitio?
+-------------------------------
 
-Validation runs in two mergeable tiers: the hosted canonical-validator
-report (one HTTP request) and the local Rust core (the routing-critical
-rule set under canonical notice codes). Every downloaded artefact carries a
-provenance sidecar -- feed, dataset, URL, checksum, retrieval timestamp --
-so a matrix computed downstream stays citable to the dataset version.
+- **Find places and their feeds.** Look up a city, metro area, region or
+  country by name and list the feeds that serve it, from local to
+  international. See :doc:`finding_places`.
+- **Choose the feeds to use.** ``recommend()`` considers the feeds that serve
+  a place, selects which to use and explains why it leaves the others out.
+  See :doc:`choosing_feeds`.
+- **Fetch the data.** Download the feeds for a place, a box or any polygon
+  and crop them to that area. Also download an OpenStreetMap extract of the
+  area. See :doc:`fetching_data`.
+- **Reuse downloads.** Every feed that ``fetch`` downloads is kept in a
+  cache. This lets the same analysis use the same feeds again, even offline.
+  See :doc:`download_cache`.
+- **Check, repair and edit feeds.** Validate any GTFS feed with the notice
+  codes of the canonical GTFS validator. Repair defects that can be fixed
+  without changing the trips riders see. Edit a feed with undo and redo. See
+  :doc:`working_with_feeds`.
+- **Crop and merge feeds.** Cut a feed to an area or a date range, merge
+  several feeds into one, or replace a feed's broken trips with those of
+  another. See :doc:`cropping_and_merging`.
+- **Build scenario feeds.** Turn routes drawn in a GIS tool and their
+  headways (how often they run) into a GTFS feed. See :doc:`building_feeds`.
+- **Search the catalogues.** Query the Mobility Database and download
+  OpenStreetMap extracts directly. See :doc:`catalogues`.
+- **Draw missing route shapes.** ``infer_shapes`` draws the shapes a feed
+  lacks from OpenStreetMap. See :doc:`reference`.
 
 License
 -------
 
-transitio is licensed under the MIT license. Timetable and street data are
-© their respective providers; all `OpenStreetMap
-<https://www.openstreetmap.org>`__ data is licensed under the `Open Database
-License <https://www.openstreetmap.org/copyright>`__.
+transitio is licensed under the MIT license. The feeds and OpenStreetMap data
+it downloads keep their own licenses. OpenStreetMap data is available under
+the `Open Database License <https://www.openstreetmap.org/copyright>`__. See
+:doc:`attribution`.
 
 .. toctree::
     :caption: Getting started
     :maxdepth: 1
+    :hidden:
 
     installation
     quickstart.ipynb
@@ -70,6 +83,7 @@ License <https://www.openstreetmap.org/copyright>`__.
 .. toctree::
     :caption: User guide
     :maxdepth: 1
+    :hidden:
 
     finding_places.ipynb
     choosing_feeds.ipynb
@@ -83,17 +97,13 @@ License <https://www.openstreetmap.org/copyright>`__.
 .. toctree::
     :caption: API reference
     :maxdepth: 1
+    :hidden:
 
     reference
 
 .. toctree::
     :caption: About
     :maxdepth: 1
+    :hidden:
 
     attribution
-
-Indices and tables
-==================
-
-* :ref:`genindex`
-* :ref:`search`
