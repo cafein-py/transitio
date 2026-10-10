@@ -694,9 +694,9 @@ def _gate(report, check, tables, table_sets, prefixes, positions, budgets):
             builder = FeedBuilder()
             builder.tables = source
             path = pathlib.Path(workdir, f"{name}.zip")
-            validations.append(
-                builder.save(path, check=False, change_log=False, **budgets)
-            )
+            # A zip only read back once: the fastest compression will do.
+            builder._write(path, compresslevel=1)
+            validations.append(_structure.validate_feed(path, **budgets))
             path.unlink()
             reasons = _structure._unreliable(validations[-1])
             if reasons:
