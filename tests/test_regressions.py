@@ -3600,3 +3600,40 @@ def test_trips_listed_per_date_are_matched_through_their_days(blocks):
     expected = {f"u{n}{half}" for n in range(first, 13) for half in "ab"}
     assert gone == (expected | {"x1a"} if blocks else expected)
     assert of == [0]
+
+
+def test_filling_and_clearing_the_cache_sweep_its_blobs_once(tmp_path, monkeypatch):
+    # Every download, and every feed or version clearing removed, listed and
+    # checked every blob: filling a cache with 3,000 feeds took 42 s and
+    # clearing it 38 s.
+    import datetime
+
+    import transitio.cache
+    from transitio._http import sha256_file
+    from transitio.catalog import _cache
+
+    sweeps, swept = [], _cache.FeedCache._swept
+
+    def counting(self):
+        sweeps.append(self)
+        return swept(self)
+
+    monkeypatch.setattr(_cache.FeedCache, "_swept", counting)
+    cache, blobs = _cache.FeedCache(tmp_path), tmp_path / "gtfs" / "blobs"
+    used = "2026-01-01T00:00:00+00:00"
+    for older_than in (datetime.timedelta(0), None):
+        for n in range(3):
+            with cache.staging(f"f{n}") as staging, cache.lock(f"f{n}"):
+                staged = staging / "download.zip"
+                with zipfile.ZipFile(staged, "w") as archive:
+                    archive.writestr("agency.txt", f"agency_id\n{n}\n")
+                source = {
+                    "source_url": f"https://example.org/{n}",
+                    "retrieved_at": used,
+                }
+                cache.publish(f"f{n}", staged, sha256_file(staged), {}, source)
+        assert not sweeps
+        assert transitio.cache.clear(tmp_path, older_than=older_than) > 0
+        assert len(sweeps) == 1
+        assert not blobs.exists() or not list(blobs.iterdir())
+        sweeps.clear()
