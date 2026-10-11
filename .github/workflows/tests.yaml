@@ -47,6 +47,14 @@ jobs:
         with:
           path: tests/data
           key: test-data-${{ hashFiles('scripts/fetch_test_data.py') }}
+      # The reference places read a published index snapshot: one job
+      # downloads it, with the place files it reads on demand.
+      - uses: actions/cache@v4
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        with:
+          path: tests/cache/reference-index
+          key: reference-index-${{ hashFiles('tests/data/reference_places.json') }}
+          restore-keys: reference-index-
       - run: python scripts/fetch_test_data.py
       - run: cargo test --workspace
       - run: pip install pytest pytest-cov
@@ -54,4 +62,5 @@ jobs:
       - run: pytest --cov=transitio --cov-report=term-missing
         env:
           TRANSITIO_REQUIRE_TEST_DATA: "1"
+          TRANSITIO_REFERENCE_PLACES: ${{ matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12' && '1' || '' }}
 
