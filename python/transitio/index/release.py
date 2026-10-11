@@ -4,7 +4,9 @@ Each snapshot is its own GitHub release in the index repository
 (``transitio-dev/transitio-index``, the home of the build, never the code
 repository), tagged ``index-<snapshot_id>``, holding the archive
 ``transitio-index-<snapshot_id>.tar.gz``, its ``.sha256`` and an immutable
-``manifest.json``. The transitio-index publisher writes them;
+``manifest.json``; from schema 12 the archive holds the core tables
+(``transitio-index-<snapshot_id>-core.tar.gz``) and each on-demand table is
+an asset of its own. The transitio-index publisher writes them;
 the refresh side lists releases and takes the newest one whose manifest
 declares a schema this reader supports. Both sides share the names, the
 selection rule and the HTTP helpers here, so they cannot drift apart.
@@ -23,6 +25,8 @@ __all__ = [
     "TAG_PREFIX",
     "MEMBERS",
     "archive_name",
+    "core_archive_name",
+    "part_asset_name",
     "release_tag",
     "is_snapshot_id",
     "compatible",
@@ -59,12 +63,21 @@ MEMBERS = (
 # lists (``<partition>/<table>.parquet``) and the NOTICE.
 PARTITION_NAME = re.compile(r"[A-Z]{2}|international|links")
 PARTITION_MEMBER = re.compile(
-    r"(?:[A-Z]{2}|international|links)/(?:feeds|realtime|places|edges)\.parquet"
+    r"(?:[A-Z]{2}|international|links)/"
+    r"(?:feeds|realtime|places|edges|boundaries|details)\.parquet"
 )
 TABLES = ("feeds", "realtime", "places", "edges")
+# From schema 12 the place boundaries and the edges' full evidence and
+# selectors sit in on-demand tables beside the core four, each paired with
+# the core table it extends.
+ON_DEMAND_TABLES = ("boundaries", "details")
+_ON_DEMAND_PAIRS = (("places", "boundaries"), ("edges", "details"))
 # ``international`` holds feeds and their companions only, ``links`` edges
-# only; the realtime table exists from schema 8.
-PARTITION_TABLES = {"international": {"feeds", "realtime"}, "links": {"edges"}}
+# (and their details) only; the realtime table exists from schema 8.
+PARTITION_TABLES = {
+    "international": {"feeds", "realtime"},
+    "links": {"edges", "details"},
+}
 # From schema 11 the archive also holds the credential providers' table at
 # its root.
 ACCESS_PROVIDERS_MEMBER = "access_providers.parquet"
@@ -75,7 +88,9 @@ def members(snapshot):
     the flat five before schema 7, else the snapshot, from schema 11 the
     providers table, every listed partition table and the NOTICE. A schema-7
     snapshot must list places and edges somewhere, as the flat contract
-    required them."""
+    required them. From schema 12 the archive holds the core tables only,
+    and each partition lists boundaries exactly where it lists places and
+    details exactly where it lists edges."""
     version = snapshot.get("schema_version")
     if not isinstance(version, int) or isinstance(version, bool) or version < 7:
         # A malformed version is the reader's to refuse; the members owed
@@ -85,12 +100,18 @@ def members(snapshot):
     if not isinstance(listing, dict) or not listing:
         raise ValueError("lists no partitions")
     known = set(TABLES) if version >= 8 else set(TABLES) - {"realtime"}
+    if version >= 12:
+        known |= set(ON_DEMAND_TABLES)
     for partition, tables in listing.items():
         if not isinstance(partition, str) or not PARTITION_NAME.fullmatch(partition):
             raise ValueError(f"names a partition outside the layout: {partition!r}")
         allowed = PARTITION_TABLES.get(partition, known) & known
         if not isinstance(tables, dict) or not tables or set(tables) - allowed:
             raise ValueError(f"lists tables outside the layout for {partition!r}")
+        for core, extra in _ON_DEMAND_PAIRS if version >= 12 else ():
+            if (core in tables) != (extra in tables):
+                listed, absent = (core, extra) if core in tables else (extra, core)
+                raise ValueError(f"lists {listed} without {absent} for {partition!r}")
     found = [
         f"{partition}/{table}.parquet"
         for partition, tables in sorted(listing.items())
@@ -104,6 +125,21 @@ def members(snapshot):
     return ["snapshot.json", *root, *found, "NOTICE"]
 
 
+def on_demand(snapshot):
+    """The on-demand members of a schema-12 snapshot, sorted, each released
+    as its own asset; none before schema 12."""
+    members(snapshot)
+    version = snapshot.get("schema_version")
+    if not isinstance(version, int) or isinstance(version, bool) or version < 12:
+        return []
+    return sorted(
+        f"{partition}/{table}.parquet"
+        for partition, tables in snapshot["partitions"].items()
+        for table in ON_DEMAND_TABLES
+        if table in tables
+    )
+
+
 _SNAPSHOT_ID = re.compile(r"[0-9a-f]{16}")
 
 
@@ -114,6 +150,14 @@ def is_snapshot_id(value):
 
 def archive_name(snapshot_id):
     return f"transitio-index-{snapshot_id}.tar.gz"
+
+
+def core_archive_name(snapshot_id):
+    return f"transitio-index-{snapshot_id}-core.tar.gz"
+
+
+def part_asset_name(snapshot_id, partition, table):
+    return f"transitio-index-{snapshot_id}-{partition}-{table}.parquet"
 
 
 def release_tag(snapshot_id):

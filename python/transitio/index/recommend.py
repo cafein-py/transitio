@@ -6,7 +6,7 @@ indexed, when its timetable as indexed does not run on the day, when it
 needs a paid account, or when the index measured no service for it.
 
 On an index that records which feeds run the same lines (each tier edge's
-``evidence["overlap"]``), the place's departures are counted once per mode
+``summary["overlap"]``), the place's departures are counted once per mode
 family, rail, subway and tram being one family, and feeds are taken one at
 a time. Each step takes the feed adding the most departures the taken feeds
 do not run, or among the feeds adding within ``SIZE_TOLERANCE`` of the
@@ -291,7 +291,7 @@ def _apart(feeds, blocks):
         if feed.feed_id not in blocks:
             continue
         for edge in feed.edges.values():
-            compared = ((edge.evidence or {}).get("overlap") or {}).get("compared")
+            compared = (edge.summary.get("overlap") or {}).get("compared")
             if not isinstance(compared, list):
                 continue
             listed = True
@@ -411,7 +411,7 @@ def _kept(feed):
         return f"contained in {', '.join(feed.contained_in)}"
     carriers = set()
     for edge in feed.edges.values():
-        carriers.update((edge.evidence or {}).get("carried_by") or {})
+        carriers.update(edge.summary.get("carried_by") or {})
     if carriers:
         return f"carried by {', '.join(sorted(carriers))}"
     return None

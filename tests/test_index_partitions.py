@@ -1,18 +1,33 @@
 """Schema 7: a partitioned index read whole, per country, and its links."""
 
+import gc
 import hashlib
 import json
 
+import httpx
 import pytest
 
 pytest.importorskip("geopandas")
 
+import numpy as np  # noqa: E402
+import pandas  # noqa: E402
+import pyarrow as pa  # noqa: E402
+import pyarrow.parquet as pq  # noqa: E402
+import shapely  # noqa: E402
 import transitio  # noqa: E402
 from transitio import index as reader  # noqa: E402
-from transitio.exceptions import IncompatibleIndexError  # noqa: E402
+from transitio.exceptions import (  # noqa: E402
+    DownloadError,
+    IncompatibleIndexError,
+    TransitioError,
+)
 from transitio.index import _refresh, release as contract  # noqa: E402
+from test_index_boundaries import BOUNDARIES  # noqa: E402
 from index_fixture import (  # noqa: E402
+    API,
     SNAPSHOT_ID,
+    SUMMARY_KEYS,
+    FakeGitHub,
     covered_feed,
     edge,
     pack,
@@ -675,3 +690,444 @@ def test_a_schema_9_index_carries_the_feed_spans_and_place_validity(tmp_path):
     staging = tmp_path / "staging"
     _unpack(assets[contract.archive_name(snapshot["snapshot_id"])], staging)
     assert reader.read_index(staging).schema_version == 9
+
+
+SHAPED_PLACES = [
+    {**record, "geometry": None if shape is None else shape.wkb_hex}
+    for record, shape in zip([*PLACES, place("esp", "city")], BOUNDARIES)
+]
+DETAILED_EDGES = [
+    {**EDGES[0], "evidence": {"share_of_place": 0.9, "overlap": {"compared": 2}}},
+    {**EDGES[1], "selector": {"route_id": ["r1"]}, "curation": {"by": "x"}},
+    *EDGES[2:],
+]
+
+
+def _split_index(directory, **kw):
+    return write_partitioned_index(
+        directory, feeds=FEEDS, places=SHAPED_PLACES, edges=DETAILED_EDGES, **kw
+    )
+
+
+def _released(directory, index):
+    """Give ``directory`` the release.json of the release ``index`` packs."""
+    manifest = json.loads(pack(index)[contract.MANIFEST_NAME])
+    record = _refresh._release_record("o/r", manifest["snapshot_id"], manifest["parts"])
+    (directory / "release.json").write_text(json.dumps(record))
+
+
+def _evidence(index, name):
+    """Each matched edge of the place's feeds: its evidence, selector and
+    summary."""
+    found = reader.place(name, index=index).feeds(categories=None, international=True)
+    return {
+        (feed.feed_id, tier): (edge.evidence, edge.selector, edge.summary)
+        for feed in found
+        for tier, edge in feed.edges.items()
+    }
+
+
+def test_a_schema_12_index_reads_its_on_demand_tables_when_used(tmp_path, monkeypatch):
+    monkeypatch.setattr(transitio, "__version__", reader.MIN_READER_VERSIONS[12])
+    eleven = reader.read_index(_split_index(tmp_path / "11", access={}))
+    directory = _split_index(tmp_path / "12", split=True).resolve()
+    twelve = reader.read_index(directory)
+    finland = reader.read_index(directory, country="FI")
+    assert twelve.schema_version == 12 and reader.check_index(directory) is None
+    # The core frames are schema 11's less the on-demand columns; read whole,
+    # as check_index reads them, they are schema 11's.
+    snapshot = json.loads((directory / "snapshot.json").read_text())
+    whole = reader._read_partitioned(directory, snapshot, 12, None, whole=True)
+    for table in ("places", "edges", "links"):
+        old, new = getattr(eleven, table), getattr(twelve, table)
+        joined = getattr(whole, table)
+        assert sorted(joined.columns) == sorted(old.columns)
+        pandas.testing.assert_frame_equal(joined[old.columns], old)
+        core = [column for column in old.columns if column in new.columns]
+        pandas.testing.assert_frame_equal(new[core], pandas.DataFrame(old[core]))
+    # A boundary is read from its partition when first asked for.
+    names = ["Helsinki", "Turku", "Tallinn", "esp"]
+    shapes = [
+        [reader.place(n, index=i).geometry for n in names] for i in (eleven, twelve)
+    ]
+    wkb = [shapely.to_wkb(np.array(found, dtype=object)).tolist() for found in shapes]
+    assert wkb[0] == wkb[1] and wkb[0][3] is None
+    assert reader.place("Helsinki", index=finland).geometry == shapes[0][0]
+    assert set(finland._partition_tables) == {("FI", "boundaries")}
+    box = shapely.box(22.0, 59.0, 27.0, 62.0)
+    for country in (None, "EE"):
+        found = [reader.area(box, country=country, index=i) for i in (eleven, twelve)]
+        parts = [[tuple(p) for p in area.parts] for area in found]
+        assert parts[0] == parts[1] and parts[0]
+        assert found[0].coverage == found[1].coverage
+    # Edges: evidence and selectors from the details, a domestic edge's from
+    # its country's, a cross-border one's from the links.
+    for name in ("Helsinki", "Turku"):
+        expected = _evidence(eleven, name)
+        assert _evidence(twelve, name) == expected == _evidence(finland, name)
+        for evidence, _, summary in expected.values():
+            evidence = evidence or {}
+            assert summary == {k: evidence[k] for k in SUMMARY_KEYS if k in evidence}
+    assert expected[("f-hsl", "regional")][1] == {"route_id": ["r1"]}
+    for wrong in (pa.string(), pa.float32()):
+        with pytest.raises(IncompatibleIndexError, match="'xmin' is .*, not float64"):
+            reader._check_types(pa.schema([("xmin", wrong)]), "places", "places")
+
+
+WKB = pa.chunked_array([[shapely.box(0, 0, 1, 1).wkb] * 3])
+
+
+def _rewritten(partition, table, change):
+    """Rewrite one table through ``change``, its listing kept consistent."""
+
+    def mutate(directory):
+        path = directory / partition / f"{table}.parquet"
+        rewritten = change(pq.read_table(path))
+        pq.write_table(rewritten, path)
+        data = path.read_bytes()
+        _listed(
+            lambda listing: listing[partition][table].update(
+                rows=rewritten.num_rows,
+                sha256=hashlib.sha256(data).hexdigest(),
+                bytes=len(data),
+            )
+        )(directory)
+
+    return mutate
+
+
+def _listed(change):
+    def mutate(directory):
+        path = directory / "snapshot.json"
+        snapshot = json.loads(path.read_text())
+        change(snapshot["partitions"])
+        path.write_text(json.dumps(snapshot))
+
+    return mutate
+
+
+def _null_key(table):
+    ids = table.column("place_id").to_pylist()
+    index = table.schema.get_field_index("place_id")
+    return table.set_column(index, "place_id", pa.array([None, *ids[1:]], pa.string()))
+
+
+def _null_flag(table):
+    index = table.schema.get_field_index("polygon")
+    return table.set_column(
+        index, "polygon", pa.array([None] * table.num_rows, pa.bool_())
+    )
+
+
+def _null_vertex(table):
+    index = table.schema.get_field_index("geometry")
+    shapes = table.column("geometry").to_pylist()
+    shapes[0][0][0][0] = None
+    field = table.schema.field("geometry")
+    return table.set_column(index, field, pa.array(shapes, field.type))
+
+
+def _geo(change):
+    """A table with its GeoParquet geometry metadata passed through
+    ``change``; None drops the metadata."""
+
+    def rewrite(table):
+        geo = json.loads(table.schema.metadata[b"geo"])
+        column = change(geo["columns"]["geometry"])
+        if column is None:
+            return table.replace_schema_metadata({})
+        geo["columns"]["geometry"] = column
+        return table.replace_schema_metadata({"geo": json.dumps(geo)})
+
+    return rewrite
+
+
+@pytest.mark.parametrize(
+    ("mutate", "refusal"),
+    [
+        (_rewritten("FI", "details", lambda t: t.slice(1)), "the edges rows one"),
+        (_rewritten("FI", "boundaries", lambda t: t.slice(1)), "the places rows one"),
+        (
+            _rewritten("FI", "details", lambda t: pa.concat_tables([t, t.slice(1)])),
+            "a key repeats",
+        ),
+        (
+            _rewritten("FI", "details", lambda t: t.drop_columns(["selector"])),
+            "details columns do not match",
+        ),
+        (
+            _rewritten(
+                "EE", "boundaries", lambda t: t.set_column(2, "polygon", [[True]])
+            ),
+            "more than one part",
+        ),
+        (
+            _rewritten("FI", "boundaries", lambda t: t.set_column(1, "geometry", WKB)),
+            "multipolygon layout",
+        ),
+        (_rewritten("FI", "details", _null_key), "key is null"),
+        (_rewritten("FI", "boundaries", _null_flag), "polygon flag is null"),
+        (_rewritten("FI", "boundaries", _null_vertex), "null part, ring or coordinate"),
+        (_rewritten("FI", "boundaries", _geo(lambda c: None)), "no GeoParquet"),
+        (
+            _rewritten(
+                "FI",
+                "boundaries",
+                _geo(
+                    lambda c: {**c, "crs": {"id": {"authority": "EPSG", "code": 3857}}}
+                ),
+            ),
+            "not in EPSG:4326",
+        ),
+        (_listed(lambda p: p["FI"]["places"].update(bytes=1)), "lists 1$"),
+        (_listed(lambda p: p["FI"]["places"].pop("bytes")), "outside the layout"),
+        (_listed(lambda p: p["FI"].pop("places")), "lists places and boundaries"),
+    ],
+    ids=[
+        "details",
+        "boundaries",
+        "repeat",
+        "columns",
+        "parts",
+        "layout",
+        "null key",
+        "null flag",
+        "null vertex",
+        "metadata",
+        "crs",
+        "bytes",
+        "unsized",
+        "apart",
+    ],
+)
+def test_a_schema_12_index_is_refused_when_its_parts_disagree(
+    tmp_path, monkeypatch, mutate, refusal
+):
+    monkeypatch.setattr(transitio, "__version__", reader.MIN_READER_VERSIONS[12])
+    directory = _split_index(tmp_path / "index", split=True)
+    mutate(directory)
+    with pytest.raises(IncompatibleIndexError, match=refusal):
+        reader.check_index(directory)
+
+
+def test_a_schema_12_release_packs_its_core(tmp_path, monkeypatch):
+    monkeypatch.setattr(transitio, "__version__", reader.MIN_READER_VERSIONS[12])
+    directory = _split_index(tmp_path / "index", split=True)
+    snapshot = json.loads((directory / "snapshot.json").read_text())
+    core = [
+        "snapshot.json",
+        "access_providers.parquet",
+        "EE/feeds.parquet",
+        "EE/places.parquet",
+        "EE/edges.parquet",
+        "FI/feeds.parquet",
+        "FI/places.parquet",
+        "FI/edges.parquet",
+        "international/feeds.parquet",
+        "links/edges.parquet",
+        "NOTICE",
+    ]
+    assert contract.members(snapshot) == core
+    assert contract.on_demand(snapshot) == [
+        "EE/boundaries.parquet",
+        "EE/details.parquet",
+        "FI/boundaries.parquet",
+        "FI/details.parquet",
+        "links/details.parquet",
+    ]
+    eleven = {"schema_version": 11, "partitions": {"FI": {"places": {}, "edges": {}}}}
+    assert contract.on_demand(eleven) == []
+    assert contract.core_archive_name(SNAPSHOT_ID) == (
+        "transitio-index-0123456789abcdef-core.tar.gz"
+    )
+    assert contract.part_asset_name(SNAPSHOT_ID, "FI", "details") == (
+        "transitio-index-0123456789abcdef-FI-details.parquet"
+    )
+    staging = tmp_path / "staging"
+    _unpack(pack(directory)[contract.core_archive_name(SNAPSHOT_ID)], staging)
+    assert not (staging / "FI" / "boundaries.parquet").exists()
+    # Whole once a release.json lists the on-demand files as released.
+    assert not _refresh._whole_members(staging)
+    _released(staging, directory)
+    assert _refresh._whole_members(staging)
+    # Only the snapshot's own release on GitHub: another URL, tag or a
+    # repository that is not ``owner/name`` makes the install damaged.
+    record = json.loads((staging / "release.json").read_text())
+    for change in (
+        {"url": "https://example.com/"},
+        {"tag": "index-feedfeedfeedfeed"},
+        {"repository": "o/..", "url": record["url"].replace("o/r", "o/..")},
+    ):
+        (staging / "release.json").write_text(json.dumps({**record, **change}))
+        assert not _refresh._whole_members(staging)
+    # A table listed without its partner, either way round, is refused.
+    for partition, table in (("FI", "places"), ("links", "details")):
+        del snapshot["partitions"][partition][table]
+        with pytest.raises(ValueError, match="without"):
+            contract.members(snapshot)
+        snapshot["partitions"][partition][table] = {}
+
+
+def test_a_schema_12_index_answers_from_its_core_alone(tmp_path, monkeypatch):
+    monkeypatch.setattr(transitio, "__version__", reader.MIN_READER_VERSIONS[12])
+    directory = _split_index(tmp_path / "index", split=True)
+    monkeypatch.setattr(_refresh, "_bundled_root", lambda: directory)
+    assert _refresh._bundled().snapshot_id == SNAPSHOT_ID
+    for table in ("boundaries", "details"):
+        for file in directory.glob(f"*/{table}.parquet"):
+            file.unlink()
+    # A bundle lacking its on-demand files is not used; read from its path,
+    # the index answers from its core.
+    assert _refresh._bundled() is None
+    index = reader.read_index(directory)
+    helsinki = reader.place("Helsinki", index=index)
+    assert reader.places("Helsinki", index=index) == [helsinki]
+    assert reader.suggest("hel", index=index)[0].place == helsinki
+    feeds = helsinki.feeds()
+    assert feeds.to_dataframe()["share_of_place"].tolist() == [0.9]
+    assert helsinki.recommend().to_dataframe()["feed_id"].tolist() == ["f-hsl"]
+    # An on-demand table the directory lacks is named when it is needed.
+    with pytest.raises(TransitioError, match="FI.boundaries.parquet: missing; the"):
+        helsinki.geometry
+    with pytest.raises(TransitioError, match="does not carry it"):
+        feeds[0].edges["local"].evidence
+
+
+def test_an_installed_snapshot_stays_while_anything_read_from_it_lives(
+    tmp_path, monkeypatch
+):
+    pytest.importorskip("fcntl")  # without shared locks nothing is pruned
+    monkeypatch.setattr(transitio, "__version__", reader.MIN_READER_VERSIONS[12])
+    monkeypatch.setattr(_refresh, "_state", {key: None for key in _refresh._state})
+    root = tmp_path / "cache"
+    old, new = f"{1:016x}", f"{2:016x}"
+    for snapshot_id in (old, new):
+        directory = root / "snapshots" / snapshot_id
+        _split_index(directory, split=True, snapshot_id=snapshot_id)
+        _released(directory, directory)
+
+    def held():
+        # Read through the selection, which is then cleared: only the
+        # place keeps the snapshot.
+        _refresh.use(old, cache_dir=root)
+        helsinki = reader.place("Helsinki")
+        _refresh.use(None)
+        return helsinki
+
+    helsinki = held()
+    assert _refresh._prune(root, 1, set()) == ([], [])
+    geometry = helsinki.geometry
+    evidence = helsinki.feeds()[0].edges["local"].evidence
+    assert geometry == BOUNDARIES[0] and evidence == DETAILED_EDGES[0]["evidence"]
+    del helsinki
+    gc.collect()
+    assert _refresh._prune(root, 1, set()) == ([old], [])
+
+
+def _install_split(tmp_path, monkeypatch, fake=None, parts=None, **kw):
+    """Release the schema-12 index into ``fake``, its manifest's ``parts``
+    passed through ``parts``, and refresh a private cache from it; returns
+    the fake and the cache."""
+    monkeypatch.setattr(transitio, "__version__", reader.MIN_READER_VERSIONS[12])
+    monkeypatch.setattr(_refresh, "_state", {key: None for key in _refresh._state})
+    fake = fake or FakeGitHub()
+    assets = pack(_split_index(tmp_path / "index", split=True))
+    if parts is not None:
+        manifest = json.loads(assets[contract.MANIFEST_NAME])
+        parts(manifest["parts"])
+        assets[contract.MANIFEST_NAME] = json.dumps(manifest).encode()
+    fake.seed(contract.release_tag(SNAPSHOT_ID), assets)
+    root = tmp_path / "cache"
+    _refresh.refresh(
+        repository="o/r",
+        api_url=API,
+        cache_dir=root,
+        transport=fake.transport(),
+        progress=False,
+        **kw,
+    )
+    return fake, root
+
+
+def _unreachable(request):
+    raise httpx.ConnectError("no route to host")
+
+
+@pytest.mark.parametrize("failure", [None, "corrupt", "offline"])
+def test_a_schema_12_release_installs_its_core_and_downloads_a_part_when_used(
+    tmp_path, monkeypatch, failure
+):
+    name = contract.part_asset_name(SNAPSHOT_ID, "FI", "boundaries")
+    fake = FakeGitHub(corrupt=name if failure == "corrupt" else None)
+    fake, root = _install_split(tmp_path, monkeypatch, fake)
+    directory = root / "snapshots" / SNAPSHOT_ID
+    fetched = [url.path for url in fake.requests if url.host == "objects.example"]
+    assert [path.rsplit("/", 1)[1] for path in fetched] == [
+        contract.MANIFEST_NAME,
+        contract.core_archive_name(SNAPSHOT_ID),
+    ]
+    tag = contract.release_tag(SNAPSHOT_ID)
+    record = json.loads((directory / "release.json").read_text())
+    assert (record["repository"], record["tag"]) == ("o/r", tag)
+    assert record["url"] == f"https://github.com/o/r/releases/download/{tag}/"
+    _refresh.use(SNAPSHOT_ID, cache_dir=root)
+    helsinki = reader.place("Helsinki")
+    assert [feed.feed_id for feed in helsinki.feeds()] == ["f-hsl"]
+    fake.requests.clear()
+    if failure == "offline":
+        _refresh._state["transport"] = httpx.MockTransport(_unreachable)
+    if failure is not None:
+        refusal = r"FI.boundaries\.parquet: .*refresh\(everything=True\) downloads"
+        with pytest.raises(TransitioError, match=refusal):
+            helsinki.geometry
+        assert sorted(path.name for path in (directory / "FI").iterdir()) == [
+            "edges.parquet",
+            "feeds.parquet",
+            "places.parquet",
+        ]
+        return
+    # One download, then the local copy, for this index and a new one.
+    assert helsinki.geometry == BOUNDARIES[0]
+    assert [url.path for url in fake.requests if url.host == "github.com"] == [
+        f"/o/r/releases/download/{tag}/{name}"
+    ]
+    fake.requests.clear()
+    assert reader.place("Turku").geometry == BOUNDARIES[1]
+    again = _refresh._load(root, SNAPSHOT_ID)
+    assert reader.place("Turku", index=again).geometry == BOUNDARIES[1]
+    assert fake.requests == []
+
+
+def test_refresh_everything_downloads_every_on_demand_file(tmp_path, monkeypatch):
+    fake, root = _install_split(tmp_path, monkeypatch)
+    summary = _refresh.refresh(
+        repository="o/r",
+        api_url=API,
+        cache_dir=root,
+        transport=fake.transport(),
+        progress=False,
+        everything=True,
+    )
+    directory = root / "snapshots" / SNAPSHOT_ID
+    parts = contract.on_demand(json.loads((directory / "snapshot.json").read_text()))
+    assert summary["installed"] is False
+    assert all((directory / member).is_file() for member in parts)
+    assert len([url for url in fake.requests if url.host == "github.com"]) == 5
+    assert reader.check_index(directory) is None
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda parts: parts.pop("FI/details.parquet"),
+        lambda parts: parts["FI/details.parquet"].update(name="details.parquet"),
+        lambda parts: parts["FI/details.parquet"].update(sha256="0" * 64),
+    ],
+    ids=["missing", "name", "digest"],
+)
+def test_a_release_listing_its_on_demand_files_otherwise_is_refused(
+    tmp_path, monkeypatch, change
+):
+    with pytest.raises(DownloadError, match="does not list the snapshot's on-demand"):
+        _install_split(tmp_path, monkeypatch, parts=change)
+    assert _refresh.installed(cache_dir=tmp_path / "cache") == []

@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.24.0 — 2026-10-11
+
+### Added
+
+- `transitio.index.check_index(path)` reads every table of an index directory
+  with every check and raises `IncompatibleIndexError` at the first problem.
+- `transitio.index.refresh(everything=True)` downloads every on-demand file of
+  the snapshot in advance and checks the directory.
+
+### Changed
+
+- The index reader reads schema 12. A schema-12 release keeps place
+  boundaries and the edges' full evidence, selectors and curation in separate
+  files per country. `refresh()` installs only the core archive; a country's
+  boundaries or edge details are downloaded the first time a query needs them
+  (`Place.geometry`, `area()`, `fetch(aoi=...)`, `TierEdge.evidence` and
+  `selector`), checked against the snapshot's digests and kept with it.
+  Offline, such a query raises an error naming the file. Earlier transitio
+  versions skip schema-12 releases and install the newest schema-11 one.
+- Place boundaries are stored as GeoArrow multipolygons with their float64
+  coordinates unchanged: Germany's boundaries take 25.8 MB instead of 36.1 MB.
+- An index loaded from the cache keeps its snapshot from being pruned while
+  the index is in use.
+
 ## 0.23.0 — 2026-10-10
 
 ### Added
