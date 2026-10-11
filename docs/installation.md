@@ -56,6 +56,13 @@ needs it, and `fetch(aoi=...)` takes from it the feeds of the index places
 covering the area. Without an index, `fetch(aoi=...)` searches the Mobility
 Database catalogue by bounding box, with a warning.
 
+The refresh downloads the core of the index, about 70 MB. Two kinds of data
+come later, one country at a time, the first time a query needs them: the
+boundaries of the country's places, and the details of the links between its
+places and feeds. The first such query for a country therefore needs network
+access. To work offline, run `transitio.index.refresh(everything=True)`
+beforehand: it downloads these files for every country, about 295 MB more.
+
 ### Feed credentials
 
 Some feeds need a free account with their provider.
