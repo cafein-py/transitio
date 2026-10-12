@@ -247,19 +247,26 @@ def test_an_area_recommendation_sums_its_parts(tmp_path, monkeypatch):
             area.recommend(**wrong)
 
 
-def test_a_recommendation_considers_local_and_regional_feeds_unless_told(tmp_path):
-    # A national train feed, of which no local or regional feed runs a trip.
+def test_a_recommendation_considers_the_tiers_of_its_kind_of_place(tmp_path):
+    # A national train feed, of which no local or regional feed runs a trip,
+    # and a cross-border tram of its own.
     ice = {"name": "ICE", "tiers": ("national",), "modes": {"rail": 40}, "stops": 30}
-    index = munich_index(tmp_path, {**MUNICH, "f-ice": ice}, providers=PROVIDERS)
+    tram = {"name": "Tram", "modes": {"tram": 60}, "stops": 20, "cross_border": True}
+    feeds = {**MUNICH, "f-ice": ice, "f-tram": tram}
+    index = munich_index(tmp_path / "city", feeds, providers=PROVIDERS)
     munich = reader.place("muc", index=index)
     found = munich.recommend("2026-10-13")
     assert found.tiers == ("local", "regional")
-    assert found.feed_ids == ["f-tiny", "f-mvg", "f-mvv", "f-bw", "f-delfi"]
+    assert found.feed_ids == ["f-tiny", "f-mvg", "f-mvv", "f-bw", "f-delfi", "f-tram"]
     given = {c.feed.feed_id: c.reason for c in found.left_out}
     assert given["f-ice"] == "not considered: serves the place at the national tier"
     every = munich.recommend("2026-10-13", tiers=None)
     assert every.tiers is None and "f-ice" in every.feed_ids
     assert "considers" not in str(every)
+    # A region considers every tier by default.
+    index = munich_index(tmp_path / "region", feeds, providers=PROVIDERS, kind="region")
+    region = reader.place("muc", index=index).recommend("2026-10-13")
+    assert region.tiers is None and "f-ice" in region.feed_ids
     # Tiers left out by exclude are not said to be considered.
     local = munich.recommend("2026-10-13", exclude="regional")
     assert local.tiers == ("local",)
@@ -279,13 +286,13 @@ def test_a_recommendation_considers_local_and_regional_feeds_unless_told(tmp_pat
     least = munich.recommend("2026-10-13", target=0.95)
     assert least.feed_ids == ["f-tiny", "f-mvg", "f-mvv"]
     assert least.note == (
-        "the feeds taken reach the target of 95 % of the departures; 3 feeds are "
+        "the feeds taken reach the target of 95 % of the departures; 4 feeds are "
         "left out for it"
     )
     # A cap that stops short of the target says so, not that nothing adds more.
     short = munich.recommend("2026-10-13", target=0.95, max_feeds=2)
     assert short.note == (
-        "at most 2 feeds are taken; 5 feeds are left out for it; the feeds taken "
+        "at most 2 feeds are taken; 6 feeds are left out for it; the feeds taken "
         "cover 92 % of the departures, short of 95 % of them"
     )
     # Without overlap evidence a cap is said as well.

@@ -451,7 +451,7 @@ class Place:
         self,
         when=None,
         *,
-        tiers=("local", "regional"),
+        tiers="default",
         exclude=None,
         target=None,
         max_feeds=None,
@@ -460,12 +460,13 @@ class Place:
         None), and why the others are left out, as a
         :class:`~transitio.index.Recommendation`; ``print()`` it to read it.
 
-        The candidates are the feeds serving the place at ``tiers``, local
-        and regional by default, together with those of unknown tier, whatever
-        their category; ``tiers=None`` takes every tier, national and
-        international included, and ``exclude`` drops tiers as in
-        :meth:`feeds`. A feed serving the place at other tiers only is listed
-        as not considered. A candidate is left out when it was
+        The candidates are the feeds serving the place at ``tiers``, together
+        with those of unknown tier, whatever their category and cross-border
+        ones included: by default local and regional feeds at a city or a
+        metro, and every tier at a region or a country. ``tiers`` names the
+        tiers instead, ``tiers=None`` takes every tier, and ``exclude`` drops
+        tiers as in :meth:`feeds`; a feed serving the place at other tiers
+        only is listed as not considered. A candidate is left out when it was
         stale when indexed, when its timetable as indexed does not run on the
         day, when it needs a paid account, or when it adds no departure the
         feeds taken before it do not run. The candidates are taken the most
@@ -559,14 +560,16 @@ class Area:
         self,
         when=None,
         *,
-        tiers=("local", "regional"),
+        tiers="default",
         exclude=None,
         target=None,
         max_feeds=None,
     ):
         """Which of the feeds serving the area's parts to use on ``when``,
         as :meth:`Place.recommend` answers for a place, each feed's
-        departures and the shares other feeds run summed over the parts."""
+        departures and the shares other feeds run summed over the parts. By
+        default an area considers every tier when one of its parts is a
+        region or a country, else local and regional feeds."""
         from transitio.index.recommend import recommend_for
 
         return recommend_for(self, when, tiers, exclude, target, max_feeds)

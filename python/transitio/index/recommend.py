@@ -2,10 +2,12 @@
 
 :meth:`Place.recommend` and :meth:`Area.recommend` answer with a
 :class:`Recommendation`. They consider the feeds serving the place at the
-tiers asked for (local and regional by default); a feed serving it only at
-other tiers is listed as not considered. A feed is left out when it was
-stale when indexed, when its timetable as indexed does not run on the day,
-when it needs a paid account, or when the index measured no service for it.
+tiers asked for, cross-border ones included: by default local and regional
+ones (``DEFAULT_TIERS``) at a city or a metro, every tier at a region or a
+country. A feed serving the place only at other tiers is listed as not
+considered. A feed is left out when it was stale when indexed, when its
+timetable as indexed does not run on the day, when it needs a paid account,
+or when the index measured no service for it.
 
 The candidates are taken the most local first: the one whose coverage
 covers the smallest area, then the open one, the newer timetable and the
@@ -39,6 +41,7 @@ from transitio.index.feeds import (
     _unrun,
 )
 
+DEFAULT_TIERS = ("local", "regional")
 FAMILY_TARGET = 0.8
 FAMILY_SHARE = 0.01
 # A share of the place's departures below this is float residue: a feed
@@ -158,22 +161,41 @@ class Recommendation:
         )
 
 
+def _default_tiers(target):
+    """The tiers a place or an area considers by default: every tier (None)
+    at a region or a country, or an area with one among its parts, else
+    ``DEFAULT_TIERS``."""
+    from transitio.index.places import Place
+
+    places = [target] if isinstance(target, Place) else [p.place for p in target.parts]
+    if any(place.kind in ("region", "country") for place in places):
+        return None
+    return DEFAULT_TIERS
+
+
 def recommend_for(target, when, tiers, exclude, goal, max_feeds):
     """The :class:`Recommendation` for ``target``, a place or an area, from
-    the feeds serving it at ``tiers`` (every tier when None), listing those
-    serving it at other tiers only as not considered."""
-    if tiers is not None:
+    the feeds serving it at ``tiers`` (every tier when None, the kind of
+    place's own when ``"default"``), cross-border ones included, listing
+    those serving it at other tiers only as not considered."""
+    if isinstance(tiers, str) and tiers == "default":
+        tiers = _default_tiers(target)
+    elif tiers is not None:
         tiers = (tiers,) if isinstance(tiers, str) else tuple(tiers)
     if exclude is not None:
         exclude = (exclude,) if isinstance(exclude, str) else tuple(exclude)
     excluded = set(exclude or ())
-    feeds = target.feeds(tiers=tiers, exclude=exclude, categories=None)
+    feeds = target.feeds(
+        tiers=tiers, exclude=exclude, categories=None, international=True
+    )
     outside = []
     if tiers is not None:
         considered = {feed.feed_id for feed in feeds}
         outside = [
             feed
-            for feed in target.feeds(exclude=exclude, categories=None)
+            for feed in target.feeds(
+                exclude=exclude, categories=None, international=True
+            )
             if feed.feed_id not in considered
         ]
     if tiers is not None or excluded:

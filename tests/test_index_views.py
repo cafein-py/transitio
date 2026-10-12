@@ -462,11 +462,12 @@ def _around_munich(extent):
     return (11.58 - extent, 48.14 - extent, 11.58 + extent, 48.14 + extent)
 
 
-def munich_index(directory, feeds=MUNICH, *, overlap=True, providers=None):
-    """A schema-11 index of one city, ``muc``, served by ``feeds`` (specs as
-    in :data:`MUNICH`, an ``extent`` the half-width in degrees of a feed's
-    coverage around the city); ``overlap=False`` leaves out the overlap
-    evidence and the recorded staleness, as an index built before them."""
+def munich_index(directory, feeds=MUNICH, *, overlap=True, providers=None, kind="city"):
+    """A schema-11 index of one place of ``kind``, ``muc``, served by
+    ``feeds`` (specs as in :data:`MUNICH`, an ``extent`` the half-width in
+    degrees of a feed's coverage around the city, ``cross_border`` its edges'
+    flag); ``overlap=False`` leaves out the overlap evidence and the recorded
+    staleness, as an index built before them."""
     total = sum(sum(spec.get("modes", {}).values()) for spec in feeds.values())
     records, edges = [], []
     for feed_id, spec in feeds.items():
@@ -503,7 +504,15 @@ def munich_index(directory, feeds=MUNICH, *, overlap=True, providers=None):
             category = "primary" if tier == "local" else "secondary"
             edges.append(
                 {
-                    **_edge("muc", feed_id, tier, category, 0.5, service=service),
+                    **_edge(
+                        "muc",
+                        feed_id,
+                        tier,
+                        category,
+                        0.5,
+                        cross=spec.get("cross_border", False),
+                        service=service,
+                    ),
                     # The first tier's routes run all of the feed's service.
                     "evidence": evidence if n == 0 else {**evidence, "overlap": None},
                 }
@@ -511,7 +520,7 @@ def munich_index(directory, feeds=MUNICH, *, overlap=True, providers=None):
     path = write_partitioned_index(
         directory,
         feeds=records,
-        places=[place("muc", "city", country_code="DE", name="Munich")],
+        places=[place("muc", kind, country_code="DE", name="Munich")],
         edges=edges,
         contained={i: spec.get("contained", []) for i, spec in feeds.items()},
         access={"providers": MUNICH_PROVIDERS if providers is None else providers},
