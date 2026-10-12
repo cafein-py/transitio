@@ -1336,7 +1336,7 @@ def test_merge_leaves_out_the_feed_whose_stops_lie_in_another_time_zone(tmp_path
     output = tmp_path / "merged.zip"
     left = f"left out feed 0 (f1, {feeds[0]}): America/New_York, "
     with pytest.warns(UserWarning, match=re.escape(left + "stops in Pacific/Honolulu")):
-        report = merge_feeds(feeds, output, reference_date="20260601")
+        report = merge_feeds(feeds, output, timezones="skip", reference_date="20260601")
     assert report["skipped_feeds"] == [
         {
             "feed": 0,

@@ -87,9 +87,19 @@ _ID_COLUMNS = {
     "trips.txt": ("route_id", "service_id", "trip_id", "shape_id", "block_id"),
 }
 
-# Per-source-feed metadata that cannot describe a merger (feed_info) or
-# whose record references break under id renaming (translations).
-_DROPPED_TABLES = ("feed_info.txt", "translations.txt")
+# The table whose prefixed id a translations.txt record_id names, by its
+# table_name; stop_times rows are named by trip_id (record_sub_id is the
+# stop_sequence, kept as it is).
+_TRANSLATED = {
+    "agency": "agency.txt",
+    "stops": "stops.txt",
+    "routes": "routes.txt",
+    "trips": "trips.txt",
+    "stop_times": "trips.txt",
+    "pathways": "pathways.txt",
+    "levels": "levels.txt",
+    "attributions": "attributions.txt",
+}
 
 # UTC offsets reach from -12:00 to +14:00, so these margins take in every
 # zone's local service day.
@@ -164,10 +174,12 @@ def _backfill_agency(tables, prefix):
 def _prefix_feed(tables, prefix, dropped):
     out = {}
     for filename, table in tables.items():
-        if filename in _DROPPED_TABLES:
-            dropped.add(filename)
-            continue
         table = table.copy()
+        if filename == "translations.txt" and "record_id" in table.columns:
+            named = table.get("table_name", pd.Series("", index=table.index))
+            ids = table["record_id"]
+            mask = named.str.strip().isin(list(_TRANSLATED)) & (ids.str.strip() != "")
+            table.loc[mask, "record_id"] = prefix + ":" + ids[mask]
         for column in _ID_COLUMNS.get(filename, ()):
             if column not in table.columns:
                 continue
@@ -177,6 +189,41 @@ def _prefix_feed(tables, prefix, dropped):
         out[filename] = table
     _backfill_agency(out, prefix)
     return out
+
+
+def _one_feed_info(tables, position, infos):
+    """The input ``tables`` at ``position`` as the merge keeps them, with
+    ``infos`` every input's feed_info.txt (None without one): the first
+    input with a feed_info.txt row keeps it, its ``feed_start_date`` and
+    ``feed_end_date`` widened to every input's when each declares them,
+    else blank, and ``feed_version`` kept when every input declares the
+    same, else blank; the others lose theirs and their feed_info
+    translations, as every input does when none has a row."""
+    found = [n for n, info in enumerate(infos) if info is not None and len(info)]
+    tables = dict(tables)
+    if not found or position != found[0]:
+        tables.pop("feed_info.txt", None)
+        translations = tables.get("translations.txt")
+        if translations is not None and "table_name" in translations.columns:
+            own = translations["table_name"].str.strip() != "feed_info"
+            tables["translations.txt"] = translations[own]
+        return tables
+
+    def first(info, column):
+        if info is None or not len(info) or column not in info.columns:
+            return ""
+        return str(info[column].iloc[0]).strip()
+
+    row = infos[position].iloc[[0]].copy()
+    for column, pick in (("feed_start_date", min), ("feed_end_date", max)):
+        dates = [first(info, column) for info in infos]
+        if column in row.columns:
+            row[column] = pick(dates) if all(dates) else ""
+    versions = {first(info, "feed_version") for info in infos}
+    if "feed_version" in row.columns:
+        row["feed_version"] = versions.pop() if len(versions) == 1 else ""
+    tables["feed_info.txt"] = row.reset_index(drop=True)
+    return tables
 
 
 def _normalise_networks(tables):
@@ -207,9 +254,12 @@ def merge_tables(
     never collide and the original id is recoverable at the first
     ``:``. Per filename, rows are concatenated in input order over the
     union of columns (missing columns fill with ``""``).
-    ``feed_info.txt`` and ``translations.txt`` are dropped (they
-    describe one source feed and cannot survive id renaming); GTFS-Flex
-    feeds are refused. Two residuals are documented rather than
+    ``translations.txt`` rows are kept, a ``record_id`` naming a prefixed
+    id prefixed too and rows repeated across inputs kept once;
+    ``feed_info.txt`` keeps one row (:func:`_one_feed_info`): the first
+    input's that has one, its dates widened to every input's when each
+    declares them, its ``feed_version`` kept when every input declares the
+    same. GTFS-Flex feeds are refused. Two residuals are documented rather than
     handled: nonstandard columns pass through unprefixed (id references
     in them go stale), and wildcard fare scopes — blank optional
     selectors in fare tables, or a fare with no ``fare_rules`` rows —
@@ -233,8 +283,8 @@ def merge_tables(
     year after. An unknown name is equivalent only to itself. The
     merged ``agency.txt`` then uses the name most inputs declare (ties:
     the earliest input's) for every agency; ``stop_timezone`` is kept.
-    :func:`merge_feeds` leaves out the inputs of another time zone instead
-    by default.
+    :func:`merge_feeds` raises as well by default, and with
+    ``timezones="skip"`` leaves out the inputs of another time zone.
 
     Parameters
     ----------
@@ -354,12 +404,19 @@ def _merge_tables(
     for tables, extras, prefix in zip(table_sets, extra_entries, prefixes):
         dropped.update(extras)
         prefixed.append(_prefix_feed(tables, prefix, dropped))
-        for filename, table in prefixed[-1].items():
+    infos = [tables.get("feed_info.txt") for tables in prefixed]
+    for position, tables in enumerate(prefixed):
+        for filename, table in _one_feed_info(tables, position, infos).items():
             parts.setdefault(filename, []).append(table)
     merged = {
         filename: pd.concat(tables, ignore_index=True).fillna("")
         for filename, tables in parts.items()
     }
+    if "translations.txt" in merged:
+        # A translation by field value repeats across inputs.
+        merged["translations.txt"] = merged["translations.txt"].drop_duplicates(
+            ignore_index=True
+        )
     _normalise_networks(merged)
     if aliases:
         agency = merged["agency.txt"]
@@ -767,7 +824,7 @@ def merge_feeds(
     *,
     prefixes=None,
     check=True,
-    timezones="skip",
+    timezones="refuse",
     duplicate_trips="drop",
     **budgets,
 ):
@@ -808,9 +865,12 @@ def merge_feeds(
         when one applies, the budget. Unless
         ``check`` is ``False``, the tables of in-memory inputs are copied
         first, so the merge holds them twice.
-    timezones : {"skip", "refuse"}, default "skip"
+    timezones : {"refuse", "skip"}, default "refuse"
         Feeds declaring ``agency_timezone`` names that are not equivalent
-        (see :func:`merge_tables`) cannot share one dataset. ``"skip"``
+        (see :func:`merge_tables`) cannot share one dataset. ``"refuse"``
+        raises :class:`~transitio.exceptions.InvalidFeedError` (also a
+        ``ValueError``) naming each input with its zones, by position,
+        prefix and path. ``"skip"``
         leaves out, with a ``UserWarning``, the feeds whose time zone is
         not equivalent to the common one and merges the rest, each keeping
         the prefix it had among all the inputs, even when one feed is left.
@@ -819,9 +879,6 @@ def merge_feeds(
         common zone is the one most feeds vouch for, then the one most
         feeds declare, then the earliest feed's, then the first by name.
         When every feed would be left out, it raises as ``"refuse"`` does.
-        ``"refuse"`` raises :class:`~transitio.exceptions.InvalidFeedError`
-        (also a ``ValueError``) naming each input with its zones, by
-        position, prefix and path.
     duplicate_trips : {"drop", "exact", "keep"}, default "drop"
         Whether to leave out the trips an input repeats, or nearly repeats
         (``"drop"``), from the inputs before it (see :func:`merge_tables`).
