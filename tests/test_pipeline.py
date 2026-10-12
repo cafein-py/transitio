@@ -1610,6 +1610,11 @@ AB, ABC = {**C, "routes": ("a", "b")}, {**C, "routes": ("a", "b", "c")}
 IN_C = {**F, "in": "C", "hours": (9,)}
 ADDS = f"+ similar to A but adds service on {DAY}"
 ON_DAY = {"when": DAY}
+# A feed the index marks private, skipped unless named.
+MARKED = (
+    "private or campus service, not considered: fetch takes it when named in feeds="
+)
+NAMED, ALL = {"feeds": ["A", "M"]}, {"A": "+", "M": "+"}
 # A trip half a minute after the 09:00 trip, which it nearly repeats.
 NEAR_NINE = {
     "trips.txt": "r1,wk,x\n",
@@ -1787,6 +1792,12 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
             {"duplicate_trips": "exact"},
             {"A": "+", "B": "+ 1 repeated trips of A left out (1)"},
         ),
+        (
+            {"A": C, "M": {**F, "hours": (15,), "mark": "private"}},
+            {},
+            {"A": "+", "M": f"- {MARKED}"},
+        ),
+        ({"A": C, "M": {**F, "hours": (15,), "mark": "private"}}, NAMED, ALL),
     ],
     ids=(
         "identical identical-overlapping-routes container-renewed "
@@ -1800,7 +1811,8 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
         "version-transfers versions-no-study-day placeholder-starting-later "
         "placeholder-under-stop-threshold placeholders-other-routes "
         "repeats-other-agency repeats-on-the-day repeats-not-every-date "
-        "repeats-other-time-zone repeats-kept repeats-exact"
+        "repeats-other-time-zone repeats-kept repeats-exact marked-skipped "
+        "marked-named"
     ).split(),
 )
 def test_fetch_delivers_one_copy_per_service(
@@ -1816,7 +1828,7 @@ def test_fetch_delivers_one_copy_per_service(
         # Nothing is compared, so no feed counts repeats.
         assert {e["duplicate_trips"] for e in result.selection} == {None}
     # A feed left out before download is never downloaded; every other is.
-    early = ("contained in", "unchanged since indexed")
+    early = ("contained in", "unchanged since indexed", "not considered")
     assert sorted(downloads) == sorted(
         e["feed_id"]
         for e in result.selection
@@ -1828,29 +1840,35 @@ def test_fetch_delivers_one_copy_per_service(
     assert sorted((tmp_path / "out").rglob("*.zip")) == sorted(paths)
 
 
-def _fetch_networks(tmp_path, monkeypatch, feeds, **options):
+def _fetch_networks(tmp_path, monkeypatch, specs, **options):
     """``(result, downloaded)``: a fetch of Q1757 into ``tmp_path / "out"``
-    over ``feeds``, ``{feed id: spec}`` in record order (the specs above),
+    over ``specs``, ``{feed id: spec}`` in record order (the specs above),
     with ``options``, and the ids of the feeds downloaded."""
     from transitio.catalog._atlas import TransitlandAtlas
 
     monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
     payloads, columns, edges, contained, renewed = {}, {}, {}, {}, set()
-    for feed_id, spec in feeds.items():
+    marks = {}
+    for feed_id, spec in specs.items():
         spec = dict(spec)
-        cut, containers, ended = (spec.pop(key, None) for key in ("cut", "in", "ended"))
+        cut, containers, ended, mark = (
+            spec.pop(key, None) for key in ("cut", "in", "ended", "mark")
+        )
         renewed.update([feed_id] if spec.pop("renewed", False) else [])
         payloads[feed_id] = _network(**spec)
         columns[feed_id] = {"etag": '"v1"'}
         if ended:
             columns[feed_id].update(service_start=ENDED[0], service_end=ENDED[1])
+        if mark:
+            marks[feed_id] = {"evidence": {"declared_level": "city", "mark": mark}}
         if cut:
             selector = {"route_id": cut.split()}
             fields = {"selector_state": "complete", "selector": selector}
             edges[feed_id] = _stamp_fingerprint([fields], payloads[feed_id])[0]
         if containers:
             contained[feed_id] = containers.split()
-    index = _partitioned_index(tmp_path, monkeypatch, columns, contained, edges)
+    fields = {f: {**marks.get(f, {}), **edges.get(f, {})} for f in {*marks, *edges}}
+    index = _partitioned_index(tmp_path, monkeypatch, columns, contained, fields)
     downloads = []
 
     def handler(request):

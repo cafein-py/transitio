@@ -5,10 +5,11 @@
 tiers asked for, cross-border ones included: by default local and regional
 ones (``DEFAULT_TIERS``) at a city or a metro, every tier at a region or a
 country. A feed serving the place only at other tiers is listed as not
-considered. A feed is left out when its timetable as indexed does not run
-on the day (the study day, else today), whether or not it was stale when
-indexed, when it needs a paid account, or when the index measured no service
-for it.
+considered, as is a feed the index marks as a private or campus service or
+an unofficial compilation. A feed is left out when its timetable as indexed
+does not run on the day (the study day, else today), whether or not it was
+stale when indexed, when it needs a paid account, or when the index measured
+no service for it.
 
 The candidates are taken the most local first: the one whose coverage
 covers the smallest area, then the open one, the newer timetable and the
@@ -34,6 +35,7 @@ import numbers
 from collections import namedtuple
 
 from transitio.index.feeds import (
+    MARKS,
     _access_note,
     _family_blocks,
     _percent,
@@ -386,6 +388,9 @@ def recommend(
 def _excluded(feed, day, blocks):
     """Why ``feed`` is no candidate on ``day``, or None: its timetable as
     indexed must run on the day, whether or not it was stale when indexed."""
+    if feed.mark is not None:
+        reason = "not considered: fetch takes it when named in feeds="
+        return f"{MARKS[feed.mark]}, {reason}"
     ended = feed.stale_when_indexed
     if ended is not None and ended < day:
         return f"stale when indexed: its timetable ended {ended}"

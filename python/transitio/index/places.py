@@ -468,7 +468,9 @@ class Place:
         metro, and every tier at a region or a country. ``tiers`` names the
         tiers instead, ``tiers=None`` takes every tier, and ``exclude`` drops
         tiers as in :meth:`feeds`; a feed serving the place at other tiers
-        only is listed as not considered. A candidate is left out when its
+        only is listed as not considered, as is a feed the index marks as a
+        private or campus service or an unofficial compilation (``fetch``
+        takes it when named in ``feeds=``). A candidate is left out when its
         timetable as indexed does not run on the day (a feed stale when
         indexed is a candidate for a day its timetable covers), when it needs
         a paid account, or when it adds no departure the feeds taken before

@@ -2339,7 +2339,10 @@ def fetch(
         or an object whose ``feed_ids`` attribute lists them. They are
         taken from every relevance category of the place, or of the area's
         places, not only the default view, and ``tiers``, ``exclude`` and
-        ``on_unknown`` still apply; ``selection`` lists only them. An id
+        ``on_unknown`` still apply; ``selection`` lists only them. Without
+        ``feeds``, a feed the index marks as a private or campus service or
+        an unofficial compilation is skipped (``"private or campus service,
+        not considered: …"``); named here, it is fetched. An id
         not indexed for the place, or not in the tiers asked, raises
         ``ValueError`` before anything is downloaded, as does an empty list.
     credentials : mapping, optional
@@ -3200,7 +3203,7 @@ def _fetch_place(
         _coerce_index,
         place as resolve_place,
     )
-    from transitio.index.feeds import _hosted_url
+    from transitio.index.feeds import MARKS, _hosted_url
     from transitio.index.places import _as_shape
     from transitio.osm._fetch import _buffered
 
@@ -3247,7 +3250,10 @@ def _fetch_place(
                 f"feeds= names feeds not indexed for {where}{asked}: "
                 f"{', '.join(sorted(missing))}"
             )
-    kept = _containers_first(offered) if contained == "drop" else offered
+    # A feed the index marks (private, a compilation) is fetched when named.
+    marked = set() if wanted is not None else {f.feed_id for f in offered if f.mark}
+    unmarked = [feed for feed in offered if feed.feed_id not in marked]
+    kept = _containers_first(unmarked) if contained == "drop" else unmarked
     # Credentials are checked and resolved before any download.
     explicit = {
         provider_id: _checked(_provider(provider_id, resolved_index), fields)
@@ -3480,7 +3486,10 @@ def _fetch_place(
             if feed.feed_id not in kept_ids:
                 _skip(entry, "only unknown-tier edges")
     for feed in offered:
-        entry_for(feed)
+        entry = entry_for(feed)
+        if feed.feed_id in marked:
+            reason = "not considered: fetch takes it when named in feeds="
+            _skip(entry, f"{MARKS[feed.mark]}, {reason}")
     view_note = None
     if tiers is None and wanted is None and not offered:
         # An empty default view may hide feeds a tier query would fetch.

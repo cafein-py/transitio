@@ -325,6 +325,36 @@ def test_a_feed_after_an_uncompared_one_adds_to_the_compared_feeds(tmp_path):
     )
 
 
+def test_a_feed_the_index_marks_is_not_considered(tmp_path):
+    uiuc = {"name": "UIUC", "modes": {"bus": 30}, "stops": 20}
+    feeds = {**MUNICH, "f-uiuc": {**uiuc, "evidence": {"mark": "compilation"}}}
+    munich = reader.place("muc", index=munich_index(tmp_path, feeds))
+    found = munich.recommend("2026-10-13")
+    assert {c.feed.feed_id: c.reason for c in found.left_out}["f-uiuc"] == (
+        "unofficial compilation, not considered: fetch takes it when named in " "feeds="
+    )
+    table = munich.feeds().to_dataframe().set_index("feed_id")
+    assert table["mark"].dropna().to_dict() == {"f-uiuc": "compilation"}
+    assert table.loc["f-uiuc", "reason"].endswith("; unofficial compilation")
+
+
+@pytest.mark.parametrize(
+    "marks, expected",
+    [
+        ((["x"], {"y": 1}, "other", None), None),
+        (([], "private"), "private"),
+    ],
+    ids=["unknown-values", "after-an-unknown-one"],
+)
+def test_a_mark_the_reader_does_not_know_counts_as_none(marks, expected):
+    from types import SimpleNamespace
+
+    from transitio.index.feeds import IndexedFeed
+
+    edges = {n: SimpleNamespace(summary={"mark": m}) for n, m in enumerate(marks)}
+    assert IndexedFeed.mark.fget(SimpleNamespace(edges=edges)) == expected
+
+
 def test_an_unreadable_coverage_orders_a_feed_last():
     from types import SimpleNamespace
 
