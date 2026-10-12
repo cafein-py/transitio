@@ -2384,20 +2384,21 @@ def test_a_failed_extract_download_keeps_the_fetched_feeds(
 
 
 _HIDDEN_NOTE = (
-    "default view (region: secondary, tertiary) holds none of the place's 1 feed:"
-    " f-bus (primary); tiers=['local'] fetches it"
+    "the local and regional tiers of a city hold none of the place's 1 feed: "
+    "f-bus (national); tiers=['national'] fetches it"
 )
 
 
 @pytest.mark.parametrize(
-    "bbox, note",
+    "kind, bbox, tier, note",
     [
-        pytest.param(CITY_BBOX, None, id="town-sized"),
-        pytest.param(WIDE_BBOX, _HIDDEN_NOTE, id="wide"),
+        pytest.param("region", CITY_BBOX, "local", None, id="town-sized"),
+        pytest.param("region", WIDE_BBOX, "local", None, id="wide"),
+        pytest.param("city", CITY_BBOX, "national", _HIDDEN_NOTE, id="city"),
     ],
 )
 def test_an_empty_default_view_is_not_fetched_silently(
-    tmp_path, monkeypatch, bbox, note
+    tmp_path, monkeypatch, kind, bbox, tier, note
 ):
     # A town-sized region or country (Monaco, San Juan) left its local-only
     # feeds out of the default view, and fetch(place=...) returned no feeds,
@@ -2425,10 +2426,8 @@ def test_an_empty_default_view_is_not_fetched_silently(
         "home_country": "FI",
         "scope": "domestic",
     }
-    region = place("r", "region", geometry=shapely.to_wkb(shapely.box(*bbox)).hex())
-    local = edge(
-        "r", "f-bus", tier="local", relevance_category="primary", relevance=0.9
-    )
+    region = place("r", kind, geometry=shapely.to_wkb(shapely.box(*bbox)).hex())
+    local = edge("r", "f-bus", tier=tier, relevance_category="primary", relevance=0.9)
     index = transitio_index.read_index(
         write_partitioned_index(
             tmp_path / "index", feeds=[feed], places=[region], edges=[local]
@@ -2452,8 +2451,13 @@ def test_an_empty_default_view_is_not_fetched_silently(
         (entry,) = result.selection
         assert (warned, calls, entry["decision"]) == ([], ["f-bus"], "delivered")
         return
-    assert (warned, calls, result.feeds) == ([note], [], [])
-    assert (result.selection, result.view_note) == ([], note)
+    assert (warned, calls, result.feeds, result.view_note) == ([note], [], [], note)
+    (entry,) = result.selection
+    assert (entry["decision"], entry["reason"]) == (
+        "skipped",
+        "not considered: serves the place at the national tier; fetch takes it "
+        "when named in feeds=",
+    )
 
 
 @pytest.mark.parametrize("osm", [True, False])

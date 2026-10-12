@@ -156,6 +156,14 @@ DEFAULT_CATEGORIES = {
 TOWN_MAX_KM2 = 1000.0
 
 
+def _names(value):
+    """A ``tiers=`` or ``exclude=`` value read once: None stays None, a string
+    is one name, any other iterable a tuple of its names."""
+    if value is None:
+        return None
+    return (value,) if isinstance(value, str) else tuple(value)
+
+
 def _relevance(value):
     try:
         number = float(value)

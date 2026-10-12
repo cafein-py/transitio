@@ -270,6 +270,10 @@ def test_a_recommendation_considers_the_tiers_of_its_kind_of_place(tmp_path):
     # Tiers left out by exclude are not said to be considered.
     local = munich.recommend("2026-10-13", exclude="regional")
     assert local.tiers == ("local",)
+    assert {c.feed.feed_id: c.reason for c in local.left_out}["f-bw"] == (
+        "not considered: serves the place at the regional tier, which exclude= "
+        "leaves out"
+    )
     for once in (iter(["regional"]), pandas.Index(["regional"])):
         assert str(munich.recommend("2026-10-13", exclude=once)) == str(local)
     assert str(munich.recommend("2026-10-13", tiers=iter(found.tiers))) == str(found)

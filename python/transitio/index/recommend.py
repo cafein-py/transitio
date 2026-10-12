@@ -38,6 +38,7 @@ from transitio.index.feeds import (
     MARKS,
     _access_note,
     _family_blocks,
+    _names,
     _percent,
     _summed_service,
     _universe,
@@ -183,22 +184,19 @@ def recommend_for(target, when, tiers, exclude, goal, max_feeds):
     those serving it at other tiers only as not considered."""
     if isinstance(tiers, str) and tiers == "default":
         tiers = _default_tiers(target)
-    elif tiers is not None:
-        tiers = (tiers,) if isinstance(tiers, str) else tuple(tiers)
-    if exclude is not None:
-        exclude = (exclude,) if isinstance(exclude, str) else tuple(exclude)
+    else:
+        tiers = _names(tiers)
+    exclude = _names(exclude)
     excluded = set(exclude or ())
     feeds = target.feeds(
         tiers=tiers, exclude=exclude, categories=None, international=True
     )
     outside = []
-    if tiers is not None:
+    if tiers is not None or excluded:
         considered = {feed.feed_id for feed in feeds}
         outside = [
             feed
-            for feed in target.feeds(
-                exclude=exclude, categories=None, international=True
-            )
+            for feed in target.feeds(categories=None, international=True)
             if feed.feed_id not in considered
         ]
     if tiers is not None or excluded:
@@ -260,7 +258,9 @@ def recommend(
             candidates.append(feed)
         else:
             left_out.append(Choice(feed, _with_access(feed, reason), None))
-    left_out += [Choice(f, _with_access(f, _not_considered(f)), None) for f in outside]
+    left_out += [
+        Choice(f, _with_access(f, _not_considered(f, excluded)), None) for f in outside
+    ]
     blocks = {f.feed_id: blocks[f.feed_id] for f in candidates if f.feed_id in blocks}
     apart = _apart(candidates, blocks)
     blocks = {i: block for i, block in blocks.items() if i not in apart}
@@ -643,13 +643,15 @@ def _considered(tiers, excluded=()):
     return line
 
 
-def _not_considered(feed):
-    """Why a feed serving the place at other tiers only is left out."""
+def _not_considered(feed, excluded=()):
+    """Why a feed serving the place at other tiers only is left out, saying
+    so when ``exclude`` left out every one of them."""
     tiers = {edge.tier for edge in feed.edges.values()}
-    return (
+    reason = (
         f"not considered: serves the place at the {_tier_words(tiers)} "
         f"tier{'' if len(tiers) == 1 else 's'}"
     )
+    return reason + (", which exclude= leaves out" if tiers <= set(excluded) else "")
 
 
 def _with_access(feed, reason):
