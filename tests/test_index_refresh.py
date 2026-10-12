@@ -84,6 +84,7 @@ def test_refresh_installs_the_published_snapshot_and_queries_read_it(tmp_path):
         "installed": True,
         "skipped": [],
         "removed": [],
+        "removed_bytes": {},
         "leftover": [],
     }
     root = client.cache_root()
@@ -266,7 +267,7 @@ def test_nothing_installed_says_to_refresh():
         transitio_index.place("Q1757")
 
 
-def test_the_cache_keeps_the_newest_three_and_the_pinned_one(tmp_path):
+def test_the_cache_keeps_the_newest_and_the_pinned_one(tmp_path, monkeypatch):
     root = client.cache_root()
     for n in range(1, 6):
         snapshot_id = f"{n:016x}"
@@ -280,10 +281,16 @@ def test_the_cache_keeps_the_newest_three_and_the_pinned_one(tmp_path):
     held = open(client._lock_file(root, f"{2:016x}"), "a+b")
     fcntl.flock(held.fileno(), fcntl.LOCK_SH)
     try:
-        assert client._prune(root, 3, {f"{1:016x}"}) == ([], [])
+        assert client._prune(root, 3, {f"{1:016x}"})[:2] == ([], [])
     finally:
         held.close()
-    assert client._prune(root, 3, {f"{1:016x}"}) == ([f"{2:016x}"], [])
+    # keep=None removes nothing.
+    assert client._prune(root, None, set()) == ([], [], {})
+    # A tree that cannot be read has no size.
+    assert client._tree_bytes(root / "absent") is None
+    size = len((root / "snapshots" / f"{2:016x}" / "snapshot.json").read_bytes())
+    removed = ([f"{2:016x}"], [], {f"{2:016x}": size})
+    assert client._prune(root, 3, {f"{1:016x}"}) == removed
     assert not list(root.glob("snapshots/.removed-*"))
     assert [s for s, _ in client.installed()] == [
         f"{5:016x}",
@@ -291,6 +298,65 @@ def test_the_cache_keeps_the_newest_three_and_the_pinned_one(tmp_path):
         f"{3:016x}",
         f"{1:016x}",
     ]
+    # A snapshot that cannot be moved aside stays; the others still go.
+    replace = client.os.replace
+
+    def refused(source, target):
+        if str(source).endswith(f"{3:016x}"):
+            raise OSError("busy")
+        return replace(source, target)
+
+    monkeypatch.setattr(client.os, "replace", refused)
+    assert client._prune(root, 1, set())[0] == [f"{4:016x}", f"{1:016x}"]
+    assert [s for s, _ in client.installed()] == [f"{5:016x}", f"{3:016x}"]
+
+
+def test_refresh_reports_what_it_removes_and_installs_a_named_snapshot(
+    tmp_path, monkeypatch
+):
+    fake, snapshot_id = _published(tmp_path)
+    root = client.cache_root()
+    sizes = {}
+    for n in (1, 2):
+        old = root / "snapshots" / f"{n:016x}"
+        old.mkdir(parents=True)
+        body = json.dumps({"snapshot_id": f"{n:016x}", "built_at": f"2000-01-0{n}"})
+        (old / "snapshot.json").write_text(body)
+        sizes[f"{n:016x}"] = len(body)
+    with pytest.warns(UserWarning) as caught:
+        summary = _refresh(fake, keep=1)
+    removed = [f"{2:016x}", f"{1:016x}"]
+    assert (summary["removed"], summary["removed_bytes"]) == (removed, sizes)
+    assert str(caught[0].message) == (
+        f"refresh removed 2 older snapshots to keep the newest 1: {removed[0]} "
+        f"(0 MB), {removed[1]} (0 MB); refresh(keep=None) keeps every snapshot, "
+        "and refresh(snapshot=...) installs one again"
+    )
+    # A named snapshot is installed from its own release, not the newest; an
+    # unknown one is refused.
+    older = release(
+        fake, write_index(tmp_path / "older", snapshot_id="00000000000000aa")
+    )
+    fake.requests.clear()
+    # Read by its tag, also when the listing's first page lacks it.
+    monkeypatch.setattr(contract, "list_releases", lambda *a: [])
+    named = _refresh(fake, snapshot=older)
+    assert (named["snapshot_id"], named["installed"]) == (older, True)
+    fetched = " ".join(str(url) for url in fake.requests)
+    assert contract.archive_name(older) in fetched
+    assert contract.archive_name(snapshot_id) not in fetched
+    with pytest.raises(DownloadError, match="0000000000000000 is not published"):
+        _refresh(fake, snapshot="0000000000000000")
+    with pytest.raises(ValueError, match="not a snapshot id"):
+        _refresh(fake, snapshot="../releases")
+    # A release whose manifest names another snapshot is refused.
+    newest = contract.release_tag(snapshot_id)
+    (forged,) = [r for r in fake.releases.values() if r["tag_name"] == newest]
+    wanted = "00000000000000bb"
+    forged = {**forged, "tag_name": contract.release_tag(wanted)}
+    monkeypatch.setattr(contract, "release_by_tag", lambda *a: forged)
+    with pytest.raises(IncompatibleIndexError, match="names another snapshot"):
+        _refresh(fake, snapshot=wanted)
 
 
 def test_an_archive_that_expands_past_the_ceiling_is_refused(tmp_path, monkeypatch):
