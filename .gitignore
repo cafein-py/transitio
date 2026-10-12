@@ -23,6 +23,8 @@ tests/data/*
 !tests/data/helsinki-transit.osm.pbf
 !tests/data/helsinki-transit-gap.osm.pbf
 !tests/data/helsinki-transit-missing.osm.pbf
+# ...and the reference places' expected feeds.
+!tests/data/reference_places.json
 cache/
 
 # Sphinx build artifacts (docs/api holds generated autosummary stubs)
