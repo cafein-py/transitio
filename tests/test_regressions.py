@@ -2796,11 +2796,12 @@ def test_the_munich_feeds_are_told_apart(tmp_path, monkeypatch):
     assert table.loc["f-urban", "repeats"] == "f-delfi 100 %, f-mvv 99 %"
 
 
-def test_munich_takes_one_feed_and_says_why_it_leaves_out_the_rest(
+def test_munich_takes_its_own_feeds_first_and_says_why_it_leaves_out_the_rest(
     tmp_path, monkeypatch
 ):
-    # Munich's view listed ten feeds and nothing said which to use: MVV alone
-    # runs nearly all of the city's service, its S-Bahn typed as tram.
+    # Munich's view listed ten feeds and nothing said which to use: the city's
+    # own feeds come first, MVV adds what MVG lacks (its S-Bahn typed as
+    # tram), and the aggregates add the little both lack.
     import transitio
     import transitio.index as transitio_index
     from test_index_views import munich_index
@@ -2810,23 +2811,25 @@ def test_munich_takes_one_feed_and_says_why_it_leaves_out_the_rest(
     )
     munich = transitio_index.place("muc", index=munich_index(tmp_path))
     found = munich.recommend("2026-10-13")
-    assert found.feed_ids == ["f-mvv"]
+    assert found.feed_ids == ["f-tiny", "f-mvg", "f-mvv", "f-bw", "f-delfi"]
     assert str(found).splitlines() == [
-        "Munich (city), 2026-10-13: take 1 feed, covering about 98 % of the "
+        "Munich (city), 2026-10-13: take 5 feeds, covering about 100 % of the "
         "departures the index records there, each counted once",
-        "  + f-mvv: covers 98 % of the place's departures (98 % of bus; 98 % of "
-        "rail, subway and tram)",
-        "  - f-delfi (DELFI): repeats f-mvv (98 % of its departures); 550,396 "
-        "stops against 28,330",
-        "  - f-urban (Public Transport Germany): repeats f-mvv (99 % of its "
-        "departures); 674,929 stops against 28,330",
-        "  - f-mvg (MVG): repeats f-mvv (99 % of its departures); needs a free "
-        "account with MVG API",
+        "  considers local and regional feeds only, and those of unknown tier; "
+        "tiers=None adds national and international feeds",
+        "  + f-tiny (Tiny): covers 0.0074 % of the place's departures (0.010 % of "
+        "bus; 0 % of rail, subway and tram)",
+        "  + f-mvg (MVG): adds bus the feeds above lack: 95 % of the place's bus; "
+        "needs a free account with MVG API",
+        "  + f-mvv: adds rail, subway and tram the feeds above lack: 13 % of the "
+        "place's rail, subway and tram",
+        "  + f-bw (BW aggregate): adds bus the feeds above lack: 0.028 % of the "
+        "place's bus",
+        "  + f-delfi (DELFI): adds bus the feeds above lack: 1 % of the place's bus",
+        "  - f-urban (Public Transport Germany): repeats f-delfi (100 % of its "
+        "departures)",
         "  - f-rail (Regional Rail): repeats f-mvv (100 % of its departures); "
         "needs credentials the index has no details for",
-        "  - f-bw (BW aggregate): adds too little: 0.021 % of the place's "
-        "departures",
-        "  - f-tiny (Tiny): contained in f-bw",
         "  - f-old (MVV (old)): stale when indexed: its timetable ended 2026-07-31",
     ]
 
@@ -2846,12 +2849,14 @@ def test_a_feed_running_the_same_lines_less_often_does_not_replace_it(
     feeds = {
         "f-city": {
             "name": "City",
+            "extent": 0.2,
             "modes": {"bus": 1000},
             "stops": 500,
             "with": {"f-nat": {"bus": 1.0}},
         },
         "f-nat": {
             "name": "National",
+            "extent": 5.0,
             "modes": {"bus": 500, "rail": 100},
             "stops": 400,
             "with": {"f-city": {"bus": 1.0}},
@@ -2892,7 +2897,8 @@ def test_a_feed_running_the_same_lines_less_often_does_not_replace_it(
 
 def test_a_feed_measured_apart_is_not_counted_as_new_service(tmp_path, monkeypatch):
     # The merged index measured MVV's feed in another build than DELFI's, so
-    # neither named the other and MVV was taken as service DELFI lacks; a
+    # neither named the other and MVV was counted as service DELFI lacks. It
+    # is taken as a feed whose addition is unknown, outside the coverage; a
     # tram feed measured with DELFI and sharing no line still adds service.
     import transitio
     import transitio.index as transitio_index
@@ -2924,21 +2930,26 @@ def test_a_feed_measured_apart_is_not_counted_as_new_service(tmp_path, monkeypat
         ),
         "f-tram": spec("Tram", {"tram": 100}, 50, ["f-delfi", "f-mvg"]),
         "f-mvv": spec("MVV", {"bus": 900, "rail": 500}, 1000, []),
-        # Apart too, but contained in DELFI: left out for that.
+        # Apart too, though contained in DELFI: taken before it, as the more
+        # local feed.
         "f-sub": {**spec("Sub", {"bus": 20}, 10, []), "contained": ["f-delfi"]},
     }
     found = transitio_index.place("muc", index=munich_index(tmp_path, feeds)).recommend(
         "2026-10-13"
     )
-    assert found.feed_ids == ["f-delfi", "f-tram"]
-    reasons = {c.feed.feed_id: c.reason for c in found.left_out}
-    assert reasons["f-mvv"] == (
-        "not compared: the index measured it apart from the feeds taken"
+    assert found.feed_ids == ["f-sub", "f-tram", "f-mvg", "f-mvv", "f-delfi"]
+    assert found.coverage == pytest.approx(1.0)
+    reasons = {c.feed.feed_id: c.reason for c in found.taken + found.left_out}
+    apart = (
+        "not compared: the index measured it apart from the feeds compared, so "
+        "what it adds is unknown; fetch leaves out the trips it repeats of the "
+        "feeds before it"
     )
-    assert reasons["f-sub"] == "contained in f-delfi"
+    assert reasons["f-mvv"] == reasons["f-sub"] == apart
+    assert next(c for c in found.taken if c.feed.feed_id == "f-mvv").adds is None
     assert found.note == (
-        "the coverage leaves out 1 feed not compared with the others "
-        "(1,400 departures a day)"
+        "the coverage counts only the feeds compared; 2 feeds are taken without "
+        "comparison (1,420 departures a day)"
     )
 
 

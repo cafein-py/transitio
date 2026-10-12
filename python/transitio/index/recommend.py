@@ -1,25 +1,29 @@
 """Which of a place's feeds to use, and why the others are left out.
 
 :meth:`Place.recommend` and :meth:`Area.recommend` answer with a
-:class:`Recommendation`. A feed is left out first when it was stale when
-indexed, when its timetable as indexed does not run on the day, when it
-needs a paid account, or when the index measured no service for it.
+:class:`Recommendation`. They consider the feeds serving the place at the
+tiers asked for (local and regional by default); a feed serving it only at
+other tiers is listed as not considered. A feed is left out when it was
+stale when indexed, when its timetable as indexed does not run on the day,
+when it needs a paid account, or when the index measured no service for it.
 
-On an index that records which feeds run the same lines (each tier edge's
-``summary["overlap"]``), the place's departures are counted once per mode
-family, rail, subway and tram being one family, and feeds are taken one at
-a time. Each step takes the feed adding the most departures the taken feeds
-do not run, or among the feeds adding within ``SIZE_TOLERANCE`` of the
-place's departures of that, the open one with the fewest stops. It stops
-once the taken feeds cover ``TARGET`` of the departures and
-``FAMILY_TARGET`` of each family holding at least ``FAMILY_SHARE`` of them,
-when no feed adds ``MIN_GAIN``, or at ``MAX_FEEDS`` feeds; a taken feed
-adding less than ``MIN_GAIN`` beside the others is then dropped. A merged
-index measures overlap within each build only and lists, per block, the
-feeds its build compared (``compared``): the feeds are taken from the
-largest group measured together, and the others are not compared. On an
-index without overlap evidence the feed with the most departures is taken, or
-a smaller one within ``SIZE_TOLERANCE`` of them.
+The candidates are taken the most local first: the one whose coverage
+covers the smallest area, then the open one, the newer timetable and the
+fewer stops (:func:`_local_key`), so an operator's own feed comes before an
+aggregate repeating it and fetch, which keeps a trip in the first feed
+delivering it, keeps the operator's trips. On an index that records which
+feeds run the same lines (each tier edge's ``summary["overlap"]``), the
+place's departures are counted once per mode family, rail, subway and tram
+being one family, and each candidate is taken when it adds a departure the
+feeds taken before it do not run. A ``goal`` stops the selection once the
+taken feeds cover that share of the departures and ``FAMILY_TARGET`` of
+each family holding at least ``FAMILY_SHARE`` of them, and ``max_feeds``
+once that many are taken. A merged index measures overlap within each build
+only and lists, per block, the feeds its build compared (``compared``): the
+feeds are compared within the largest group measured together, and the
+feeds the index did not compare with them are taken as well, their trips
+repeated in the feeds before them being dropped when they are fetched. On an
+index without overlap evidence every feed is taken.
 """
 
 import math
@@ -35,12 +39,11 @@ from transitio.index.feeds import (
     _unrun,
 )
 
-TARGET = 0.95
 FAMILY_TARGET = 0.8
 FAMILY_SHARE = 0.01
-MIN_GAIN = 0.01
-SIZE_TOLERANCE = 0.02
-MAX_FEEDS = 4
+# A share of the place's departures below this is float residue: a feed
+# adding no more adds nothing.
+_NOTHING = 1e-9
 # A feed left out names a second taken feed running at least this much more
 # of its departures.
 _SECOND_FEED = 0.05
@@ -56,20 +59,33 @@ class Recommendation:
     ``taken`` and ``left_out`` hold a :class:`Choice` per feed: the
     :class:`~transitio.index.IndexedFeed`, the reason in words, and
     ``adds``, the share of the place's departures the feed adds to the
-    feeds taken before it (for a feed left out, to all of them), None where
-    it was not compared. ``coverage`` is the share of the place's
-    departures, each counted once, that the taken feeds run, and
+    compared feeds taken before it (for a feed left out, to all the compared
+    feeds taken), None where it was not compared. ``coverage`` is the share
+    of the place's departures, each counted once, that the taken feeds run, and
     ``coverage_by_family`` the same per mode family (``"rail"`` for rail,
     subway and tram), both counting only the feeds the index records overlap
     for. ``basis`` is ``"overlap"``, or ``"departures"`` on an index without
-    overlap evidence, where the coverages are None. ``note`` says when the
-    target is not reached, which feeds the coverage leaves out, or that the
-    index records no overlap.
+    overlap evidence, where the coverages are None. ``note`` says when a
+    ``target`` or ``max_feeds`` stopped the selection, which feeds were taken
+    without comparison, or that the index records no overlap. ``tiers`` are
+    the tiers whose feeds were considered, those asked for less those
+    excluded, None for every tier; a feed serving the place at other tiers
+    only is left out as not considered.
     ``str()`` gives the answer as lines of text.
     """
 
     def __init__(
-        self, place, when, taken, left_out, coverage, coverage_by_family, basis, note
+        self,
+        place,
+        when,
+        taken,
+        left_out,
+        coverage,
+        coverage_by_family,
+        basis,
+        note,
+        tiers=None,
+        excluded=(),
     ):
         self.place = place
         self.when = when
@@ -79,6 +95,8 @@ class Recommendation:
         self.coverage_by_family = coverage_by_family
         self.basis = basis
         self.note = note
+        self.tiers = None if tiers is None else tuple(tiers)
+        self._excluded = frozenset(excluded)
 
     @property
     def feed_ids(self):
@@ -107,21 +125,22 @@ class Recommendation:
 
     def __str__(self):
         head = _label(self.place) + (f", {self.when}" if self.when else "")
+        count = len(self.taken)
+        take = f"take {count} feed{'' if count == 1 else 's'}"
         if self.basis == "departures":
-            taken = [f"{c.feed.feed_id} ({c.reason})" for c in self.taken]
-            lines = [": ".join([head, self.note] + taken)]
+            lines = [f"{head}: {take}"]
         else:
-            count = len(self.taken)
             share = _percent(self.coverage)
             # "over 99 %" is a bound already, not an estimate.
             share = share if share.startswith("over") else f"about {share}"
             lines = [
-                f"{head}: take {count} feed{'' if count == 1 else 's'}, covering "
-                f"{share} of the departures the index records there, each "
-                "counted once"
+                f"{head}: {take}, covering {share} of the departures the index "
+                "records there, each counted once"
             ]
-            lines += [f"  {self.note}"] if self.note else []
-            lines += [f"  + {_named(c.feed)}: {c.reason}" for c in self.taken]
+        if self.tiers is not None:
+            lines.append(f"  {_considered(self.tiers, self._excluded)}")
+        lines += [f"  {self.note}"] if self.note else []
+        lines += [f"  + {_named(c.feed)}: {c.reason}" for c in self.taken]
         alike = {}
         for choice in self.left_out:
             alike.setdefault(choice.reason, []).append(choice.feed)
@@ -139,13 +158,58 @@ class Recommendation:
         )
 
 
-def recommend(target, feeds, when, *, goal=TARGET, max_feeds=MAX_FEEDS):
+def recommend_for(target, when, tiers, exclude, goal, max_feeds):
     """The :class:`Recommendation` for ``target``, a place or an area, from
-    its ``feeds`` on ``when`` (today when None); see
-    :meth:`~transitio.index.Place.recommend`."""
-    if not 0 < goal <= 1:
+    the feeds serving it at ``tiers`` (every tier when None), listing those
+    serving it at other tiers only as not considered."""
+    if tiers is not None:
+        tiers = (tiers,) if isinstance(tiers, str) else tuple(tiers)
+    if exclude is not None:
+        exclude = (exclude,) if isinstance(exclude, str) else tuple(exclude)
+    excluded = set(exclude or ())
+    feeds = target.feeds(tiers=tiers, exclude=exclude, categories=None)
+    outside = []
+    if tiers is not None:
+        considered = {feed.feed_id for feed in feeds}
+        outside = [
+            feed
+            for feed in target.feeds(exclude=exclude, categories=None)
+            if feed.feed_id not in considered
+        ]
+    if tiers is not None or excluded:
+        named = _TIER_ORDER[:4] if tiers is None else tiers
+        tiers = tuple(tier for tier in named if tier not in excluded)
+    return recommend(
+        target,
+        feeds,
+        when,
+        goal=goal,
+        max_feeds=max_feeds,
+        tiers=tiers,
+        outside=outside,
+        excluded=excluded,
+    )
+
+
+def recommend(
+    target,
+    feeds,
+    when,
+    *,
+    goal=None,
+    max_feeds=None,
+    tiers=None,
+    outside=(),
+    excluded=(),
+):
+    """The :class:`Recommendation` for ``target``, a place or an area, from
+    its ``feeds`` on ``when`` (today when None): the feeds at the ``tiers``
+    considered (every tier when None), with ``outside`` the feeds serving it
+    at other tiers only and ``excluded`` the tiers left out by ``exclude``;
+    see :meth:`~transitio.index.Place.recommend`."""
+    if goal is not None and not 0 < goal <= 1:
         raise ValueError(f"target must be above 0 and at most 1, not {goal!r}")
-    if (
+    if max_feeds is not None and (
         isinstance(max_feeds, bool)
         or not isinstance(max_feeds, numbers.Integral)
         or max_feeds < 1
@@ -171,24 +235,94 @@ def recommend(target, feeds, when, *, goal=TARGET, max_feeds=MAX_FEEDS):
             candidates.append(feed)
         else:
             left_out.append(Choice(feed, _with_access(feed, reason), None))
+    left_out += [Choice(f, _with_access(f, _not_considered(f)), None) for f in outside]
     blocks = {f.feed_id: blocks[f.feed_id] for f in candidates if f.feed_id in blocks}
     apart = _apart(candidates, blocks)
     blocks = {i: block for i, block in blocks.items() if i not in apart}
+    order = sorted(candidates, key=_local_key)
     if not blocks:
-        taken, rest, note = _by_departures(candidates)
+        taken, rest, note = _without_overlap(order, max_feeds)
         left_out = _largest_first(rest) + _largest_first(left_out)
         return Recommendation(
-            target, when, taken, left_out, None, None, "departures", note
+            target,
+            when,
+            taken,
+            left_out,
+            None,
+            None,
+            "departures",
+            note,
+            tiers,
+            excluded,
         )
     universe = _universe(blocks)
     total = sum(universe.values())
     by_id = {feed.feed_id: feed for feed in candidates}
-    taken, capped = _greedy(blocks, universe, by_id, goal, max_feeds)
-    by_family = _covered(blocks, taken, universe)
+    compared, chosen, rest, uncompared = [], [], [], []
+    reached = False
+    capped = targeted = 0
+    for feed in order:
+        block = blocks.get(feed.feed_id)
+        full = max_feeds is not None and len(chosen) >= max_feeds
+        stopped = (
+            "the feeds taken reach the target without it"
+            if reached
+            else f"at most {_feeds_are(max_feeds)} taken"
+        )
+        if block is None:
+            why = (
+                "the index measured it apart from the feeds compared"
+                if feed.feed_id in apart
+                else "the index records no overlap for it"
+            )
+            if reached or full:
+                targeted, capped = targeted + reached, capped + (not reached)
+                reason = f"not compared: {why}; {stopped}"
+                rest.append(Choice(feed, _with_access(feed, reason), None))
+                continue
+            reason = (
+                f"not compared: {why}, so what it adds is unknown; fetch leaves out "
+                "the trips it repeats of the feeds before it"
+            )
+            chosen.append(Choice(feed, _with_access(feed, reason), None))
+            uncompared.append(feed)
+            continue
+        adds = sum(_unrun(block, compared).values()) / total
+        if adds <= _NOTHING:
+            stops = [by_id[i].stop_count for i in compared]
+            stops = None if None in stops else sum(stops)
+            reason = _repeats(feed, block, compared, stops)
+            rest.append(Choice(feed, _with_access(feed, reason), adds))
+            continue
+        if reached or full:
+            targeted, capped = targeted + reached, capped + (not reached)
+            reason = f"adds {_percent(adds)} of the place's departures; {stopped}"
+            rest.append(Choice(feed, _with_access(feed, reason), adds))
+            continue
+        compared.append(feed.feed_id)
+        chosen.append(
+            _taken_choice(
+                by_id, blocks, compared, len(compared) - 1, universe, bool(uncompared)
+            )
+        )
+        if goal is not None:
+            by_family = _covered(blocks, compared, universe)
+            coverage = sum(by_family[f] * u for f, u in universe.items()) / total
+            reached = _reached(by_family, coverage, universe, goal)
+    by_family = _covered(blocks, compared, universe)
     coverage = sum(by_family[f] * u for f, u in universe.items()) / total
-    reached = _reached(by_family, coverage, universe, goal)
-    note = None
-    if not reached:
+    notes = []
+    if capped:
+        notes.append(
+            f"at most {_feeds_are(max_feeds)} taken; {_feeds_are(capped)} left out "
+            "for it"
+        )
+    if targeted:
+        notes.append(
+            f"the feeds taken reach the target of {_percent(goal)} of the "
+            f"departures; {_feeds_are(targeted)} left out for it"
+        )
+    elif goal is not None and not reached:
         short = [f for f in _families(universe) if by_family[f] < FAMILY_TARGET]
         missing = (
             f"{_percent(goal)} of them"
@@ -196,58 +330,33 @@ def recommend(target, feeds, when, *, goal=TARGET, max_feeds=MAX_FEEDS):
             else f"{_percent(FAMILY_TARGET)} of "
             + " and of ".join(_FAMILY_WORDS.get(f, f) for f in short)
         )
-        why = (
-            f"at most {max_feeds} feed{' is' if max_feeds == 1 else 's are'} taken"
-            if capped
-            else f"no other feed adds {_percent(MIN_GAIN)} of the departures"
-        )
-        note = (
+        notes.append(
             f"the feeds taken cover {_percent(coverage)} of the departures, "
-            f"short of {missing}: {why}"
+            f"short of {missing}"
+            + ("" if capped else ": no other feed adds a departure")
         )
-    # A feed contained in or carried by another is left out for that reason,
-    # its departures being that feed's.
-    uncompared = [f for f in candidates if f.feed_id not in blocks and _kept(f) is None]
     if uncompared:
-        count = len(uncompared)
         departures = sum(
-            _summed_service(f)["departures_per_day"] or 0.0 for f in uncompared
+            _summed_service(feed)["departures_per_day"] or 0.0 for feed in uncompared
         )
-        left = (
-            f"the coverage leaves out {count} feed{'' if count == 1 else 's'} not "
-            f"compared with the others ({departures:,.0f} departures a day)"
+        notes.append(
+            "the coverage counts only the feeds compared; "
+            f"{_feeds_are(len(uncompared))} taken without comparison "
+            f"({departures:,.0f} departures a day)"
         )
-        note = left if note is None else f"{note}; {left}"
-    chosen = [
-        _taken_choice(by_id, blocks, taken, n, universe) for n in range(len(taken))
-    ]
-    stops = [by_id[feed_id].stop_count for feed_id in taken]
-    stops = None if None in stops else sum(stops)
-    rest = []
-    for feed in candidates:
-        if feed.feed_id in taken:
-            continue
-        block = blocks.get(feed.feed_id)
-        reason, adds = _kept(feed), None
-        if block is not None:
-            adds = sum(_unrun(block, taken).values()) / total
-            reason = reason or _repeats(feed, block, taken, goal, stops)
-        if reason is None and feed.feed_id in apart:
-            reason = "not compared: the index measured it apart from the feeds taken"
-        elif reason is None and block is None:
-            reason = "not compared: the index records no overlap for it"
-        elif reason is None and adds < MIN_GAIN:
-            reason = f"adds too little: {_percent(adds)} of the place's departures"
-        elif reason is None:
-            reason = f"adds {_percent(adds)} of the place's departures"
-            if reached:
-                reason += "; the feeds taken reach the target without it"
-            elif capped:
-                reason += f"; at most {max_feeds} feeds are taken"
-        rest.append(Choice(feed, _with_access(feed, reason), adds))
     left_out = _largest_first(rest) + _largest_first(left_out)
+    note = "; ".join(notes) or None
     return Recommendation(
-        target, when, chosen, left_out, coverage, by_family, "overlap", note
+        target,
+        when,
+        chosen,
+        left_out,
+        coverage,
+        by_family,
+        "overlap",
+        note,
+        tiers,
+        excluded,
     )
 
 
@@ -273,11 +382,34 @@ def _excluded(feed, when, day, blocks):
     return None
 
 
-def _size_key(feed, gain):
-    """Sorts the feeds adding about as much: open before key, fewer stops
-    (unknown counting as most), more added, then the id."""
-    stops = math.inf if feed.stop_count is None else feed.stop_count
-    return (feed.access == "key", stops, -gain, feed.feed_id)
+def _area(feed):
+    """The area the feed's coverage covers, in square degrees; None without a
+    readable coverage."""
+    import shapely
+
+    if feed.coverage is None:
+        return None
+    try:
+        geometry = shapely.from_wkb(feed.coverage)
+    except (shapely.errors.GEOSException, TypeError, ValueError):
+        return None
+    area = None if geometry is None or geometry.is_empty else geometry.area
+    return area if area is not None and math.isfinite(area) else None
+
+
+def _local_key(feed):
+    """Orders feeds the most local first: the smallest coverage area (an
+    unknown one counting as the largest), then open before key, the newer
+    timetable, fewer stops (unknown counting as most), then the id."""
+    area = _area(feed)
+    start = feed.service_start
+    return (
+        math.inf if area is None else area,
+        feed.access == "key",
+        -start.toordinal() if start is not None else 0,
+        math.inf if feed.stop_count is None else feed.stop_count,
+        feed.feed_id,
+    )
 
 
 def _apart(feeds, blocks):
@@ -323,37 +455,6 @@ def _apart(feeds, blocks):
     return set(blocks) - kept
 
 
-def _greedy(blocks, universe, by_id, goal, max_feeds):
-    """``(taken, capped)``: the ids of the feeds taken, in order, and whether
-    the selection stopped at ``max_feeds`` short of the target."""
-    total = sum(universe.values())
-    taken = []
-    capped = False
-    while len(taken) < len(blocks):
-        if len(taken) == max_feeds:
-            capped = True
-            break
-        gains = {
-            feed_id: sum(_unrun(block, taken).values())
-            for feed_id, block in blocks.items()
-            if feed_id not in taken
-        }
-        best = max(gains.values())
-        if best < MIN_GAIN * total:
-            break
-        near = [i for i, gain in gains.items() if gain >= best - SIZE_TOLERANCE * total]
-        taken.append(min(_size_key(by_id[i], gains[i]) for i in near)[-1])
-        by_family = _covered(blocks, taken, universe)
-        coverage = sum(by_family[f] * u for f, u in universe.items()) / total
-        if _reached(by_family, coverage, universe, goal):
-            break
-    for feed_id in reversed(list(taken)):
-        others = [i for i in taken if i != feed_id]
-        if sum(_unrun(blocks[feed_id], others).values()) < MIN_GAIN * total:
-            taken.remove(feed_id)
-    return taken, capped
-
-
 def _covered(blocks, taken, universe):
     """Per family, the share of the place's departures the ``taken`` feeds
     run, each adding what the feeds before it do not."""
@@ -378,8 +479,10 @@ def _reached(by_family, coverage, universe, goal):
     )
 
 
-def _taken_choice(by_id, blocks, taken, n, universe):
-    """The :class:`Choice` of the ``n``-th taken feed."""
+def _taken_choice(by_id, blocks, taken, n, universe, after_uncompared=False):
+    """The :class:`Choice` of the ``n``-th taken feed, saying "the compared
+    feeds above" when ``after_uncompared`` feeds taken without comparison
+    come before it."""
     feed_id = taken[n]
     added = _unrun(blocks[feed_id], taken[:n])
     gain = sum(added.values())
@@ -394,40 +497,30 @@ def _taken_choice(by_id, blocks, taken, n, universe):
     else:
         family = max(added, key=added.get)
         words = _FAMILY_WORDS.get(family, family)
+        above = "the compared feeds above" if after_uncompared else "the feeds above"
         if added[family] >= gain / 2:
             reason = (
-                f"adds {words} the feeds above lack: "
+                f"adds {words} {above} lack: "
                 f"{_percent(added[family] / universe[family])} of the place's {words}"
             )
         else:
             reason = f"adds {_percent(adds)} of the place's departures"
+            if after_uncompared:
+                reason += " to the compared feeds above"
     return Choice(by_id[feed_id], _with_access(by_id[feed_id], reason), adds)
 
 
-def _kept(feed):
-    """The feeds containing or carrying ``feed``, in words; None without
-    any."""
-    if feed.contained_in:
-        return f"contained in {', '.join(feed.contained_in)}"
-    carriers = set()
-    for edge in feed.edges.values():
-        carriers.update(edge.summary.get("carried_by") or {})
-    if carriers:
-        return f"carried by {', '.join(sorted(carriers))}"
-    return None
-
-
-def _repeats(feed, block, taken, goal, stops):
-    """ "repeats X (N % of its departures)" when the taken feeds run at least
-    ``goal`` of the feed's departures, naming the one running the most and,
-    when it runs ``_SECOND_FEED`` more of them, a second; None otherwise."""
+def _repeats(feed, block, taken, stops):
+    """ "repeats X (N % of its departures)" for a feed adding no departure to
+    the ``taken`` ones, naming the one running the most of them and, when it
+    runs ``_SECOND_FEED`` more of them, a second."""
     total = sum(block[0].values())
 
     def run(others):
-        return 1 - sum(_unrun(block, others).values()) / total
+        return 1 - sum(_unrun(block, others).values()) / total if total else 1.0
 
-    if not taken or run(taken) < goal:
-        return None
+    if not taken:
+        return "adds no departure"
     first = max(taken, key=lambda i: run([i]))
     names, share = first, run([first])
     others = [i for i in taken if i != first]
@@ -441,39 +534,39 @@ def _repeats(feed, block, taken, goal, stops):
     return reason
 
 
-def _by_departures(candidates):
-    """``(taken, left_out, note)`` on an index without overlap evidence."""
-    departures = {
-        f.feed_id: _summed_service(f)["departures_per_day"] or 0.0 for f in candidates
-    }
-    if not candidates:
+def _without_overlap(order, max_feeds):
+    """``(taken, left_out, note)`` on an index without overlap evidence: every
+    feed in ``order``, at most ``max_feeds`` of them."""
+    if not order:
         return [], [], "no feed is left to take"
-    top = max(departures.values())
-    near = [
-        f for f in candidates if departures[f.feed_id] >= (1 - SIZE_TOLERANCE) * top
-    ]
-    pick = min(_size_key(f, departures[f.feed_id]) for f in near)[-1]
-    summed = sum(departures.values())
     taken, rest = [], []
-    for feed in candidates:
-        share = departures[feed.feed_id] / summed
-        if feed.feed_id == pick:
-            reason = f"{departures[pick]:,.0f} departures a day as indexed"
-            taken.append(Choice(feed, _with_access(feed, reason), None))
-            continue
-        reason = _kept(feed)
-        if reason is None and share < MIN_GAIN:
+    for feed in order:
+        if max_feeds is not None and len(taken) == max_feeds:
             reason = (
-                f"adds too little: {_percent(share)} of the departures summed "
-                "over the place's feeds"
+                "not compared: the index records no overlap for it; "
+                f"at most {_feeds_are(max_feeds)} taken"
             )
-        reason = reason or "not compared: the index records no overlap for it"
-        rest.append(Choice(feed, _with_access(feed, reason), None))
+            rest.append(Choice(feed, _with_access(feed, reason), None))
+            continue
+        departures = _summed_service(feed)["departures_per_day"] or 0.0
+        reason = f"{departures:,.0f} departures a day as indexed"
+        taken.append(Choice(feed, _with_access(feed, reason), None))
+    taking = "every feed is taken, the most local first"
+    if rest:
+        taking = (
+            f"at most {max_feeds} are taken, the most local first, and "
+            f"{_feeds_are(len(rest))} left out"
+        )
     note = (
-        "this index records no overlap between feeds; taking the feed with the "
-        f"most departures, or a smaller one within {_percent(SIZE_TOLERANCE)} of it"
+        f"this index records no overlap between feeds, so {taking}; fetch leaves "
+        "out the trips a feed repeats of the feeds before it"
     )
     return taken, rest, note
+
+
+def _feeds_are(count):
+    """``count`` feeds are, or 1 feed is, in words."""
+    return f"{count} feed{' is' if count == 1 else 's are'}"
 
 
 def _largest_first(choices):
@@ -485,6 +578,49 @@ def _largest_first(choices):
         return (-(departures or 0.0), choice.feed.feed_id)
 
     return sorted(choices, key=key)
+
+
+# The tiers in their order of reach, for the words that name them.
+_TIER_ORDER = ("local", "regional", "national", "international", "unknown")
+
+
+def _tier_words(tiers):
+    """``tiers`` in their order of reach, joined as words: "local and
+    regional"."""
+    ordered = sorted(
+        tiers, key=lambda t: (_TIER_ORDER.index(t) if t in _TIER_ORDER else 9, t)
+    )
+    if len(ordered) < 2:
+        return "".join(ordered)
+    return f"{', '.join(ordered[:-1])} and {ordered[-1]}"
+
+
+def _considered(tiers, excluded=()):
+    """The line saying which tiers' feeds a recommendation considered and
+    which ``tiers=None`` adds, the ``excluded`` ones apart."""
+    if not tiers:
+        line = (
+            "considers no feed"
+            if "unknown" in excluded
+            else "considers feeds of unknown tier only"
+        )
+    else:
+        line = f"considers {_tier_words(tiers)} feeds only"
+        if "unknown" not in excluded:
+            line += ", and those of unknown tier"
+    missing = [t for t in _TIER_ORDER[:4] if t not in tiers and t not in excluded]
+    if missing:
+        line += f"; tiers=None adds {_tier_words(missing)} feeds"
+    return line
+
+
+def _not_considered(feed):
+    """Why a feed serving the place at other tiers only is left out."""
+    tiers = {edge.tier for edge in feed.edges.values()}
+    return (
+        f"not considered: serves the place at the {_tier_words(tiers)} "
+        f"tier{'' if len(tiers) == 1 else 's'}"
+    )
 
 
 def _with_access(feed, reason):

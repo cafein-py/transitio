@@ -360,6 +360,7 @@ def test_an_area_is_made_of_the_places_covering_it(
 # each mode's departures it also runs.
 MUNICH = {
     "f-mvv": {
+        "extent": 0.6,
         "name": None,
         "tiers": ("local", "regional"),
         "modes": {"bus": 283773, "tram": 76006, "subway": 37658, "rail": 1938},
@@ -373,6 +374,7 @@ MUNICH = {
         },
     },
     "f-delfi": {
+        "extent": 5.0,
         "name": "DELFI",
         "mdb": {"name": "Registration required at the DELFI portal"},
         "tiers": ("regional",),
@@ -386,6 +388,7 @@ MUNICH = {
         },
     },
     "f-urban": {
+        "extent": 5.0,
         "name": "Public Transport Germany",
         "modes": {"bus": 283289, "tram": 61747, "subway": 37860},
         "stops": 674929,
@@ -397,6 +400,7 @@ MUNICH = {
         },
     },
     "f-mvg": {
+        "extent": 0.15,
         "name": "MVG",
         "modes": {"bus": 274129, "tram": 61747, "subway": 37658},
         "stops": 4250,
@@ -409,6 +413,7 @@ MUNICH = {
         },
     },
     "f-rail": {
+        "extent": 1.5,
         "name": "Regional Rail",
         "tiers": ("regional",),
         "modes": {"rail": 17190},
@@ -419,6 +424,7 @@ MUNICH = {
     },
     "f-old": {"name": "MVV (old)", "stops": 27000, "end": "2026-07-31"},
     "f-bw": {
+        "extent": 2.5,
         "name": "BW aggregate",
         "tiers": ("regional",),
         "modes": {"bus": 200, "rail": 46},
@@ -430,6 +436,7 @@ MUNICH = {
         },
     },
     "f-tiny": {
+        "extent": 0.05,
         "name": "Tiny",
         "modes": {"bus": 30},
         "stops": 120,
@@ -451,10 +458,15 @@ MUNICH_PROVIDERS = [
 ]
 
 
+def _around_munich(extent):
+    return (11.58 - extent, 48.14 - extent, 11.58 + extent, 48.14 + extent)
+
+
 def munich_index(directory, feeds=MUNICH, *, overlap=True, providers=None):
     """A schema-11 index of one city, ``muc``, served by ``feeds`` (specs as
-    in :data:`MUNICH`); ``overlap=False`` leaves out the overlap evidence
-    and the recorded staleness, as an index built before them."""
+    in :data:`MUNICH`, an ``extent`` the half-width in degrees of a feed's
+    coverage around the city); ``overlap=False`` leaves out the overlap
+    evidence and the recorded staleness, as an index built before them."""
     total = sum(sum(spec.get("modes", {}).values()) for spec in feeds.values())
     records, edges = [], []
     for feed_id, spec in feeds.items():
@@ -470,6 +482,11 @@ def munich_index(directory, feeds=MUNICH, *, overlap=True, providers=None):
                 "last_crawled": "2026-10-01T03:00:00+00:00",
                 "access": spec.get("access", "open"),
                 "access_provider": spec.get("provider"),
+                "coverage": (
+                    shapely.box(*_around_munich(spec["extent"])).wkb_hex
+                    if "extent" in spec
+                    else None
+                ),
             }
         )
         modes = spec.get("modes")
