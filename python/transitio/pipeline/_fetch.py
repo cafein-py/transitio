@@ -2362,7 +2362,7 @@ def fetch(
     exclude=None,
     on_unknown="include",
     on_untrusted_selector="auto",
-    contained="drop",
+    contained="keep",
     feeds=None,
     index=None,
     credentials=None,
@@ -2420,9 +2420,13 @@ def fetch(
     ``"whole"`` always delivers it whole; ``"drop"`` always skips it;
     ``"error"`` raises :class:`~transitio.exceptions.StaleSelectorError`.
     A schema-10 index records the larger feeds whose stops and routes contain
-    a feed's (``IndexedFeed.contained_in``). With ``contained="drop"``
-    (default) containers are processed first, and a contained feed is left
-    out before download (``"contained in <id>"``)
+    a feed's (``IndexedFeed.contained_in``). With ``contained="keep"``
+    (default) a contained feed is downloaded like any other and its trips
+    are compared with its container's as ``duplicate_trips`` says (below),
+    so only the trips the container runs too are left out. With
+    ``contained="drop"`` containers
+    are processed first, and a contained feed is left out before download
+    (``"contained in <id>"``), its trips never compared,
     when a container was delivered whole (not cut to a route selection) or
     skipped as the same content as a feed delivered whole, and conditional
     ``HEAD`` probes (as for ``expired``) prove both archives unchanged since
@@ -2436,8 +2440,11 @@ def fetch(
     one skipped as the same content as a feed delivered whole standing for
     that feed, and, with a container that lost repeated trips (below), the
     feeds holding them; a feed with no such feed delivered is not listed.
-    ``contained="keep"`` leaves no feed out for containment, and
-    ``contained`` is empty.
+    Containment is judged from stops and route names when the index was
+    built, not from trips: a contained feed can run trips its container
+    lacks (the container repeats 72 % of ``nvbw~ding``'s trips at Augsburg
+    over all dates), and ``"drop"`` loses them. With ``"keep"`` no feed is
+    left out for containment, and ``contained`` is empty.
 
     Resolves and crops the OSM extract, discovers the GTFS feeds (the
     indexed feeds of the place or the area, or the catalogue's overlapping
@@ -2980,7 +2987,7 @@ def fetch(
         f"on_untrusted_selector={on_untrusted_selector!r}": (
             on_untrusted_selector != "auto"
         ),
-        f"contained={contained!r}": contained != "drop",
+        f"contained={contained!r}": contained != "keep",
         "feeds=": feeds is not None,
         "credentials=": credentials is not None,
     }

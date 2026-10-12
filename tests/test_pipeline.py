@@ -948,7 +948,7 @@ def test_fetch_place_selects_downloads_and_processes(tmp_path, monkeypatch):
         ({"exclude": ["national"]}, "exclude="),
         ({"on_unknown": "exclude"}, "on_unknown='exclude'"),
         ({"on_untrusted_selector": "drop"}, "on_untrusted_selector='drop'"),
-        ({"contained": "keep"}, "contained='keep'"),
+        ({"contained": "drop"}, "contained='drop'"),
         ({"feeds": ["f-a"]}, "feeds="),
         ({"credentials": {"p": {"key": "k"}}}, "credentials="),
     ],
@@ -1767,6 +1767,8 @@ MARKED = (
     "private or campus service, not considered: fetch takes it when named in feeds="
 )
 NAMED, ALL = {"feeds": ["A", "M"]}, {"A": "+", "M": "+"}
+# Containers first, contained feeds left out before download.
+DROP = {"contained": "drop"}
 # A trip half a minute after the 09:00 trip, which it nearly repeats.
 NEAR_NINE = {
     "trips.txt": "r1,wk,x\n",
@@ -1792,11 +1794,12 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
                 "Y": "+ cut to 2 of 3 routes; 1 repeated trips of X left out [X] (1)",
             },
         ),
-        ({"F": IN_C, "C": {**C, "renewed": True}}, {}, {"C": "+", "F": KEPT}),
-        ({"F": {**IN_C, "renewed": True}, "C": C}, {}, {"C": "+", "F": KEPT}),
+        ({"F": IN_C, "C": C}, {}, {"C": "+", "F": "+"}),
+        ({"F": IN_C, "C": {**C, "renewed": True}}, DROP, {"C": "+", "F": KEPT}),
+        ({"F": {**IN_C, "renewed": True}, "C": C}, DROP, {"C": "+", "F": KEPT}),
         (
             {"F": IN_C, "C": {**AB, "cut": "a"}},
-            {},
+            DROP,
             {
                 "C": "+ cut to 1 of 2 routes",
                 "F": f"+ {WHOLE}; kept: container C cropped to selected routes",
@@ -1804,12 +1807,12 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
         ),
         (
             {"F": IN_C, "C": {**C, "ended": True}},
-            {},
+            DROP,
             {"C": f"- {R_ENDED}{SAME}", "F": "+ kept: container C skipped"},
         ),
         (
             {"P": {**AB, "cut": "a"}, "C": AB, "F": IN_C},
-            {},
+            DROP,
             {
                 "P": "+ cut to 1 of 2 routes",
                 "C": f"+ {WHOLE}; 1 repeated trips of P left out [P] (1)",
@@ -1818,7 +1821,7 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
         ),
         (
             {"C": AB, "P": {**AB, "cut": "a"}, "F": IN_C},
-            {},
+            DROP,
             {"C": f"+ {WHOLE}", "P": "- same content as C [C]", "F": f"{SKIP_C} -> C"},
         ),
         (
@@ -1873,12 +1876,12 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
         ),
         (
             {"V": {**NEW, "hours": (9,)}, "C": OLD, "F": IN_C},
-            ON_DAY,
+            {**ON_DAY, **DROP},
             {"V": "+", "C": "+", "F": f"{SKIP_C} -> C"},
         ),
         (
             {"V": {**NEW, "hours": (9,)}, "E": OLD, "C": OLD, "F": IN_C},
-            ON_DAY,
+            {**ON_DAY, **DROP},
             {"V": "+", "E": "+", "C": "- same content as E [E]", "F": f"{SKIP_C} -> E"},
         ),
         (
@@ -1970,7 +1973,7 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
         ),
     ],
     ids=(
-        "identical identical-overlapping-routes container-renewed "
+        "identical identical-overlapping-routes contained-kept container-renewed "
         "contained-renewed container-cropped container-expired "
         "partial-copy-first partial-copy-after version-covered "
         "version-legal-form version-unnamed-agency version-extra-trip "
@@ -2429,7 +2432,7 @@ def test_containment_from_the_cache_follows_the_proofs_of_the_snapshot(
 
     monkeypatch.setattr("transitio.catalog.TransitlandAtlas", Served)
     cache_dir = tmp_path / "cache"
-    options = dict(place="Q1757", index=index, crop=False, osm=False)
+    options = dict(place="Q1757", index=index, crop=False, osm=False, **DROP)
 
     def decisions():
         result = fetch(cache_dir=cache_dir, **options)
@@ -2469,7 +2472,7 @@ def test_a_container_read_from_the_hosted_copy_proves_nothing(tmp_path, monkeypa
 
     _serve(monkeypatch, handler)
     cache_dir = tmp_path / "cache"
-    options = dict(place="Q1757", index=index, crop=False, osm=False)
+    options = dict(place="Q1757", index=index, crop=False, osm=False, **DROP)
     first = fetch(cache_dir=cache_dir, **options)
     online[0] = False
     again = fetch(cache_dir=cache_dir, **options)
