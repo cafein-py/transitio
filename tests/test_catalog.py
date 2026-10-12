@@ -171,7 +171,8 @@ def test_pagination(tmp_path):
 
     routes = {"/v1/gtfs_feeds": feeds_endpoint}
     with make_db(routes, tmp_path, requests) as db:
-        feeds = db.search_feeds(country_code="FI", limit=150)
+        # Every page by default.
+        feeds = db.search_feeds(country_code="FI")
 
     assert len(feeds) == 150
     pages = api_requests(requests, "/v1/gtfs_feeds")
@@ -399,6 +400,23 @@ def test_dataset_for_scans_all_versions(tmp_path):
         # The only dataset covering early 2025 sits past the first page.
         assert db.dataset_for("mdb-1", "2025-03-01").id == "mdb-1-202501"
     assert len(api_requests(requests, "/v1/gtfs_feeds/mdb-1/datasets")) == 2
+
+
+def test_rows_without_a_box_are_counted(tmp_path):
+    from transitio.catalog._csv import count_unboxed, search_csv
+
+    unboxed = [
+        "mdb-20,gtfs,active,True,No Box,FI,Uusimaa,Espoo,,,,,"
+        "https://example.com/espoo.zip,,",
+        "mdb-21,gtfs,deprecated,True,Old,FI,,,,,,,https://example.com/old.zip,,",
+    ]
+    path = tmp_path / "feeds_v2.csv"
+    path.write_text("\n".join([CSV_HEADER, *CSV_ROWS, *unboxed]) + "\n")
+    assert count_unboxed(path) == 1
+    # An explicit limit caps the search, none returning nothing.
+    assert search_csv(path, limit=0) == [] and len(search_csv(path, limit=1)) == 1
+    assert count_unboxed(path, status=None) == 2
+    assert count_unboxed(path, country_code="SE") == 0
 
 
 def test_token_present_skips_csv(tmp_path):

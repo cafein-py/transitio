@@ -103,7 +103,8 @@ class FetchResult:
     # The index places the feeds were selected for: the place, the area's
     # parts, or none on the catalogue path.
     places: list = dataclasses.field(default_factory=list)
-    # The area's parts, the land they cover and the places not used.
+    # The area's parts, the land they cover and the places not used; on the
+    # catalogue path, the feeds found and those it cannot find.
     area_note: str | None = None
 
     def __iter__(self):  # convenient (pbf, feeds) unpacking
@@ -2727,22 +2728,22 @@ def fetch(
         tokenless = when is not None and not db._refresh_token
         # Without a token the search reads the catalogue export, downloaded
         # when the cached copy is missing or a day old.
+        # Every page; with a study day, feeds of every status, which the
+        # date rules then judge by their own windows.
+        status = None if study else "active"
         with progress.downloads("Downloading the Mobility Database catalogue"):
-            found = db.search_feeds(aoi=geometry, country_code=country_code)
+            found = db.search_feeds(
+                aoi=geometry, country_code=country_code, status=status
+            )
+            unboxed = db._unboxed(country_code=country_code, status=status)
         candidates = sorted(found, key=_rank)
         progress.start(len(candidates), "from the Mobility Database catalogue")
+        area_note = _catalogue_note(len(candidates), study, unboxed)
         if index is not False:
-            count = len(candidates)
-            found = f"{count} feed{'' if count == 1 else 's'}"
             hint = ""
             if why == _NO_INDEX:
                 hint = "; transitio.index.refresh() installs the feed index"
-            warnings.warn(
-                f"{why}; {found} from the Mobility Database catalogue by "
-                f"bounding box{hint}",
-                UserWarning,
-                stacklevel=2,
-            )
+            warnings.warn(f"{why}; {area_note}{hint}", UserWarning, stacklevel=2)
         if osm:
             progress.say("Fetching the OSM extract")
             with progress.downloads("Downloading the OpenStreetMap extract"):
@@ -2928,6 +2929,7 @@ def fetch(
         selection=record,
         osm_area=None if osm_pbf is None else geometry,
         osm_note=osm_note,
+        area_note=area_note,
     )
 
 
@@ -3050,6 +3052,22 @@ def _osm_stops(area, coords):
     shapely.prepare(area)
     inside = np.unique(located[shapely.intersects_xy(area, located)], axis=0)
     return shapely.multipoints(inside) if len(inside) else None
+
+
+def _catalogue_note(count, study, unboxed):
+    """The ``area_note`` of a catalogue search: the feeds found by bounding
+    box, of every status with a study day, and the catalogue feeds without
+    a bounding box, which a search by area cannot find."""
+    note = (
+        f"{count} feed{'' if count == 1 else 's'} from the Mobility Database "
+        "catalogue by bounding box"
+    )
+    if study:
+        note += ", of every status"
+    if unboxed:
+        feeds = "feed" if unboxed == 1 else "feeds"
+        note += f"; {unboxed} catalogue {feeds} without a bounding box cannot be found"
+    return note
 
 
 def _area_note(area):

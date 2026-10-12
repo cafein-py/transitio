@@ -13,7 +13,12 @@ import platformdirs
 
 from transitio import _http
 from transitio.catalog._cache import FeedCache, _write_provenance
-from transitio.catalog._csv import fetch_catalog_csv, find_feed, search_csv
+from transitio.catalog._csv import (
+    count_unboxed,
+    fetch_catalog_csv,
+    find_feed,
+    search_csv,
+)
 from transitio.catalog._models import Dataset, Feed, as_date
 from transitio.exceptions import DownloadError, MissingTokenError
 
@@ -217,7 +222,7 @@ class MobilityDatabase:
         status="active",
         official_only=False,
         enclosure="partially_enclosed",
-        limit=100,
+        limit=None,
     ):
         """Search GTFS feeds in the Mobility Database catalog.
 
@@ -240,8 +245,9 @@ class MobilityDatabase:
             Keep only feeds marked official by the operator.
         enclosure : {"partially_enclosed", "completely_enclosed"}
             How feed extents must relate to the AOI bounding box.
-        limit : int, default 100
-            Maximum number of matching feeds to return.
+        limit : int, optional
+            Maximum number of matching feeds to return; None (the default)
+            reads every page and returns every match.
 
         Returns
         -------
@@ -294,6 +300,13 @@ class MobilityDatabase:
 
         records = self._paginated("/gtfs_feeds", params, limit, predicate)
         return [Feed.from_api(record) for record in records]
+
+    def _unboxed(self, *, country_code=None, status="active"):
+        """How many GTFS feeds of the catalogue, of ``country_code`` and
+        ``status`` when given, have no bounding box, so a search by area
+        cannot find them; counted in the CSV catalogue export."""
+        path = fetch_catalog_csv(self._cache_dir, self._http)
+        return count_unboxed(path, country_code=country_code, status=status)
 
     def feed(self, feed_id):
         """Fetch a single feed by its catalog ID.

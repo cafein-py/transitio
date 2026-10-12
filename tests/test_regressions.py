@@ -2651,7 +2651,7 @@ def test_an_area_fetch_selects_the_feeds_of_the_index_places(tmp_path, monkeypat
             tmp_path / "index", feeds=feeds, places=places, edges=edges
         )
     )
-    downloads, searches, extracts = [], [], []
+    downloads, searches, extracts, statuses = [], [], [], []
 
     def download(self, feed, directory=None):
         downloads.append(feed.feed_id)
@@ -2659,6 +2659,7 @@ def test_an_area_fetch_selects_the_feeds_of_the_index_places(tmp_path, monkeypat
 
     def search(self, *args, **kwargs):
         searches.append(kwargs["aoi"].bounds)
+        statuses.append(kwargs["status"])
         return []
 
     def extract(area, **options):
@@ -2668,6 +2669,7 @@ def test_an_area_fetch_selects_the_feeds_of_the_index_places(tmp_path, monkeypat
     monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
     monkeypatch.setattr("transitio.catalog.TransitlandAtlas._fetch_static", download)
     monkeypatch.setattr(MobilityDatabase, "search_feeds", search)
+    monkeypatch.setattr(MobilityDatabase, "_unboxed", lambda self, **kwargs: 0)
     monkeypatch.setattr("transitio.osm.fetch_pbf", extract)
     options = dict(index=index, directory=tmp_path / "out", crop=False)
     result = fetch(CITY_BBOX, **options)
@@ -2690,6 +2692,10 @@ def test_an_area_fetch_selects_the_feeds_of_the_index_places(tmp_path, monkeypat
         "Mobility Database catalogue by bounding box"
     ) in [str(warning.message) for warning in caught]
     assert (searches, result.places, result.snapshot) == ([mostly_ee], [], None)
+    # With a study day the catalogue search takes feeds of every status.
+    with pytest.warns(UserWarning):
+        fetch(mostly_ee, when="2026-06-01", **options)
+    assert statuses == ["active", None]
 
 
 def test_stops_at_the_origin_are_not_located(tmp_path):

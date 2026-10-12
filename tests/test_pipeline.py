@@ -129,6 +129,10 @@ def test_fetch_end_to_end(pipeline_env, monkeypatch):
         "catalogue by bounding box; transitio.index.refresh() installs the feed index"
     ) in [str(warning.message) for warning in caught]
     assert result.osm_pbf == fake_pbf and result.places == []
+    assert (
+        result.area_note
+        == "1 feed from the Mobility Database catalogue by bounding box"
+    )
     assert result.osm_area.bounds == (24.6, 60.1, 25.2, 60.4)
     # A pinned snapshot that is not installed is an error, not a fallback.
     monkeypatch.setenv("TRANSITIO_INDEX_SNAPSHOT", "0123456789abcdef")
@@ -541,6 +545,9 @@ def test_fetch_skips_day_outside_service_window(pipeline_env):
             directory=tmp_path,
         )
     assert result.feeds == []
+    assert result.area_note == (
+        "1 feed from the Mobility Database catalogue by bounding box, of every status"
+    )
     assert result.skipped == [("mdb-10", "service ended 2026-12-31")]
     assert result.selection[0]["feed_window"] == ["2026-01-01", "2026-12-31"]
 
@@ -2705,7 +2712,7 @@ def test_hidden_view_note(area, hidden, expected):
 def test_area_note_names_the_regions_and_the_places_not_used():
     from types import SimpleNamespace
 
-    from transitio.pipeline._fetch import _area_note
+    from transitio.pipeline._fetch import _area_note, _catalogue_note
 
     def part(place_id, kind, name=None):
         place = SimpleNamespace(id=place_id, kind=kind, name=name)
@@ -2717,6 +2724,10 @@ def test_area_note_names_the_regions_and_the_places_not_used():
         for n in range(6)
     ]
     parts = [part("c", "city", "Espoo"), part("r", "region", "Uusimaa")]
+    assert _catalogue_note(1, False, 2) == (
+        "1 feed from the Mobility Database catalogue by bounding box; 2 catalogue "
+        "feeds without a bounding box cannot be found"
+    )
     area = SimpleNamespace(coverage=0.874, parts=parts, unused=unused)
     assert _area_note(area) == (
         "2 index places stand for the area, covering 87% of its land: 1 city, "
