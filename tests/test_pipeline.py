@@ -1919,6 +1919,19 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
             ON_DAY,
             {"A": f"+ {HELD_NOTE}", "B": f"+ {HELD_NOTE}"},
         ),
+        (
+            {"A": NEW, "B": {**HELD, "routes": ("x",), "hours": (2,)}},
+            ON_DAY,
+            {"A": "+", "B": f"+ {HELD_NOTE}; similar to A but adds service on {DAY}"},
+        ),
+        (
+            {
+                "A": {**NEW, "routes": ("r1", "r2", "r3", "r4")},
+                "B": {**HELD, "routes": ("r1", "r2", "r3")},
+            },
+            ON_DAY,
+            {"A": "+", "B": f"- another version of A {HELD_NOTE} [A 0.75 1.0]"},
+        ),
         ({"X": F, "Y": C}, {}, {"X": "+", "Y": "- every trip repeats a trip of X (1)"}),
         (
             {"A": NEW, "B": {**OLD, **F}},
@@ -1963,6 +1976,7 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
         "version-same-content-container version-under-stop-threshold "
         "version-transfers versions-no-study-day placeholder-starting-later "
         "placeholder-under-stop-threshold placeholders-other-routes "
+        "placeholder-other-routes-adds placeholder-other-routes-repeats "
         "repeats-other-agency repeats-on-the-day repeats-not-every-date "
         "repeats-other-time-zone repeats-kept repeats-exact marked-skipped "
         "marked-named repeats-kept-in-the-more-local-feed"

@@ -299,7 +299,7 @@ def route_keys(tables):
     return _keyed(keys, _column(routes, "route_id"))
 
 
-def trip_signatures(tables, with_stops=False):
+def trip_signatures(tables, with_stops=False, unrouted=False):
     """The signature of each trip in a feed's tables.
 
     A signature is 128 bits, written as 32 hex digits, over the trip's route
@@ -318,12 +318,13 @@ def trip_signatures(tables, with_stops=False):
     ``exact_times`` (blank as 0); it never signs equal to a timetabled trip.
 
     Returns one ``trip_id``, ``service_id``, ``signature`` row per signed
-    trip. A trip listed twice in trips.txt, one naming a stop or route the
-    feed lacks, one whose stop times cannot be ordered (a blank,
-    non-numeric or repeated ``stop_sequence``, or one over 18 digits past
-    leading zeros), and a frequency-based trip whose first departure, or a
-    frequency row's ``start_time``, ``end_time`` or ``headway_secs``, cannot
-    be read are not signed.
+    trip; with ``unrouted``, also ``unrouted``, the signature without the
+    route name and mode. A trip listed twice in trips.txt, one naming a stop
+    or route the feed lacks, one whose stop times cannot be ordered (a
+    blank, non-numeric or repeated ``stop_sequence``, or one over 18 digits
+    past leading zeros), and a frequency-based trip whose first departure,
+    or a frequency row's ``start_time``, ``end_time`` or ``headway_secs``,
+    cannot be read are not signed.
 
     With ``with_stops``, returns ``(signatures, stops)``, ``stops`` the
     signed trips' stop times, by trip and in ``stop_sequence`` order, as
@@ -446,7 +447,7 @@ def trip_signatures(tables, with_stops=False):
         count=per_trip(counts[signed]),
         headway=per_trip(headway[signed_codes]),
     )
-    halves = []
+    halves, bare = [], []
     for key in _HASH_KEYS:
         stop = np.append(_digest(coordinates, key), np.uint64(0))[stop_rows]
         placed = pd.DataFrame(
@@ -459,10 +460,11 @@ def trip_signatures(tables, with_stops=False):
         sums = np.add.reduceat(placed, starts)[signed] if len(order) else placed
         runs = np.zeros(len(trip_ids), dtype="uint64")
         np.add.at(runs, listed[named], _digest(periods, key)[named])
-        whole_hash = _digest(
-            whole.assign(stops=per_trip(sums), runs=per_trip(runs[signed_codes])), key
-        )
-        halves.append(np.char.mod("%016x", whole_hash))
+        signing = whole.assign(stops=per_trip(sums), runs=per_trip(runs[signed_codes]))
+        halves.append(np.char.mod("%016x", _digest(signing, key)))
+        if unrouted:
+            loose = _digest(signing.drop(columns=["name", "mode"]), key)
+            bare.append(np.char.mod("%016x", loose))
     signatures = pd.DataFrame(
         {
             "trip_id": trips.index.to_numpy(),
@@ -470,6 +472,8 @@ def trip_signatures(tables, with_stops=False):
             "signature": np.char.add(*halves) if len(trips) else [],
         }
     )
+    if unrouted:
+        signatures["unrouted"] = np.char.add(*bare) if len(trips) else []
     if not with_stops:
         return signatures
     kept = np.repeat(signed, counts)

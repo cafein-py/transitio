@@ -1006,7 +1006,7 @@ def _service(path, day=None, max_total_bytes=None):
         running = dates.loc[dates["date"] == pd.Timestamp(day), "service_id"]
         today = trips[trips["service_id"].isin(running)]
         on_day, used = today["trip_id"], today["service_id"]
-        signed = trip_signatures(tables)
+        signed = trip_signatures(tables, unrouted=True)
         signed = signed[signed["trip_id"].isin(on_day)]
         rows = placeholder_rows(tables)
         rows = rows[rows["service_id"].isin(used)]
@@ -1017,6 +1017,7 @@ def _service(path, day=None, max_total_bytes=None):
         return None
     found.update(
         day=set(signed["signature"]),
+        unrouted=set(signed["unrouted"]),
         complete=len(signed) == len(on_day),
         linked=any(len(tables.get(n, ())) for n in ("transfers.txt", "pathways.txt")),
         placeholder=placeholder,
@@ -1127,12 +1128,19 @@ def _settle_versions(record, services, protected, day):
             continue
         kept = [m for m in members if m == top or m in protected]
         covered = set().union(*(services[m]["day"] for m in kept))
+        bare = set().union(*(services[m]["unrouted"] for m in kept))
         for member in members:
             if member in kept:
                 continue
             service = services[member]
             partners = [other for other in kept if other in pairs[member]]
-            if any(supersedes(other, member) for other in partners):
+            later = [other for other in partners if supersedes(other, member)]
+            # A later dated version supersedes an undated one with the same
+            # routes, or one whose trips on the day it runs whatever their
+            # route names.
+            if any(pairs[member][other][0] >= _ROUTE_OVERLAP for other in later) or (
+                later and service["complete"] and service["unrouted"] <= bare
+            ):
                 removed.add(member)
                 continue
             adds = not (service["complete"] and service["day"] <= covered)
@@ -1145,6 +1153,7 @@ def _settle_versions(record, services, protected, day):
                 _note(entries[member], f"similar to {partners[0]}{why}")
             kept = sorted([*kept, member], key=ids.index)
             covered |= service["day"]
+            bare |= service["unrouted"]
         for member in [m for m in members if m in removed]:
             partners = [other for other in kept if other in pairs[member]]
             later = [other for other in partners if supersedes(other, member)]
@@ -2285,12 +2294,17 @@ def fetch(
     widest dates of those rows, and ranks by its placeholder start. An
     undated feed also pairs on stops alone with a dated one starting after
     its placeholder start, so its ``version_of`` route overlap may be under
-    0.9, and a kept such version leaves it out whatever it runs on the day
-    and its transfers or pathways; the top version and the containers
-    relied on still stay. A left-out version's fares are not delivered.
-    Without ``when`` none is left out; similar feeds are noted. A feed
-    whose routes, stops or, with ``when``, calendars cannot be read, or with
-    a blank agency name that is not unnamed, is never a version.
+    0.9. A kept such version leaves it out, whatever its transfers or
+    pathways, when their routes overlap 0.9 or more, or when the kept
+    versions run every trip it runs on the day by trip signature without the
+    route name and mode, so a timetable whose route names drifted is still
+    the same service; otherwise it stays, noted ``"similar to <id> but adds
+    service on <day>"``, as a night network on a day network's stops does.
+    The top version and the containers relied on still stay. A left-out
+    version's fares are not delivered. Without ``when`` none is left out;
+    similar feeds are noted. A feed whose routes, stops or, with ``when``,
+    calendars cannot be read, or with a blank agency name that is not
+    unnamed, is never a version.
 
     With ``duplicate_trips="drop"`` (default) the delivered feeds do not
     repeat each other's trips. A trip that a feed earlier in the selection
