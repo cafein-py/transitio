@@ -70,6 +70,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the first time a query needs them, and how to download all of them in
   advance for offline work.
 
+### Fixed
+
+- Network snapping and shape inference work with pyrosm 0.19, which
+  simplifies `to_graph()` by default and no longer fills the reader's
+  caches on a custom-criteria read.
+
 ## 0.24.0 — 2026-10-11
 
 ### Added
