@@ -985,7 +985,12 @@ def test_a_schema_12_index_answers_from_its_core_alone(tmp_path, monkeypatch):
     assert reader.suggest("hel", index=index)[0].place == helsinki
     feeds = helsinki.feeds()
     assert feeds.to_dataframe()["share_of_place"].tolist() == [0.9]
-    assert helsinki.recommend().to_dataframe()["feed_id"].tolist() == ["f-hsl"]
+    # The cross-border feeds are listed as not considered.
+    assert helsinki.recommend().to_dataframe()["feed_id"].tolist() == [
+        "f-ferry",
+        "f-hsl",
+        "f-tlt",
+    ]
     # An on-demand table the directory lacks is named when it is needed.
     with pytest.raises(TransitioError, match="FI.boundaries.parquet: missing; the"):
         helsinki.geometry
