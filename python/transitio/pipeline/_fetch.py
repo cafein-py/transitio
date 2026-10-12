@@ -2295,9 +2295,11 @@ def fetch(
     With ``duplicate_trips="drop"`` (default) the delivered feeds do not
     repeat each other's trips. A trip that a feed earlier in the selection
     record also runs is left out of the later feed: on the index paths the
-    record follows the view (:meth:`~transitio.index.Place.feeds` or
-    :meth:`~transitio.index.Area.feeds`: category, then relevance, then id),
-    on the catalogue path the order above.
+    record follows the order :meth:`~transitio.index.Place.recommend` takes
+    feeds in, the most local first (the smallest coverage area, then open
+    before key, the newer timetable, fewer stops, then id), so an aggregate
+    keeps only the trips the more local feeds lack; on the catalogue path
+    the order above.
     Trips compare as :func:`~transitio.gtfs.merge_feeds` compares them:
     route name and mode (the route type's basic mode, as ``modes`` names
     them, else the type itself, so local bus 704 equals bus 3), stops and
@@ -3303,6 +3305,7 @@ def _fetch_place(
         _by_place,
         _default_tiers,
         _less,
+        _local_key,
         _not_considered,
         _tier_words,
     )
@@ -3345,7 +3348,9 @@ def _fetch_place(
         )
         return found if wanted is None else [f for f in found if f.feed_id in wanted]
 
-    offered = candidates(on_unknown)
+    # The most local first, as recommend() takes them, so a trip repeated in
+    # an aggregate is kept in the operator's own feed.
+    offered = sorted(candidates(on_unknown), key=_local_key)
     if wanted is not None:
         missing = wanted.difference(f.feed_id for f in candidates("include"))
         if missing:
