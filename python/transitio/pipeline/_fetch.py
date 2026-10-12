@@ -358,6 +358,15 @@ def _note(entry, text):
     entry["note"] = text if entry["note"] is None else f"{entry['note']}; {text}"
 
 
+def _renamed_note(version):
+    """``"read 'Agency.txt' as agency.txt, ..."`` for a version stored with
+    its GTFS files under their own names (:func:`_add_version`); None
+    otherwise."""
+    renamed = version.sidecar.get("renamed") or {}
+    pairs = (f"{old!r} as {new}" for old, new in sorted(renamed.items()))
+    return f"read {', '.join(pairs)}" if renamed else None
+
+
 def _dropped_note(report):
     """``"dropped <n> <file> rows whose <field> is not in <parent>"``,
     ``"dropped <n> trips.txt rows left with fewer than two stop_times"`` or
@@ -1839,9 +1848,14 @@ def _add_version(cache, feed_id, path, url, fetched_from, errors, **options):
     acquisition recorded with ``fetched_from``, the failed attempts before it
     (``errors``), ``with_credentials``, the ``snapshot`` in use and, from the
     sidecar beside a feed read out of a larger archive, that archive's URL and
-    SHA-256; ``dataset`` and ``replace`` pass through. Returns the version."""
+    SHA-256; ``dataset`` and ``replace`` pass through. A download holding
+    GTFS files under other names is stored with them under their own
+    (:func:`~transitio.catalog._nested.rename_tables`, within
+    ``max_total_bytes``), the version recording them as ``renamed``. Returns
+    the version."""
     from transitio import _http
     from transitio.catalog._cache import _now
+    from transitio.catalog._nested import rename_tables
 
     sidecar = path.with_suffix(".provenance.json")
     staged = json.loads(sidecar.read_text()) if sidecar.exists() else {}
@@ -1858,6 +1872,9 @@ def _add_version(cache, feed_id, path, url, fetched_from, errors, **options):
     acquired = ("source_url", "sha256", "retrieved_at")
     record = {k: v for k, v in staged.items() if k not in acquired}
     record["feed_id"] = feed_id
+    renamed = rename_tables(path, options.pop("max_total_bytes", None))
+    if renamed:
+        record["renamed"] = renamed
     digest = _http.sha256_file(path)
     return cache.publish(feed_id, path, digest, record, source, used=False, **options)
 
@@ -2263,7 +2280,12 @@ def fetch(
     report run again on every call, and deleting a version deletes what was
     made of it. Every overlapping feed is processed, in a
     deterministic order with official feeds first; one broken feed never
-    aborts the others — it lands in ``skipped`` with its reason. A feed
+    aborts the others — it lands in ``skipped`` with its reason. A download
+    holding its GTFS files under other names, in another case, padded with
+    spaces, ending ``.csv`` or all in one folder, is stored and read with
+    them under their own names, noted ``"read 'Agency.txt' as agency.txt"``;
+    a file present under its own name, or two files taking one name, are
+    left as they are. A feed
     lacking a file GTFS requires is skipped, with or without ``when`` and
     ``repair``: ``"missing required file agency.txt"`` (several
     names sorted, ``"missing required files ..."``) or ``"missing calendar.txt
@@ -2828,6 +2850,7 @@ def fetch(
                 return "skipped"
             entry.update(decision="delivered", feed_window=window, path=path)
             for note in (
+                _renamed_note(version),
                 _timezone_note(path, budgets.get("max_total_bytes")),
                 _dropped_note(report),
             ):
@@ -2919,8 +2942,9 @@ def fetch(
                             "; ".join(errors) or None,
                             dataset=dataset and {dataset.id: _dataset_entry(dataset)},
                             replace=not use_cache,
+                            max_total_bytes=budgets.get("max_total_bytes"),
                         )
-                    except DownloadError as error:  # not a zip archive
+                    except DownloadError as error:  # not a zip archive, or over budget
                         errors.append(str(error))
                         path = None
                     except Exception as error:  # noqa: B902 — isolate failures
@@ -3588,7 +3612,8 @@ def _fetch_place(
             cropped.add(feed.feed_id)
         else:
             carriers[feed.feed_id] = feed.feed_id
-        notes = [applied, *notes, _timezone_note(path, budget), _dropped_note(report)]
+        notes = [applied, *notes, _renamed_note(version)]
+        notes += [_timezone_note(path, budget), _dropped_note(report)]
         for text in dict.fromkeys(filter(None, notes)):
             _note(entry, text)
         reports.append(report)
@@ -3906,6 +3931,7 @@ def _fetch_place(
                         snapshot=snapshot,
                         dataset=acquired_as and {acquired_as: _dataset_entry(dataset)},
                         replace=not use_cache,
+                        max_total_bytes=budget,
                     )
                 except Exception as error:  # noqa: B902 — isolate per-feed failures
                     if not last:

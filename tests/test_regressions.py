@@ -1518,6 +1518,49 @@ def test_a_feed_missing_a_required_file_is_skipped(tmp_path, dropped, reason, wi
     assert (caught.value.reason, caught.value.window) == (reason, window)
 
 
+@pytest.mark.parametrize(
+    "names, extra, note",
+    [
+        pytest.param({"agency.txt": "Agency.txt"}, {}, "'Agency.txt'", id="case"),
+        pytest.param({"stops.txt": " stops.txt"}, {}, "' stops.txt'", id="padded"),
+        pytest.param({"routes.txt": "routes.csv"}, {}, "'routes.csv'", id="csv"),
+        pytest.param({n: f"gtfs/{n}" for n in FEED}, {}, "'gtfs/", id="folder"),
+        pytest.param({}, {"Agency.txt": "x\n"}, None, id="own-name-present"),
+        pytest.param(
+            {"agency.txt": "Agency.txt"}, {"AGENCY.csv": "x\n"}, None, id="two-claims"
+        ),
+    ],
+)
+def test_files_under_other_names_are_read_under_their_own(tmp_path, names, extra, note):
+    # 13 crawled feeds held a required file as Agency.txt, stops.csv or with a
+    # leading space, and fetch skipped each as missing that file.
+    from transitio.catalog._cache import FeedCache
+    from transitio.pipeline._fetch import (
+        _add_version,
+        _process_feed,
+        _renamed_note,
+        _SkipFeed,
+    )
+
+    cache = FeedCache(tmp_path / "cache")
+    cache.folder("f-a").mkdir(parents=True)
+    files = {names.get(name, name): text for name, text in FEED.items()}
+    staged = write_zip(cache.folder("f-a") / "latest.zip", {**files, **extra})
+    version = _add_version(cache, "f-a", staged, "https://x.example", "producer", None)
+    options = dict(geometry=None, repair=False, crop=False, modes=None, day=None)
+    options.update(study=False, hosted=None, budgets={})
+    if note is None and names:
+        with pytest.raises(_SkipFeed, match="missing required file agency.txt"):
+            _process_feed(version.path, **options)
+        assert _renamed_note(version) is None
+        return
+    _process_feed(version.path, **options)
+    with zipfile.ZipFile(version.path) as archive:
+        assert set(FEED) <= set(archive.namelist())
+    said = _renamed_note(version)
+    assert said is None if note is None else said.startswith(f"read {note}")
+
+
 FK = "foreign_key_violation"
 
 
