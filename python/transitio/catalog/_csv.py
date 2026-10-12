@@ -99,28 +99,9 @@ def fetch_catalog_csv(cache_dir, client, *, update=False):
     return path
 
 
-def search_csv(
-    path,
-    *,
-    bounds=None,
-    country_code=None,
-    subdivision=None,
-    municipality=None,
-    status="active",
-    official_only=False,
-    enclosure="partially_enclosed",
-    limit=100,
-):
-    """Filter the CSV catalogue with the same semantics as the API search.
-
-    With ``bounds``, results are ordered by the share of each feed's
-    bounding box lying inside the AOI, so feeds about the searched area
-    rank above continental aggregates whose rectangles merely sweep over
-    it; ``limit`` applies after that ordering.
-    """
-    aoi_box = box(*bounds) if bounds is not None else None
-    feeds = []
-    scored = []
+def _matching(path, country_code, subdivision, municipality, status, official_only):
+    """``(row, feed)`` for each GTFS row of the CSV catalogue passing the
+    filters the API search applies."""
     for row in _gtfs_rows(path):
         if country_code:
             value = _first(row, *_ALIASES["country_code"]) or ""
@@ -134,32 +115,65 @@ def search_csv(
             value = _first(row, *_ALIASES["municipality"]) or ""
             if value.lower() != municipality.lower():
                 continue
-        feed_box = None
-        if aoi_box is not None:
-            feed_box = _row_box(row)
-            if feed_box is None:
-                continue
-            if enclosure == "completely_enclosed":
-                if not aoi_box.contains(feed_box):
-                    continue
-            elif not aoi_box.intersects(feed_box):
-                continue
         feed = _feed_from_row(row)
         if status is not None and feed.status != status:
             continue
         if official_only and not feed.official:
             continue
+        yield row, feed
+
+
+def search_csv(
+    path,
+    *,
+    bounds=None,
+    country_code=None,
+    subdivision=None,
+    municipality=None,
+    status="active",
+    official_only=False,
+    enclosure="partially_enclosed",
+    limit=None,
+):
+    """Filter the CSV catalogue with the same semantics as the API search.
+
+    With ``bounds``, results are ordered by the share of each feed's
+    bounding box lying inside the AOI, so feeds about the searched area
+    rank above continental aggregates whose rectangles merely sweep over
+    it; ``limit`` (None for every match) applies after that ordering.
+    """
+    aoi_box = box(*bounds) if bounds is not None else None
+    feeds = []
+    scored = []
+    filters = (country_code, subdivision, municipality, status, official_only)
+    for row, feed in _matching(path, *filters):
         if aoi_box is None:
-            feeds.append(feed)
-            if len(feeds) >= limit:
+            if limit is not None and len(feeds) >= limit:
                 break
-        else:
-            scored.append((_overlap_share(aoi_box, feed_box), feed))
+            feeds.append(feed)
+            continue
+        feed_box = _row_box(row)
+        if feed_box is None:
+            continue
+        if enclosure == "completely_enclosed":
+            if not aoi_box.contains(feed_box):
+                continue
+        elif not aoi_box.intersects(feed_box):
+            continue
+        scored.append((_overlap_share(aoi_box, feed_box), feed))
     if aoi_box is not None:
         # Stable sort: equal shares keep their catalogue order.
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return [feed for _, feed in scored[:limit]]
     return feeds
+
+
+def count_unboxed(path, *, country_code=None, status="active"):
+    """How many GTFS rows of the CSV catalogue, of ``country_code`` and
+    ``status`` when given, have no bounding box: a search by area cannot
+    find them."""
+    rows = _matching(path, country_code, None, None, status, False)
+    return sum(1 for row, _ in rows if _row_box(row) is None)
 
 
 def find_feed(path, feed_id):

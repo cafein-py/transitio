@@ -273,6 +273,19 @@ def list_releases(client, repository):
         raise ReleaseError(f"listing the releases: {error}") from error
 
 
+def release_by_tag(client, repository, tag):
+    """The repository's release tagged ``tag``, or None when it has none."""
+    try:
+        response = client.get(
+            f"/repos/{repository}/releases/tags/{tag}", follow_redirects=True
+        )
+        if response.status_code == 404:
+            return None
+        return _check(response, f"reading the release {tag}").json()
+    except (httpx.HTTPError, ValueError) as error:
+        raise ReleaseError(f"reading the release {tag}: {error}") from error
+
+
 def download(client, url, what, limit=MAX_ASSET_BYTES):
     """An asset's bytes, streamed up to ``limit`` and refused beyond it,
     following GitHub's redirect to its object store."""

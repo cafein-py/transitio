@@ -28,6 +28,7 @@ import shutil
 import stat
 import tarfile
 import tempfile
+import warnings
 import weakref
 from pathlib import Path
 
@@ -40,7 +41,7 @@ from transitio.index import release as contract
 __all__ = ["refresh", "use", "installed", "active_index", "cache_root", "SNAPSHOT_ENV"]
 
 SNAPSHOT_ENV = "TRANSITIO_INDEX_SNAPSHOT"
-KEEP = 3
+KEEP = 10
 TIMEOUT = 60.0
 # Beside snapshot.json from schema 12: the release the snapshot came from,
 # whose assets its on-demand files are downloaded from.
@@ -679,44 +680,93 @@ def _install(root, snapshot_id, archive, record=None):
 
 
 def _prune(root, keep, protect):
-    """Remove all but the ``keep`` newest installed snapshots, never one in
-    ``protect`` nor one another process holds selected or loaded (its
-    shared lock refuses the exclusive one taken here). Each removal is a
-    rename to a private tombstone under that lock, so a failure to delete
-    the tombstone's contents cannot leave a half-present snapshot. Returns
-    the ids removed and the tombstones that could not be deleted."""
+    """Remove all but the ``keep`` newest installed snapshots (none when
+    ``keep`` is None), never one in ``protect`` nor one another process
+    holds selected or loaded (its shared lock refuses the exclusive one
+    taken here). Each removal is a rename to a private tombstone under that
+    lock, so a failure to delete the tombstone's contents cannot leave a
+    half-present snapshot. Returns the ids removed, the tombstones that
+    could not be deleted and the bytes each removed snapshot took (None
+    when they could not be read)."""
     try:
         import fcntl
     except ImportError:
         # Windows: no shared locks to protect other processes' selections,
         # so nothing is pruned there.
-        return [], []
-    removed = []
-    leftover = []
+        return [], [], {}
+    removed, leftover, sizes = [], [], {}
+    if keep is None:
+        return removed, leftover, sizes
     for position, (snapshot_id, _) in enumerate(installed(cache_dir=root)):
         if position < keep or snapshot_id in protect:
             continue
-        lock = open(_lock_file(root, snapshot_id), "a+b")
+        # A snapshot that cannot be locked or moved aside stays installed, so
+        # nothing removed goes unreported.
+        try:
+            lock = open(_lock_file(root, snapshot_id), "a+b")
+        except OSError:
+            continue
         try:
             try:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                tombstone = Path(
+                    tempfile.mkdtemp(
+                        prefix=f".removed-{snapshot_id}-", dir=_snapshots(root)
+                    )
+                )
             except OSError:
                 continue
-            tombstone = Path(
-                tempfile.mkdtemp(
-                    prefix=f".removed-{snapshot_id}-", dir=_snapshots(root)
-                )
-            )
-            os.replace(_snapshots(root) / snapshot_id, tombstone / "snapshot")
+            try:
+                os.replace(_snapshots(root) / snapshot_id, tombstone / "snapshot")
+            except OSError:
+                shutil.rmtree(tombstone, ignore_errors=True)
+                continue
             with contextlib.suppress(OSError):
                 os.unlink(_lock_file(root, snapshot_id))
             removed.append(snapshot_id)
+            sizes[snapshot_id] = _tree_bytes(tombstone / "snapshot")
         finally:
             lock.close()
         shutil.rmtree(tombstone, ignore_errors=True)
         if tombstone.exists():
             leftover.append(str(tombstone))
-    return removed, leftover
+    return removed, leftover, sizes
+
+
+def _tree_bytes(path):
+    """The bytes the regular files under ``path`` take, links not followed;
+    None when a file cannot be read."""
+    total = 0
+
+    def failed(error):
+        raise error
+
+    try:
+        for folder, _, files in os.walk(path, onerror=failed):
+            for name in files:
+                info = os.lstat(os.path.join(folder, name))
+                if stat.S_ISREG(info.st_mode):
+                    total += info.st_size
+    except OSError:
+        return None
+    return total
+
+
+def _removed_note(removed, sizes, keep):
+    """The warning naming the snapshots a refresh removed, their sizes and
+    how to keep them."""
+
+    def size(snapshot_id):
+        taken = sizes.get(snapshot_id)
+        return "size unknown" if taken is None else f"{taken / 1e6:,.0f} MB"
+
+    named = ", ".join(f"{s} ({size(s)})" for s in removed)
+    return (
+        f"refresh removed {len(removed)} older snapshot"
+        f"{'' if len(removed) == 1 else 's'} to keep the newest {keep}: {named}; "
+        "refresh(keep=None) keeps every snapshot, and refresh(snapshot=...) "
+        "installs one again"
+    )
 
 
 def _download(release, manifest, directory, transport, progress):
@@ -785,8 +835,10 @@ def refresh(
     keep=KEEP,
     progress=True,
     everything=False,
+    snapshot=None,
 ):
-    """Install the newest published snapshot this reader supports.
+    """Install the newest published snapshot this reader supports, or with
+    ``snapshot`` the published snapshot of that id.
 
     The archive is streamed to a private directory in the cache and
     unpacked from there. Before schema 12 it holds the whole snapshot:
@@ -805,9 +857,14 @@ def refresh(
     Returns a summary: the snapshot id, whether it was newly ``installed``
     (a damaged install is replaced), the releases ``skipped`` (newer but
     incompatible, or incomplete), the older snapshots ``removed`` to keep
-    the cache at ``keep`` and any ``leftover`` tombstone that could not be
-    deleted. Raises :class:`~transitio.exceptions.DownloadError`
-    when the listing is unreachable or a download fails verification, and
+    the newest ``keep`` (10 by default; ``keep=None`` removes none, and the
+    snapshot installed and the pinned one are always kept) with the bytes
+    each took (``removed_bytes``), and any ``leftover`` tombstone that could
+    not be deleted. A ``UserWarning`` names every snapshot removed, with
+    its size. Raises ``ValueError`` when ``snapshot`` is not a snapshot id,
+    :class:`~transitio.exceptions.DownloadError` when the listing is
+    unreachable, the named snapshot is not published, or a download fails
+    verification, and
     :class:`~transitio.exceptions.IncompatibleIndexError` when no listed
     release is one this transitio reads or, with ``everything=True``, the
     snapshot fails a check. A failed install leaves the active snapshot in
@@ -815,13 +872,24 @@ def refresh(
     on-demand files are downloaded, so it stays installed with those that
     arrived.
     """
+    if snapshot is not None and not contract.is_snapshot_id(snapshot):
+        raise ValueError(f"not a snapshot id: {snapshot!r}")
     root = cache_root(cache_dir)
     _state["transport"] = transport
     with _client(api_url, transport) as client:
         try:
-            releases = contract.list_releases(client, repository)
+            if snapshot is None:
+                releases = contract.list_releases(client, repository)
+            else:
+                # Read by its tag, wherever the listing would page it.
+                tag = contract.release_tag(snapshot)
+                found = contract.release_by_tag(client, repository, tag)
+                same = found is not None and found.get("tag_name") == tag
+                releases = [found] if same else []
         except contract.ReleaseError as error:
             raise DownloadError(str(error)) from error
+        if snapshot is not None and not releases:
+            raise DownloadError(f"snapshot {snapshot} is not published")
         release, manifest, skipped = contract.newest_compatible(
             releases, lambda asset: contract.read_manifest(client, asset)
         )
@@ -856,10 +924,13 @@ def refresh(
                     _progress.say(f"Unpacking and checking snapshot {snapshot_id}")
                 record = _release_record(repository, snapshot_id, manifest.get("parts"))
                 _install(root, snapshot_id, archive, record)
-            removed, leftover = _prune(root, keep, {snapshot_id, _pinned(cache_dir)[1]})
+            protect = {snapshot_id, _pinned(cache_dir)[1]}
+            removed, leftover, sizes = _prune(root, keep, protect)
             # Held while the on-demand files arrive, so no other refresh
             # prunes the snapshot meanwhile.
             lease = _hold(root, snapshot_id) if everything else None
+    if removed:
+        warnings.warn(_removed_note(removed, sizes, keep), UserWarning, stacklevel=2)
     # The next query resolves afresh: a newer snapshot may now be active.
     _state["handle"] = None
     _state["handle_key"] = None
@@ -874,5 +945,6 @@ def refresh(
         "installed": not already,
         "skipped": [{"tag": tag, "reason": reason} for tag, reason in skipped],
         "removed": removed,
+        "removed_bytes": sizes,
         "leftover": leftover,
     }

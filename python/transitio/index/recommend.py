@@ -38,6 +38,7 @@ from transitio.index.feeds import (
     MARKS,
     _access_note,
     _family_blocks,
+    _hull,
     _names,
     _percent,
     _summed_service,
@@ -76,8 +77,9 @@ class Recommendation:
     ``target`` or ``max_feeds`` stopped the selection, which feeds were taken
     without comparison, or that the index records no overlap. ``tiers`` are
     the tiers whose feeds were considered, those asked for less those
-    excluded, None for every tier; a feed serving the place at other tiers
-    only is left out as not considered.
+    excluded, None for every tier, and for an area whose parts differ in
+    kind ``{kind: tiers}``; a feed serving the place at other tiers only is
+    left out as not considered.
     ``str()`` gives the answer as lines of text.
     """
 
@@ -102,7 +104,7 @@ class Recommendation:
         self.coverage_by_family = coverage_by_family
         self.basis = basis
         self.note = note
-        self.tiers = None if tiers is None else tuple(tiers)
+        self.tiers = tiers if tiers is None or isinstance(tiers, dict) else tuple(tiers)
         self._excluded = frozenset(excluded)
 
     @property
@@ -167,14 +169,36 @@ class Recommendation:
 
 def _default_tiers(target):
     """The tiers a place or an area considers by default: every tier (None)
-    at a region or a country, or an area with one among its parts, else
-    ``DEFAULT_TIERS``."""
+    at a region or a country, else ``DEFAULT_TIERS``. An area's parts each
+    keep their kind's: one value when they agree, else ``{kind: tiers}``."""
     from transitio.index.places import Place
 
     places = [target] if isinstance(target, Place) else [p.place for p in target.parts]
-    if any(place.kind in ("region", "country") for place in places):
-        return None
-    return DEFAULT_TIERS
+    by_kind = {
+        place.kind: None if place.kind in ("region", "country") else DEFAULT_TIERS
+        for place in places
+    }
+    values = set(by_kind.values())
+    if len(values) > 1:
+        return by_kind
+    return values.pop() if values else DEFAULT_TIERS
+
+
+def _by_place(target, tiers):
+    """``tiers`` for a query of ``target``'s feeds: ``{place id: tiers}``
+    when they are given by kind (an area's parts), else as given."""
+    if not isinstance(tiers, dict):
+        return tiers
+    return {part.place.id: tiers.get(part.place.kind) for part in target.parts}
+
+
+def _less(tiers, excluded):
+    """The tiers considered, ``tiers`` (every named tier when None) less the
+    ``excluded`` ones; a ``{kind: tiers}`` mapping kind by kind."""
+    if isinstance(tiers, dict):
+        return {kind: _less(value, excluded) for kind, value in tiers.items()}
+    named = _TIER_ORDER[:4] if tiers is None else tiers
+    return tuple(tier for tier in named if tier not in excluded)
 
 
 def recommend_for(target, when, tiers, exclude, goal, max_feeds):
@@ -189,7 +213,10 @@ def recommend_for(target, when, tiers, exclude, goal, max_feeds):
     exclude = _names(exclude)
     excluded = set(exclude or ())
     feeds = target.feeds(
-        tiers=tiers, exclude=exclude, categories=None, international=True
+        tiers=_by_place(target, tiers),
+        exclude=exclude,
+        categories=None,
+        international=True,
     )
     outside = []
     if tiers is not None or excluded:
@@ -199,9 +226,7 @@ def recommend_for(target, when, tiers, exclude, goal, max_feeds):
             for feed in target.feeds(categories=None, international=True)
             if feed.feed_id not in considered
         ]
-    if tiers is not None or excluded:
-        named = _TIER_ORDER[:4] if tiers is None else tiers
-        tiers = tuple(tier for tier in named if tier not in excluded)
+        tiers = _less(tiers, excluded)
     return recommend(
         target,
         feeds,
@@ -414,15 +439,8 @@ def _excluded(feed, day, blocks):
 def _area(feed):
     """The area the feed's coverage covers, in square degrees; None without a
     readable coverage."""
-    import shapely
-
-    if feed.coverage is None:
-        return None
-    try:
-        geometry = shapely.from_wkb(feed.coverage)
-    except (shapely.errors.GEOSException, TypeError, ValueError):
-        return None
-    area = None if geometry is None or geometry.is_empty else geometry.area
+    hull = _hull(feed)
+    area = None if hull is None else hull.area
     return area if area is not None and math.isfinite(area) else None
 
 
@@ -609,6 +627,13 @@ def _largest_first(choices):
     return sorted(choices, key=key)
 
 
+# The kinds of place an area's parts are, in words.
+_KINDS = {
+    "city": "cities",
+    "metro": "metros",
+    "region": "regions",
+    "country": "countries",
+}
 # The tiers in their order of reach, for the words that name them.
 _TIER_ORDER = ("local", "regional", "national", "international", "unknown")
 
@@ -626,7 +651,16 @@ def _tier_words(tiers):
 
 def _considered(tiers, excluded=()):
     """The line saying which tiers' feeds a recommendation considered and
-    which ``tiers=None`` adds, the ``excluded`` ones apart."""
+    which ``tiers=None`` adds, the ``excluded`` ones apart; with tiers by
+    kind of place, those at each kind."""
+    if isinstance(tiers, dict):
+        said = [
+            f"{_tier_words(tiers[kind]) or 'no'} feeds at its {plural}"
+            for kind, plural in _KINDS.items()
+            if kind in tiers
+        ]
+        unknown = "" if "unknown" in excluded else ", and those of unknown tier"
+        return f"considers {'; '.join(said)}{unknown}"
     if not tiers:
         line = (
             "considers no feed"
