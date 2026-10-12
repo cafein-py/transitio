@@ -499,14 +499,19 @@ class Place:
 
 
 # A place covering part of an area: the index's place, the share of the
-# place inside the area, the share of the area it holds, and whether it is
-# a whole part.
+# place inside the area, the share of the area it stands for, and whether it
+# is a whole part.
 AreaPart = namedtuple("AreaPart", ["place", "inside", "holds", "whole"])
+# A place with feeds meeting an area that is not one of its parts, and why.
+AreaUnused = namedtuple("AreaUnused", ["place", "reason"])
 
-# A candidate at least this much inside an area may be a whole part; one
-# holding at least this much of the area, a partial part.
+# A place at least this much inside an area is a whole part; one standing
+# for at least this much of the area, a partial part.
 _WHOLE_SHARE = 0.5
 _PARTIAL_SHARE = 0.01
+_SMALL = "holds less than 1 % of the area"
+_COVERED = "narrower places cover its land in the area"
+_FLAT = "the area has no extent"
 
 
 class Area:
@@ -515,15 +520,22 @@ class Area:
     ``geometry`` is the area as given, in WGS84, and ``country`` the
     ``country=`` filter or None. ``parts`` holds an :class:`AreaPart` per
     place, ordered by ``holds`` descending, then place id, and ``coverage``
-    is the share of the area's land the parts cover, from 0 to 1.
+    is the share of the area's land the parts cover, from 0 to 1. ``unused``
+    holds an ``AreaUnused`` (``place``, ``reason``) per place with feeds
+    meeting the area that is not a part, by place id.
     """
 
-    def __init__(self, geometry, country, parts, coverage, index):
+    def __init__(
+        self, geometry, country, parts, coverage, index, unused=(), stands=None
+    ):
         self.geometry = geometry
         self.country = country
         self.parts = tuple(parts)
         self.coverage = coverage
+        self.unused = tuple(unused)
         self._index = index
+        # The land in the area each region or country part stands for.
+        self._stands = stands or {}
 
     def feeds(
         self,
@@ -540,16 +552,24 @@ class Area:
         objects, each feed once.
 
         Each part answers as :meth:`Place.feeds` does, with the same
-        arguments: by default every feed serving it. A feed's ``edges`` are keyed
+        arguments: by default every feed serving it; ``tiers`` may also map
+        place ids to their tiers. At a region or a country part a feed counts
+        only when its coverage meets the land the part stands for (an
+        unknown coverage counts as meeting it). A feed's ``edges`` are keyed
         by ``(place_id, tier)``, its ``selector`` unites theirs (a
         ``whole_feed`` one makes it whole, else an ``unavailable`` one makes
-        it unavailable, otherwise the route ids are united) and ``service`` is its
-        service in the first part it serves. The feeds come back as a
+        it unavailable, otherwise the route ids are united) and ``service``
+        is its service in the first part it serves. The feeds come back as a
         place's view orders them.
         """
-        from transitio.index.feeds import _feeds_for_places
+        from transitio.index.feeds import (
+            FeedList,
+            _feeds_for_places,
+            _ranked,
+            _view_key,
+        )
 
-        return _feeds_for_places(
+        found = _feeds_for_places(
             self._index,
             [part.place for part in self.parts],
             tiers=tiers,
@@ -560,6 +580,40 @@ class Area:
             categories=categories,
             international=international,
         )
+        if not self._stands:
+            return found
+        kept = FeedList(f for f in map(self._serving, found) if f is not None)
+        if _ranked(self._index):
+            # The edges left decide a feed's place in the order.
+            kept.sort(key=_view_key)
+        return kept
+
+    def _serving(self, feed):
+        """``feed`` with only the edges of its parts it serves: at a region or
+        a country, only when its coverage meets the land the part stands for
+        (a coverage missing, unreadable or empty, or a failed test, counts as
+        meeting it); None with none left."""
+        import shapely
+
+        from transitio.index.feeds import _hull
+
+        hull = _hull(feed)
+
+        def meets(land):
+            try:
+                return bool(shapely.intersects(hull, land))
+            except shapely.errors.GEOSException:
+                return True
+
+        edges = {
+            key: edge
+            for key, edge in feed.edges.items()
+            if key[0] not in self._stands or hull is None or meets(self._stands[key[0]])
+        }
+        if not edges:
+            return None
+        feed.edges = edges
+        return feed
 
     def recommend(
         self,
@@ -573,8 +627,8 @@ class Area:
         """Which of the feeds serving the area's parts to use on ``when``,
         as :meth:`Place.recommend` answers for a place, each feed's
         departures and the shares other feeds run summed over the parts. By
-        default an area considers every tier when one of its parts is a
-        region or a country, else local and regional feeds."""
+        default each part considers its own kind's tiers: local and regional
+        feeds at a city or a metro, every tier at a region or a country."""
         from transitio.index.recommend import recommend_for
 
         return recommend_for(self, when, tiers, exclude, target, max_feeds)
@@ -969,30 +1023,53 @@ class _PlaceLookup:
         ids = ids[candidate].tolist()
         own, clipped, total = np.split(sizes, [len(ids), 2 * len(ids)])
         if not total[0]:
-            return Area(geometry, country, (), 0.0, self._index)
+            unused = [AreaUnused(self.get(pid), _FLAT) for pid in sorted(ids)]
+            return Area(geometry, country, (), 0.0, self._index, unused)
         inside = np.divide(clipped, own, out=np.zeros(len(ids)), where=own > 0)
         inside, holds = np.minimum(inside, 1.0), np.minimum(clipped / total[0], 1.0)
-        share = dict(zip(ids, zip(inside.tolist(), holds.tolist())))
-        above = {pid: {p.id for p in self.get(pid).ancestors} for pid in ids}
-        half = {pid for pid in ids if share[pid][0] >= _WHOLE_SHARE}
-        whole = {pid for pid in half if not above[pid] & half}
-        partial = {
-            pid
-            for pid in ids
-            if pid not in half
-            and share[pid][1] >= _PARTIAL_SHARE
-            and not above[pid] & whole
-        }
-        # A broad place gives way to a narrower one that is a part itself.
-        partial -= set().union(*(above[pid] for pid in partial | whole))
-        chosen = sorted(whole | partial, key=lambda pid: (-share[pid][1], pid))
         held = dict(zip(ids, clips[candidate]))
-        covered = shapely.union_all([held[pid] for pid in chosen])
+        places = {pid: self.get(pid) for pid in ids}
+        # Every city at least half inside, or holding 1 % of the area, is a
+        # part; a region or country stands for the land no city part and no
+        # narrower place with feeds covers, when that is 1 % of the area.
+        shares, unused, covered, stands = {}, [], shapely.Polygon(), {}
+        for n in sorted(range(len(ids)), key=ids.__getitem__):
+            pid = ids[n]
+            if places[pid].kind != "city":
+                continue
+            if inside[n] >= _WHOLE_SHARE or holds[n] >= _PARTIAL_SHARE:
+                shares[pid] = (float(inside[n]), float(holds[n]))
+                covered = shapely.union(covered, held[pid])
+            else:
+                unused.append(AreaUnused(places[pid], _SMALL))
+        broad = sorted(
+            (n for n, pid in enumerate(ids) if places[pid].kind != "city"),
+            key=lambda n: (-len(places[ids[n]].ancestors), own[n], ids[n]),
+        )
+        above = {pid: {p.id for p in places[pid].ancestors} for pid in ids}
+        for n in broad:
+            pid = ids[n]
+            # Land a narrower place with feeds covers is its, part or not.
+            inner = [held[other] for other in ids if pid in above[other]]
+            rest = shapely.difference(held[pid], shapely.union_all([covered, *inner]))
+            share = min(float(_areas_km2([rest])[0] / total[0]), 1.0)
+            if share >= _PARTIAL_SHARE:
+                shares[pid] = (float(inside[n]), share)
+                stands[pid] = rest
+                covered = shapely.union(covered, rest)
+            else:
+                why = _COVERED if holds[n] >= _PARTIAL_SHARE else _SMALL
+                unused.append(AreaUnused(places[pid], why))
+        chosen = sorted(shares, key=lambda pid: (-shares[pid][1], pid))
         ground = shapely.union_all([*clips[land], covered])
         covered_km2, land_km2 = _areas_km2([covered, ground])
         coverage = min(float(covered_km2 / land_km2), 1.0) if land_km2 else 0.0
-        parts = [AreaPart(self.get(pid), *share[pid], pid in whole) for pid in chosen]
-        return Area(geometry, country, parts, coverage, self._index)
+        parts = [
+            AreaPart(places[pid], *shares[pid], shares[pid][0] >= _WHOLE_SHARE)
+            for pid in chosen
+        ]
+        unused.sort(key=lambda u: u.place.id)
+        return Area(geometry, country, parts, coverage, self._index, unused, stands)
 
     def _candidates(self, query, kind=None, definition=None):
         query_norm = _normalize(query)

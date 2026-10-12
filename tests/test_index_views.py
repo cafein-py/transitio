@@ -289,8 +289,15 @@ AREA_EDGES = [
 ]
 
 
+# Why a place meeting an area is not one of its parts.
+COVERED, SMALL = (
+    "narrower places cover its land in the area",
+    "holds less than 1 % of the area",
+)
+
+
 @pytest.mark.parametrize(
-    "bounds, country, parts, coverage, feeds",
+    "bounds, country, parts, coverage, feeds, unused",
     [
         pytest.param(
             (2, 0, 2.8, 0.4),
@@ -298,6 +305,7 @@ AREA_EDGES = [
             [("c1", True, 1.0, 0.5), ("k2", True, 1.0, 0.5)],
             1.0,
             {"f-bus": ["c1", "k2"], "f-c1": ["c1"]},
+            [("aa", COVERED), ("r", COVERED)],
             id="city-and-county",
         ),
         pytest.param(
@@ -306,6 +314,7 @@ AREA_EDGES = [
             [("c1", False, 0.06, 1.0)],
             1.0,
             {"f-bus": ["c1"], "f-c1": ["c1"]},
+            [("aa", COVERED), ("r", COVERED)],
             id="box-in-a-district",
         ),
         pytest.param(
@@ -314,15 +323,26 @@ AREA_EDGES = [
             [("c1", False, 0.09, 0.5), ("k2", False, 0.09, 0.5)],
             1.0,
             {"f-bus": ["c1", "k2"], "f-c1": ["c1"]},
+            [("aa", COVERED), ("r", COVERED)],
             id="across-two-cities",
         ),
-        pytest.param((10, 0, 10.5, 0.5), None, [], 0.0, {}, id="off-the-country"),
+        pytest.param((10, 0, 10.5, 0.5), None, [], 0.0, {}, [], id="off-the-country"),
+        pytest.param(
+            shapely.Point(2.1, 0.1),
+            None,
+            [],
+            0.0,
+            {},
+            [(p, "the area has no extent") for p in ("aa", "c1", "r")],
+            id="a-point",
+        ),
         pytest.param(
             (3.9, 0, 4.1, 0.3),
             "BB",
             [("b1", False, 0.19, 0.5)],
             1.0,
             {"f-b1": ["b1"]},
+            [("bb", COVERED)],
             id="country-filter",
         ),
         pytest.param(
@@ -331,15 +351,17 @@ AREA_EDGES = [
             [("aa", False, 0.01, 0.25)],
             0.25,
             {"f-aa": ["aa"]},
+            [],
             id="mostly-in-a-country-without-feeds",
         ),
         pytest.param(
             (2.5, 0.3, 2.9, 0.95),
             None,
-            [("k2", False, 0.19, 0.12)],
-            0.12,
-            {"f-bus": ["k2"]},
-            id="city-over-1pc-displaces-its-region",
+            [("r", False, 0.26, 0.88), ("k2", False, 0.19, 0.12)],
+            1.0,
+            {"f-bus": ["k2"], "f-r": ["r"]},
+            [("aa", COVERED)],
+            id="a-city-and-its-region-for-the-rest",
         ),
         pytest.param(
             (2.79, 0.39, 2.99, 0.79),
@@ -347,12 +369,13 @@ AREA_EDGES = [
             [("r", False, 0.08, 1.0)],
             1.0,
             {"f-r": ["r"]},
+            [("aa", COVERED), ("k2", SMALL)],
             id="city-under-1pc-leaves-its-region",
         ),
     ],
 )
 def test_an_area_is_made_of_the_places_covering_it(
-    tmp_path, bounds, country, parts, coverage, feeds
+    tmp_path, bounds, country, parts, coverage, feeds, unused
 ):
     from index_fixture import covered_feed as feed, write_index
 
@@ -371,6 +394,8 @@ def test_an_area_is_made_of_the_places_covering_it(
         for part in area.parts
     ]
     assert found == parts
+    assert [(u.place.id, u.reason) for u in area.unused] == unused
+    assert all(isinstance(u, reader.AreaUnused) for u in area.unused)
     assert round(area.coverage, 2) == coverage
     assert f"parts={len(parts)}, coverage={coverage:.2f})" in repr(area)
     listed = {f.feed_id: sorted({p for p, _ in f.edges}) for f in area.feeds()}
@@ -391,6 +416,48 @@ def test_an_area_is_made_of_the_places_covering_it(
     once = area.feeds(categories=iter(["primary"]))
     every = area.feeds(categories=["primary"])
     assert [sorted(f.edges) for f in once] == [sorted(f.edges) for f in every]
+
+
+def test_a_region_part_takes_the_feeds_serving_the_land_it_stands_for(tmp_path):
+    from index_fixture import covered_feed as feed, write_index
+
+    # Region r stands for the box outside city k2: a regional feed elsewhere
+    # in r is left out, one meeting that land or of unknown coverage kept.
+    coverage = {
+        "f-near": _box(2.6, 0.5, 2.7, 0.6),
+        "f-far": _box(2.0, 0.8, 2.1, 0.9),
+        "f-empty": shapely.to_wkb(shapely.Point()).hex(),
+    }
+    ids = ("f-near", "f-far", "f-unknown", "f-empty")
+    feeds = [{**feed(i), "coverage": coverage.get(i)} for i in ids]
+    edges = [edge("r", i, tier="regional") for i in ids]
+    index = reader.read_index(
+        write_index(
+            tmp_path / "index",
+            feeds=[*feeds, feed("f-bus")],
+            places=AREA_PLACES,
+            edges=[*edges, edge("k2", "f-bus", tier="local")],
+        )
+    )
+    area = reader.area((2.5, 0.3, 2.9, 0.95), index=index)
+    assert sorted(_ids(area.feeds())) == ["f-bus", "f-empty", "f-near", "f-unknown"]
+    # A feed kept through its city edge alone ranks by that edge, not by the
+    # region edge left out.
+    ranked = [
+        edge("k2", "f-bus", tier="local", relevance_category="primary", relevance=0.5),
+        edge("k2", "f-far", tier="regional", relevance_category="secondary"),
+        edge("r", "f-far", tier="regional", relevance_category="primary", relevance=1),
+    ]
+    index = reader.read_index(
+        write_partitioned_index(
+            tmp_path / "ranked",
+            feeds=[feeds[1], feed("f-bus")],
+            places=AREA_PLACES,
+            edges=ranked,
+        )
+    )
+    area = reader.area((2.5, 0.3, 2.9, 0.95), index=index)
+    assert _ids(area.feeds()) == ["f-bus", "f-far"]
 
 
 # A Munich-like city: three large feeds each running nearly all of its

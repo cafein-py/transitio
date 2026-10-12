@@ -1022,13 +1022,13 @@ def test_an_installed_snapshot_stays_while_anything_read_from_it_lives(
         return helsinki
 
     helsinki = held()
-    assert _refresh._prune(root, 1, set()) == ([], [])
+    assert _refresh._prune(root, 1, set())[:2] == ([], [])
     geometry = helsinki.geometry
     evidence = helsinki.feeds()[0].edges["local"].evidence
     assert geometry == BOUNDARIES[0] and evidence == DETAILED_EDGES[0]["evidence"]
     del helsinki
     gc.collect()
-    assert _refresh._prune(root, 1, set()) == ([old], [])
+    assert _refresh._prune(root, 1, set())[:2] == ([old], [])
 
 
 def _install_split(tmp_path, monkeypatch, fake=None, parts=None, **kw):

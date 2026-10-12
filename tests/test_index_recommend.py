@@ -247,6 +247,46 @@ def test_an_area_recommendation_sums_its_parts(tmp_path, monkeypatch):
             area.recommend(**wrong)
 
 
+def test_each_part_of_an_area_considers_its_own_kinds_tiers(tmp_path):
+    def served(place_id, feed_id, tier, departures):
+        service = {"stops": 10, "routes": 1, "departures_per_day": departures}
+        record = _edge(place_id, feed_id, tier, "primary", 0.5, service=service)
+        overlap = {"departures": {"bus": departures}, "with": {}}
+        return {**record, "evidence": {"overlap": overlap}}
+
+    # City k2 and region r: a national coach at the city is not considered,
+    # a national feed at the region is.
+    edges = [
+        served("k2", "f-city", "local", 400),
+        served("k2", "f-coach", "national", 20),
+        served("r", "f-reg", "regional", 300),
+        served("r", "f-nat", "national", 50),
+    ]
+    feeds = [
+        {**covered_feed(feed_id), "home_country": "AA"}
+        for feed_id in ("f-city", "f-coach", "f-reg", "f-nat")
+    ]
+    path = write_partitioned_index(
+        tmp_path, feeds=feeds, places=AREA_PLACES, edges=edges, access={}
+    )
+    area = reader.area((2.5, 0.3, 2.9, 0.95), index=reader.read_index(path))
+    assert [part.place.id for part in area.parts] == ["r", "k2"]
+    found = area.recommend("2026-10-13")
+    assert found.tiers == {
+        "region": ("local", "regional", "national", "international"),
+        "city": ("local", "regional"),
+    }
+    assert sorted(found.feed_ids) == ["f-city", "f-nat", "f-reg"]
+    assert [(c.feed.feed_id, c.reason) for c in found.left_out] == [
+        ("f-coach", "not considered: serves the place at the national tier")
+    ]
+    assert str(found).splitlines()[1] == (
+        "  considers local and regional feeds at its cities; local, regional, "
+        "national and international feeds at its regions, and those of unknown "
+        "tier"
+    )
+
+
 def test_a_recommendation_considers_the_tiers_of_its_kind_of_place(tmp_path):
     # A national train feed, of which no local or regional feed runs a trip,
     # and a cross-border tram of its own.
@@ -367,6 +407,7 @@ def test_an_unreadable_coverage_orders_a_feed_last():
     from transitio.index.recommend import _area
 
     nan = shapely.Polygon([(0, 0), (float("nan"), 0), (1, 1)])
-    for coverage in (None, b"junk", shapely.Point().wkb, nan.wkb):
+    listed = [shapely.box(0, 0, 1, 1).wkb]
+    for coverage in (None, b"junk", shapely.Point().wkb, nan.wkb, listed):
         assert _area(SimpleNamespace(coverage=coverage)) is None
     assert _area(SimpleNamespace(coverage=shapely.box(0, 0, 1, 2).wkb)) == 2

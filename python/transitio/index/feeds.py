@@ -156,6 +156,30 @@ DEFAULT_CATEGORIES = {
 TOWN_MAX_KM2 = 1000.0
 
 
+def _hull(feed):
+    """The feed's coverage as a geometry, or None when it has none, cannot
+    be read as one geometry or is empty."""
+    import shapely
+
+    if feed.coverage is None:
+        return None
+    try:
+        geometry = shapely.from_wkb(feed.coverage)
+    except (shapely.errors.GEOSException, TypeError, ValueError):
+        return None
+    if not isinstance(geometry, shapely.Geometry) or geometry.is_empty:
+        return None
+    return geometry
+
+
+def _ranked(index):
+    """Whether ``index`` records relevance (schema 7 and later), so its
+    feeds are listed by category and relevance rather than by id."""
+    return index.links is not None or (
+        index.edges is not None and "relevance_category" in index.edges.columns
+    )
+
+
 def _names(value):
     """A ``tiers=`` or ``exclude=`` value read once: None stays None, a string
     is one name, any other iterable a tuple of its names."""
@@ -1235,9 +1259,7 @@ def _feeds_for_places(
         if not all(isinstance(name, str) for name in needed):
             raise ValueError("requires must name GTFS files as strings")
     allowed = None if spec is None else {spec} if isinstance(spec, str) else set(spec)
-    ranked = index.links is not None or (
-        index.edges is not None and "relevance_category" in index.edges.columns
-    )
+    ranked = _ranked(index)
     if index.edges is None and not (ranked and international):
         return FeedList()
     ids = [place.id for place in places]
@@ -1258,10 +1280,12 @@ def _feeds_for_places(
         named = {edge["feed_id"] for edge in records}
         own = index.feeds[index.feeds["feed_id"].isin(named)]
         rows.update((row["feed_id"], row) for row in own.to_dict("records"))
+    # ``tiers`` may name each place's tiers, by place id.
+    at = {p.id: tiers.get(p.id) if isinstance(tiers, dict) else tiers for p in places}
     wanted = dict.fromkeys(ids)
     if ranked:
         wanted = {
-            p.id: _default_categories(p, tiers, categories, international)
+            p.id: _default_categories(p, at[p.id], categories, international)
             for p in places
         }
     by_feed = {}
@@ -1278,7 +1302,7 @@ def _feeds_for_places(
         matched = {}
         for place_id in ids:
             edges = by_feed[feed_id].get(place_id, ())
-            query = (tiers, exclude, on_unknown, wanted[place_id], index)
+            query = (at[place_id], exclude, on_unknown, wanted[place_id], index)
             for tier, edge in _matched(edges, *query).items():
                 matched[(place_id, tier)] = edge
         if not matched:

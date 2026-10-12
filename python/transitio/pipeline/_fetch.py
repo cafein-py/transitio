@@ -103,6 +103,9 @@ class FetchResult:
     # The index places the feeds were selected for: the place, the area's
     # parts, or none on the catalogue path.
     places: list = dataclasses.field(default_factory=list)
+    # The area's parts, the land they cover and the places not used; on the
+    # catalogue path, the feeds found and those it cannot find.
+    area_note: str | None = None
 
     def __iter__(self):  # convenient (pbf, feeds) unpacking
         return iter((self.osm_pbf, self.feeds))
@@ -1880,6 +1883,17 @@ def _context(version, key):
     return next(iter(version.datasets), None)
 
 
+def _staged_dataset(db, dataset, staging):
+    """A catalogued dataset's archive downloaded into ``staging``; raises when
+    the download fails or is not a zip archive."""
+    from transitio.exceptions import DownloadError
+
+    path = db._fetch_dataset(dataset, directory=staging)
+    if not zipfile.is_zipfile(path):
+        raise DownloadError("not a zip archive")
+    return path
+
+
 def _hosted(db, cache, version, dataset_id):
     """The hosted validation report of ``dataset_id`` stored with
     ``version``: fetched and stored at its first use (``"unavailable"`` when
@@ -2187,13 +2201,16 @@ def fetch(
     the AOI), downloads each feed, spatially
     crops it, optionally repairs it, validates it, and builds a merged report
     per feed.
-    With an API token, downloads come from catalogued dataset versions
-    (checksum-verified, with the hosted canonical-validator report);
-    without one, the unversioned latest hosted zip is fetched — a moving
-    target with no upstream checksum, documented in its provenance
-    sidecar as such. On the index paths, a feed without a catalogued dataset,
-    or whose dataset download fails, is read from the first of its indexed
-    URLs that serves a zip archive: the Mobility Database direct download,
+    With an API token and a study day, each catalogued dataset version
+    covering the day (checksum-verified, with the hosted canonical-validator
+    report) is tried, newest first, the next when one fails to download or
+    misses the day, and then the feed's own source, whose computed window
+    decides; with a token and no day the feed's own source comes first and
+    the newest dataset is the fallback when it fails. Without a token the
+    unversioned latest copy is fetched — a moving target with no upstream
+    checksum, documented in its provenance sidecar as such. On the index
+    paths the feed's own source is the first of its indexed URLs that
+    serves a zip archive: the Mobility Database direct download,
     the Transitland Atlas static feed, then the Mobility Database hosted
     copy; on a schema-11 index the URL the index crawled
     (``IndexedFeed.download_url``) comes first and the hosted copy second.
@@ -2573,6 +2590,14 @@ def fetch(
         tiers that fetch them, and a ``UserWarning`` repeats it, e.g. ``"the
         local and regional tiers of a city hold none of the place's 2 feeds:
         f-a (national), f-b (national); tiers=['national'] fetches them"``.
+        An area fetched from the index's places carries ``area_note``: how
+        many places stand for it and the share of its land they cover, the
+        regions and countries standing for the land between its cities, and
+        the places meeting it that are not used, with why, e.g. ``"3 index
+        places stand for the area, covering 98% of its land: 2 cities, and
+        Uusimaa for the land outside them; not used: Finland (narrower places
+        cover its land in the area)"``. Each part considers its own kind's tiers
+        (:meth:`~transitio.index.Place.recommend`).
         When the OSM extract leaves out parts of the place, or delivered
         stops lie outside its area, ``osm_note`` notes them, e.g. ``"OSM
         area: 1 of 47 parts (1783 of 2188 km²); 4970 of 10026 located stops
@@ -2717,22 +2742,22 @@ def fetch(
         tokenless = when is not None and not db._refresh_token
         # Without a token the search reads the catalogue export, downloaded
         # when the cached copy is missing or a day old.
+        # Every page; with a study day, feeds of every status, which the
+        # date rules then judge by their own windows.
+        status = None if study else "active"
         with progress.downloads("Downloading the Mobility Database catalogue"):
-            found = db.search_feeds(aoi=geometry, country_code=country_code)
+            found = db.search_feeds(
+                aoi=geometry, country_code=country_code, status=status
+            )
+            unboxed = db._unboxed(country_code=country_code, status=status)
         candidates = sorted(found, key=_rank)
         progress.start(len(candidates), "from the Mobility Database catalogue")
+        area_note = _catalogue_note(len(candidates), study, unboxed)
         if index is not False:
-            count = len(candidates)
-            found = f"{count} feed{'' if count == 1 else 's'}"
             hint = ""
             if why == _NO_INDEX:
                 hint = "; transitio.index.refresh() installs the feed index"
-            warnings.warn(
-                f"{why}; {found} from the Mobility Database catalogue by "
-                f"bounding box{hint}",
-                UserWarning,
-                stacklevel=2,
-            )
+            warnings.warn(f"{why}; {area_note}{hint}", UserWarning, stacklevel=2)
         if osm:
             progress.say("Fetching the OSM extract")
             with progress.downloads("Downloading the OpenStreetMap extract"):
@@ -2833,62 +2858,79 @@ def fetch(
             cached = _candidates(cache, feed.id, key, False)
             if use_cache and reuse(feed, entry, cached, "reused"):
                 continue
-            dataset = None
+            covering, newest, errors = [], None, []
             if db._refresh_token:
                 try:
                     if when is not None:
-                        dataset = db.dataset_for(feed, when)
-                        if dataset is None:
-                            _skip(entry, "no dataset covers the requested day")
-                            continue
+                        covering = db.datasets_for(feed, when)
                     else:
-                        # Prefer a versioned dataset (checksum, hosted
-                        # report) over the unversioned moving target.
                         versions = db.datasets(feed)
-                        dataset = versions[0] if versions else None
-                except Exception as error:  # noqa: B902
-                    reason = f"dataset selection failed: {error}"
-                    failed(feed, entry, cached, reason, f"dataset selection: {error}")
+                        newest = versions[0] if versions else None
+                except Exception as error:  # noqa: B902 — the latest copy next
+                    errors.append(f"dataset selection: {error}")
+            # With a day, each dataset covering it, newest first, then the
+            # latest hosted copy, whose window decides; without a day the
+            # latest copy, then the newest dataset. None stands for the copy.
+            if when is not None:
+                sources = [*covering, None]
+            else:
+                sources = [None] if newest is None else [None, newest]
+            for n, dataset in enumerate(sources):
+                last = n == len(sources) - 1
+                path = None
+                try:
+                    if dataset is None:
+                        path = db._fetch_latest(feed, directory=staging)
+                    else:
+                        path = _staged_dataset(db, dataset, staging)
+                except Exception as error:  # noqa: B902 — try the next source
+                    errors.append(
+                        str(error) if dataset is None else f"mdb dataset: {error}"
+                    )
+                fetched_from = "mdb_latest" if dataset is None else "mdb_dataset"
+                if path is not None:
+                    try:
+                        version = _add_version(
+                            cache,
+                            feed.id,
+                            path,
+                            (
+                                feed.latest_dataset_url
+                                if dataset is None
+                                else dataset.hosted_url
+                            ),
+                            fetched_from,
+                            "; ".join(errors) or None,
+                            dataset=dataset and {dataset.id: _dataset_entry(dataset)},
+                            replace=not use_cache,
+                        )
+                    except DownloadError as error:  # not a zip archive
+                        errors.append(str(error))
+                        path = None
+                    except Exception as error:  # noqa: B902 — isolate failures
+                        if last:
+                            _skip(entry, f"processing failed: {error}")
+                            break
+                        errors.append(f"{fetched_from}: {error}")
+                        continue
+                if path is None:
+                    if last:
+                        message = "; ".join(errors)
+                        failed(
+                            feed, entry, cached, f"download failed: {message}", message
+                        )
                     continue
-            try:
-                if dataset is not None:
-                    path = db._fetch_dataset(dataset, directory=staging)
-                else:
-                    path = db._fetch_latest(feed, directory=staging)
-            except Exception as error:  # noqa: B902
-                failed(feed, entry, cached, f"download failed: {error}", str(error))
-                continue
-            fetched_from = "mdb_latest" if dataset is None else "mdb_dataset"
-            try:
-                version = _add_version(
-                    cache,
-                    feed.id,
-                    path,
-                    feed.latest_dataset_url if dataset is None else dataset.hosted_url,
-                    fetched_from,
-                    None,
-                    dataset=dataset and {dataset.id: _dataset_entry(dataset)},
-                    replace=not use_cache,
+                entry.update(
+                    fetched_from=fetched_from,
+                    download_errors="; ".join(errors) or None,
+                    cache="downloaded" if use_cache else "refreshed",
                 )
-            except DownloadError as error:  # not a zip archive
-                failed(feed, entry, cached, f"download failed: {error}", str(error))
-                continue
-            except Exception as error:  # noqa: B902 — isolate per-feed failures
-                _skip(entry, f"processing failed: {error}")
-                continue
-            entry.update(
-                fetched_from=fetched_from,
-                cache="downloaded" if use_cache else "refreshed",
-            )
-            # Read as a reuse would, so identical bytes report alike.
-            dataset_id = _context(version, key)
-            take(
-                feed,
-                entry,
-                version,
-                dataset_id,
-                _hosted(db, cache, version, dataset_id),
-            )
+                # Read as a reuse would, so identical bytes report alike.
+                dataset_id = _context(version, key)
+                hosted = _hosted(db, cache, version, dataset_id)
+                outcome = take(feed, entry, version, dataset_id, hosted, last=last)
+                if outcome != "rejected":
+                    break
 
     _warn_undated(undated, day, stacklevel=3)
     repeats = dict(budgets=budgets, modes=modes, day=day if study else None)
@@ -2918,6 +2960,7 @@ def fetch(
         selection=record,
         osm_area=None if osm_pbf is None else geometry,
         osm_note=osm_note,
+        area_note=area_note,
     )
 
 
@@ -3042,6 +3085,46 @@ def _osm_stops(area, coords):
     return shapely.multipoints(inside) if len(inside) else None
 
 
+def _catalogue_note(count, study, unboxed):
+    """The ``area_note`` of a catalogue search: the feeds found by bounding
+    box, of every status with a study day, and the catalogue feeds without
+    a bounding box, which a search by area cannot find."""
+    note = (
+        f"{count} feed{'' if count == 1 else 's'} from the Mobility Database "
+        "catalogue by bounding box"
+    )
+    if study:
+        note += ", of every status"
+    if unboxed:
+        feeds = "feed" if unboxed == 1 else "feeds"
+        note += f"; {unboxed} catalogue {feeds} without a bounding box cannot be found"
+    return note
+
+
+def _area_note(area):
+    """The ``area_note`` of an area fetch: how many places stand for the
+    area and how much of its land they cover, the regions and countries
+    standing for the land between the cities, and the places not used, at
+    most five named."""
+    cities = sum(part.place.kind == "city" for part in area.parts)
+    broad = [part.place for part in area.parts if part.place.kind != "city"]
+    share = math.floor(area.coverage * 100)
+    count = len(area.parts)
+    places = "index place stands" if count == 1 else "index places stand"
+    note = (
+        f"{count} {places} for the area, covering {share}% of its land: "
+        f"{cities} {'city' if cities == 1 else 'cities'}"
+    )
+    if broad:
+        names = ", ".join(place.name or place.id for place in broad)
+        note += f", and {names} for the land outside them"
+    unused = [f"{u.place.name or u.place.id} ({u.reason})" for u in area.unused]
+    if unused:
+        more = f" and {len(unused) - 5} more" if len(unused) > 5 else ""
+        note += f"; not used: {', '.join(unused[:5])}{more}"
+    return note
+
+
 def _hidden_note(place, hidden, considered, reach):
     """The ``view_note`` on a place, or an area, whose ``considered`` tiers
     (less those excluded) hold none of its ``hidden`` feeds: those tiers,
@@ -3063,7 +3146,9 @@ def _hidden_note(place, hidden, considered, reach):
     tiers = [tier for tier in order if tier in reach]
     feeds, them = ("feed", "it") if len(hidden) == 1 else ("feeds", "them")
     count = f"{whose} {len(hidden)} {feeds}"
-    if considered:
+    if isinstance(considered, dict):
+        head = f"the tiers {where} consider by their kind hold none of {count}"
+    elif considered:
         tiers_of = f"the {_tier_words(considered)} tier"
         tiers_of += (
             f"s of {where} hold" if len(considered) > 1 else f" of {where} holds"
@@ -3205,7 +3290,7 @@ def _fetch_place(
     from transitio.catalog import Feed, MobilityDatabase, TransitlandAtlas
     from transitio.catalog._client import _dataset_entry
     from transitio.credentials import _checked, _provider
-    from transitio.exceptions import DownloadError, StaleSelectorError
+    from transitio.exceptions import StaleSelectorError
     from transitio.index import (
         DISCOVERY_SEMANTICS_VERSION,
         Area,
@@ -3215,7 +3300,9 @@ def _fetch_place(
     )
     from transitio.index.feeds import MARKS, _hosted_url, _names
     from transitio.index.recommend import (
+        _by_place,
         _default_tiers,
+        _less,
         _not_considered,
         _tier_words,
     )
@@ -3250,7 +3337,7 @@ def _fetch_place(
 
     def candidates(unknown, at=considered):
         found = place_obj.feeds(
-            tiers=at,
+            tiers=_by_place(place_obj, at),
             exclude=exclude,
             on_unknown=unknown,
             categories=None,
@@ -3510,10 +3597,23 @@ def _fetch_place(
         every = {feed.feed_id: feed for feed in listing}
     named = "fetch takes it when named in feeds="
 
+    kinds = {}
+    if isinstance(place_obj, Area):
+        kinds = {part.place.id: part.place.kind for part in place_obj.parts}
+
     def elsewhere(feed_id):
+        # The feed's tiers at the place, or each part, beyond those its kind
+        # considers.
         if tiers is not None or considered is None or feed_id not in every:
             return set()
-        return every[feed_id].tiers - set(considered) - excluded - {"unknown"}
+        found = set()
+        for key, edge in every[feed_id].edges.items():
+            at = considered
+            if isinstance(considered, dict):
+                at = considered.get(kinds.get(key[0]))
+            if at is not None and edge.tier not in at:
+                found.add(edge.tier)
+        return found - excluded - {"unknown"}
 
     if on_unknown == "exclude":
         for feed in candidates("include"):
@@ -3540,8 +3640,7 @@ def _fetch_place(
     view_note = None
     if tiers is None and wanted is None and hidden and not offered:
         reach = set().union(*(elsewhere(feed.feed_id) for feed in hidden))
-        effective = tuple(tier for tier in considered if tier not in excluded)
-        view_note = _hidden_note(place_obj, hidden, effective, reach)
+        view_note = _hidden_note(place_obj, hidden, _less(considered, excluded), reach)
         warnings.warn(view_note, UserWarning, stacklevel=3)
 
     cache = _feed_cache(cache_dir, directory)
@@ -3697,8 +3796,7 @@ def _fetch_place(
                     continue
                 _skip(entry, keyless)
                 continue
-            dataset = None
-            errors = []
+            covering, newest, errors = [], None, []
             # A protected feed with credentials skips the dataset versions:
             # its fallback is the hosted copy alone.
             if db._refresh_token and access is None:
@@ -3707,95 +3805,116 @@ def _fetch_place(
                     try:
                         mdb_feed = Feed.from_api({"id": mdb_id})
                         if when is not None:
-                            dataset = db.dataset_for(mdb_feed, when)
-                            if dataset is None:
-                                _skip(entry, "no dataset covers the requested day")
-                                continue
+                            covering = db.datasets_for(mdb_feed, when)
                         else:
                             versions = db.datasets(mdb_feed)
-                            dataset = versions[0] if versions else None
+                            newest = versions[0] if versions else None
                     except Exception as error:  # noqa: B902 — fall back to the urls
                         errors.append(f"dataset selection: {error}")
-            if dataset is None and expired_unchanged(feed, entry):
+            if not covering and newest is None and expired_unchanged(feed, entry):
                 continue
             if proven:
-                if dataset is None and unchanged(feed):
+                if not covering and unchanged(feed):
                     _skip(entry, f"contained in {proven[0]}", contained_in=proven)
                     protected.update(carriers[c] for c in proven)
                     continue
                 notes.append(_unproven(proven))
-            # The hosted validation report only describes the dataset's own
-            # bytes, so it is attached only when the dataset supplied them.
-            path = fetched_from = url = None
-            if dataset is not None:
+
+            # With a day, each dataset covering it, newest first, then the
+            # feed's own URLs, whose window decides; without a day the feed's
+            # own URLs, then the newest dataset. None stands for the URLs.
+            if when is not None:
+                sources = [*covering, None]
+            else:
+                sources = [None] if newest is None else [None, newest]
+            for n, dataset in enumerate(sources):
+                last = n == len(sources) - 1
+                path = url = fetched_from = None
+                if dataset is None:
+                    if not last:
+                        # The newest dataset follows an archive proven ended.
+                        missed = _misses(feed.service_start, feed.service_end, day)
+                        if expired == "skip" and missed and unchanged(feed):
+                            errors.append(f"{missed}; unchanged since indexed")
+                            continue
+                    elif covering and expired_unchanged(feed, entry):
+                        break
+                    if contained == "drop" and feed.feed_id in container_ids:
+                        # Probed before its download, a container can prove
+                        # itself.
+                        unchanged(feed)
+                    try:
+                        path, fetched_from, failures, url = _download_indexed(
+                            feed, db, atlas, staging, archives, budget, access, progress
+                        )
+                        errors.extend(failures)
+                    except Exception as error:  # noqa: B902
+                        errors.append(str(error))
+                else:
+                    try:
+                        path = _staged_dataset(db, dataset, staging)
+                        url, fetched_from = dataset.hosted_url, "mdb_dataset"
+                    except Exception as error:  # noqa: B902 — try the next source
+                        errors.append(f"mdb dataset: {error}")
+                        if not last:
+                            progress.retry(str(error), dataset.hosted_url)
+                # Set before the later checks, so a feed skipped after its
+                # download still records where it came from.
+                download_errors = "; ".join(e for e in errors if e) or None
+                if access is not None and download_errors is not None:
+                    download_errors = access.redact(download_errors)
+                entry.update(fetched_from=fetched_from, download_errors=download_errors)
+                if path is None:
+                    if not last:
+                        continue
+                    if fall_back(
+                        feed, entry, candidates, key, notes, keyless, proven, deferred
+                    ):
+                        break
+                    _skip(entry, f"download failed: {download_errors}", note=keyless)
+                    break
+                acquired_as = dataset.id if fetched_from == "mdb_dataset" else None
                 try:
-                    url = dataset.hosted_url
-                    path = db._fetch_dataset(dataset, directory=staging)
-                    if not zipfile.is_zipfile(path):
-                        path = None
-                        raise DownloadError("not a zip archive")
-                    fetched_from = "mdb_dataset"
-                except Exception as error:  # noqa: B902 — try the fallback next
-                    errors.append(f"mdb dataset: {error}")
-                    progress.retry(str(error), url)
-                if path is None and expired_unchanged(feed, entry):
-                    continue
-            if path is None:
-                if contained == "drop" and feed.feed_id in container_ids:
-                    # Probed before its download, a container can prove itself.
-                    unchanged(feed)
-                try:
-                    path, fetched_from, failures, url = _download_indexed(
-                        feed, db, atlas, staging, archives, budget, access, progress
+                    version = _add_version(
+                        cache,
+                        feed.feed_id,
+                        path,
+                        url,
+                        fetched_from,
+                        download_errors,
+                        with_credentials=access is not None
+                        and fetched_from == "producer",
+                        snapshot=snapshot,
+                        dataset=acquired_as and {acquired_as: _dataset_entry(dataset)},
+                        replace=not use_cache,
                     )
-                    errors.extend(failures)
-                except Exception as error:  # noqa: B902
-                    errors.append(str(error))
-            # Set before the later checks, so a feed skipped after its
-            # download still records where it came from.
-            download_errors = "; ".join(e for e in errors if e) or None
-            if access is not None and download_errors is not None:
-                download_errors = access.redact(download_errors)
-            entry.update(fetched_from=fetched_from, download_errors=download_errors)
-            if path is None:
-                if fall_back(
-                    feed, entry, candidates, key, notes, keyless, proven, deferred
-                ):
-                    continue
-                _skip(entry, f"download failed: {download_errors}", note=keyless)
-                continue
-            acquired_as = dataset.id if fetched_from == "mdb_dataset" else None
-            try:
-                version = _add_version(
-                    cache,
-                    feed.feed_id,
-                    path,
-                    url,
-                    fetched_from,
-                    download_errors,
-                    with_credentials=access is not None and fetched_from == "producer",
-                    snapshot=snapshot,
-                    dataset=acquired_as and {acquired_as: _dataset_entry(dataset)},
-                    replace=not use_cache,
+                except Exception as error:  # noqa: B902 — isolate per-feed failures
+                    if not last:
+                        errors.append(f"{fetched_from}: {error}")
+                        continue
+                    _skip(entry, f"processing failed: {error}")
+                    break
+                # Read as a reuse would, so identical bytes report alike.
+                dataset_id = _context(version, key)
+                probe = probes.get(feed.feed_id)
+                acquired = version.sidecar["cache"]["sources"][-1]
+                if snapshot and probe and acquired["source_url"] == probe:
+                    # The proof covers only a download from the probed URL.
+                    _prove(cache, version, snapshot, probe)
+                current[feed.feed_id] = snapshot in version.index_proofs
+                said = list(notes)
+                if fetched_from == "mdb_latest" and (download_errors or keyless):
+                    said.append("from the Mobility Database hosted copy")
+                said.append(keyless)
+                hosted = _hosted(db, cache, version, dataset_id)
+                entry["cache"] = "downloaded" if use_cache else "refreshed"
+                outcome = take(
+                    feed, entry, version, said, dataset_id, hosted, key, last=last
                 )
-            except Exception as error:  # noqa: B902 — isolate per-feed failures
-                _skip(entry, f"processing failed: {error}")
-                continue
-            path = version.path
-            # Read as a reuse would, so identical bytes report alike.
-            dataset_id = _context(version, key)
-            probe = probes.get(feed.feed_id)
-            acquired = version.sidecar["cache"]["sources"][-1]
-            if snapshot and probe and acquired["source_url"] == probe:
-                # The proof covers only a download from the probed URL.
-                _prove(cache, version, snapshot, probe)
-            current[feed.feed_id] = snapshot in version.index_proofs
-            if fetched_from == "mdb_latest" and (download_errors or keyless):
-                notes.append("from the Mobility Database hosted copy")
-            notes.append(keyless)
-            hosted = _hosted(db, cache, version, dataset_id)
-            entry["cache"] = "downloaded" if use_cache else "refreshed"
-            take(feed, entry, version, notes, dataset_id, hosted, key)
+                # A source that does not serve, or whose selector another
+                # version may match, gives way to the next.
+                if outcome not in ("rejected", "stale"):
+                    break
 
     _warn_undated(undated, day, stacklevel=4)
     removed = _settle_versions(record, services, protected, day if study else None)
@@ -3883,6 +4002,7 @@ def _fetch_place(
         osm_area=osm_area,
         view_note=view_note,
         osm_note=osm_note,
+        area_note=_area_note(place_obj) if isinstance(place_obj, Area) else None,
         places=(
             [part.place for part in place.parts]
             if isinstance(place, Area)
