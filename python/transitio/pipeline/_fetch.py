@@ -103,6 +103,8 @@ class FetchResult:
     # The index places the feeds were selected for: the place, the area's
     # parts, or none on the catalogue path.
     places: list = dataclasses.field(default_factory=list)
+    # The area's parts, the land they cover and the places not used.
+    area_note: str | None = None
 
     def __iter__(self):  # convenient (pbf, feeds) unpacking
         return iter((self.osm_pbf, self.feeds))
@@ -2573,6 +2575,14 @@ def fetch(
         tiers that fetch them, and a ``UserWarning`` repeats it, e.g. ``"the
         local and regional tiers of a city hold none of the place's 2 feeds:
         f-a (national), f-b (national); tiers=['national'] fetches them"``.
+        An area fetched from the index's places carries ``area_note``: how
+        many places stand for it and the share of its land they cover, the
+        regions and countries standing for the land between its cities, and
+        the places meeting it that are not used, with why, e.g. ``"3 index
+        places stand for the area, covering 98% of its land: 2 cities, and
+        Uusimaa for the land outside them; not used: Finland (narrower places
+        cover its land in the area)"``. Each part considers its own kind's tiers
+        (:meth:`~transitio.index.Place.recommend`).
         When the OSM extract leaves out parts of the place, or delivered
         stops lie outside its area, ``osm_note`` notes them, e.g. ``"OSM
         area: 1 of 47 parts (1783 of 2188 km²); 4970 of 10026 located stops
@@ -3042,6 +3052,30 @@ def _osm_stops(area, coords):
     return shapely.multipoints(inside) if len(inside) else None
 
 
+def _area_note(area):
+    """The ``area_note`` of an area fetch: how many places stand for the
+    area and how much of its land they cover, the regions and countries
+    standing for the land between the cities, and the places not used, at
+    most five named."""
+    cities = sum(part.place.kind == "city" for part in area.parts)
+    broad = [part.place for part in area.parts if part.place.kind != "city"]
+    share = math.floor(area.coverage * 100)
+    count = len(area.parts)
+    places = "index place stands" if count == 1 else "index places stand"
+    note = (
+        f"{count} {places} for the area, covering {share}% of its land: "
+        f"{cities} {'city' if cities == 1 else 'cities'}"
+    )
+    if broad:
+        names = ", ".join(place.name or place.id for place in broad)
+        note += f", and {names} for the land outside them"
+    unused = [f"{u.place.name or u.place.id} ({u.reason})" for u in area.unused]
+    if unused:
+        more = f" and {len(unused) - 5} more" if len(unused) > 5 else ""
+        note += f"; not used: {', '.join(unused[:5])}{more}"
+    return note
+
+
 def _hidden_note(place, hidden, considered, reach):
     """The ``view_note`` on a place, or an area, whose ``considered`` tiers
     (less those excluded) hold none of its ``hidden`` feeds: those tiers,
@@ -3063,7 +3097,9 @@ def _hidden_note(place, hidden, considered, reach):
     tiers = [tier for tier in order if tier in reach]
     feeds, them = ("feed", "it") if len(hidden) == 1 else ("feeds", "them")
     count = f"{whose} {len(hidden)} {feeds}"
-    if considered:
+    if isinstance(considered, dict):
+        head = f"the tiers {where} consider by their kind hold none of {count}"
+    elif considered:
         tiers_of = f"the {_tier_words(considered)} tier"
         tiers_of += (
             f"s of {where} hold" if len(considered) > 1 else f" of {where} holds"
@@ -3215,7 +3251,9 @@ def _fetch_place(
     )
     from transitio.index.feeds import MARKS, _hosted_url, _names
     from transitio.index.recommend import (
+        _by_place,
         _default_tiers,
+        _less,
         _not_considered,
         _tier_words,
     )
@@ -3250,7 +3288,7 @@ def _fetch_place(
 
     def candidates(unknown, at=considered):
         found = place_obj.feeds(
-            tiers=at,
+            tiers=_by_place(place_obj, at),
             exclude=exclude,
             on_unknown=unknown,
             categories=None,
@@ -3510,10 +3548,23 @@ def _fetch_place(
         every = {feed.feed_id: feed for feed in listing}
     named = "fetch takes it when named in feeds="
 
+    kinds = {}
+    if isinstance(place_obj, Area):
+        kinds = {part.place.id: part.place.kind for part in place_obj.parts}
+
     def elsewhere(feed_id):
+        # The feed's tiers at the place, or each part, beyond those its kind
+        # considers.
         if tiers is not None or considered is None or feed_id not in every:
             return set()
-        return every[feed_id].tiers - set(considered) - excluded - {"unknown"}
+        found = set()
+        for key, edge in every[feed_id].edges.items():
+            at = considered
+            if isinstance(considered, dict):
+                at = considered.get(kinds.get(key[0]))
+            if at is not None and edge.tier not in at:
+                found.add(edge.tier)
+        return found - excluded - {"unknown"}
 
     if on_unknown == "exclude":
         for feed in candidates("include"):
@@ -3540,8 +3591,7 @@ def _fetch_place(
     view_note = None
     if tiers is None and wanted is None and hidden and not offered:
         reach = set().union(*(elsewhere(feed.feed_id) for feed in hidden))
-        effective = tuple(tier for tier in considered if tier not in excluded)
-        view_note = _hidden_note(place_obj, hidden, effective, reach)
+        view_note = _hidden_note(place_obj, hidden, _less(considered, excluded), reach)
         warnings.warn(view_note, UserWarning, stacklevel=3)
 
     cache = _feed_cache(cache_dir, directory)
@@ -3883,6 +3933,7 @@ def _fetch_place(
         osm_area=osm_area,
         view_note=view_note,
         osm_note=osm_note,
+        area_note=_area_note(place_obj) if isinstance(place_obj, Area) else None,
         places=(
             [part.place for part in place.parts]
             if isinstance(place, Area)

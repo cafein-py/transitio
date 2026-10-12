@@ -36,6 +36,7 @@ from transitio.index.feeds import (
 from transitio.index.places import (
     Area,
     AreaPart,
+    AreaUnused,
     Delineation,
     Place,
     Suggestion,
@@ -47,6 +48,7 @@ __all__ = [
     "AccessProvider",
     "Area",
     "AreaPart",
+    "AreaUnused",
     "Delineation",
     "Index",
     "IndexedFeed",
@@ -1424,13 +1426,16 @@ def area(geometry, *, country=None, index=None):
     regions and countries with at least one feed whose boundary intersects
     the area; metros are left out. Each is measured on its part inside the
     area: ``inside``, the share of the place, and ``holds``, the share of the
-    area. A candidate at least half inside is a whole part unless a place
-    containing it (:attr:`Place.ancestors`) is also at least half inside.
-    One less than half inside is a partial part when it holds at least 1 %
-    of the area and no place containing it is a whole part, and it gives way
-    to the places it contains that are parts: Munich city and its Landkreis
-    make two whole parts, not Bavaria, and a box inside one district gives
-    that district alone. ``coverage`` is the area the parts cover, divided
+    area it stands for. Every city at least half inside (a whole part), or
+    holding at least 1 % of the area, is a part. A region or a country stands
+    only for the area's land that no city part and no narrower place with
+    feeds covers, and is a part when that land is at least 1 % of the area:
+    a box around Los Angeles gives its cities, then Los Angeles County for
+    the land between them, not California; a box inside one district gives
+    that district alone. ``unused`` lists the other candidates with why
+    (``"holds less than 1 % of the area"``, ``"narrower places cover its
+    land in the area"``, or ``"the area has no extent"`` for a point or a
+    line). ``coverage`` is the area the parts cover, divided
     by the area's land: its part within the index's country places, with or
     without feeds, or with ``country`` within that country's, plus the
     parts. Land in a country without feeds counts as uncovered, sea and land

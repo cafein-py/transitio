@@ -2702,6 +2702,30 @@ def test_hidden_view_note(area, hidden, expected):
     assert _hidden_note(target, feeds, considered, reach) == expected
 
 
+def test_area_note_names_the_regions_and_the_places_not_used():
+    from types import SimpleNamespace
+
+    from transitio.pipeline._fetch import _area_note
+
+    def part(place_id, kind, name=None):
+        place = SimpleNamespace(id=place_id, kind=kind, name=name)
+        return SimpleNamespace(place=place)
+
+    small = "holds less than 1 % of the area"
+    unused = [
+        SimpleNamespace(place=part(f"u{n}", "city").place, reason=small)
+        for n in range(6)
+    ]
+    parts = [part("c", "city", "Espoo"), part("r", "region", "Uusimaa")]
+    area = SimpleNamespace(coverage=0.874, parts=parts, unused=unused)
+    assert _area_note(area) == (
+        "2 index places stand for the area, covering 87% of its land: 1 city, "
+        "and Uusimaa for the land outside them; not used: "
+        + ", ".join(f"u{n} ({small})" for n in range(5))
+        + " and 1 more"
+    )
+
+
 @pytest.mark.parametrize("path", ["area", "place"])
 def test_a_delivered_feed_notes_an_agency_timezone_its_stops_disagree_with(
     pipeline_env, monkeypatch, path

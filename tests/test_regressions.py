@@ -2673,15 +2673,20 @@ def test_an_area_fetch_selects_the_feeds_of_the_index_places(tmp_path, monkeypat
     result = fetch(CITY_BBOX, **options)
     assert (downloads, searches) == (["f-local", "f-regional"], [])
     assert [p.id for p in result.places] == ["c"]
+    assert result.area_note == (
+        "1 index place stands for the area, covering 100% of its land: 1 city; "
+        "not used: fi (narrower places cover its land in the area)"
+    )
     assert result.snapshot == index.snapshot_id
     # The extract covers the area itself, not grown.
     assert extracts == [(CITY_BBOX, ["cache_dir", "directory", "progress"])]
-    # Mostly in a country without feeds: the catalogue, with a warning.
+    # Mostly in a country without feeds: the catalogue, with a warning. The
+    # city and Finland, for its land outside the city, cover 40 % of the box.
     mostly_ee = (24.9, 59.7, 25.0, 60.2)
     with pytest.warns(UserWarning) as caught:
         result = fetch(mostly_ee, **options)
     assert (
-        "the feed index's places cover 19% of the area; 0 feeds from the "
+        "the feed index's places cover 39% of the area; 0 feeds from the "
         "Mobility Database catalogue by bounding box"
     ) in [str(warning.message) for warning in caught]
     assert (searches, result.places, result.snapshot) == ([mostly_ee], [], None)
