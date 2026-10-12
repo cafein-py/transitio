@@ -3693,3 +3693,46 @@ def test_dangling_parents_and_agencies_are_cleared_where_the_rules_allow(tmp_pat
         if fix["action"] == "drop_entity"
     ]
     assert dropped == [("stops.txt", 3)]
+
+
+def test_recommend_judges_a_timetable_by_the_study_day(tmp_path, monkeypatch):
+    # A feed stale when indexed was left out even for a day its timetable
+    # covers, and without a day a timetable starting later was taken.
+    import datetime
+
+    import transitio
+    import transitio.index as transitio_index
+    from test_index_views import munich_index
+
+    monkeypatch.setattr(
+        transitio, "__version__", transitio_index.MIN_READER_VERSIONS[11]
+    )
+    monkeypatch.setattr(
+        "transitio.pipeline._fetch._today", lambda: datetime.date(2026, 10, 13)
+    )
+    feeds = {
+        "f-old": {
+            "name": "Old",
+            "modes": {"bus": 900},
+            "stops": 90,
+            "end": "2026-07-31",
+        },
+        "f-next": {
+            "name": "Next",
+            "modes": {"bus": 800},
+            "stops": 80,
+            "start": "2026-11-01",
+        },
+    }
+    place = transitio_index.place("muc", index=munich_index(tmp_path, feeds))
+    july = place.recommend("2026-07-15")
+    assert july.feed_ids == ["f-old"]
+    assert [c.reason for c in july.left_out] == [
+        "its timetable as indexed starts 2026-11-01, after 2026-07-15"
+    ]
+    today = place.recommend()
+    assert today.feed_ids == []
+    assert {c.feed.feed_id: c.reason for c in today.left_out} == {
+        "f-old": "stale when indexed: its timetable ended 2026-07-31",
+        "f-next": "its timetable as indexed starts 2026-11-01, after 2026-10-13",
+    }

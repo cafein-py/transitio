@@ -466,10 +466,11 @@ class Place:
         metro, and every tier at a region or a country. ``tiers`` names the
         tiers instead, ``tiers=None`` takes every tier, and ``exclude`` drops
         tiers as in :meth:`feeds`; a feed serving the place at other tiers
-        only is listed as not considered. A candidate is left out when it was
-        stale when indexed, when its timetable as indexed does not run on the
-        day, when it needs a paid account, or when it adds no departure the
-        feeds taken before it do not run. The candidates are taken the most
+        only is listed as not considered. A candidate is left out when its
+        timetable as indexed does not run on the day (a feed stale when
+        indexed is a candidate for a day its timetable covers), when it needs
+        a paid account, or when it adds no departure the feeds taken before
+        it do not run. The candidates are taken the most
         local first, the one covering the smallest area, so an operator's own
         feed comes before an aggregate repeating it and the aggregate is taken
         for what it adds; among feeds covering as much, the open one and the

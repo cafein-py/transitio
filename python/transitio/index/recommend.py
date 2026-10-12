@@ -5,9 +5,10 @@
 tiers asked for, cross-border ones included: by default local and regional
 ones (``DEFAULT_TIERS``) at a city or a metro, every tier at a region or a
 country. A feed serving the place only at other tiers is listed as not
-considered. A feed is left out when it was stale when indexed, when its
-timetable as indexed does not run on the day, when it needs a paid account,
-or when the index measured no service for it.
+considered. A feed is left out when its timetable as indexed does not run
+on the day (the study day, else today), whether or not it was stale when
+indexed, when it needs a paid account, or when the index measured no service
+for it.
 
 The candidates are taken the most local first: the one whose coverage
 covers the smallest area, then the open one, the newer timetable and the
@@ -252,7 +253,7 @@ def recommend(
     blocks = _family_blocks(feeds)
     left_out, candidates = [], []
     for feed in feeds:
-        reason = _excluded(feed, when, day, blocks)
+        reason = _excluded(feed, day, blocks)
         if reason is None:
             candidates.append(feed)
         else:
@@ -382,10 +383,11 @@ def recommend(
     )
 
 
-def _excluded(feed, when, day, blocks):
-    """Why ``feed`` is no candidate on ``day``, or None."""
+def _excluded(feed, day, blocks):
+    """Why ``feed`` is no candidate on ``day``, or None: its timetable as
+    indexed must run on the day, whether or not it was stale when indexed."""
     ended = feed.stale_when_indexed
-    if ended is not None:
+    if ended is not None and ended < day:
         return f"stale when indexed: its timetable ended {ended}"
     start, end = feed.service_start, feed.service_end
     if end is not None and end < day:
@@ -393,8 +395,8 @@ def _excluded(feed, when, day, blocks):
             f"its timetable as indexed ends {end}, before {day} "
             "(a newer download may run then)"
         )
-    if when is not None and start is not None and start > when:
-        return f"its timetable as indexed starts {start}, after {when}"
+    if start is not None and start > day:
+        return f"its timetable as indexed starts {start}, after {day}"
     provider = feed._provider()
     if feed.access == "key" and provider is not None and provider.free is False:
         return _access_note(feed)

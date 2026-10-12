@@ -1107,6 +1107,7 @@ ETAG, MODIFIED = {"etag": '"v1"'}, {"last_modified": "Tue, 01 Jun 2021 00:00:00 
 # The skip reasons the cases expect.
 R_ENDED, R_SPRING = "service ended 2021-12-31", "service ended 2026-05-01"
 R_STARTS = "service starts 2027-01-01, after 2026-06-07"
+R_NEXT = "service starts 2026-07-01, after 2026-06-01"
 R_IDLE, SAME = f"no service on {DAY}", "; unchanged since indexed"
 
 
@@ -1123,7 +1124,7 @@ R_IDLE, SAME = f"no service on {DAY}", "; unchanged since indexed"
         (NOW, {}, 200, (*NOW, "0000000"), DAY, "skip", True, R_IDLE, None),
         (NOW, {}, 200, (*LONG, "1111100"), DAY, "skip", True, R_IDLE, LONG),
         (LATER, ETAG, 200, LATER, DAY, "skip", True, R_STARTS, LATER),
-        (NEXT, ETAG, 304, NEXT, None, "skip", True, None, NEXT),
+        (NEXT, ETAG, 304, NEXT, None, "skip", False, R_NEXT + SAME, None),
         (NOW, ETAG, 304, SPRING, None, "skip", True, R_SPRING, SPRING),
         (NOW, ETAG, 304, NOW, DAY, "skip", True, None, NOW),
         (ENDED, ETAG, 304, ENDED, None, "keep", True, None, ENDED),
@@ -1737,7 +1738,7 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
             {"A": "+", "B": "+ similar to A; kept, has transfers or pathways"},
         ),
         (
-            {"A": {"start": "20260701"}, "B": OLD},
+            {"A": NEW, "B": OLD},
             {},
             {
                 "A": "+ similar to B; kept, no study day",

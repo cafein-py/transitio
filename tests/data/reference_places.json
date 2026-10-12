@@ -216,7 +216,7 @@
         {"service": "Trenes Argentinos commuter lines", "source": "https://data.buenosaires.gob.ar/dataset/trenes-gtfs", "left_out": {"f-buenosaires~trenes": "out of date"}, "gap": "the transport API's train timetable is not in the index yet"},
         {"service": "Belgrano Norte and Urquiza lines", "source": "https://argentina.gob.ar/cnrt/lineas-de-trenes-pasajeros", "gap": "no published timetable found"},
         {"service": "Subte and Premetro in 2019", "source": "https://data.buenosaires.gob.ar/dataset/subte-gtfs", "day": "2019-12-02", "via": ["f-69y7-recursosdatabuenosairesgobar"], "fails": {"f-69y7-recursosdatabuenosairesgobar": ["not at the place", "the Buenos Aires Subte record is placed in the Province, not the city, and was never crawled"]}},
-        {"service": "Buses in 2019", "source": "https://data.buenosaires.gob.ar/dataset/colectivos-gtfs", "day": "2019-12-02", "via": ["f-mdb-1220"], "fails": {"f-mdb-1220": ["left out", "recommend() judges a feed by its staleness when indexed, not by the study day"]}},
+        {"service": "Buses in 2019", "source": "https://data.buenosaires.gob.ar/dataset/colectivos-gtfs", "day": "2019-12-02", "via": ["f-mdb-1220"]},
         {"service": "Trenes Argentinos commuter lines in 2019", "source": "https://data.buenosaires.gob.ar/dataset/trenes-gtfs", "day": "2019-12-02", "left_out": {"f-buenosaires~trenes": "out of date"}}
       ]
     }

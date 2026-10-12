@@ -284,15 +284,12 @@ def _service_window(validation):
     )
 
 
-def _misses(start, end, day, study):
-    """Why a service window from ``start`` to ``end`` misses ``day``, or None.
-
-    With a ``study`` day the window must cover it; otherwise it must only not
-    end before it. An unknown bound (``None``) cannot miss.
-    """
+def _misses(start, end, day):
+    """Why a service window from ``start`` to ``end`` misses ``day``, the
+    study day or today, or None. An unknown bound (``None``) cannot miss."""
     if end is not None and end < day:
         return f"service ended {end.isoformat()}"
-    if study and start is not None and start > day:
+    if start is not None and start > day:
         return f"service starts {start.isoformat()}, after {day.isoformat()}"
     return None
 
@@ -426,8 +423,8 @@ def _process_feed(
 
     A feed whose validation finds a required file missing drops out on any
     day. The computed service window is tested against ``day`` (None tests
-    nothing): with a ``study`` day it must cover the day and the validation
-    report must not prove the day idle; otherwise it must not end before it.
+    nothing): it must cover the day, and with a ``study`` day the validation
+    report must not prove the day idle.
 
     With ``outputs``, ``(cache, version)`` of the cached version at ``path``,
     what the crop, repair and validation make is stored with the version
@@ -498,7 +495,7 @@ def _process_feed(
     if missing is not None:
         raise _SkipFeed(missing, window)
     if day is not None:
-        reason = _misses(start, end, day, study)
+        reason = _misses(start, end, day)
         if reason is None and study and _idle(validation, day):
             reason = f"no service on {day.isoformat()}"
         if reason is not None:
@@ -2329,8 +2326,8 @@ def fetch(
         the day counts no active trip and carries the
         ``no_service_on_reference_date`` notice (``"no service on
         <day>"``). Without ``when`` there is no study day, only today: a
-        feed is skipped only when its computed window ended before today,
-        and one that starts later or runs on other weekdays stays. An
+        feed is skipped when its computed window ended before today or
+        starts after it, and one that runs on other weekdays stays. An
         unknown window passes the window checks, and a report without a
         ``moment`` for the day passes the day check.
     feeds : list of str, Recommendation or object with ``feed_ids``, optional
@@ -2390,17 +2387,18 @@ def fetch(
         compares nothing. Another value raises ``ValueError``.
     expired : {"skip", "keep"}, default "skip"
         With ``"skip"``, on the index paths, an indexed feed whose index
-        service window misses the day (ends before it, or starts after the
-        study day) is skipped before download when a conditional ``HEAD``
-        to the URL the index crawled, carrying the ETag or Last-Modified it
-        recorded, answers 304 Not Modified: the served archive is still the
-        one the index saw, and the reason ends ``"; unchanged since
-        indexed"``. Any other answer, or no recorded validator, downloads
-        the feed and leaves the decision to its computed window, as does a
-        feed downloaded as a catalogued dataset (with an API token).
+        service window misses the day, the study day or today (ends before
+        it or starts after it), is skipped before download when a
+        conditional ``HEAD`` to the URL the index crawled, carrying the ETag
+        or Last-Modified it recorded, answers 304 Not Modified: the served
+        archive is still the one the index saw, and the reason ends
+        ``"; unchanged since indexed"``. Any other answer, or no recorded
+        validator, downloads the feed and leaves the decision to its computed
+        window, as does a feed downloaded as a catalogued dataset (with an
+        API token).
         ``"keep"`` sends no probe and, without ``when``, keeps a feed whose
-        computed window ended; with ``when`` the window and day checks
-        still apply.
+        computed window misses today; with ``when`` the window and day
+        checks still apply.
     repair : bool, default False
         Repair each feed (gtfstidy contract) after the crop, before use;
         conservative default leaves feeds untouched.
@@ -3524,7 +3522,7 @@ def _fetch_place(
             # Index metadata describes the archive the index crawled, so it
             # decides a feed only before a download from the indexed URLs,
             # and only once a probe proves that archive unchanged.
-            missed = _misses(feed.service_start, feed.service_end, day, study)
+            missed = _misses(feed.service_start, feed.service_end, day)
             if expired == "skip" and missed and unchanged(feed):
                 _skip(entry, f"{missed}; unchanged since indexed")
                 if datable(feed):
