@@ -1526,6 +1526,33 @@ def test_a_feed_missing_a_required_file_is_skipped(tmp_path, dropped, reason, wi
             _process_feed(source, **{**options, "modes": {"bus"}})
 
 
+def test_the_area_crop_says_what_it_left_out(tmp_path):
+    # Stops just outside a boundary, served only by trips that never stop
+    # inside, were removed with no word (50 HSL stops at Helsinki).
+    from shapely.geometry import box
+
+    from transitio.pipeline._fetch import _crop_counts_read, _crop_note, _process_feed
+
+    source = write_zip(tmp_path / "feed.zip", FEED)
+    *_, made, _, _ = _process_feed(
+        source,
+        geometry=box(*CITY_BBOX),
+        tag="t",
+        repair=False,
+        crop=True,
+        modes=None,
+        day=None,
+        study=False,
+        hosted=None,
+        budgets={},
+    )
+    assert _crop_note(made) == "crop to the area: kept 1 of 2 trips and 2 of 3 stops"
+    # Stored with the cached output, they are read back only in that shape.
+    assert _crop_counts_read(made["crop_counts"]) and _crop_counts_read(None)
+    for bad in ({}, {"trips.txt": [1, 2]}, {"trips.txt": [1], "stops.txt": [2, 3]}):
+        assert not _crop_counts_read(bad)
+
+
 def test_a_size_limit_is_noted_and_warned(tmp_path):
     # A crop over 2 GiB was refused with a skip line only, and an uncropped
     # feed over a budget was delivered with a report that silently skipped

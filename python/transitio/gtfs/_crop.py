@@ -136,14 +136,16 @@ def crop_feed(
     Returns
     -------
     dict
-        ``{"row_counts": ..., "source_routes": [...] or None,
-        "source_notices": [...], "remaining_notices": [...],
+        ``{"row_counts": ..., "source_counts": ..., "source_routes": [...]
+        or None, "source_notices": [...], "remaining_notices": [...],
         "service_window": ..., "dropped_rows": [...], "validation": ...}``
         for the cropped feed, ``validation`` being the cropped feed's
         :func:`~transitio.validate.validate_feed` report under the same
-        options. ``source_routes`` is the distinct ``route_id`` values in the
-        source routes.txt (before the crop), or ``None`` without routes.txt,
-        so a caller can tell what a ``routes`` filter dropped.
+        options. ``source_counts`` holds the rows of trips.txt and stops.txt
+        in the source, before the crop. ``source_routes`` is the distinct
+        ``route_id`` values in the source routes.txt (before the crop), or
+        ``None`` without routes.txt, so a caller can tell what a ``routes``
+        filter dropped.
         ``source_notices`` holds one ``leading_or_trailing_whitespaces``
         notice per source file the crop read and trimmed, its row numbered
         as in the source; shapes.txt is read only when a kept trip has a

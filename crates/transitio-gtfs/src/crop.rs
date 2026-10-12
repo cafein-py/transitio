@@ -68,6 +68,8 @@ pub struct CropResult {
     /// stop_times, and the exact repeats of a kept trips.txt row, per file,
     /// field and code.
     pub dropped_rows: Vec<DroppedRows>,
+    /// The rows of trips.txt and stops.txt in the source, before the crop.
+    pub source_counts: BTreeMap<String, usize>,
 }
 
 /// Rows the crop left out for one reason: a kept trip's stop_times row
@@ -236,7 +238,8 @@ pub fn crop(
         )?),
         None => None,
     };
-    let (mut kept_trips, trips) = select_trips(
+    let source_stops = result.tables.get("stops.txt").map_or(0, |t| t.rows.len());
+    let (mut kept_trips, trips, source_trips) = select_trips(
         &source,
         &options,
         crop_options,
@@ -308,12 +311,17 @@ pub fn crop(
         .map(|(name, table)| (name.clone(), table.rows.len()))
         .collect();
     row_counts.extend(streamed_counts);
+    let source_counts = BTreeMap::from([
+        ("stops.txt".to_string(), source_stops),
+        ("trips.txt".to_string(), source_trips),
+    ]);
     Ok(CropResult {
         row_counts,
         validation,
         source_routes,
         source_notices,
         dropped_rows: dropped.records(),
+        source_counts,
     })
 }
 
@@ -642,8 +650,9 @@ fn trips_touching(
 }
 
 /// Decide which trips survive every crop, streaming trips.txt and keeping
-/// only the survivors as the trips table. `routes` holds the routes.txt ids.
-/// An exact repeat of a kept row is left out and counted.
+/// only the survivors as the trips table, with the number of rows read.
+/// `routes` holds the routes.txt ids. An exact repeat of a kept row is left
+/// out and counted.
 #[allow(clippy::too_many_arguments)]
 fn select_trips(
     source: &std::fs::File,
@@ -654,7 +663,7 @@ fn select_trips(
     source_notices: &mut Vec<Notice>,
     dropped: &mut Dropped,
     routes: Option<&HashSet<&str>>,
-) -> Result<(HashSet<String>, Table), String> {
+) -> Result<(HashSet<String>, Table, usize), String> {
     let mut archive = open_archive(source)?;
     let Some(mut reader) = stream_table(&mut archive, "trips.txt", options)? else {
         return Err("feed has no usable trips.txt".to_string());
@@ -666,7 +675,9 @@ fn select_trips(
     let mut kept: HashMap<String, usize> = HashMap::new();
     let mut rows: Vec<Row> = Vec::new();
     let mut notices = Vec::new();
+    let mut read = 0;
     while let Some(row) = reader.next_row(&mut notices) {
+        read += 1;
         if let Some(routes) = &crop_options.routes {
             let route = route_index.map(|i| row.field(i)).unwrap_or("");
             if !routes.contains(route) {
@@ -711,7 +722,7 @@ fn select_trips(
     }
     whole(&reader, "trips.txt", &notices, options)?;
     source_notices.extend(whitespace(&notices));
-    Ok((kept.into_keys().collect(), Table { headers, rows }))
+    Ok((kept.into_keys().collect(), Table { headers, rows }, read))
 }
 
 /// Write the cropped feed: the kept trips' stop_times straight from the

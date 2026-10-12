@@ -93,13 +93,11 @@ class FetchResult:
     # ``skipped`` lists the same skips.
     selection: list = dataclasses.field(default_factory=list)
     # The WGS84 area the OSM extract was fetched for; None without one. A
-    # failed extract download leaves it and osm_pbf None. On the place path,
-    # its parts farther than 1.6 km from every delivered stop may lack OSM data.
+    # failed extract download leaves it and osm_pbf None.
     osm_area: object = None
     # The feeds at tiers not considered when none is, and the tiers that fetch them.
     view_note: str | None = None
-    # The place parts the OSM extract leaves out and the delivered stops
-    # outside its area, or why it was not fetched.
+    # The delivered stops outside the OSM area, or why it was not fetched.
     osm_note: str | None = None
     # The index places the feeds were selected for: the place, the area's
     # parts, or none on the catalogue path.
@@ -592,7 +590,12 @@ def _transform(path, folder, stem, **steps):
     route crop, the notices of the source the crop trimmed, the rows the crop
     dropped and the repair's fixes. A failed step removes the outputs the
     call wrote."""
-    made = {"present_routes": None, "source_notices": [], "dropped": None}
+    made = {
+        "present_routes": None,
+        "source_notices": [],
+        "dropped": None,
+        "crop_counts": None,
+    }
     written = []
     try:
         return _transformed(path, folder, stem, made, written, **steps)
@@ -640,6 +643,12 @@ def _transformed(
         # reported with the feed.
         made["source_notices"] = report["source_notices"]
         made["dropped"] = report["dropped_rows"]
+        if crop:
+            # Kept and source rows, for the note on what the area crop left out.
+            made["crop_counts"] = {
+                name: [report["row_counts"].get(name, 0), count]
+                for name, count in report["source_counts"].items()
+            }
         if not repair:
             made["validation"] = report["validation"]
         path = _read_only(cropped)
@@ -766,6 +775,23 @@ def _warn_budgets(record, stacklevel):
         )
 
 
+def _crop_note(made):
+    """``"crop to the area: kept <n> of <m> trips and <n> of <m> stops"``
+    when the area crop left out a trip or a stop; None otherwise."""
+    counts = made.get("crop_counts") or {}
+    trips, stops = (counts.get(name) for name in ("trips.txt", "stops.txt"))
+    if (
+        trips is None
+        or stops is None
+        or (trips[0] == trips[1] and stops[0] == stops[1])
+    ):
+        return None
+    return (
+        f"crop to the area: kept {trips[0]} of {trips[1]} trips and "
+        f"{stops[0]} of {stops[1]} stops"
+    )
+
+
 def _agency_note(made):
     """The note on a feed the repair gave an agency.txt
     (:func:`_agency_written`); None otherwise."""
@@ -889,10 +915,29 @@ def _stored_output(version, key):
         ]
         if not all(isinstance(value, kind) for value, kind in shapes):
             return None
+        if not _crop_counts_read(made["crop_counts"]):
+            return None
     except (OSError, ValueError, KeyError, TypeError):
         return None
     made.update(path=path, present_routes=None if routes is None else set(routes))
     return made
+
+
+def _crop_counts_read(counts):
+    """Whether stored ``crop_counts`` are None or, for trips.txt and
+    stops.txt, a kept and a source row count each."""
+    if counts is None:
+        return True
+    return (
+        isinstance(counts, dict)
+        and set(counts) == {"trips.txt", "stops.txt"}
+        and all(
+            isinstance(pair, list)
+            and len(pair) == 2
+            and all(type(n) is int and n >= 0 for n in pair)
+            for pair in counts.values()
+        )
+    )
 
 
 def _store_output(cache, version, key, made, transform=None):
@@ -919,6 +964,7 @@ def _store_output(cache, version, key, made, transform=None):
         "source_notices": made["source_notices"],
         "dropped": made["dropped"],
         "fixes": made["fixes"],
+        "crop_counts": made.get("crop_counts"),
     }
     if "validation" in made:
         results["validation"] = made["validation"]
@@ -2655,16 +2701,17 @@ def fetch(
         trip such rows leave with fewer than two stop_times, and an exact
         repeat of a trips.txt row (:func:`~transitio.gtfs.crop_feed`); a
         feed whose routes.txt or stops.txt has no id column, or whose
-        trips.txt repeats a ``trip_id`` with other values, is skipped.
+        trips.txt repeats a ``trip_id`` with other values, is skipped. A
+        feed the area crop leaves trips or stops out of is noted ``"crop to
+        the area: kept <n> of <m> trips and <n> of <m> stops"``: trips that
+        stop nowhere in the area go, and with them the stops only they
+        serve, also just outside its boundary.
     osm : bool, default True
         Fetch the OSM extract for the AOI. With ``place``, it is fetched
-        after the feeds, for the place's parts that hold a stop of a
-        delivered feed (the whole place when none does, nothing was
-        delivered or a delivered feed's stops.txt cannot be read), each part
-        grown by 1.6 km, cafein's default snap distance. Parts of that area
-        farther than 1.6 km from every delivered stop may lack OSM data, as
-        the extract need only cover the stops' surroundings. With ``aoi`` it
-        covers the area itself, from the index or the catalogue. The crop keeps
+        after the feeds, for the whole place grown by 1.6 km, cafein's
+        default snap distance, so a place on a border or the coast can need
+        a larger extract than its own. With ``aoi`` it covers the area itself, from the
+        index or the catalogue. The crop keeps
         each trip that serves the area whole, so a delivered feed's stops
         can lie beyond the OSM area and get no footpaths in cafein;
         ``stops_outside_osm`` in ``selection`` counts them. With ``osm=False``
@@ -2821,10 +2868,9 @@ def fetch(
         Uusimaa for the land outside them; not used: Finland (narrower places
         cover its land in the area)"``. Each part considers its own kind's tiers
         (:meth:`~transitio.index.Place.recommend`).
-        When the OSM extract leaves out parts of the place, or delivered
-        stops lie outside its area, ``osm_note`` notes them, e.g. ``"OSM
-        area: 1 of 47 parts (1783 of 2188 km²); 4970 of 10026 located stops
-        outside it"``, the stops summed over the delivered feeds, with
+        When delivered stops lie outside the OSM area, ``osm_note`` notes
+        them, e.g. ``"OSM area: 4970 of 10026 located stops outside it"``,
+        the stops summed over the delivered feeds, with
         ``"(stops.txt of 1 feed not read)"`` added for feeds not counted;
         when its download failed, it notes that instead, e.g. ``"OSM
         extract not fetched: Could not download any of the 1 extracts that
@@ -3037,6 +3083,7 @@ def fetch(
             entry.update(decision="delivered", feed_window=window, path=path)
             for note in (
                 _renamed_note(version),
+                _crop_note(made),
                 _agency_note(made),
                 _partial_note(made),
                 _timezone_note(path, budgets.get("max_total_bytes")),
@@ -3178,7 +3225,7 @@ def fetch(
         coords = {path: _stop_coords(path) for path in feeds}
         counts = _count_outside(record, geometry, coords)
         _warn_outside(*counts, stacklevel=3)
-        osm_note = _osm_note(geometry, geometry, *counts)
+        osm_note = _osm_note(*counts)
     progress.done(record)
     return FetchResult(
         osm_pbf=osm_pbf,
@@ -3263,55 +3310,6 @@ def _stop_coords(path):
         return None
     points = np.array(list(coords.values()), dtype=float).reshape(-1, 2)
     return points[points.any(axis=1)]
-
-
-def _located_stops(coords):
-    """The located stops of every feed in ``coords`` (:func:`_stop_coords`,
-    by path) as one ``(n, 2)`` array; None when there is no feed or a feed's
-    stops.txt cannot be read."""
-    import numpy as np
-
-    located = list(coords.values())
-    if not located or any(points is None for points in located):
-        return None
-    return np.concatenate(located)
-
-
-def _osm_parts(geometry, feeds):
-    """``(parts, coords)``: ``coords`` maps each delivered feed in ``feeds``
-    to its located stops (:func:`_stop_coords`), and ``parts`` is what of
-    ``geometry`` the OSM extract is fetched for, the union of the parts
-    holding such a stop, else the whole geometry. A feed whose stops.txt
-    cannot be read could serve any part, so it also yields the whole
-    geometry."""
-    import numpy as np
-    import shapely
-
-    coords = {path: _stop_coords(path) for path in feeds}
-    located = _located_stops(coords)
-    if located is None:
-        return geometry, coords
-    parts = shapely.get_parts(geometry)
-    points = shapely.points(located)
-    held = np.unique(shapely.STRtree(parts).query(points, predicate="intersects")[1])
-    if len(held) in (0, len(parts)):
-        return geometry, coords
-    return shapely.union_all(parts[held]), coords
-
-
-def _osm_stops(area, coords):
-    """The located stops in ``coords`` (:func:`_osm_parts`) inside ``area``
-    as a MultiPoint, what the OSM extract must cover; None when nothing was
-    delivered, a feed's stops.txt cannot be read or no stop lies inside."""
-    import numpy as np
-    import shapely
-
-    located = _located_stops(coords)
-    if located is None:
-        return None
-    shapely.prepare(area)
-    inside = np.unique(located[shapely.intersects_xy(area, located)], axis=0)
-    return shapely.multipoints(inside) if len(inside) else None
 
 
 def _catalogue_note(count, study, unboxed):
@@ -3429,29 +3427,17 @@ def _warn_outside(outside, total, unread, stacklevel):
         )
 
 
-def _osm_note(geometry, parts, outside=0, total=0, unread=0):
-    """The ``osm_note`` on the OSM area: the parts of ``geometry``
-    that ``parts`` leaves out, and the ``outside`` of ``total`` located
-    stops outside the area with the ``unread`` feeds whose stops.txt was not
-    read; None when no part is left out and neither count is non-zero."""
-    import shapely
-
-    from transitio.osm._fetch import _area_km2
-
-    clauses = []
-    whole, kept = shapely.get_num_geometries([geometry, parts])
-    if kept != whole:
-        clauses.append(
-            f"{kept} of {whole} parts "
-            f"({_area_km2(parts):.0f} of {_area_km2(geometry):.0f} km²)"
-        )
-    if outside or unread:
-        clause = f"{outside} of {total} located stops outside it"
-        if unread:
-            feeds = "feed" if unread == 1 else "feeds"
-            clause += f" (stops.txt of {unread} {feeds} not read)"
-        clauses.append(clause)
-    return "OSM area: " + "; ".join(clauses) if clauses else None
+def _osm_note(outside=0, total=0, unread=0):
+    """The ``osm_note`` on the OSM area: the ``outside`` of ``total`` located
+    stops outside it, with the ``unread`` feeds whose stops.txt was not
+    read; None when neither count is non-zero."""
+    if not (outside or unread):
+        return None
+    note = f"OSM area: {outside} of {total} located stops outside it"
+    if unread:
+        feeds = "feed" if unread == 1 else "feeds"
+        note += f" (stops.txt of {unread} {feeds} not read)"
+    return note
 
 
 def _osm_extract(area, **options):
@@ -3512,8 +3498,8 @@ def _fetch_place(
     when it has none, and its texts in the record are masked
     (:meth:`_Access.redact`). The versions among the delivered feeds are
     settled after the feed loop, then their repeated trips left out
-    (:func:`_drop_repeats`), and the OSM extract comes last, for the parts
-    of the place the remaining feeds serve, or for the area. ``progress``
+    (:func:`_drop_repeats`), and the OSM extract comes last, for the whole
+    place grown by 1.6 km, or for the area. ``progress``
     (:class:`_Progress`) says how it goes."""
     from transitio import __version__
     from transitio.catalog import Feed, MobilityDatabase, TransitlandAtlas
@@ -3802,8 +3788,8 @@ def _fetch_place(
             cropped.add(feed.feed_id)
         else:
             carriers[feed.feed_id] = feed.feed_id
-        notes = [applied, *notes, _renamed_note(version), _agency_note(made)]
-        notes.append(_partial_note(made))
+        notes = [applied, *notes, _renamed_note(version), _crop_note(made)]
+        notes += [_agency_note(made), _partial_note(made)]
         notes += [_timezone_note(path, budget), _dropped_note(report)]
         for text in dict.fromkeys(filter(None, notes)):
             _note(entry, text)
@@ -4196,22 +4182,18 @@ def _fetch_place(
 
     osm_pbf = osm_area = osm_note = None
     if osm:
+        coords = {path: _stop_coords(path) for path in feeds}
         if isinstance(place, Area):
             # An area's extract covers the area itself, as on the catalogue path.
-            parts = osm_area = geometry
-            coords = {path: _stop_coords(path) for path in feeds}
-            grown = {}
+            osm_area, grown = geometry, {}
         else:
-            parts, coords = _osm_parts(geometry, feeds)
-            osm_area = _buffered(parts, _OSM_BUFFER_M)
-            grown = {
-                "buffer_m": _OSM_BUFFER_M,
-                "must_cover": _osm_stops(osm_area, coords),
-            }
+            # A place's covers all of it, grown to reach the stops near it.
+            osm_area = _buffered(geometry, _OSM_BUFFER_M)
+            grown = {"buffer_m": _OSM_BUFFER_M}
         progress.say("Fetching the OSM extract")
         with progress.downloads("Downloading the OpenStreetMap extract"):
             osm_pbf, osm_note = _osm_extract(
-                parts,
+                geometry,
                 cache_dir=cache_dir,
                 directory=directory,
                 progress=progress.bar or False,
@@ -4222,7 +4204,7 @@ def _fetch_place(
         else:
             counts = _count_outside(record, osm_area, coords)
             _warn_outside(*counts, stacklevel=4)
-            osm_note = _osm_note(geometry, parts, *counts)
+            osm_note = _osm_note(*counts)
 
     progress.done(record)
     return FetchResult(

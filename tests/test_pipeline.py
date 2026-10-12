@@ -3189,53 +3189,6 @@ _REMOTE = (26.0, 61.0, 26.2, 61.2)
 
 
 @pytest.mark.parametrize(
-    "stops, expected, inside",
-    [
-        pytest.param([[(60.169, 24.931)]], "served", [(24.931, 60.169)], id="one-part"),
-        pytest.param(
-            [[(60.169, 24.931)], [(61.1, 26.1), (60.169, 24.931)]],
-            "whole",
-            [(24.931, 60.169), (26.1, 61.1)],
-            id="both-parts",
-        ),
-        pytest.param([[(59.0, 24.0)]], "whole", None, id="no-part"),
-        pytest.param([], "whole", None, id="nothing-delivered"),
-        # A feed whose stops cannot be read could serve the remote part.
-        pytest.param([[(60.169, 24.931)], None], "whole", None, id="unreadable-stops"),
-    ],
-)
-def test_osm_parts_are_those_holding_a_delivered_stop(
-    tmp_path, stops, expected, inside
-):
-    import shapely
-
-    from transitio.osm._fetch import _buffered
-    from transitio.pipeline._fetch import _osm_parts, _osm_stops
-
-    geometry = shapely.union_all([shapely.box(*_SERVED), shapely.box(*_REMOTE)])
-    feeds = []
-    for number, coords in enumerate(stops):
-        path = tmp_path / f"{number}.zip"
-        if coords is None:
-            path.write_bytes(_zip({"agency.txt": GTFS["agency.txt"]}))
-        else:
-            rows = "".join(f"s{i},{y},{x}\n" for i, (y, x) in enumerate(coords))
-            # A row without coordinates is not a located stop.
-            rows += "s-blank,,\n"
-            path.write_bytes(_zip({"stops.txt": "stop_id,stop_lat,stop_lon\n" + rows}))
-        feeds.append(path)
-    parts, located = _osm_parts(geometry, feeds)
-    assert parts.equals(shapely.box(*_SERVED) if expected == "served" else geometry)
-    assert [None if located[p] is None else located[p].tolist() for p in feeds] == [
-        None if coords is None else [[x, y] for y, x in coords] for coords in stops
-    ]
-    # What the extract must cover: the located stops inside the grown parts,
-    # each once.
-    must_cover = _osm_stops(_buffered(parts, 1600), located)
-    assert must_cover == (None if inside is None else shapely.multipoints(inside))
-
-
-@pytest.mark.parametrize(
     ("outside", "total", "warned"),
     [(21, 40, True), (20, 40, False), (0, 0, False)],
 )
@@ -3256,45 +3209,27 @@ def test_most_stops_outside_the_osm_extract_warn(outside, total, warned):
     )
 
 
-_PARTS_NOTE = "OSM area: 1 of 2 parts (247 of 488 km²)"
-
-
 @pytest.mark.parametrize(
-    "served, counts, expected",
+    "counts, expected",
     [
-        pytest.param(True, (0, 2, 0), _PARTS_NOTE, id="parts"),
         pytest.param(
-            False,
-            (12, 40, 0),
-            "OSM area: 12 of 40 located stops outside it",
-            id="stops",
+            (12, 40, 0), "OSM area: 12 of 40 located stops outside it", id="stops"
         ),
         pytest.param(
-            True,
-            (1, 3, 0),
-            f"{_PARTS_NOTE}; 1 of 3 located stops outside it",
-            id="parts-and-stops",
-        ),
-        pytest.param(
-            False,
             (0, 40, 1),
             "OSM area: 0 of 40 located stops outside it (stops.txt of 1 feed not read)",
             id="unread",
         ),
-        pytest.param(False, (0, 40, 0), None, id="neither"),
+        pytest.param((0, 40, 0), None, id="neither"),
     ],
 )
-def test_osm_note_names_the_parts_and_stops_outside_the_area(served, counts, expected):
-    import shapely
-
+def test_osm_note_names_the_stops_outside_the_area(counts, expected):
     from transitio.pipeline._fetch import _osm_note
 
-    geometry = shapely.union_all([shapely.box(*_SERVED), shapely.box(*_REMOTE)])
-    parts = shapely.box(*_SERVED) if served else geometry
-    assert _osm_note(geometry, parts, *counts) == expected
+    assert _osm_note(*counts) == expected
 
 
-def test_fetch_place_fetches_the_osm_extract_last_for_the_served_parts(
+def test_fetch_place_fetches_the_osm_extract_last_for_the_whole_place(
     tmp_path, monkeypatch
 ):
     import shapely
@@ -3314,26 +3249,27 @@ def test_fetch_place_fetches_the_osm_extract_last_for_the_served_parts(
         return download(self, feed, directory=directory)
 
     def recorded_fetch_pbf(aoi, **kwargs):
-        events.append((aoi, kwargs["buffer_m"], kwargs["must_cover"]))
+        events.append((aoi, kwargs["buffer_m"], kwargs.get("must_cover")))
         return fake_pbf
 
     monkeypatch.setattr(
         "transitio.catalog.TransitlandAtlas._fetch_static", recorded_download
     )
     monkeypatch.setattr("transitio.osm.fetch_pbf", recorded_fetch_pbf)
-    served = shapely.box(*_SERVED)
     place_obj = transitio.place("Q1757", index=index)
-    place_obj._record["geometry"] = shapely.union_all([served, shapely.box(*_REMOTE)])
+    # Only the first part holds a stop; the extract covers both.
+    whole = shapely.union_all([shapely.box(*_SERVED), shapely.box(*_REMOTE)])
+    place_obj._record["geometry"] = whole
     result = fetch(place=place_obj, directory=tmp_path / "out", crop=False)
 
     feed, (aoi, buffer_m, must_cover) = events
-    assert feed == "feed" and aoi.equals(served) and buffer_m == 1600
-    assert must_cover == shapely.multipoints([(24.931, 60.169), (24.941, 60.171)])
+    assert feed == "feed" and aoi.equals(whole) and buffer_m == 1600
+    assert must_cover is None  # all of the grown place
     assert result.osm_pbf == fake_pbf
-    assert result.osm_area.equals(_buffered(served, 1600))
+    assert result.osm_area.equals(_buffered(whole, 1600))
     (entry,) = result.selection
     assert entry["decision"] == "delivered"
-    assert result.osm_note.startswith("OSM area: 1 of 2 parts (")
+    assert result.osm_note is None
 
 
 # route -> (agency, stop, trip, route_type); a1 carries local+regional.
