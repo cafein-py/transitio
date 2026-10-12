@@ -113,22 +113,30 @@ def _ids(feeds):
     return [feed.feed_id for feed in feeds]
 
 
-def test_the_default_view_follows_the_place_kind_and_ranks_by_relevance(index):
+# The place kind's view, the default before every feed was listed.
+VIEW = {"categories": "default", "international": False}
+
+
+def test_feeds_lists_every_feed_and_the_kind_view_follows_the_place_kind(index):
     helsinki = reader.place("hel", index=index)
-    # A city: primary then secondary, each by relevance; the national rail,
-    # the unknown feed and the cross-border feeds are not in the default view.
-    view = helsinki.feeds()
+    # Every feed by default: by category, then relevance, cross-border ones
+    # and the declared feed of unknown tier included.
+    every = ["f-hsl", "f-coach", "f-vr", "f-ferry", "f-tlt", "f-old"]
+    assert _ids(helsinki.feeds()) == every
+    # A city's view: primary then secondary, each by relevance; the national
+    # rail, the unknown feed and the cross-border feeds are not in it.
+    view = helsinki.feeds(**VIEW)
     assert _ids(view) == ["f-hsl", "f-coach"]
     assert view[0].relevance_category == "primary" and view[0].relevance == 0.9
     assert view[0].tiers == {"local", "regional"} and view[0].cross_border is False
     # A region: secondary and tertiary; a country: tertiary only, best first.
-    assert _ids(reader.place("uus", index=index).feeds()) == ["f-coach", "f-vr"]
-    assert _ids(reader.place("fi", index=index).feeds()) == ["f-vr", "f-coach"]
-    # Every category on request; a tier query is answered in tiers.
-    assert _ids(helsinki.feeds(categories=None)) == ["f-hsl", "f-coach", "f-vr"]
+    assert _ids(reader.place("uus", index=index).feeds(**VIEW)) == ["f-coach", "f-vr"]
+    assert _ids(reader.place("fi", index=index).feeds(**VIEW)) == ["f-vr", "f-coach"]
+    # Named categories; a tier query is answered in tiers.
+    assert _ids(helsinki.feeds(international=False)) == ["f-hsl", "f-coach", "f-vr"]
     assert _ids(helsinki.feeds(categories=["tertiary"])) == ["f-vr"]
     # A tier query keeps its unknown edges flagged, as before, after the tier.
-    assert _ids(helsinki.feeds(tiers=["national"])) == ["f-vr"]
+    assert _ids(helsinki.feeds(tiers=["national"], international=False)) == ["f-vr"]
     # The declared feed without a home country is a link: unknown tier,
     # shown only with the cross-border feeds, after them.
     assert _ids(helsinki.feeds(tiers=["national"], international=True)) == [
@@ -149,35 +157,42 @@ def test_a_town_sized_region_or_country_lists_its_local_feeds(
     index, place_id, expected
 ):
     # At most 1,000 km²: primary, secondary and tertiary; larger: by kind.
-    assert _ids(reader.place(place_id, index=index).feeds()) == expected
+    assert _ids(reader.place(place_id, index=index).feeds(**VIEW)) == expected
 
 
 def test_international_adds_the_cross_border_feeds(index, tmp_path):
     helsinki = reader.place("hel", index=index)
     # On the whole index the cross-border edges are in the joined table: the
-    # default view gains the international feeds, every category all of them.
-    assert _ids(helsinki.feeds(international=True)) == [
+    # kind's view gains the international feeds, every category all of them.
+    assert _ids(helsinki.feeds(categories="default")) == [
         "f-hsl",
         "f-coach",
         "f-ferry",
         "f-tlt",
     ]
-    everything = helsinki.feeds(international=True, categories=None)
+    everything = helsinki.feeds()
     assert _ids(everything) == ["f-hsl", "f-coach", "f-vr", "f-ferry", "f-tlt", "f-old"]
     ferry = everything[3]
     assert ferry.relevance_category == "international" and ferry.cross_border is True
+    table = everything.to_dataframe().set_index("feed_id")
+    assert table["cross_border"].tolist() == [False] * 3 + [True] * 3
+    assert table["no_tier_reason"].isna().tolist() == [True] * 5 + [False]
+    assert table.loc["f-old", "reason"] == (
+        "unknown (unknown tier); serves the place across a border; no tier "
+        "(known only from a catalogue: the index has not crawled it)"
+    )
     # On a country load they come from the links and the partitions that
     # hold their feeds, read once.
     finland = reader.read_index(tmp_path / "index", country="FI")
     helsinki = reader.place("hel", index=finland)
-    assert _ids(helsinki.feeds(categories=None)) == ["f-hsl", "f-coach", "f-vr"]
-    assert _ids(helsinki.feeds(international=True)) == [
+    assert _ids(helsinki.feeds(international=False)) == ["f-hsl", "f-coach", "f-vr"]
+    assert _ids(helsinki.feeds(categories="default")) == [
         "f-hsl",
         "f-coach",
         "f-ferry",
         "f-tlt",
     ]
-    linked = helsinki.feeds(international=True, categories=["international"])
+    linked = helsinki.feeds(categories=["international"])
     assert _ids(linked) == ["f-ferry", "f-tlt"]
     assert linked[0].name == "f-ferry" and linked[1].name == "f-tlt"
     assert {p for p, t in finland._partition_tables if t == "feeds"} == {
@@ -189,6 +204,32 @@ def test_international_adds_the_cross_border_feeds(index, tmp_path):
     # edges, and still answers with them on request.
     estonia = reader.read_index(tmp_path / "index", country="EE")
     assert _ids(reader.place("tll", index=estonia).feeds()) == ["f-tlt"]
+
+
+@pytest.mark.parametrize(
+    "tier, method, departures, kinds, expected",
+    [
+        ("local", "crawl", 10.0, ["bus"], None),
+        ("unknown", "inferred", None, [], "known only from a catalogue"),
+        ("unknown", "crawl", None, [], "the index measured no service for it"),
+        ("unknown", "crawl", 10.0, ["1501", "1100"], "of types the index gives no"),
+        ("unknown", "crawl", 10.0, ["bus"], "could not classify its routes"),
+    ],
+    ids=["tiered", "catalogued", "no-service", "air-and-taxi", "unclassified"],
+)
+def test_a_feed_of_unknown_tier_says_why(tier, method, departures, kinds, expected):
+    from types import SimpleNamespace
+
+    from transitio.index.feeds import IndexedFeed
+
+    edge = SimpleNamespace(
+        tier=tier,
+        method=method,
+        service=SimpleNamespace(departures_per_day=departures),
+        summary={"overlap": {"departures": dict.fromkeys(kinds, 1.0)}},
+    )
+    reason = IndexedFeed.no_tier_reason.fget(SimpleNamespace(edges={tier: edge}))
+    assert reason is None if expected is None else expected in reason
 
 
 def test_an_index_without_relevance_lists_every_feed_by_id():
@@ -537,7 +578,8 @@ def test_the_feed_table_ranks_and_explains_each_feed(tmp_path, monkeypatch, over
         list(table.reset_index().columns)
         == (
             "feed_id name catalogue_name tiers relevance_category relevance "
-            "share_of_place departures_per_day stops routes modes covers repeats "
+            "cross_border no_tier_reason share_of_place departures_per_day stops "
+            "routes modes covers repeats "
             "service_start service_end stale_when_indexed contained_in access "
             "stop_count reason"
         ).split()

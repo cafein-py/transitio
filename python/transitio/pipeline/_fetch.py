@@ -3229,6 +3229,7 @@ def _fetch_place(
             exclude=exclude,
             on_unknown=unknown,
             categories="default" if wanted is None else None,
+            international=False,
         )
         return found if wanted is None else [f for f in found if f.feed_id in wanted]
 
@@ -3484,7 +3485,7 @@ def _fetch_place(
     if tiers is None and wanted is None and not offered:
         # An empty default view may hide feeds a tier query would fetch.
         hidden = place_obj.feeds(
-            exclude=exclude, on_unknown=on_unknown, categories=None
+            exclude=exclude, on_unknown=on_unknown, categories=None, international=False
         )
         if hidden:
             view_note = _hidden_note(place_obj, hidden)

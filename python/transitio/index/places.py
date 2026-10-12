@@ -420,20 +420,22 @@ class Place:
         spec="gtfs",
         on_unknown="include",
         requires=None,
-        categories="default",
-        international=False,
+        categories=None,
+        international=True,
     ):
-        """The feeds serving this place, as :class:`IndexedFeed` objects.
+        """The feeds serving this place, as :class:`IndexedFeed` objects: by
+        default every feed, of every tier and relevance category, cross-border
+        ones included, by category (primary first), then relevance, then id.
 
         ``tiers`` keeps only edges of those tiers, ``exclude`` drops edges of
         the named tiers (a feed with nothing left is dropped), ``spec`` selects
         the feed kind (static GTFS by default; ``None`` for everything, a list
         to narrow), ``on_unknown`` governs unknown-tier edges and ``requires``
         keeps only feeds whose manifest carries the named GTFS files (for
-        example ``"shapes.txt"``). On a schema-7 index ``categories`` picks
-        the relevance categories (the place kind's default view unless named,
-        in which a region or country of at most 1,000 km² keeps its primary
-        feeds too; ``None`` for all) and ``international=True`` adds the
+        example ``"shapes.txt"``). On a schema-7 index ``categories`` names
+        the relevance categories to keep (``"default"`` for the place kind's
+        view, in which a region or country of at most 1,000 km² keeps its
+        primary feeds too) and ``international=False`` leaves out the
         cross-border feeds. See :func:`transitio.index.feeds.feeds_for_place`.
         """
         return self._lookup.feeds(
@@ -529,14 +531,14 @@ class Area:
         spec="gtfs",
         on_unknown="include",
         requires=None,
-        categories="default",
-        international=False,
+        categories=None,
+        international=True,
     ):
         """The feeds serving the area's parts, as :class:`IndexedFeed`
         objects, each feed once.
 
-        Each part answers as :meth:`Place.feeds` does, its kind's default
-        view included, with the same arguments. A feed's ``edges`` are keyed
+        Each part answers as :meth:`Place.feeds` does, with the same
+        arguments: by default every feed serving it. A feed's ``edges`` are keyed
         by ``(place_id, tier)``, its ``selector`` unites theirs (a
         ``whole_feed`` one makes it whole, else an ``unavailable`` one makes
         it unavailable, otherwise the route ids are united) and ``service`` is its
