@@ -43,7 +43,8 @@ class _Network:
             described = f"{network_type} network"
         if nodes is None or edges is None or nodes.empty or edges.empty:
             raise ValueError(f"no {described} in {pbf if name is None else name}")
-        self.graph = osm.to_graph(nodes, edges, graph_type="networkx")
+        # Unsimplified, so every node of the network is a node of the graph.
+        self.graph = osm.to_graph(nodes, edges, graph_type="networkx", simplify=False)
 
         # Nearest-node search in a locally metric, antimeridian-safe frame:
         # an azimuthal equidistant projection centered on the network.
