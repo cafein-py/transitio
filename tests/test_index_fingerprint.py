@@ -56,6 +56,31 @@ def test_from_feed_reads_the_routes_and_reflects_the_stops(kind):
     assert missing == (None if kind == "route_stops" else digest)
 
 
+def test_version_2_kinds_read_ids_trimmed():
+    # Metra's trips.txt put a space after each comma, so no trip matched its
+    # stop times and the index recorded no service for Chicago's rail.
+    def pad(text):
+        # Every value of every data row, first columns included, padded.
+        header, *rows = text.split("\n")
+        rows = [
+            ",".join(f" {v} " for v in row.split(",")) if row else row for row in rows
+        ]
+        return "\n".join([header, *rows])
+
+    padded = {name: pad(text) for name, text in _MEMBERS.items()}
+    clean, spaced = (io.BytesIO(_feed_zip(m)) for m in (_MEMBERS, padded))
+    for kind in ("route_stops@2", "feed_stops@2"):
+        clean.seek(0), spaced.seek(0)
+        assert fingerprint.from_feed(spaced, kind) == fingerprint.from_feed(clean, kind)
+    clean.seek(0), spaced.seek(0)
+    # Version 1 reads ids as written, so an index built with it still matches.
+    plain, _ = fingerprint.from_feed(clean, "route_stops")
+    assert fingerprint.from_feed(spaced, "route_stops")[0] != plain
+    assert fingerprint.compute("feed_stops@2", ROUTES, COORDS) != fingerprint.compute(
+        "feed_stops", ROUTES, COORDS
+    )
+
+
 def test_from_feed_fails_closed_on_unreadable_or_oversize(monkeypatch):
     # A malformed download is an untrusted selector, never a crash.
     assert fingerprint.from_feed(io.BytesIO(b"not a zip"), "feed_stops") == (
