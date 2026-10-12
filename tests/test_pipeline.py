@@ -3365,7 +3365,7 @@ def _feed_tables(path):
     return out
 
 
-def _selector_index(tmp_path, edges):
+def _selector_index(tmp_path, edges, **columns):
     import transitio.index as transitio_index
     from index_fixture import HULL, covered_feed, write_index
 
@@ -3373,6 +3373,7 @@ def _selector_index(tmp_path, edges):
         **covered_feed("f-a", coverage_source="crawl"),
         "coverage": HULL,
         "atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}},
+        **columns,
     }
     return transitio_index.read_index(
         write_index(tmp_path / "index", feeds=[feed], edges=edges)
@@ -3618,7 +3619,8 @@ def test_fetch_place_stale_selector_follows_on_untrusted_selector(
     assert sel["trusted"] is False and sel["reason"] == "stale" and sel["kept"] is None
     assert whole.selection[0]["note"] == "delivered whole: selector out of date"
 
-    # auto + exclude: the exclusion is a hard constraint, so the feed is skipped.
+    # auto + exclude: the exclusion is a hard constraint, so the changed feed
+    # is cut to the selected routes it still has; "drop" skips it.
     _stub_pbf_and_atlas(monkeypatch, tmp_path, payload)
     excl = fetch(
         place="Q1757",
@@ -3628,8 +3630,28 @@ def test_fetch_place_stale_selector_follows_on_untrusted_selector(
         tiers=["local"],
         exclude=["national"],
     )
-    assert excl.feeds == []
-    assert any("untrustworthy selector" in reason for _, reason in excl.skipped)
+    assert {r["route_id"] for r in _feed_tables(excl.feeds[0])["routes.txt"]} == {
+        "r-local"
+    }
+    (sel,) = excl.selections
+    assert (sel["trusted"], sel["reason"], sel["kept"]) == (False, "stale", ["r-local"])
+    assert sel["dropped"] == ["r-nat", "r-reg", "r-unknown"]
+    assert excl.selection[0]["note"] == (
+        "cut to 1 of 4 routes; "
+        "changed since indexed: 1 of 1 selected routes still in it"
+    )
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, payload)
+    dropped = fetch(
+        place="Q1757",
+        index=index,
+        directory=tmp_path / "d",
+        crop=False,
+        tiers=["local"],
+        exclude=["national"],
+        on_untrusted_selector="drop",
+    )
+    assert dropped.feeds == []
+    assert any("untrustworthy selector" in reason for _, reason in dropped.skipped)
 
     # error policy: an untrustworthy selector raises rather than guessing.
     _stub_pbf_and_atlas(monkeypatch, tmp_path, payload)
@@ -3651,12 +3673,116 @@ def test_fetch_place_stale_selector_follows_on_untrusted_selector(
     options = dict(place="Q1757", index=index, crop=False, tiers=["local"])
     cached = fetch(**options)
     assert [e["cache"] for e in cached.selection] == ["reused"] and cached.feeds
-    assert fetch(exclude=["national"], **options).feeds == []
+    offline_cut = fetch(exclude=["national"], **options)
+    assert {
+        r["route_id"] for r in _feed_tables(offline_cut.feeds[0])["routes.txt"]
+    } == {"r-local"}
+    (sel,) = offline_cut.selections
+    assert (sel["trusted"], sel["reason"], sel["kept"]) == (False, "stale", ["r-local"])
+    assert "changed since indexed: 1 of 1" in offline_cut.selection[0]["note"]
+    assert (
+        fetch(exclude=["national"], on_untrusted_selector="drop", **options).feeds == []
+    )
     with pytest.raises(StaleSelectorError):
         fetch(on_untrusted_selector="error", **options)
     with pytest.warns(UserWarning, match="f-a: refresh failed"):
         refreshed = fetch(use_cache=False, **options)
     assert [e["cache"] for e in refreshed.selection] == ["fallback"]
+
+
+@pytest.mark.parametrize(
+    "datasets, use_cache, failure, error",
+    [
+        pytest.param(1, True, "download", "producer down", id="download-fails"),
+        # A refresh replaces the first stale version with the second.
+        pytest.param(2, False, "download", "producer down", id="refresh-two-stale"),
+        pytest.param(1, True, "caching", "disk full", id="caching-fails"),
+    ],
+)
+def test_a_changed_dataset_is_cut_when_no_later_source_serves(
+    tmp_path, monkeypatch, datasets, use_cache, failure, error
+):
+    # A covering dataset whose selector is stale gives way to the feed's own
+    # URL; when that source fails, the dataset is cut, not skipped.
+    import io
+    from pathlib import Path as _Path
+
+    from index_fixture import edge as _edge
+    from transitio.catalog._models import Dataset
+    from transitio.pipeline import _fetch
+
+    service = {"stops": 1, "routes": 1, "departures_per_day": 1.0}
+    stale = {
+        **_edge("Q1757", "f-a", tier="local", service=service),
+        "selector_state": "complete",
+        "selector": {"route_id": ["r-local"]},
+        "fingerprint_kind": "route_stops",
+        "classification_fingerprint": "0" * 64,
+        "needs_review": False,
+    }
+    mdb = {"mdb_id": "mdb-9", "urls": {"latest": "u"}}
+    index = _selector_index(tmp_path, [stale], mdb=mdb)
+    payload = _multi_route_gtfs()
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, payload)
+    covering = [
+        Dataset.from_api(
+            {"id": f"mdb-9-{n}", "feed_id": "mdb-9", "hosted_url": f"https://x/{n}"}
+        )
+        for n in range(datasets)
+    ]
+    monkeypatch.setattr(
+        "transitio.catalog.MobilityDatabase.datasets_for",
+        lambda self, feed, when: covering,
+    )
+
+    def dataset_download(self, dataset, directory=None):
+        base = _Path(directory) if directory else tmp_path
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / f"{dataset.id}.zip"
+        # Each dataset its own bytes, so each is its own version.
+        buffer = io.BytesIO(payload)
+        with zipfile.ZipFile(buffer, "a") as archive:
+            archive.writestr("readme.txt", dataset.id)
+        path.write_bytes(buffer.getvalue())
+        return path
+
+    def producer_down(self, feed, directory=None):
+        raise RuntimeError(error)
+
+    monkeypatch.setattr(
+        "transitio.catalog.MobilityDatabase._fetch_dataset", dataset_download
+    )
+    if failure == "download":
+        monkeypatch.setattr(
+            "transitio.catalog.TransitlandAtlas._fetch_static", producer_down
+        )
+    else:
+        add = _fetch._add_version
+
+        def add_version(cache, feed_id, path, url, fetched_from, *args, **options):
+            if fetched_from == "producer":
+                raise OSError(error)
+            return add(cache, feed_id, path, url, fetched_from, *args, **options)
+
+        monkeypatch.setattr(_fetch, "_add_version", add_version)
+    result = fetch(
+        place="Q1757",
+        index=index,
+        directory=tmp_path / "out",
+        crop=False,
+        osm=False,
+        tiers=["local"],
+        exclude=["national"],
+        when="2026-06-01",
+        refresh_token="tok",
+        use_cache=use_cache,
+    )
+    (entry,) = result.selection
+    assert (entry["decision"], entry["fetched_from"]) == ("delivered", "mdb_dataset")
+    assert error in entry["download_errors"]
+    assert {r["route_id"] for r in _feed_tables(result.feeds[0])["routes.txt"]} == {
+        "r-local"
+    }
 
 
 def test_a_cached_version_lacking_a_selected_route_is_passed_over(

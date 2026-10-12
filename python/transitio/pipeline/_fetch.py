@@ -2470,8 +2470,14 @@ def fetch(
     a selector cannot be trusted -- its evidence was missing at build time,
     or its fingerprint no longer
     matches the download -- ``on_untrusted_selector`` decides the outcome:
-    ``"auto"`` (default) skips the feed when an ``exclude`` was asked for and
-    otherwise delivers it whole with its tier treated as ``unknown``;
+    ``"auto"`` (default), when an ``exclude`` or ``on_unknown="exclude"``
+    was asked for, cuts a feed that changed since indexed to the selected
+    routes it still has, noted
+    ``"cut to <k> of <m> routes; changed since indexed: <k> of <n> selected
+    routes still in it"`` (routes added since are left out, as their tiers
+    are unknown), and
+    skips it when it has none or its selector was unavailable; otherwise it
+    delivers the feed whole with its tier treated as ``unknown``;
     ``"whole"`` always delivers it whole; ``"drop"`` always skips it;
     ``"error"`` raises :class:`~transitio.exceptions.StaleSelectorError`.
     A schema-10 index records the larger feeds whose stops and routes contain
@@ -3352,8 +3358,10 @@ def _untrusted_action(policy, exclude, on_unknown):
     under ``on_untrusted_selector``.
 
     Under ``"auto"`` an explicit ``exclude`` is a hard constraint that cannot
-    be honoured, so the feed is skipped; otherwise it is delivered whole with
-    its tier treated as ``unknown``, and ``on_unknown`` decides its fate.
+    be honoured whole, so the action is ``"skip"`` (which fetch turns into a
+    cut to the selected routes still present for a changed feed whose
+    selector is complete); otherwise it is delivered whole with its tier
+    treated as ``unknown``, and ``on_unknown`` decides its fate.
     """
     if policy == "error":
         return "error"
@@ -3724,7 +3732,7 @@ def _fetch_place(
         # through on_untrusted_selector rather than filtering silently.
         # on_unknown="exclude" is itself an edge filter, so this activates
         # even without an explicit tiers/exclude query.
-        routes = selection = applied = None
+        routes = selection = applied = changed = None
         if tiers is not None or exclude is not None or on_unknown != "include":
             sel = feed.selector
             selected_by = [
@@ -3759,14 +3767,30 @@ def _fetch_place(
                     "declared_as": None,
                     "selected_by": selected_by,
                 }
-                if action == "skip":
+                # A changed feed is cut to the selected routes it still has
+                # rather than skipped, unless the selector was asked to drop.
+                still = set(sel.route_ids) & in_feed
+                if (
+                    action == "skip"
+                    and on_untrusted_selector == "auto"
+                    and reason != "unavailable"
+                    and sel.state == "complete"
+                    and still
+                ):
+                    routes = still
+                    changed = (
+                        f"changed since indexed: {len(still)} of "
+                        f"{len(sel.route_ids)} selected routes still in it"
+                    )
+                elif action == "skip":
                     _skip(entry, f"untrustworthy selector ({reason})")
                     selections.append(selection)
                     return "skipped"
-                # action == "whole": deliver unfiltered (routes stays None),
-                # the selection recording why it was not filtered.
-                state = "unavailable" if reason == "unavailable" else "out of date"
-                applied = f"delivered whole: selector {state}"
+                else:
+                    # action == "whole": deliver unfiltered (routes stays
+                    # None), the selection recording why it was not filtered.
+                    state = "unavailable" if reason == "unavailable" else "out of date"
+                    applied = f"delivered whole: selector {state}"
             elif sel.state == "complete":
                 routes = set(sel.route_ids)
                 selection = {
@@ -3847,8 +3871,9 @@ def _fetch_place(
         # A later repair may still change the delivered feed, and any
         # spatial crop is a separate transform reported in ``reports``,
         # not here. Both are None (undetermined) when routes.txt could
-        # not be read. Only a trusted complete selector was cropped
-        # (``routes`` is set).
+        # not be read. Only a complete selector was cropped (``routes`` is
+        # set): a trusted one, or one of a changed feed to its routes still
+        # present.
         present = made["present_routes"]
         if selection is not None and routes is not None:
             selection["kept"] = None if present is None else sorted(present & routes)
@@ -3864,7 +3889,7 @@ def _fetch_place(
             cropped.add(feed.feed_id)
         else:
             carriers[feed.feed_id] = feed.feed_id
-        notes = [applied, *notes, _renamed_note(version), _crop_note(made)]
+        notes = [applied, changed, *notes, _renamed_note(version), _crop_note(made)]
         notes += [_agency_note(made), _partial_note(made)]
         notes += [_timezone_note(path, budget), _dropped_note(report)]
         for text in dict.fromkeys(filter(None, notes)):
@@ -4050,6 +4075,18 @@ def _fetch_place(
                     return True, deferred
             return False, deferred
 
+        def take_stale(stale):
+            # The first of the ``stale`` downloads, ``(fetched_from, *take's
+            # arguments)``, still cached (a refresh replaces older ones),
+            # through the policy; whether one was taken.
+            for fetched_from, *arguments in stale:
+                version = arguments[2]
+                if version.path.is_file() and cache.intact(version):
+                    arguments[1]["fetched_from"] = fetched_from
+                    take(*arguments, last=True)
+                    return True
+            return False
+
         def fall_back(feed, entry, candidates, key, notes, keyless, proven, deferred):
             # Without a download: a refresh falls back to what the cache
             # serves, then the selector policy decides on the newest stale
@@ -4124,6 +4161,9 @@ def _fetch_place(
                 sources = [*covering, None]
             else:
                 sources = [None] if newest is None else [None, newest]
+            # The downloads a later source's selector may match better, kept
+            # for the policy when no later source serves.
+            stale = []
             for n, dataset in enumerate(sources):
                 last = n == len(sources) - 1
                 path = url = fetched_from = None
@@ -4164,6 +4204,8 @@ def _fetch_place(
                 if path is None:
                     if not last:
                         continue
+                    if take_stale(stale):
+                        break
                     if fall_back(
                         feed, entry, candidates, key, notes, keyless, proven, deferred
                     ):
@@ -4190,6 +4232,14 @@ def _fetch_place(
                     if not last:
                         errors.append(f"{fetched_from}: {error}")
                         continue
+                    if stale:
+                        errors.append(f"{fetched_from}: {error}")
+                        failed = "; ".join(e for e in errors if e)
+                        if access is not None:
+                            failed = access.redact(failed)
+                        entry["download_errors"] = failed
+                        if take_stale(stale):
+                            break
                     _skip(entry, f"processing failed: {error}")
                     break
                 # Read as a reuse would, so identical bytes report alike.
@@ -4209,6 +4259,19 @@ def _fetch_place(
                 outcome = take(
                     feed, entry, version, said, dataset_id, hosted, key, last=last
                 )
+                if outcome == "stale":
+                    stale.append(
+                        (
+                            fetched_from,
+                            feed,
+                            entry,
+                            version,
+                            said,
+                            dataset_id,
+                            hosted,
+                            key,
+                        )
+                    )
                 # A source that does not serve, or whose selector another
                 # version may match, gives way to the next.
                 if outcome not in ("rejected", "stale"):
