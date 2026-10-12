@@ -393,12 +393,16 @@ def test_outputs_are_keyed_by_the_exact_area_and_the_budgets():
         [(0, 0), (1, 0), (1, 1), (0.5, 0.5), (0, 1)]
     )
 
-    def key(area, crop=True, **budgets):
-        return _output_key(version, area, None, crop, False, budgets)
+    def key(area, crop=True, agency=None, **budgets):
+        return _output_key(
+            version, area, None, crop, agency is not None, budgets, agency
+        )
 
     assert key(square) != key(notched)  # the same bounds
     assert key(square) != key(square, max_notices_per_file=5)
     assert key(square, crop=False) == key(notched, crop=False)
+    # The agency a repair writes into a missing agency.txt.
+    assert key(square, agency=("A", "u")) != key(square, agency=("B", "u"))
 
 
 def test_an_area_fetch_delivers_the_same_content_once(pipeline_env, monkeypatch):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import csv
 import dataclasses
 import datetime
 import hashlib
@@ -429,9 +430,12 @@ def _process_feed(
     provenance=None,
     outputs=None,
     progress=None,
+    name=None,
 ):
     """Crop, repair, mode-filter, validate and report one downloaded feed,
     writing what it makes beside it; the report carries ``provenance``.
+    With ``repair``, a feed without agency.txt gets one named ``name``
+    (:func:`_agency_written`).
 
     A feed whose validation finds a required file missing drops out on any
     day. The computed service window is tested against ``day`` (None tests
@@ -459,9 +463,12 @@ def _process_feed(
     from transitio.validate import validate_feed
 
     made = key = transform = None
+    agency = (name, (provenance or {}).get("source_url"))
     if outputs is not None:
         cache, version = outputs
-        key = _output_key(version, geometry, routes, crop, repair, budgets)
+        key = _output_key(
+            version, geometry, routes, crop, repair, budgets, agency if repair else None
+        )
         made = _stored_output(version, key)
         if not repair:
             # A crop does not depend on the day; its validation does.
@@ -486,6 +493,7 @@ def _process_feed(
             crop=crop,
             budgets=budgets,
             routes=routes,
+            agency=agency,
         )
         if outputs is not None:
             _store_output(cache, version, key, made, transform)
@@ -494,6 +502,8 @@ def _process_feed(
         served = _feed_modes(path)
         if served is None:
             raise _SkipFeed("could not read routes.txt for mode filtering")
+        if not served and (crop or routes is not None) and _tripless(path, budgets):
+            raise _SkipFeed(_emptied(crop, routes))
         if not served & modes:
             raise _SkipFeed(f"serves {sorted(served)}, not {sorted(modes)}")
     if "validation" not in made:
@@ -504,6 +514,10 @@ def _process_feed(
     start, end = _service_window(validation)
     window = _window(start, end)
     missing = _missing_files(validation)
+    if missing is not None and (crop or routes is not None):
+        # A crop that keeps no trip leaves empty tables, not missing ones.
+        if not validation.get("row_counts", {}).get("trips.txt"):
+            missing = _emptied(crop, routes)
     if missing is not None:
         raise _SkipFeed(missing, window)
     if day is not None:
@@ -513,6 +527,23 @@ def _process_feed(
         if reason is not None:
             raise _SkipFeed(reason, window, missed_day=True)
     return path, _report(made, hosted, provenance), made, key, window
+
+
+def _tripless(path, budgets):
+    """Whether the feed at ``path`` has a trips.txt without rows."""
+    tables = _read_tables(
+        path, {"trips.txt": {"trip_id"}}, budgets.get("max_total_bytes")
+    )
+    trips = (tables or {}).get("trips.txt")
+    return trips is not None and len(trips.index) == 0
+
+
+def _emptied(crop, routes):
+    """Why a crop that keeps no trip skips its feed."""
+    if not crop:
+        return "no trip runs the selected routes"
+    selected = "" if routes is None else " of the selected routes"
+    return f"no trip{selected} stops in the area"
 
 
 def _warn_undated(feed_ids, day, stacklevel):
@@ -574,7 +605,18 @@ def _transform(path, folder, stem, **steps):
 
 
 def _transformed(
-    path, folder, stem, made, written, *, geometry, repair, crop, budgets, routes
+    path,
+    folder,
+    stem,
+    made,
+    written,
+    *,
+    geometry,
+    repair,
+    crop,
+    budgets,
+    routes,
+    agency,
 ):
     """The steps of :func:`_transform`, each output added to ``written``."""
     from transitio.catalog._cache import _directory
@@ -606,21 +648,97 @@ def _transformed(
     made["fixes"] = []
     if repair:
         _directory(folder)
+        # Written before the repair, which drops routes naming no agency.
+        named = folder / f"{stem}-agency.zip"
+        written.append(named)
+        added = _agency_written(path, named, agency, budgets.get("max_total_bytes"))
+        if added:
+            path = _read_only(named)
         repaired = folder / f"{stem}-repaired.zip"
         written.append(repaired)
-        made["fixes"] = repair_feed(path, repaired, **budgets)["fixes"]
+        made["fixes"] = added + repair_feed(path, repaired, **budgets)["fixes"]
+        if added:
+            # Only the repaired archive is kept.
+            os.unlink(named)
         path = _read_only(repaired)
     made["path"] = path
     return made
 
 
-def _output_key(version, geometry, routes, crop, repair, budgets):
+def _agency_written(path, target, agency, max_total_bytes=None):
+    """Write the feed at ``path`` with an agency.txt to ``target`` when it
+    has none: one row per ``agency_id`` its routes.txt names (one without an
+    id when none does), named after the feed (``agency``, ``(name, source
+    URL)``; with the id when there are several), its source URL as
+    ``agency_url`` and the time zone of most of its stops. Returns the
+    repair's fixes for the rows, ``add_entity`` each; empty, writing
+    nothing, when the feed has an agency.txt, or the name, the URL or the
+    zone is unknown."""
+    from transitio.catalog._nested import _repack
+    from transitio.gtfs._merge import _stop_zone
+
+    name, url = (
+        value.strip() if isinstance(value, str) else ""
+        for value in (agency or (None, None))
+    )
+    # One open archive for the check, the reads and the copy.
+    with zipfile.ZipFile(path) as source:
+        if not name or not url or "agency.txt" in source.namelist():
+            return []
+        tables = _read_tables(source, {"stops.txt", "routes.txt"}, max_total_bytes)
+        zone = None if tables is None else _stop_zone(tables)
+        if zone is None:
+            return []
+        routes = tables.get("routes.txt")
+        named = [] if routes is None else routes.get("agency_id", [])
+        ids = sorted({value.strip() for value in named} - {""})
+        rows = [(i, f"{name} ({i})" if len(ids) > 1 else name) for i in ids]
+        rows = rows or [("", name)]
+        text = io.StringIO()
+        writer = csv.writer(text, lineterminator="\n")
+        header = ["agency_id", "agency_name", "agency_url", "agency_timezone"]
+        writer.writerow(header)
+        writer.writerows([agency_id, label, url, zone] for agency_id, label in rows)
+        files = [(info, info.filename) for info in source.infolist()]
+        _repack(source, [f for f in files if not f[0].is_dir()], target)
+    with zipfile.ZipFile(target, "a", zipfile.ZIP_DEFLATED) as out:
+        out.writestr("agency.txt", text.getvalue())
+    return [
+        {
+            "action": "add_entity",
+            "filename": "agency.txt",
+            "csvRowNumber": n + 2,
+            "field": "agency_name",
+            "new_value": label,
+            "triggered_by": "missing_required_file",
+        }
+        for n, (_, label) in enumerate(rows)
+    ]
+
+
+def _agency_note(made):
+    """The note on a feed the repair gave an agency.txt
+    (:func:`_agency_written`); None otherwise."""
+    if any(
+        fix.get("action") == "add_entity" and fix.get("filename") == "agency.txt"
+        for fix in made.get("fixes") or ()
+    ):
+        return (
+            "repair wrote agency.txt: the feed's name and source URL, the time "
+            "zone of its stops"
+        )
+    return None
+
+
+def _output_key(version, geometry, routes, crop, repair, budgets, agency=None):
     """The SHA-256 naming what processing makes of ``version``: canonical
     JSON of the transitio release, the version's SHA-256, the exact area
     (when cropped to it), the routes, the crop and repair flags and the
-    budgets, the reference date among them."""
+    budgets, the reference date among them, and with an ``agency`` the
+    name and URL a repair writes into a missing agency.txt."""
     from transitio import __version__
 
+    parts = {} if agency is None else {"agency": list(agency)}
     return _request_key(
         transitio=__version__,
         version=version.sha256,
@@ -629,6 +747,7 @@ def _output_key(version, geometry, routes, crop, repair, budgets):
         crop=crop,
         repair=repair,
         budgets=budgets,
+        **parts,
     )
 
 
@@ -926,17 +1045,19 @@ def _containers_first(feeds):
 
 
 def _read_tables(path, names, max_total_bytes=None):
-    """The tables ``names`` of a feed zip, read as ``FeedEditor`` does, with
-    ``names`` a mapping only the columns it lists for each, by stripped
-    name; None when together they are over ``max_total_bytes`` (default:
-    the ``FeedEditor`` budget)."""
+    """The tables ``names`` of a feed zip (its path, or the open
+    ``zipfile.ZipFile``), read as ``FeedEditor`` does, with ``names`` a
+    mapping only the columns it lists for each, by stripped name; None when
+    together they are over ``max_total_bytes`` (default: the ``FeedEditor``
+    budget)."""
     import pandas as pd
 
     from transitio.edit._editor import _MAX_TOTAL_BYTES, _normalise_table
 
     limit = _MAX_TOTAL_BYTES if max_total_bytes is None else max_total_bytes
     csv = {"dtype": str, "keep_default_na": False, "encoding": "utf-8-sig"}
-    with zipfile.ZipFile(path) as archive:
+    opened = isinstance(path, zipfile.ZipFile)
+    with contextlib.nullcontext(path) if opened else zipfile.ZipFile(path) as archive:
         members = [m for m in archive.infolist() if m.filename in names]
         if sum(m.file_size for m in members) > limit:
             return None
@@ -2286,11 +2407,15 @@ def fetch(
     them under their own names, noted ``"read 'Agency.txt' as agency.txt"``;
     a file present under its own name, or two files taking one name, are
     left as they are. A feed
-    lacking a file GTFS requires is skipped, with or without ``when`` and
-    ``repair``: ``"missing required file agency.txt"`` (several
-    names sorted, ``"missing required files ..."``) or ``"missing calendar.txt
-    and calendar_dates.txt"``, joined with ``"; "`` when both apply; a crop
-    that keeps no trip leaves both calendar files out. A download whose
+    lacking a file GTFS requires is skipped, with or without ``when``, and
+    with ``repair`` unless the repair writes it (agency.txt, see
+    ``repair``): ``"missing required file agency.txt"`` (several names
+    sorted, ``"missing required files ..."``) or ``"missing calendar.txt
+    and calendar_dates.txt"``, joined with ``"; "`` when both apply. A crop
+    that keeps no trip skips the feed as ``"no trip stops in the area"``
+    (``"no trip of the selected routes stops in the area"`` with a route
+    selection, ``"no trip runs the selected routes"`` without the area
+    crop). A download whose
     content equals a feed already delivered in the call is skipped as
     ``"same content as <feed id>"`` when its routes are within those
     delivered from that archive (a feed delivered whole carries all);
@@ -2465,7 +2590,13 @@ def fetch(
         checks still apply.
     repair : bool, default False
         Repair each feed (gtfstidy contract) after the crop, before use;
-        conservative default leaves feeds untouched.
+        conservative default leaves feeds untouched. A feed without
+        agency.txt first gets one: a row per ``agency_id`` its routes name,
+        named after the feed, with its source URL and the time zone of most
+        of its stops, each an ``add_entity`` fix in ``repairs``, noted
+        ``"repair wrote agency.txt: …"``; when the feed's name, source URL
+        or stops' zone is unknown none is written and the feed is skipped as
+        missing it.
     crop : bool, default True
         Spatially crop each feed to the area: to its polygon when it has
         one (a place's boundary included), otherwise to its bounding box.
@@ -2833,6 +2964,7 @@ def fetch(
                     hosted=hosted,
                     budgets=budgets,
                     progress=progress,
+                    name=feed.provider,
                 )
                 path = _deliver(path, directory, origin)
                 cache.touch(version, served=(key, dataset_id))
@@ -2851,6 +2983,7 @@ def fetch(
             entry.update(decision="delivered", feed_window=window, path=path)
             for note in (
                 _renamed_note(version),
+                _agency_note(made),
                 _timezone_note(path, budgets.get("max_total_bytes")),
                 _dropped_note(report),
             ):
@@ -3565,6 +3698,7 @@ def _fetch_place(
                 budgets=budgets,
                 routes=routes,
                 progress=progress,
+                name=feed.name,
             )
         except _SkipFeed as skip:
             if not last:
@@ -3612,7 +3746,7 @@ def _fetch_place(
             cropped.add(feed.feed_id)
         else:
             carriers[feed.feed_id] = feed.feed_id
-        notes = [applied, *notes, _renamed_note(version)]
+        notes = [applied, *notes, _renamed_note(version), _agency_note(made)]
         notes += [_timezone_note(path, budget), _dropped_note(report)]
         for text in dict.fromkeys(filter(None, notes)):
             _note(entry, text)

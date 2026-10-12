@@ -1487,20 +1487,24 @@ _YEAR = ["2026-01-01", "2026-12-31"]
             id="calendars",
         ),
         pytest.param([], None, _YEAR, id="complete"),
+        # A crop keeping no trip was reported as missing both calendar files.
+        pytest.param(None, "no trip stops in the area", None, id="empty-crop"),
     ],
 )
 def test_a_feed_missing_a_required_file_is_skipped(tmp_path, dropped, reason, window):
     # A feed without agency.txt was delivered, its report counting the
     # error, and cafein then refused every delivered feed.
+    from shapely.geometry import box
+
     from transitio.pipeline._fetch import _process_feed, _SkipFeed
 
-    files = {name: text for name, text in FEED.items() if name not in dropped}
+    files = {name: text for name, text in FEED.items() if name not in (dropped or ())}
     source = write_zip(tmp_path / "feed.zip", files)
     options = dict(
-        geometry=None,
+        geometry=None if dropped is not None else box(0, 0, 1, 1),
         tag="t",
         repair=False,
-        crop=False,
+        crop=dropped is None,
         modes=None,
         day=None,
         study=False,
@@ -1516,6 +1520,59 @@ def test_a_feed_missing_a_required_file_is_skipped(tmp_path, dropped, reason, wi
     with pytest.raises(_SkipFeed) as caught:
         _process_feed(source, **options)
     assert (caught.value.reason, caught.value.window) == (reason, window)
+    if dropped is None:
+        # A mode filter reads the emptied routes.txt before the validation.
+        with pytest.raises(_SkipFeed, match=reason):
+            _process_feed(source, **{**options, "modes": {"bus"}})
+
+
+def test_the_repair_writes_a_missing_agency_txt(tmp_path):
+    # A feed without agency.txt was skipped even with repair=True.
+    from transitio.pipeline._fetch import (
+        _agency_note,
+        _agency_written,
+        _process_feed,
+    )
+
+    files = {name: text for name, text in FEED.items() if name != "agency.txt"}
+    source = write_zip(tmp_path / "feed.zip", files)
+    path, _, made, *_ = _process_feed(
+        source,
+        geometry=None,
+        tag="t",
+        repair=True,
+        crop=False,
+        modes=None,
+        day=None,
+        study=False,
+        hosted=None,
+        budgets={},
+        provenance={"source_url": "https://x.example/gtfs.zip"},
+        name="Region",
+    )
+    with zipfile.ZipFile(path) as archive:
+        rows = archive.read("agency.txt").decode().splitlines()[1:]
+    zone = "https://x.example/gtfs.zip,Europe/Helsinki"
+    assert rows == [f"espoo,Region (espoo),{zone}", f"hsl,Region (hsl),{zone}"]
+    added = [fix for fix in made["fixes"] if fix["action"] == "add_entity"]
+    assert added == [
+        {
+            "action": "add_entity",
+            "filename": "agency.txt",
+            "csvRowNumber": row,
+            "field": "agency_name",
+            "new_value": f"Region ({agency_id})",
+            "triggered_by": "missing_required_file",
+        }
+        for row, agency_id in ((2, "espoo"), (3, "hsl"))
+    ]
+    assert _agency_note(made) == (
+        "repair wrote agency.txt: the feed's name and source URL, the time zone "
+        "of its stops"
+    )
+    assert not list(tmp_path.glob("*-agency.zip"))
+    # Without a usable name nothing is written.
+    assert _agency_written(source, tmp_path / "x.zip", (" ", "https://x")) == []
 
 
 @pytest.mark.parametrize(
