@@ -1409,7 +1409,15 @@ class _Processed:
 
 
 def _drop_repeats(
-    cache, record, processed, feeds, reports, directory, progress=None, **options
+    cache,
+    record,
+    processed,
+    feeds,
+    reports,
+    directory,
+    progress=None,
+    stacklevel=2,
+    **options,
 ):
     """Leave out of the delivered feeds the trips that repeat a trip kept
     from a feed before them in ``record``, as :func:`fetch` describes.
@@ -1423,7 +1431,9 @@ def _drop_repeats(
     delivered, noted. Each compared entry gets its ``duplicate_trips``
     count. ``options`` are ``budgets``, ``modes``, ``day``, the study day or
     None, and ``duplicate_trips``, ``"keep"`` comparing nothing;
-    ``progress`` (:class:`_Progress`) says when the comparison starts.
+    ``progress`` (:class:`_Progress`) says when the comparison starts. A
+    ``UserWarning`` (:func:`_warn_unaligned`, ``stacklevel`` pointing at the
+    caller of fetch) names the stops whose departures near repeats took.
     Returns ``{feed id: [ids]}``: for each feed cut or withdrawn, the feeds
     holding the trips it repeated.
     """
@@ -1452,7 +1462,7 @@ def _drop_repeats(
     )
     keys = [_request_key(run=run, made=item.key) for item in items]
     found = _stored_repeats(items, keys) or _repeats(cache, items, keys, **options)
-    lost = {}
+    lost, unaligned = {}, {}
     for n, item, (outcome, made) in zip(order, items, found):
         entry = item.entry
         # None when not compared, else 0 until trips are left out below.
@@ -1477,6 +1487,7 @@ def _drop_repeats(
             continue
         entry["duplicate_trips"] = outcome["dropped"]
         lost[entry["feed_id"]] = outcome["of"]
+        unaligned[entry["feed_id"]] = outcome.get("unaligned", {})
         if outcome["skip"] is not None:
             _skip(entry, outcome["skip"], path=None, feed_window=outcome["window"])
             continue
@@ -1484,8 +1495,38 @@ def _drop_repeats(
             feeds[n] = made["path"]
         reports[n] = report
         entry.update(path=feeds[n], feed_window=outcome["window"])
-        _note(entry, outcome["note"])
+        _note(entry, _repeats_note(outcome))
+    _warn_unaligned(unaligned, stacklevel + 1)
     return lost
+
+
+def _warn_unaligned(unaligned, stacklevel):
+    """Warn about the stops of each feed whose departures went with its near
+    repeats (``{feed id: {stop id: count}}``): the trips those repeat do not
+    stop there, each id printable and at most 40 characters.
+    ``stacklevel`` points at the caller of fetch."""
+    from transitio._progress import _printable
+
+    def shown(value):
+        value = _printable(value)
+        return value if len(value) <= 40 else value[:39] + "…"
+
+    named = []
+    for feed_id, counts in unaligned.items():
+        if not counts:
+            continue
+        stops = sorted(counts, key=lambda stop: (-counts[stop], stop))
+        listed = ", ".join(map(shown, stops[:5])) + (", …" if len(stops) > 5 else "")
+        events = sum(counts.values())
+        named.append(f"{shown(feed_id)}: {events} at {len(stops)} stops ({listed})")
+    if named:
+        warnings.warn(
+            "trips left out as near repeats took departures at stops the trips "
+            f"they repeat do not serve: {'; '.join(named)}; "
+            'duplicate_trips="exact" keeps near repeats',
+            UserWarning,
+            stacklevel=stacklevel,
+        )
 
 
 def _stored_repeats(items, keys):
@@ -1584,6 +1625,7 @@ def _repeats(cache, items, keys, budgets, modes, day, duplicate_trips):
 
     def unchanged(error):
         kept = {"dropped": None, "of": [], "skip": None, "window": None}
+        kept.update(near=0, unaligned={})
         return [({**kept, "note": f"repeated trips kept: {error}"}, None)] * len(items)
 
     names = dict(_MATCHED_COLUMNS)
@@ -1628,9 +1670,10 @@ def _repeats(cache, items, keys, budgets, modes, day, duplicate_trips):
             except Exception as error:  # noqa: B902 — every feed keeps its trips
                 return unchanged(error)
             for n in range(len(found), len(items)):
-                trips, earlier, scope = matched[n]
+                trips, earlier, scope, nearly, unaligned = matched[n]
                 outcome = {"dropped": 0 if tables[n] else None, "skip": None}
                 outcome.update(of=[ids[p] for p in earlier], note=None, window=None)
+                outcome.update(near=0, unaligned={})
                 made, again = None, False
                 try:
                     if trips:
@@ -1639,6 +1682,7 @@ def _repeats(cache, items, keys, budgets, modes, day, duplicate_trips):
                         again = _decide(
                             outcome, made, held[n], trips, scope, modes, day
                         )
+                        outcome.update(near=len(nearly & trips), unaligned=unaligned)
                 except Exception as error:  # noqa: B902 — the feed keeps its trips
                     note = f"repeated trips kept: {error}"
                     outcome, made = {**outcome, "skip": None, "note": note}, None
@@ -1725,6 +1769,17 @@ def _decide(outcome, made, held, trips, scope, modes, day):
         return True
     outcome["note"] = f"{len(gone)} repeated trips of {listed} left out"
     return False
+
+
+def _repeats_note(outcome):
+    """The note on a feed cut of repeated trips, the near repeats among them
+    counted apart: ``"<n> repeated trips of <ids> left out (<e> exact,
+    <m> near: within 50 m and 3 minutes)"``."""
+    note, near = outcome["note"], outcome.get("near", 0)
+    if note is None or not near:
+        return note
+    exact = outcome["dropped"] - near
+    return f"{note} ({exact} exact, {near} near: within 50 m and 3 minutes)"
 
 
 def _without_repeats(made, output, trips, budgets):
@@ -2586,7 +2641,13 @@ def fetch(
     feed's first crop. Delivered feeds are separate feeds, so no transfer
     or pathway links them. The cut feed is validated again, its report
     (listing also the rows this crop left out) and ``feed_window`` come
-    from it, and its note says ``"<n> repeated trips of <ids> left out"``.
+    from it, and its note says ``"<n> repeated trips of <ids> left out"``,
+    with the near repeats counted apart (``"(<e> exact, <m> near: within
+    50 m and 3 minutes)"``). A near repeat may stop where the trip it
+    repeats does not (at most two of its stops, and one in five,
+    :func:`~transitio.gtfs._near.near_matches`), and those departures
+    go with it: a ``UserWarning`` names each feed's such stops, the most
+    affected first, and the departures taken there.
     A feed whose every trip in scope repeats is skipped as ``"every trip
     repeats a trip of <ids>"`` (with ``when``, ``"every trip on <day>
     repeats a trip of <ids>"``), and with ``modes`` a feed left without a
@@ -3219,7 +3280,15 @@ def fetch(
     repeats = dict(budgets=budgets, modes=modes, day=day if study else None)
     repeats["duplicate_trips"] = duplicate_trips
     _drop_repeats(
-        cache, record, processed, feeds, reports, directory, progress, **repeats
+        cache,
+        record,
+        processed,
+        feeds,
+        reports,
+        directory,
+        progress,
+        stacklevel=3,
+        **repeats,
     )
     progress.left_out(record)
     rows = [
@@ -4164,7 +4233,15 @@ def _fetch_place(
     repeats = dict(budgets=budgets, modes=modes, day=day if study else None)
     repeats["duplicate_trips"] = duplicate_trips
     lost = _drop_repeats(
-        cache, record, processed, feeds, reports, directory, progress, **repeats
+        cache,
+        record,
+        processed,
+        feeds,
+        reports,
+        directory,
+        progress,
+        stacklevel=4,
+        **repeats,
     )
     for feed_id, (access, _) in decided.items():
         entry = entries[feed_id]

@@ -2078,7 +2078,32 @@ def test_delivered_feeds_do_not_repeat_each_others_trips(tmp_path, monkeypatch):
     result = fetch(place="Q1757", index=index, crop=False, osm=False, expired="keep")
     trips = [read_entry(path, "trips.txt").decode().split() for path in result.feeds]
     assert [rows[1:] for rows in trips] == [["x36,wk,t1"], ["x36,wk,t2"]]
-    assert result.selection[1]["note"] == "1 repeated trips of f-a left out"
+    assert result.selection[1]["note"] == (
+        "1 repeated trips of f-a left out (0 exact, 1 near: within 50 m and 3 minutes)"
+    )
+
+
+def test_near_repeats_name_the_stops_whose_departures_they_take():
+    # Near repeats removed stop events at stops the trips they repeat do not
+    # serve (239 of 80,098 at Augsburg) with no warning.
+    from transitio.pipeline._fetch import _repeats_note, _warn_unaligned
+
+    from transitio.catalog._cache import _repeats_record
+
+    forged = "s\n\x1b[2Jx" + "y" * 60
+    with pytest.warns(UserWarning) as caught:
+        _warn_unaligned({"f-b": {"s9": 2, "s1": 1, forged: 1}, "f-c": {}}, 2)
+    (said,) = [str(w.message) for w in caught]
+    assert "f-b: 4 at 3 stops (s9, s  [2Jx" in said and "f-c" not in said
+    assert "\n" not in said and "\x1b" not in said and "y" * 40 not in said
+    # A repeat record a release before these fields stays well formed.
+    old = {"dropped": 1, "of": ["f-a"], "skip": None, "note": "n", "window": None}
+    assert _repeats_record("0" * 64, old)
+    assert not _repeats_record("0" * 64, {**old, "unaligned": {"s": 0}})
+    outcome = {"note": "3 repeated trips of f-a left out", "dropped": 3, "near": 1}
+    assert _repeats_note(outcome).endswith(
+        "(2 exact, 1 near: within 50 m and 3 minutes)"
+    )
 
 
 def test_a_placeholder_calendar_is_an_older_version_of_the_dated_network(tmp_path):
@@ -3784,7 +3809,7 @@ def test_trips_listed_per_date_are_matched_through_their_days(blocks):
 
     earlier = feed("t", range(1, 13))
     later = feed("u", range(1, 14), extra=[("x1a", 1)])
-    gone, of, _ = repeated_trips([earlier, later])[1]
+    gone, of, *_ = repeated_trips([earlier, later])[1]
     # Each earlier copy covers one later copy on its date. Unblocked trips go
     # first, so with blocks x1a takes t1a's date and block k1 is kept.
     first = 2 if blocks else 1

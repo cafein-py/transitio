@@ -1057,6 +1057,13 @@ def test_duplicate_trips(tmp_path, inputs, dropped, expected):
         "near_matches": expected.get("near", 0),
         "unaligned_stops": expected.get("unaligned", 0),
     }
+    if mode == "drop" and len(feeds) == 2:
+        # fetch's reading of the same: the near trips and their unaligned stops.
+        from transitio.gtfs._duplicates import repeated_trips
+
+        *_, near, unaligned = repeated_trips([feed.tables for feed in feeds])[1]
+        assert len(near) == expected.get("near", 0)
+        assert sum(unaligned.values()) == expected.get("unaligned", 0)
 
 
 def test_repeated_trips_on_a_day():
@@ -1076,7 +1083,11 @@ def test_repeated_trips_on_a_day():
     second = _repeats(_trips(later, {"times": LATER}), rows=[*moved, undeclared])
     tables = [_repeats(ONE).tables, second.tables]
     found = repeated_trips(tables, day=datetime.date(2026, 1, 14))
-    assert found == [(set(), [], {"t1"}), ({"t1"}, [0], {"t1", "t2", "t9"})]
+    # t1 repeats nearly, every stop aligned.
+    assert found == [
+        (set(), [], {"t1"}, set(), {}),
+        ({"t1"}, [0], {"t1", "t2", "t9"}, {"t1"}, {}),
+    ]
 
 
 def test_rows_of_dropped_trips_go():
