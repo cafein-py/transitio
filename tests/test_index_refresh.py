@@ -311,9 +311,8 @@ def test_the_cache_keeps_the_newest_and_the_pinned_one(tmp_path, monkeypatch):
     assert [s for s, _ in client.installed()] == [f"{5:016x}", f"{3:016x}"]
 
 
-def test_refresh_reports_what_it_removes_and_installs_a_named_snapshot(
-    tmp_path, monkeypatch
-):
+def test_refresh_reports_every_snapshot_it_removes(tmp_path):
+    pytest.importorskip("fcntl")  # without shared locks nothing is pruned
     fake, snapshot_id = _published(tmp_path)
     root = client.cache_root()
     sizes = {}
@@ -332,8 +331,11 @@ def test_refresh_reports_what_it_removes_and_installs_a_named_snapshot(
         f"(0 MB), {removed[1]} (0 MB); refresh(keep=None) keeps every snapshot, "
         "and refresh(snapshot=...) installs one again"
     )
-    # A named snapshot is installed from its own release, not the newest; an
-    # unknown one is refused.
+
+
+def test_refresh_installs_a_named_snapshot(tmp_path, monkeypatch):
+    # From its own release, not the newest; an unknown one is refused.
+    fake, snapshot_id = _published(tmp_path)
     older = release(
         fake, write_index(tmp_path / "older", snapshot_id="00000000000000aa")
     )
