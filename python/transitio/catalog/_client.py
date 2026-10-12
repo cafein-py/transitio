@@ -332,16 +332,17 @@ class MobilityDatabase:
             return find_feed(self._csv_catalogue(), feed_id)
         return Feed.from_api(self._get_json(f"/gtfs_feeds/{feed_id}"))
 
-    def datasets(self, feed, *, limit=100):
+    def datasets(self, feed, *, limit=None):
         """List catalogued dataset versions of a feed, newest first.
 
         Parameters
         ----------
         feed : Feed or str
             The feed, or its catalog ID.
-        limit : int or None, default 100
-            Maximum number of datasets to return; ``None`` fetches every
-            catalogued version.
+        limit : int, optional
+            Maximum number of datasets to return, newest first; None (the
+            default) reads every page, so the newest are found before
+            sorting.
 
         Returns
         -------

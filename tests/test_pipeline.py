@@ -536,6 +536,44 @@ def test_fetch_place_name_aoi(pipeline_env, monkeypatch):
     assert len(result.feeds) == 1
 
 
+@pytest.mark.parametrize(
+    "listing",
+    [[], RuntimeError("listing down")],
+    ids=["no-covering-dataset", "listing-fails"],
+)
+def test_a_catalogue_feed_without_a_usable_dataset_is_read_from_its_copy(
+    pipeline_env, monkeypatch, listing
+):
+    # With a token and a day, a feed no dataset covers, or whose datasets
+    # could not be listed, was skipped.
+    import csv as _csv
+
+    from transitio.catalog._client import MobilityDatabase
+    from transitio.catalog._csv import _feed_from_row
+
+    def covering(*args):
+        if isinstance(listing, Exception):
+            raise listing
+        return listing
+
+    tmp_path, _ = pipeline_env
+    feed = _feed_from_row(next(_csv.DictReader(CSV_BODY.splitlines())))
+    monkeypatch.setattr(MobilityDatabase, "search_feeds", lambda self, **k: [feed])
+    monkeypatch.setattr(MobilityDatabase, "_unboxed", lambda self, **k: 0)
+    monkeypatch.setattr(MobilityDatabase, "datasets_for", covering)
+    result = fetch(
+        (24.6, 60.1, 25.2, 60.4),
+        when="2026-06-01",
+        directory=tmp_path,
+        refresh_token="tok",
+        index=False,
+    )
+    (entry,) = result.selection
+    assert (entry["decision"], entry["fetched_from"]) == ("delivered", "mdb_latest")
+    failed = "dataset selection: listing down" if listing else None
+    assert entry["download_errors"] == failed
+
+
 def test_fetch_skips_day_outside_service_window(pipeline_env):
     tmp_path, _ = pipeline_env
     with pytest.warns(UserWarning):
@@ -2592,8 +2630,8 @@ def test_fetch_place_with_token_selects_the_covering_dataset(tmp_path, monkeypat
         {"id": "mdb-9-2026", "feed_id": "mdb-9", "hosted_url": "https://x/z.zip"}
     )
     monkeypatch.setattr(
-        "transitio.catalog.MobilityDatabase.dataset_for",
-        lambda self, feed, when: picked,
+        "transitio.catalog.MobilityDatabase.datasets_for",
+        lambda self, feed, when: [picked],
     )
 
     def fake_dataset_download(self, dataset, directory=None):
@@ -2615,6 +2653,121 @@ def test_fetch_place_with_token_selects_the_covering_dataset(tmp_path, monkeypat
         refresh_token="tok",
     )
     assert result.reports[0]["summary"]["provenance"]["dataset_id"] == "mdb-9-2026"
+
+
+@pytest.mark.parametrize(
+    "when, datasets, own, expected",
+    [
+        pytest.param(DAY, [], "now", ("producer", None), id="no-covering-dataset"),
+        pytest.param(
+            DAY, ["old", "now"], "now", ("mdb_dataset", "now"), id="next-dataset"
+        ),
+        pytest.param(None, ["now"], "now", ("producer", None), id="own-url-first"),
+        pytest.param(
+            None, ["now"], None, ("mdb_dataset", "now"), id="newest-when-own-fails"
+        ),
+        pytest.param(
+            None, ["now"], "old", ("mdb_dataset", "now"), id="newest-when-own-ended"
+        ),
+    ],
+)
+def test_fetch_place_with_token_tries_each_source_in_turn(
+    tmp_path, monkeypatch, when, datasets, own, expected
+):
+    # With a day, every dataset covering it, then the feed's own URLs; without
+    # a day the feed's own URLs, then the newest dataset.
+    from transitio.catalog import MobilityDatabase, TransitlandAtlas
+    from transitio.catalog._models import Dataset
+
+    def payload(window):
+        start, end = (value.replace("-", "") for value in window)
+        return _zip(_calendar(start, end))
+
+    index = _place_index(
+        tmp_path,
+        {
+            "mdb": {"mdb_id": "mdb-9", "urls": {"latest": "u"}},
+            "atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}},
+        },
+    )
+    windows = {"old": ENDED, "now": NOW}
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, payload(windows.get(own, NOW)))
+    if own is None:
+
+        def refused(self, feed, directory=None):
+            raise RuntimeError("producer down")
+
+        monkeypatch.setattr(TransitlandAtlas, "_fetch_static", refused)
+    listed = [
+        Dataset.from_api(
+            {"id": name, "feed_id": "mdb-9", "hosted_url": f"https://x/{name}.zip"}
+        )
+        for name in datasets
+    ]
+    monkeypatch.setattr(MobilityDatabase, "datasets_for", lambda *a: listed)
+    monkeypatch.setattr(MobilityDatabase, "datasets", lambda *a, **k: listed)
+
+    def staged(self, dataset, directory=None):
+        path = directory / f"{dataset.id}.zip"
+        path.write_bytes(payload(windows[dataset.id]))
+        return path
+
+    monkeypatch.setattr(MobilityDatabase, "_fetch_dataset", staged)
+    result = fetch(
+        place="Q1757",
+        index=index,
+        directory=tmp_path / "out",
+        crop=False,
+        when=when,
+        refresh_token="tok",
+    )
+    (entry,) = result.selection
+    provenance = result.reports[0]["summary"]["provenance"]
+    assert (entry["fetched_from"], provenance.get("dataset_id")) == expected
+
+
+def test_an_ended_unchanged_archive_gives_way_to_the_newest_dataset(
+    tmp_path, monkeypatch
+):
+    # Without a day, the feed's own archive proven ended and unchanged was
+    # skipped before the newest dataset was tried.
+    from transitio.catalog import MobilityDatabase
+    from transitio.catalog._models import Dataset
+
+    start, end = (value.replace("-", "") for value in NOW)
+    columns = {
+        "service_start": ENDED[0],
+        "service_end": ENDED[1],
+        "mdb": {"mdb_id": "mdb-9"},
+    }
+    index = _partitioned_index(tmp_path, monkeypatch, {"f-a": columns})
+    newest = Dataset.from_api(
+        {"id": "now", "feed_id": "mdb-9", "hosted_url": "https://x/now.zip"}
+    )
+    monkeypatch.setattr(MobilityDatabase, "datasets", lambda *a, **k: [newest])
+
+    def staged(self, dataset, directory=None):
+        path = directory / "now.zip"
+        path.write_bytes(_zip(_calendar(start, end)))
+        return path
+
+    monkeypatch.setattr(MobilityDatabase, "_fetch_dataset", staged)
+    monkeypatch.setattr(
+        "transitio.pipeline._fetch._unchanged_since_indexed", lambda *a: True
+    )
+    result = fetch(
+        place="Q1757",
+        index=index,
+        directory=tmp_path / "out",
+        crop=False,
+        osm=False,
+        refresh_token="tok",
+    )
+    (entry,) = result.selection
+    assert (entry["decision"], entry["fetched_from"]) == ("delivered", "mdb_dataset")
+    assert entry["download_errors"] == (
+        "service ended 2021-12-31; unchanged since indexed"
+    )
 
 
 def test_fetch_place_records_index_provenance(tmp_path, monkeypatch):
@@ -2785,8 +2938,8 @@ def test_fetch_place_falls_back_to_atlas_when_the_dataset_download_fails(
         {"id": "mdb-9-2026", "feed_id": "mdb-9", "hosted_url": "https://x/z.zip"}
     )
     monkeypatch.setattr(
-        "transitio.catalog.MobilityDatabase.dataset_for",
-        lambda self, feed, when: picked,
+        "transitio.catalog.MobilityDatabase.datasets_for",
+        lambda self, feed, when: [picked],
     )
 
     def failing(self, dataset, directory=None):
