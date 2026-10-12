@@ -151,19 +151,9 @@ def route_relations(source, bounding_box=None):
 
 
 def _materialize(osm):
-    """Populate pyrosm's node/way/relation caches.
-
-    pyrosm parses the whole extract into its caches on the first layer
-    read whatever the layer's own filter keeps, so the route-filtered
-    criteria read is the lightest trigger (it frames only the matching
-    handful instead of building a network graph)."""
-    osm.get_data_by_custom_criteria(
-        custom_filter={"route": list(PT_ROUTE_VALUES)},
-        filter_type="keep",
-        keep_nodes=False,
-        keep_ways=False,
-        keep_relations=True,
-    )
+    """Populate pyrosm's node/way/relation caches by parsing the whole
+    extract, as its in-memory reader does on a first layer read."""
+    osm._read_pbf()
 
 
 def rail_network(source, bounding_box=None):
@@ -217,16 +207,7 @@ def rail_ways(source, bounding_box=None):
     else:
         osm = OSM(str(source), bounding_box=bounding_box)
     if osm._way_records is None:
-        # The lightest cache trigger for this reader: a rail-filtered
-        # criteria read (pyrosm parses the extract on any layer read).
-        osm.get_data_by_custom_criteria(
-            custom_filter={"railway": ["tram", "light_rail", "subway", "rail"]},
-            filter_type="keep",
-            keep_nodes=False,
-            keep_ways=True,
-            keep_relations=False,
-            osm_keys_to_keep=["railway", "oneway", "service"],
-        )
+        _materialize(osm)
     if osm._way_records is None or osm._node_coordinates is None:
         return []
     ways = []
