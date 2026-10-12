@@ -716,6 +716,56 @@ def _agency_written(path, target, agency, max_total_bytes=None):
     ]
 
 
+def _partial_note(made):
+    """``"validated partly: <file> <why> (<budget>); ..."`` for a feed whose
+    validation a budget cut short (:func:`_cut_short`); None otherwise."""
+    cut = _cut_short(made.get("validation") or {})
+    return "validated partly: " + "; ".join(cut) if cut else None
+
+
+def _cut_short(validation):
+    """The files of ``validation`` a budget cut short, each with why and the
+    budget that raises it: an ``unreadable_file`` over a byte budget, with
+    its message, or a ``too_many_rows``."""
+    found = []
+    for notice in validation.get("notices", []):
+        context = notice.get("context") or {}
+        file = context.get("filename")
+        if notice.get("code") == "unreadable_file" and context.get("budgets"):
+            budgets = ", ".join(context["budgets"])
+            found.append(f"{file} {context.get('message', 'unreadable')} ({budgets})")
+        elif notice.get("code") == "too_many_rows":
+            found.append(f"{file} has more rows than max_rows")
+    return list(dict.fromkeys(found))
+
+
+_BUDGET = re.compile(r"\b(max_entry_bytes|max_total_bytes|max_rows|max_columns)\b")
+
+
+def _warn_budgets(record, stacklevel):
+    """Warn about the feeds a budget skipped (a crop or repair refusing a
+    table it cuts short) or left validated partly, naming each and the
+    ``fetch`` keywords that raise the budgets. ``stacklevel`` points at the
+    caller of fetch."""
+    named, budgets = [], set()
+    for entry in record:
+        text = entry["reason"] if entry["decision"] == "skipped" else entry["note"]
+        found = set(_BUDGET.findall(text or ""))
+        if not found:
+            continue
+        decided = "skipped" if entry["decision"] == "skipped" else "delivered"
+        named.append(f"{entry['feed_id']} {decided} ({text})")
+        budgets |= found
+    if named:
+        raise_them = ", ".join(f"{name}=..." for name in sorted(budgets))
+        warnings.warn(
+            f"size limits reached: {'; '.join(named)}. fetch({raise_them}) "
+            "raises them",
+            UserWarning,
+            stacklevel=stacklevel,
+        )
+
+
 def _agency_note(made):
     """The note on a feed the repair gave an agency.txt
     (:func:`_agency_written`); None otherwise."""
@@ -2669,7 +2719,11 @@ def fetch(
     **budgets
         The ``validate_feed`` keyword arguments. A feed with a table that a
         budget cuts short cannot be cropped and lands in ``skipped``, the
-        reason naming the file and the budget to raise. A reached
+        reason naming the file and the budget to raise; delivered uncropped,
+        its validation covers only part of the table, noted ``"validated
+        partly: stop_times.txt declares … uncompressed bytes, over the
+        …-byte budget (max_total_bytes)"``. Either way one ``UserWarning``
+        names every such feed and the keywords that raise the budgets. A reached
         ``max_notices_per_file`` does not stop the crop (the feed's report
         then carries ``notice_limit_reached``), but it does stop
         ``repair=True``. ``max_total_bytes`` also bounds a feed read from
@@ -2984,6 +3038,7 @@ def fetch(
             for note in (
                 _renamed_note(version),
                 _agency_note(made),
+                _partial_note(made),
                 _timezone_note(path, budgets.get("max_total_bytes")),
                 _dropped_note(report),
             ):
@@ -3106,6 +3161,7 @@ def fetch(
                     break
 
     _warn_undated(undated, day, stacklevel=3)
+    _warn_budgets(record, stacklevel=3)
     repeats = dict(budgets=budgets, modes=modes, day=day if study else None)
     repeats["duplicate_trips"] = duplicate_trips
     _drop_repeats(
@@ -3747,6 +3803,7 @@ def _fetch_place(
         else:
             carriers[feed.feed_id] = feed.feed_id
         notes = [applied, *notes, _renamed_note(version), _agency_note(made)]
+        notes.append(_partial_note(made))
         notes += [_timezone_note(path, budget), _dropped_note(report)]
         for text in dict.fromkeys(filter(None, notes)):
             _note(entry, text)
@@ -4096,6 +4153,7 @@ def _fetch_place(
                     break
 
     _warn_undated(undated, day, stacklevel=4)
+    _warn_budgets(record, stacklevel=4)
     removed = _settle_versions(record, services, protected, day if study else None)
     # A feed is delivered once the versions are settled and it stays.
     for n, (feed_id, item) in enumerate(zip(delivered_ids, processed)):

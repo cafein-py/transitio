@@ -1526,6 +1526,44 @@ def test_a_feed_missing_a_required_file_is_skipped(tmp_path, dropped, reason, wi
             _process_feed(source, **{**options, "modes": {"bus"}})
 
 
+def test_a_size_limit_is_noted_and_warned(tmp_path):
+    # A crop over 2 GiB was refused with a skip line only, and an uncropped
+    # feed over a budget was delivered with a report that silently skipped
+    # its stop times.
+    from shapely.geometry import box
+
+    from transitio.pipeline._fetch import (
+        _entry,
+        _note,
+        _partial_note,
+        _process_feed,
+        _skip,
+        _warn_budgets,
+    )
+
+    source = write_zip(tmp_path / "feed.zip", FEED)
+    options = dict(geometry=None, tag="t", repair=False, crop=False, modes=None)
+    options.update(day=None, study=False, hosted=None)
+    *_, made, _, _ = _process_feed(source, budgets={"max_entry_bytes": 160}, **options)
+    note = _partial_note(made)
+    assert note == (
+        "validated partly: stop_times.txt declares 178 uncompressed bytes, over "
+        "the 160-byte budget (max_entry_bytes)"
+    )
+    with pytest.raises(OSError) as refused:
+        options.update(crop=True, geometry=box(*CITY_BBOX))
+        _process_feed(source, budgets={"max_total_bytes": 300}, **options)
+    delivered, skipped = _entry("f-a", None), _entry("f-b", None)
+    delivered["decision"] = "delivered"
+    _note(delivered, note)
+    _skip(skipped, f"processing failed: {refused.value}")
+    with pytest.warns(UserWarning) as caught:
+        _warn_budgets([delivered, skipped], stacklevel=2)
+    (said,) = [str(w.message) for w in caught]
+    assert said.startswith(f"size limits reached: f-a delivered ({note}); f-b skipped")
+    assert said.endswith("fetch(max_entry_bytes=..., max_total_bytes=...) raises them")
+
+
 def test_the_repair_writes_a_missing_agency_txt(tmp_path):
     # A feed without agency.txt was skipped even with repair=True.
     from transitio.pipeline._fetch import (
