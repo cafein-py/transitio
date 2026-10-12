@@ -163,7 +163,9 @@ def test_a_partitioned_index_reads_whole_and_per_country(tmp_path):
     everything = helsinki.feeds(spec=None, categories=None, international=True)
     assert {f.feed_id for f in everything} == {"f-hsl", "f-tlt", "f-ferry"}
     finnish = reader.place("hel", index=finland)
-    assert [f.feed_id for f in finnish.feeds(spec=None, categories=None)] == ["f-hsl"]
+    assert [f.feed_id for f in finnish.feeds(spec=None, international=False)] == [
+        "f-hsl"
+    ]
     assert reader.load(directory, country="EE").country == "EE"
 
 
@@ -333,7 +335,7 @@ def test_a_schema_8_index_carries_the_realtime_companions(tmp_path):
     assert [c.feed_id for c in feeds["f-ferry"].realtime] == ["f-ferry-rt"]
     assert feeds["f-tlt"].realtime == []
     assert helsinki.feeds(spec="gtfs-rt", categories=None) == []
-    assert [f.feed_id for f in helsinki.feeds(categories=None)] == ["f-hsl"]
+    assert [f.feed_id for f in helsinki.feeds(international=False)] == ["f-hsl"]
     # One country: its own companions, the international ones on request,
     # and a link feed's companions from the partition holding it.
     finland = reader.read_index(directory, country="FI")
@@ -413,7 +415,7 @@ def test_a_schema_10_index_lists_the_feeds_containing_a_feed(tmp_path, monkeypat
     assert (hsl.access, hsl.access_provider, hsl.auth_method) == (None, None, None)
     assert hsl.download_url is None and hsl.access_instructions() is None
     assert hsl.access_url == "https://atlas.example/hsl.zip"
-    (tlt,) = reader.place("tll", index=index).feeds(categories=None)
+    (tlt,) = reader.place("tll", index=index).feeds(international=False)
     assert tlt.access_url == "https://mdb.example/t"
 
 
@@ -673,7 +675,7 @@ def test_a_schema_9_index_carries_the_feed_spans_and_place_validity(tmp_path):
     # partition's columns like the whole index; schema 8 has no validity.
     assert reader.place("lah", index=index).validity is None
     finland = reader.read_index(directory, country="FI")
-    (hsl,) = [f for f in reader.place("hel", index=finland).feeds(categories=None)]
+    (hsl,) = [f for f in reader.place("hel", index=finland).feeds(international=False)]
     assert hsl.service_start == datetime.date(2026, 9, 1)
     eight = reader.read_index(
         write_partitioned_index(
@@ -681,7 +683,7 @@ def test_a_schema_9_index_carries_the_feed_spans_and_place_validity(tmp_path):
         )
     )
     assert eight.schema_version == 8 and "feeds_dated" not in eight.snapshot["counts"]
-    (hsl,) = [f for f in reader.place("hel", index=eight).feeds(categories=None)]
+    (hsl,) = [f for f in reader.place("hel", index=eight).feeds(international=False)]
     assert (
         hsl.service_start is None and reader.place("hel", index=eight).validity is None
     )
@@ -983,9 +985,14 @@ def test_a_schema_12_index_answers_from_its_core_alone(tmp_path, monkeypatch):
     helsinki = reader.place("Helsinki", index=index)
     assert reader.places("Helsinki", index=index) == [helsinki]
     assert reader.suggest("hel", index=index)[0].place == helsinki
-    feeds = helsinki.feeds()
+    feeds = helsinki.feeds(international=False)
     assert feeds.to_dataframe()["share_of_place"].tolist() == [0.9]
-    assert helsinki.recommend().to_dataframe()["feed_id"].tolist() == ["f-hsl"]
+    # The cross-border feeds are listed as not considered.
+    assert helsinki.recommend().to_dataframe()["feed_id"].tolist() == [
+        "f-ferry",
+        "f-hsl",
+        "f-tlt",
+    ]
     # An on-demand table the directory lacks is named when it is needed.
     with pytest.raises(TransitioError, match="FI.boundaries.parquet: missing; the"):
         helsinki.geometry
@@ -1072,7 +1079,7 @@ def test_a_schema_12_release_installs_its_core_and_downloads_a_part_when_used(
     assert record["url"] == f"https://github.com/o/r/releases/download/{tag}/"
     _refresh.use(SNAPSHOT_ID, cache_dir=root)
     helsinki = reader.place("Helsinki")
-    assert [feed.feed_id for feed in helsinki.feeds()] == ["f-hsl"]
+    assert [feed.feed_id for feed in helsinki.feeds(international=False)] == ["f-hsl"]
     fake.requests.clear()
     if failure == "offline":
         _refresh._state["transport"] = httpx.MockTransport(_unreachable)

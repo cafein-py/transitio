@@ -95,7 +95,7 @@ class FetchResult:
     # failed extract download leaves it and osm_pbf None. On the place path,
     # its parts farther than 1.6 km from every delivered stop may lack OSM data.
     osm_area: object = None
-    # The feeds an empty default view hides and the tiers that fetch them.
+    # The feeds at tiers not considered when none is, and the tiers that fetch them.
     view_note: str | None = None
     # The place parts the OSM extract leaves out and the delivered stops
     # outside its area, or why it was not fetched.
@@ -284,15 +284,12 @@ def _service_window(validation):
     )
 
 
-def _misses(start, end, day, study):
-    """Why a service window from ``start`` to ``end`` misses ``day``, or None.
-
-    With a ``study`` day the window must cover it; otherwise it must only not
-    end before it. An unknown bound (``None``) cannot miss.
-    """
+def _misses(start, end, day):
+    """Why a service window from ``start`` to ``end`` misses ``day``, the
+    study day or today, or None. An unknown bound (``None``) cannot miss."""
     if end is not None and end < day:
         return f"service ended {end.isoformat()}"
-    if study and start is not None and start > day:
+    if start is not None and start > day:
         return f"service starts {start.isoformat()}, after {day.isoformat()}"
     return None
 
@@ -426,8 +423,8 @@ def _process_feed(
 
     A feed whose validation finds a required file missing drops out on any
     day. The computed service window is tested against ``day`` (None tests
-    nothing): with a ``study`` day it must cover the day and the validation
-    report must not prove the day idle; otherwise it must not end before it.
+    nothing): it must cover the day, and with a ``study`` day the validation
+    report must not prove the day idle.
 
     With ``outputs``, ``(cache, version)`` of the cached version at ``path``,
     what the crop, repair and validation make is stored with the version
@@ -498,7 +495,7 @@ def _process_feed(
     if missing is not None:
         raise _SkipFeed(missing, window)
     if day is not None:
-        reason = _misses(start, end, day, study)
+        reason = _misses(start, end, day)
         if reason is None and study and _idle(validation, day):
             reason = f"no service on {day.isoformat()}"
         if reason is not None:
@@ -2130,9 +2127,15 @@ def fetch(
 
     Pass exactly one of ``aoi`` (a geometry, bbox or place name geocoded
     once) or ``place`` (a place name, QID or :class:`Place`). With
-    ``place``, feeds are selected from the feed index by tier -- ``tiers``,
-    ``exclude`` and ``on_unknown`` filter the edges -- and the place geometry
-    supplies the AOI. With ``aoi``, the feeds come from the feed index too
+    ``place``, the candidates are the feeds
+    :meth:`~transitio.index.Place.recommend` considers -- local and regional
+    ones and those of unknown tier at a city or a metro, every tier at a
+    region or a country -- of every relevance category, cross-border ones
+    included, each delivered whole; ``tiers`` names the tiers instead and
+    cuts each feed to the routes of those tiers, ``exclude`` and
+    ``on_unknown`` filter the edges, and every other feed serving the place
+    is listed in ``selection`` as not considered, with its tiers. The place
+    geometry supplies the AOI. With ``aoi``, the feeds come from the feed index too
     when its places cover at least half of the area's land
     (:func:`transitio.index.area`, ``country_code`` keeping one country's
     places): those of the area's places, selected as for ``place``
@@ -2329,8 +2332,8 @@ def fetch(
         the day counts no active trip and carries the
         ``no_service_on_reference_date`` notice (``"no service on
         <day>"``). Without ``when`` there is no study day, only today: a
-        feed is skipped only when its computed window ended before today,
-        and one that starts later or runs on other weekdays stays. An
+        feed is skipped when its computed window ended before today or
+        starts after it, and one that runs on other weekdays stays. An
         unknown window passes the window checks, and a report without a
         ``moment`` for the day passes the day check.
     feeds : list of str, Recommendation or object with ``feed_ids``, optional
@@ -2340,10 +2343,13 @@ def fetch(
         ``place``, any ``aoi`` or a ``when`` on another day raises
         ``ValueError``),
         or an object whose ``feed_ids`` attribute lists them. They are
-        taken from every relevance category of the place, or of the area's
-        places, not only the default view, and ``tiers``, ``exclude`` and
-        ``on_unknown`` still apply; ``selection`` lists only them. An id
-        not indexed for the place, or not in the tiers asked, raises
+        taken from every feed serving the place, or the area's places, of
+        any tier and category and cross-border ones included, and ``tiers``,
+        ``exclude`` and ``on_unknown`` still apply; ``selection`` lists only
+        them. Without ``feeds``, a feed the index marks as a private or
+        campus service or an unofficial compilation is skipped (``"private
+        or campus service, not considered: …"``); named here, it is fetched.
+        An id not indexed for the place, or not in the tiers asked, raises
         ``ValueError`` before anything is downloaded, as does an empty list.
     credentials : mapping, optional
         Credentials for feeds that need an account with their provider, as
@@ -2390,17 +2396,18 @@ def fetch(
         compares nothing. Another value raises ``ValueError``.
     expired : {"skip", "keep"}, default "skip"
         With ``"skip"``, on the index paths, an indexed feed whose index
-        service window misses the day (ends before it, or starts after the
-        study day) is skipped before download when a conditional ``HEAD``
-        to the URL the index crawled, carrying the ETag or Last-Modified it
-        recorded, answers 304 Not Modified: the served archive is still the
-        one the index saw, and the reason ends ``"; unchanged since
-        indexed"``. Any other answer, or no recorded validator, downloads
-        the feed and leaves the decision to its computed window, as does a
-        feed downloaded as a catalogued dataset (with an API token).
+        service window misses the day, the study day or today (ends before
+        it or starts after it), is skipped before download when a
+        conditional ``HEAD`` to the URL the index crawled, carrying the ETag
+        or Last-Modified it recorded, answers 304 Not Modified: the served
+        archive is still the one the index saw, and the reason ends
+        ``"; unchanged since indexed"``. Any other answer, or no recorded
+        validator, downloads the feed and leaves the decision to its computed
+        window, as does a feed downloaded as a catalogued dataset (with an
+        API token).
         ``"keep"`` sends no probe and, without ``when``, keeps a feed whose
-        computed window ended; with ``when`` the window and day checks
-        still apply.
+        computed window misses today; with ``when`` the window and day
+        checks still apply.
     repair : bool, default False
         Repair each feed (gtfstidy contract) after the crop, before use;
         conservative default leaves feeds untouched.
@@ -2560,13 +2567,12 @@ def fetch(
         read), ``declared_as`` (the curator predicate of a complete selector
         made from one, else None) and ``selected_by`` (per matched edge
         ``{"tier", "selector_state", "route_ids"}``).
-        When ``place`` is fetched without ``tiers`` and its default view
-        (:meth:`~transitio.index.Place.feeds`) holds none of the place's
-        feeds, or an area's places hold none of theirs in their views,
-        ``view_note`` names them and the tiers that fetch them, and a
-        ``UserWarning`` repeats it, e.g. ``"default view (region: secondary,
-        tertiary) holds none of the place's 2 feeds: f-a (primary), f-b
-        (primary); tiers=['local'] fetches them"``.
+        When ``place`` is fetched without ``tiers`` and the tiers considered
+        hold none of the place's feeds, or of the area's places', while
+        feeds at other tiers serve it, ``view_note`` names them and the
+        tiers that fetch them, and a ``UserWarning`` repeats it, e.g. ``"the
+        local and regional tiers of a city hold none of the place's 2 feeds:
+        f-a (national), f-b (national); tiers=['national'] fetches them"``.
         When the OSM extract leaves out parts of the place, or delivered
         stops lie outside its area, ``osm_note`` notes them, e.g. ``"OSM
         area: 1 of 47 parts (1783 of 2188 km²); 4970 of 10026 located stops
@@ -3036,33 +3042,36 @@ def _osm_stops(area, coords):
     return shapely.multipoints(inside) if len(inside) else None
 
 
-def _hidden_note(place, hidden):
-    """The ``view_note`` on a place, or an area, whose default view holds
-    none of its ``hidden`` feeds: the view's categories (for an area, its
-    places'), the feeds (at most five named) and the tiers that fetch them,
-    local, regional and national when only unknown edges remain."""
+def _hidden_note(place, hidden, considered, reach):
+    """The ``view_note`` on a place, or an area, whose ``considered`` tiers
+    (less those excluded) hold none of its ``hidden`` feeds: those tiers,
+    the feeds (at most five named, with their tiers) and ``reach``, the
+    tiers that fetch them."""
     from transitio.index import Area
-    from transitio.index.feeds import CATEGORY_ORDER, _default_categories
+    from transitio.index.recommend import _tier_words
 
     if isinstance(place, Area):
-        view, whose = "default view of the area's places", "their"
+        where, whose = "the area's places", "their"
     else:
-        shown = _default_categories(place, None, "default", False) or ()
-        categories = ", ".join(c for c in CATEGORY_ORDER if c in shown)
-        view, whose = f"default view ({place.kind}: {categories})", "the place's"
+        where, whose = f"a {place.kind}", "the place's"
     named = ", ".join(
-        f"{feed.feed_id} ({feed.relevance_category})" for feed in hidden[:5]
+        f"{feed.feed_id} ({_tier_words(feed.tiers)})" for feed in hidden[:5]
     )
     if len(hidden) > 5:
         named += f" and {len(hidden) - 5} more"
     order = ("local", "regional", "national", "international")
-    found = set().union(*(feed.tiers for feed in hidden))
-    tiers = [tier for tier in order if tier in found] or list(order[:3])
+    tiers = [tier for tier in order if tier in reach]
     feeds, them = ("feed", "it") if len(hidden) == 1 else ("feeds", "them")
-    return (
-        f"{view} holds none of {whose} {len(hidden)} {feeds}: {named}; "
-        f"tiers={tiers} fetches {them}"
-    )
+    count = f"{whose} {len(hidden)} {feeds}"
+    if considered:
+        tiers_of = f"the {_tier_words(considered)} tier"
+        tiers_of += (
+            f"s of {where} hold" if len(considered) > 1 else f" of {where} holds"
+        )
+        head = f"{tiers_of} none of {count}"
+    else:
+        head = f"exclude= leaves out every tier considered for {where}; {count}"
+    return f"{head}: {named}; tiers={tiers} fetches {them}"
 
 
 def _count_outside(record, area, coords):
@@ -3175,11 +3184,13 @@ def _fetch_place(
 ):
     """The index paths, ``fetch(place=...)`` and ``fetch(aoi=...)`` given an
     :class:`~transitio.index.Area`: the place geometry, or the area's, is the
-    AOI, feeds come from the index by tier, each served by a cached version
-    when one serves the request, else downloaded MDB-then-Atlas (decision I)
-    and then from the MDB hosted copy (:func:`_download_indexed`), and a
-    bundled feed is cropped to the routes its matched tiers select, the drop
-    recorded in ``selections``. A feed whose index window misses ``day`` is
+    AOI, feeds come from the index at the tiers recommend() considers (or
+    those asked for), each served by a cached version when one serves the
+    request, else downloaded MDB-then-Atlas (decision I) and then from the
+    MDB hosted copy (:func:`_download_indexed`); with ``tiers``, ``exclude``
+    or ``on_unknown="exclude"`` a bundled feed is cropped to the routes its
+    matched tiers select, the drop recorded in ``selections``, and otherwise
+    delivered whole. A feed whose index window misses ``day`` is
     skipped before download when a probe proves the archive unchanged since
     indexed; ``window_day`` is what the computed window is tested against.
     A protected feed is decided before anything else (:func:`_access_for`);
@@ -3202,7 +3213,12 @@ def _fetch_place(
         _coerce_index,
         place as resolve_place,
     )
-    from transitio.index.feeds import _hosted_url
+    from transitio.index.feeds import MARKS, _hosted_url, _names
+    from transitio.index.recommend import (
+        _default_tiers,
+        _not_considered,
+        _tier_words,
+    )
     from transitio.index.places import _as_shape
     from transitio.osm._fetch import _buffered
 
@@ -3223,14 +3239,22 @@ def _fetch_place(
     if geometry is None:
         raise ValueError(f"place {place_obj.id} has no geometry to fetch for")
     study = when is not None
+    tiers, exclude = _names(tiers), _names(exclude)
 
-    def candidates(unknown):
-        # The view's feeds, or with ``wanted`` the named ones of any category.
+    # The candidates are the feeds at the tiers asked for, else at those
+    # recommend() considers for the kind of place, of every category and
+    # cross-border ones included; with ``wanted``, the named feeds.
+    considered = tiers if tiers is not None or wanted is not None else None
+    if tiers is None and wanted is None:
+        considered = _default_tiers(place_obj)
+
+    def candidates(unknown, at=considered):
         found = place_obj.feeds(
-            tiers=tiers,
+            tiers=at,
             exclude=exclude,
             on_unknown=unknown,
-            categories="default" if wanted is None else None,
+            categories=None,
+            international=True,
         )
         return found if wanted is None else [f for f in found if f.feed_id in wanted]
 
@@ -3248,7 +3272,10 @@ def _fetch_place(
                 f"feeds= names feeds not indexed for {where}{asked}: "
                 f"{', '.join(sorted(missing))}"
             )
-    kept = _containers_first(offered) if contained == "drop" else offered
+    # A feed the index marks (private, a compilation) is fetched when named.
+    marked = set() if wanted is not None else {f.feed_id for f in offered if f.mark}
+    unmarked = [feed for feed in offered if feed.feed_id not in marked]
+    kept = _containers_first(unmarked) if contained == "drop" else unmarked
     # Credentials are checked and resolved before any download.
     explicit = {
         provider_id: _checked(_provider(provider_id, resolved_index), fields)
@@ -3473,24 +3500,49 @@ def _fetch_place(
             services[feed.feed_id] = service
         return "delivered"
 
+    # Every feed serving the place gets a row. One served at tiers neither
+    # considered nor excluded (unknown apart) is fetched when named.
+    excluded = set(exclude or ())
+    offered_ids = {feed.feed_id for feed in offered}
+    every = {}
+    if wanted is None:
+        listing = place_obj.feeds(categories=None, international=True)
+        every = {feed.feed_id: feed for feed in listing}
+    named = "fetch takes it when named in feeds="
+
+    def elsewhere(feed_id):
+        if tiers is not None or considered is None or feed_id not in every:
+            return set()
+        return every[feed_id].tiers - set(considered) - excluded - {"unknown"}
+
     if on_unknown == "exclude":
-        included = candidates("include")
-        kept_ids = {f.feed_id for f in kept}
-        for feed in included:
+        for feed in candidates("include"):
             entry = entry_for(feed)
-            if feed.feed_id not in kept_ids:
-                _skip(entry, "only unknown-tier edges")
+            if feed.feed_id not in offered_ids:
+                reason, other = "only unknown-tier edges", elsewhere(feed.feed_id)
+                if other:
+                    plural = "s" if len(other) > 1 else ""
+                    words = f"the {_tier_words(other)} tier{plural}"
+                    reason += f"; serves the place at {words} too: {named}"
+                _skip(entry, reason)
     for feed in offered:
-        entry_for(feed)
+        entry = entry_for(feed)
+        if feed.feed_id in marked:
+            _skip(entry, f"{MARKS[feed.mark]}, not considered: {named}")
+    if considered is not None or excluded:
+        listed = {feed.feed_id for feed in candidates("include")}
+        for feed_id, feed in every.items():
+            if feed_id not in listed:
+                reason = _not_considered(feed, excluded)
+                hint = f"; {named}" if elsewhere(feed_id) else ""
+                _skip(entry_for(feed), reason + hint)
+    hidden = [f for i, f in every.items() if i not in offered_ids and elsewhere(i)]
     view_note = None
-    if tiers is None and wanted is None and not offered:
-        # An empty default view may hide feeds a tier query would fetch.
-        hidden = place_obj.feeds(
-            exclude=exclude, on_unknown=on_unknown, categories=None
-        )
-        if hidden:
-            view_note = _hidden_note(place_obj, hidden)
-            warnings.warn(view_note, UserWarning, stacklevel=3)
+    if tiers is None and wanted is None and hidden and not offered:
+        reach = set().union(*(elsewhere(feed.feed_id) for feed in hidden))
+        effective = tuple(tier for tier in considered if tier not in excluded)
+        view_note = _hidden_note(place_obj, hidden, effective, reach)
+        warnings.warn(view_note, UserWarning, stacklevel=3)
 
     cache = _feed_cache(cache_dir, directory)
     snapshot = provenance["snapshot"]
@@ -3524,7 +3576,7 @@ def _fetch_place(
             # Index metadata describes the archive the index crawled, so it
             # decides a feed only before a download from the indexed URLs,
             # and only once a probe proves that archive unchanged.
-            missed = _misses(feed.service_start, feed.service_end, day, study)
+            missed = _misses(feed.service_start, feed.service_end, day)
             if expired == "skip" and missed and unchanged(feed):
                 _skip(entry, f"{missed}; unchanged since indexed")
                 if datable(feed):

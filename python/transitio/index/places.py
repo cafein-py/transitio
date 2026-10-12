@@ -420,20 +420,22 @@ class Place:
         spec="gtfs",
         on_unknown="include",
         requires=None,
-        categories="default",
-        international=False,
+        categories=None,
+        international=True,
     ):
-        """The feeds serving this place, as :class:`IndexedFeed` objects.
+        """The feeds serving this place, as :class:`IndexedFeed` objects: by
+        default every feed, of every tier and relevance category, cross-border
+        ones included, by category (primary first), then relevance, then id.
 
         ``tiers`` keeps only edges of those tiers, ``exclude`` drops edges of
         the named tiers (a feed with nothing left is dropped), ``spec`` selects
         the feed kind (static GTFS by default; ``None`` for everything, a list
         to narrow), ``on_unknown`` governs unknown-tier edges and ``requires``
         keeps only feeds whose manifest carries the named GTFS files (for
-        example ``"shapes.txt"``). On a schema-7 index ``categories`` picks
-        the relevance categories (the place kind's default view unless named,
-        in which a region or country of at most 1,000 km² keeps its primary
-        feeds too; ``None`` for all) and ``international=True`` adds the
+        example ``"shapes.txt"``). On a schema-7 index ``categories`` names
+        the relevance categories to keep (``"default"`` for the place kind's
+        view, in which a region or country of at most 1,000 km² keeps its
+        primary feeds too) and ``international=False`` leaves out the
         cross-border feeds. See :func:`transitio.index.feeds.feeds_for_place`.
         """
         return self._lookup.feeds(
@@ -448,28 +450,43 @@ class Place:
         )
 
     def recommend(
-        self, when=None, *, tiers=None, exclude=None, target=0.95, max_feeds=4
+        self,
+        when=None,
+        *,
+        tiers="default",
+        exclude=None,
+        target=None,
+        max_feeds=None,
     ):
         """Which of the place's feeds to use on ``when`` (a date, today when
         None), and why the others are left out, as a
         :class:`~transitio.index.Recommendation`; ``print()`` it to read it.
 
-        Every feed serving the place is a candidate, whatever its category;
-        ``tiers`` and ``exclude`` narrow them as in :meth:`feeds`. A feed is
-        left out when it was stale when indexed, when its timetable as
-        indexed does not run on the day, or when it needs a paid account. On
-        an index that records which feeds run the same lines, feeds are
-        taken until they cover ``target`` of the place's departures, each
-        counted once, and 80 % of each mode's (rail, subway and tram
-        together), at most ``max_feeds`` of them; among feeds adding about
-        as much, the open one with the fewest stops is taken. Without that
-        evidence the feed with the most departures is taken. See
-        :mod:`transitio.index.recommend`.
+        The candidates are the feeds serving the place at ``tiers``, together
+        with those of unknown tier, whatever their category and cross-border
+        ones included: by default local and regional feeds at a city or a
+        metro, and every tier at a region or a country. ``tiers`` names the
+        tiers instead, ``tiers=None`` takes every tier, and ``exclude`` drops
+        tiers as in :meth:`feeds`; a feed serving the place at other tiers
+        only is listed as not considered, as is a feed the index marks as a
+        private or campus service or an unofficial compilation (``fetch``
+        takes it when named in ``feeds=``). A candidate is left out when its
+        timetable as indexed does not run on the day (a feed stale when
+        indexed is a candidate for a day its timetable covers), when it needs
+        a paid account, or when it adds no departure the feeds taken before
+        it do not run. The candidates are taken the most
+        local first, the one covering the smallest area, so an operator's own
+        feed comes before an aggregate repeating it and the aggregate is taken
+        for what it adds; among feeds covering as much, the open one and the
+        newer timetable come first. ``target`` (a share of the place's
+        departures, each counted once) stops the selection once the feeds
+        taken cover it and 80 % of each mode's (rail, subway and tram
+        together), and ``max_feeds`` once that many are taken. Without overlap
+        evidence every feed is taken. See :mod:`transitio.index.recommend`.
         """
-        from transitio.index.recommend import recommend
+        from transitio.index.recommend import recommend_for
 
-        feeds = self.feeds(tiers=tiers, exclude=exclude, categories=None)
-        return recommend(self, feeds, when, goal=target, max_feeds=max_feeds)
+        return recommend_for(self, when, tiers, exclude, target, max_feeds)
 
     def __eq__(self, other):
         return isinstance(other, Place) and other.id == self.id
@@ -516,14 +533,14 @@ class Area:
         spec="gtfs",
         on_unknown="include",
         requires=None,
-        categories="default",
-        international=False,
+        categories=None,
+        international=True,
     ):
         """The feeds serving the area's parts, as :class:`IndexedFeed`
         objects, each feed once.
 
-        Each part answers as :meth:`Place.feeds` does, its kind's default
-        view included, with the same arguments. A feed's ``edges`` are keyed
+        Each part answers as :meth:`Place.feeds` does, with the same
+        arguments: by default every feed serving it. A feed's ``edges`` are keyed
         by ``(place_id, tier)``, its ``selector`` unites theirs (a
         ``whole_feed`` one makes it whole, else an ``unavailable`` one makes
         it unavailable, otherwise the route ids are united) and ``service`` is its
@@ -545,15 +562,22 @@ class Area:
         )
 
     def recommend(
-        self, when=None, *, tiers=None, exclude=None, target=0.95, max_feeds=4
+        self,
+        when=None,
+        *,
+        tiers="default",
+        exclude=None,
+        target=None,
+        max_feeds=None,
     ):
         """Which of the feeds serving the area's parts to use on ``when``,
         as :meth:`Place.recommend` answers for a place, each feed's
-        departures and the shares other feeds run summed over the parts."""
-        from transitio.index.recommend import recommend
+        departures and the shares other feeds run summed over the parts. By
+        default an area considers every tier when one of its parts is a
+        region or a country, else local and regional feeds."""
+        from transitio.index.recommend import recommend_for
 
-        feeds = self.feeds(tiers=tiers, exclude=exclude, categories=None)
-        return recommend(self, feeds, when, goal=target, max_feeds=max_feeds)
+        return recommend_for(self, when, tiers, exclude, target, max_feeds)
 
     def __repr__(self):
         from transitio.osm._fetch import _fmt_coord

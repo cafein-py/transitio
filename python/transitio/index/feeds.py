@@ -142,6 +142,11 @@ class PlaceService(ServiceLevel):
 # A region or country of at most 1,000 km² is town-sized and keeps its
 # primary, secondary and tertiary feeds.
 CATEGORY_ORDER = ("primary", "secondary", "tertiary", "international", "unknown")
+# The marks the index puts on feeds a study does not take by default, in words.
+MARKS = {
+    "private": "private or campus service",
+    "compilation": "unofficial compilation",
+}
 DEFAULT_CATEGORIES = {
     "city": ("primary", "secondary"),
     "metro": ("primary", "secondary"),
@@ -149,6 +154,14 @@ DEFAULT_CATEGORIES = {
     "country": ("tertiary",),
 }
 TOWN_MAX_KM2 = 1000.0
+
+
+def _names(value):
+    """A ``tiers=`` or ``exclude=`` value read once: None stays None, a string
+    is one name, any other iterable a tuple of its names."""
+    if value is None:
+        return None
+    return (value,) if isinstance(value, str) else tuple(value)
 
 
 def _relevance(value):
@@ -175,6 +188,7 @@ _SUMMARY_KEYS = (
     "stale_when_indexed",
     "carried_by",
     "overlap",
+    "mark",
 )
 
 
@@ -670,6 +684,43 @@ class IndexedFeed:
         return any(e.cross_border for e in self.edges.values())
 
     @property
+    def mark(self):
+        """The index's mark on a feed a study does not take by default:
+        ``"private"`` for a private or campus service, ``"compilation"`` for
+        an unofficial compilation (built by a third party, not the operator
+        or an authority); None otherwise, and on an index that marks
+        nothing. The index records it in each edge's evidence."""
+        marks = [edge.summary.get("mark") for edge in self.edges.values()]
+        valid = (mark for mark in marks if isinstance(mark, str) and mark in MARKS)
+        return next(valid, None)
+
+    @property
+    def no_tier_reason(self):
+        """Why the index gives the feed no tier here, in words, when every
+        matched edge is of unknown tier; None otherwise. The index records no
+        reason, so it is read from the edges: a feed known only from a
+        catalogue, one whose service the index did not measure, one whose
+        routes are all of types the index does not classify (air, taxi and
+        others), else one whose routes it could not classify."""
+        edges = list(self.edges.values())
+        if not edges or any(edge.tier != "unknown" for edge in edges):
+            return None
+        if all(edge.method == "inferred" for edge in edges):
+            return "known only from a catalogue: the index has not crawled it"
+        if all(edge.service.departures_per_day is None for edge in edges):
+            return "the index measured no service for it"
+        kinds = {
+            kind
+            for edge in edges
+            for kind in ((edge.summary.get("overlap") or {}).get("departures") or {})
+        }
+        if kinds and all(str(kind).isdigit() for kind in kinds):
+            return (
+                "its routes are of types the index gives no tier, such as air and taxi"
+            )
+        return "the index could not classify its routes"
+
+    @property
     def service(self):
         """The feed's service level in the place — identical on every tier
         edge of the pair, so any matched edge's copy is the answer."""
@@ -774,9 +825,13 @@ class FeedList(list):
         counted once, that the feed runs, and ``repeats`` names up to three
         listed feeds running the most of the feed's own departures, with
         their shares; both come from the index's overlap evidence and are
-        None without it. ``reason`` gives the category and tiers, the share
-        of the departures summed over the place's feeds, the feed repeating
-        the most of it, and where they apply, staleness, the feeds
+        None without it. ``cross_border`` says whether the feed serves the
+        place across a border, ``no_tier_reason`` why the index gives a feed
+        of unknown tier no tier, and ``mark`` the index's mark on a private
+        or campus service or an unofficial compilation. ``reason`` gives the
+        category and tiers, the share of the departures summed over the
+        place's feeds, the feed repeating the most of it, and where they
+        apply, the border, the mark, the missing tier, staleness, the feeds
         containing it and the account it needs.
         """
         import pandas
@@ -800,6 +855,9 @@ class FeedList(list):
                     "tiers": sorted(feed.tiers),
                     "relevance_category": feed.relevance_category,
                     "relevance": feed.relevance,
+                    "cross_border": feed.cross_border,
+                    "no_tier_reason": feed.no_tier_reason,
+                    "mark": feed.mark,
                     "share_of_place": feed.share_of_place,
                     **_summed_service(feed),
                     "modes": sorted(departures, key=departures.get, reverse=True),
@@ -832,6 +890,9 @@ _TABLE_COLUMNS = (
     "tiers",
     "relevance_category",
     "relevance",
+    "cross_border",
+    "no_tier_reason",
+    "mark",
     "share_of_place",
     "departures_per_day",
     "stops",
@@ -995,6 +1056,12 @@ def _ranking_reason(feed, repeats):
     notes = []
     if repeats:
         notes.append(f"repeats {repeats[0][0]} ({_percent(repeats[0][1])})")
+    if feed.cross_border:
+        notes.append("serves the place across a border")
+    if feed.mark is not None:
+        notes.append(MARKS[feed.mark])
+    if feed.no_tier_reason:
+        notes.append(f"no tier ({feed.no_tier_reason})")
     ended = feed.stale_when_indexed
     if ended is not None:
         notes.append(f"stale when indexed: its timetable ended {ended}")

@@ -932,12 +932,13 @@ def test_fetch_rejects_invalid_options():
 
 
 def _partitioned_index(
-    tmp_path, monkeypatch, feeds, contained=None, edges=None, providers=None
+    tmp_path, monkeypatch, feeds, contained=None, edges=None, providers=None, more=()
 ):
     """A schema-10 index serving Q1757 with ``feeds`` (``{feed id: extra
     columns}``) in that order, each a local feed at
-    ``https://feeds.example/<feed id>``; ``edges`` adds edge fields by feed id.
-    With ``providers`` (access provider records) a schema-11 index."""
+    ``https://feeds.example/<feed id>``; ``edges`` adds edge fields by feed id
+    and ``more`` further edge records. With ``providers`` (access provider
+    records) a schema-11 index."""
     import transitio.index as transitio_index
     from index_fixture import HULL, PLACES, covered_feed, edge, write_partitioned_index
 
@@ -973,7 +974,7 @@ def _partitioned_index(
         tmp_path / "index",
         feeds=rows,
         places=[PLACES[0]],
-        edges=records,
+        edges=[*records, *more],
         contained=contained or {},
         access=None if providers is None else {"providers": providers},
     )
@@ -997,6 +998,105 @@ def _serve_by_id(monkeypatch, payloads):
         "transitio.catalog.TransitlandAtlas._fetch_static", fake_download
     )
     return fetched
+
+
+def test_fetch_takes_the_tiers_recommend_considers(tmp_path, monkeypatch):
+    # A city fetches its local and cross-border feeds whole and lists a
+    # national one as not considered; named in feeds=, it is fetched.
+    # The local feed's selector names one of its two routes: without a tier
+    # query it is delivered whole.
+    local = _network(routes=("r1", "r2"))
+    selector = {"selector_state": "complete", "selector": {"route_id": ["r1"]}}
+    edges = {
+        "f-l": _stamp_fingerprint([selector], local)[0],
+        "f-x": {"cross_border": True},
+        "f-n": {"tier": "national", "relevance_category": "tertiary"},
+    }
+    index = _partitioned_index(
+        tmp_path, monkeypatch, {"f-l": {}, "f-x": {}, "f-n": {}}, edges=edges
+    )
+
+    def at(hour, agency):
+        times = GTFS["stop_times.txt"].replace("08:", f"{hour}:")
+        agencies = GTFS["agency.txt"].replace("HSL", agency)
+        return _zip({**GTFS, "agency.txt": agencies, "stop_times.txt": times})
+
+    payloads = {"f-l": local, "f-x": at(10, "X"), "f-n": at(12, "N")}
+    fetched = _serve_by_id(monkeypatch, payloads)
+    options = {"index": index, "crop": False, "osm": False}
+    result = fetch(place="Q1757", directory=tmp_path / "out", **options)
+    decisions = [(e["feed_id"], e["decision"], e["reason"]) for e in result.selection]
+    assert decisions == [
+        ("f-l", "delivered", None),
+        ("f-x", "delivered", None),
+        (
+            "f-n",
+            "skipped",
+            "not considered: serves the place at the national tier; fetch takes it "
+            "when named in feeds=",
+        ),
+    ]
+    assert fetched == ["f-l", "f-x"] and result.view_note is None
+    routes = _feed_tables(result.paths["f-l"])["routes.txt"]
+    assert sorted(row["route_id"] for row in routes) == ["r1", "r2"]
+    assert result.selections == []
+    named = fetch(place="Q1757", feeds=["f-n"], directory=tmp_path / "n", **options)
+    assert [e["decision"] for e in named.selection] == ["delivered"]
+    # A feed at an excluded tier alone is listed, as left out by exclude,
+    # however exclude is given.
+    import pandas
+
+    for n, exclude in enumerate((iter(["national"]), pandas.Index(["national"]))):
+        out = fetch(
+            place="Q1757", exclude=exclude, directory=tmp_path / str(n), **options
+        )
+        assert out.selection[-1]["reason"] == (
+            "not considered: serves the place at the national tier, which exclude= "
+            "leaves out"
+        )
+
+
+@pytest.mark.parametrize(
+    "tier, options, reason, note",
+    [
+        pytest.param(
+            "unknown",
+            {"on_unknown": "exclude"},
+            "only unknown-tier edges; serves the place at the national tier too: "
+            "fetch takes it when named in feeds=",
+            "the local and regional tiers of a city hold none of the place's 1 "
+            "feed: f-u (national and unknown); tiers=['national'] fetches it",
+            id="unknown-and-national",
+        ),
+        pytest.param(
+            "international",
+            {"exclude": "regional"},
+            "not considered: serves the place at the national and international "
+            "tiers; fetch takes it when named in feeds=",
+            "the local tier of a city holds none of the place's 1 feed: f-u "
+            "(national and international); tiers=['national', 'international'] "
+            "fetches it",
+            id="exclude",
+        ),
+    ],
+)
+def test_a_feed_left_out_names_the_tiers_that_fetch_it(
+    tmp_path, monkeypatch, tier, options, reason, note
+):
+    from index_fixture import edge
+
+    first = {"tier": tier, "relevance_category": tier}
+    national = edge("Q1757", "f-u", tier="national", relevance_category="tertiary")
+    index = _partitioned_index(
+        tmp_path, monkeypatch, {"f-u": {}}, edges={"f-u": first}, more=[national]
+    )
+    with pytest.warns(UserWarning) as caught:
+        result = fetch(
+            place="Q1757", index=index, directory=tmp_path, osm=False, **options
+        )
+    (entry,) = result.selection
+    assert (entry["reason"], result.view_note) == (reason, note)
+    assert note in [str(warning.message) for warning in caught]
 
 
 def test_contained_keep_leaves_no_feed_out(tmp_path, monkeypatch):
@@ -1107,6 +1207,7 @@ ETAG, MODIFIED = {"etag": '"v1"'}, {"last_modified": "Tue, 01 Jun 2021 00:00:00 
 # The skip reasons the cases expect.
 R_ENDED, R_SPRING = "service ended 2021-12-31", "service ended 2026-05-01"
 R_STARTS = "service starts 2027-01-01, after 2026-06-07"
+R_NEXT = "service starts 2026-07-01, after 2026-06-01"
 R_IDLE, SAME = f"no service on {DAY}", "; unchanged since indexed"
 
 
@@ -1123,7 +1224,7 @@ R_IDLE, SAME = f"no service on {DAY}", "; unchanged since indexed"
         (NOW, {}, 200, (*NOW, "0000000"), DAY, "skip", True, R_IDLE, None),
         (NOW, {}, 200, (*LONG, "1111100"), DAY, "skip", True, R_IDLE, LONG),
         (LATER, ETAG, 200, LATER, DAY, "skip", True, R_STARTS, LATER),
-        (NEXT, ETAG, 304, NEXT, None, "skip", True, None, NEXT),
+        (NEXT, ETAG, 304, NEXT, None, "skip", False, R_NEXT + SAME, None),
         (NOW, ETAG, 304, SPRING, None, "skip", True, R_SPRING, SPRING),
         (NOW, ETAG, 304, NOW, DAY, "skip", True, None, NOW),
         (ENDED, ETAG, 304, ENDED, None, "keep", True, None, ENDED),
@@ -1609,6 +1710,11 @@ AB, ABC = {**C, "routes": ("a", "b")}, {**C, "routes": ("a", "b", "c")}
 IN_C = {**F, "in": "C", "hours": (9,)}
 ADDS = f"+ similar to A but adds service on {DAY}"
 ON_DAY = {"when": DAY}
+# A feed the index marks private, skipped unless named.
+MARKED = (
+    "private or campus service, not considered: fetch takes it when named in feeds="
+)
+NAMED, ALL = {"feeds": ["A", "M"]}, {"A": "+", "M": "+"}
 # A trip half a minute after the 09:00 trip, which it nearly repeats.
 NEAR_NINE = {
     "trips.txt": "r1,wk,x\n",
@@ -1737,7 +1843,7 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
             {"A": "+", "B": "+ similar to A; kept, has transfers or pathways"},
         ),
         (
-            {"A": {"start": "20260701"}, "B": OLD},
+            {"A": NEW, "B": OLD},
             {},
             {
                 "A": "+ similar to B; kept, no study day",
@@ -1786,6 +1892,12 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
             {"duplicate_trips": "exact"},
             {"A": "+", "B": "+ 1 repeated trips of A left out (1)"},
         ),
+        (
+            {"A": C, "M": {**F, "hours": (15,), "mark": "private"}},
+            {},
+            {"A": "+", "M": f"- {MARKED}"},
+        ),
+        ({"A": C, "M": {**F, "hours": (15,), "mark": "private"}}, NAMED, ALL),
     ],
     ids=(
         "identical identical-overlapping-routes container-renewed "
@@ -1799,7 +1911,8 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
         "version-transfers versions-no-study-day placeholder-starting-later "
         "placeholder-under-stop-threshold placeholders-other-routes "
         "repeats-other-agency repeats-on-the-day repeats-not-every-date "
-        "repeats-other-time-zone repeats-kept repeats-exact"
+        "repeats-other-time-zone repeats-kept repeats-exact marked-skipped "
+        "marked-named"
     ).split(),
 )
 def test_fetch_delivers_one_copy_per_service(
@@ -1815,7 +1928,7 @@ def test_fetch_delivers_one_copy_per_service(
         # Nothing is compared, so no feed counts repeats.
         assert {e["duplicate_trips"] for e in result.selection} == {None}
     # A feed left out before download is never downloaded; every other is.
-    early = ("contained in", "unchanged since indexed")
+    early = ("contained in", "unchanged since indexed", "not considered")
     assert sorted(downloads) == sorted(
         e["feed_id"]
         for e in result.selection
@@ -1827,29 +1940,35 @@ def test_fetch_delivers_one_copy_per_service(
     assert sorted((tmp_path / "out").rglob("*.zip")) == sorted(paths)
 
 
-def _fetch_networks(tmp_path, monkeypatch, feeds, **options):
+def _fetch_networks(tmp_path, monkeypatch, specs, **options):
     """``(result, downloaded)``: a fetch of Q1757 into ``tmp_path / "out"``
-    over ``feeds``, ``{feed id: spec}`` in record order (the specs above),
+    over ``specs``, ``{feed id: spec}`` in record order (the specs above),
     with ``options``, and the ids of the feeds downloaded."""
     from transitio.catalog._atlas import TransitlandAtlas
 
     monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
     payloads, columns, edges, contained, renewed = {}, {}, {}, {}, set()
-    for feed_id, spec in feeds.items():
+    marks = {}
+    for feed_id, spec in specs.items():
         spec = dict(spec)
-        cut, containers, ended = (spec.pop(key, None) for key in ("cut", "in", "ended"))
+        cut, containers, ended, mark = (
+            spec.pop(key, None) for key in ("cut", "in", "ended", "mark")
+        )
         renewed.update([feed_id] if spec.pop("renewed", False) else [])
         payloads[feed_id] = _network(**spec)
         columns[feed_id] = {"etag": '"v1"'}
         if ended:
             columns[feed_id].update(service_start=ENDED[0], service_end=ENDED[1])
+        if mark:
+            marks[feed_id] = {"evidence": {"declared_level": "city", "mark": mark}}
         if cut:
             selector = {"route_id": cut.split()}
             fields = {"selector_state": "complete", "selector": selector}
             edges[feed_id] = _stamp_fingerprint([fields], payloads[feed_id])[0]
         if containers:
             contained[feed_id] = containers.split()
-    index = _partitioned_index(tmp_path, monkeypatch, columns, contained, edges)
+    fields = {f: {**marks.get(f, {}), **edges.get(f, {})} for f in {*marks, *edges}}
+    index = _partitioned_index(tmp_path, monkeypatch, columns, contained, fields)
     downloads = []
 
     def handler(request):
@@ -2533,7 +2652,7 @@ def test_timezone_note(tmp_path, zone, stops, budget, expected):
     assert _timezone_note(path, budget) == expected
 
 
-PLACE_VIEW = "default view (city: primary, secondary) holds none of the place's "
+PLACE_VIEW = "the local and regional tiers of a city hold none of the place's "
 
 
 @pytest.mark.parametrize(
@@ -2541,25 +2660,32 @@ PLACE_VIEW = "default view (city: primary, secondary) holds none of the place's 
     [
         pytest.param(
             False,
-            [("f-u", "unknown", {"unknown"})],
-            PLACE_VIEW + "1 feed: f-u (unknown); "
-            "tiers=['local', 'regional', 'national'] fetches it",
-            id="unknown-only",
+            [("f-n", {"national"})],
+            PLACE_VIEW + "1 feed: f-n (national); tiers=['national'] fetches it",
+            id="national",
         ),
         pytest.param(
             False,
-            [(f"f-{n}", "tertiary", {"national", "regional"}) for n in range(7)],
-            PLACE_VIEW + "7 feeds: f-0 (tertiary), f-1 (tertiary), f-2 (tertiary), "
-            "f-3 (tertiary), f-4 (tertiary) and 2 more; "
-            "tiers=['regional', 'national'] fetches them",
+            [(f"f-{n}", {"national", "international"}) for n in range(7)],
+            PLACE_VIEW + "7 feeds: f-0 (national and international), f-1 (national "
+            "and international), f-2 (national and international), f-3 (national "
+            "and international), f-4 (national and international) and 2 more; "
+            "tiers=['national', 'international'] fetches them",
             id="seven",
         ),
         pytest.param(
             True,
-            [("f-l", "primary", {"local"})],
-            "default view of the area's places holds none of their 1 feed: "
-            "f-l (primary); tiers=['local'] fetches it",
+            [("f-i", {"international"})],
+            "the local and regional tiers of the area's places hold none of their 1 "
+            "feed: f-i (international); tiers=['international'] fetches it",
             id="area",
+        ),
+        pytest.param(
+            None,
+            [("f-n", {"national"})],
+            "exclude= leaves out every tier considered for a city; the place's 1 "
+            "feed: f-n (national); tiers=['national'] fetches it",
+            id="all-excluded",
         ),
     ],
 )
@@ -2569,12 +2695,11 @@ def test_hidden_view_note(area, hidden, expected):
     from transitio.index import Area
     from transitio.pipeline._fetch import _hidden_note
 
-    feeds = [
-        SimpleNamespace(feed_id=feed_id, relevance_category=category, tiers=tiers)
-        for feed_id, category, tiers in hidden
-    ]
+    feeds = [SimpleNamespace(feed_id=feed_id, tiers=tiers) for feed_id, tiers in hidden]
     target = Area(None, None, (), 1.0, None) if area else SimpleNamespace(kind="city")
-    assert _hidden_note(target, feeds) == expected
+    considered = () if area is None else ("local", "regional")
+    reach = set().union(*(feed.tiers for feed in feeds)) - {"local", "regional"}
+    assert _hidden_note(target, feeds, considered, reach) == expected
 
 
 @pytest.mark.parametrize("path", ["area", "place"])
