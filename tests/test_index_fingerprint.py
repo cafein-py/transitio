@@ -68,14 +68,15 @@ def test_version_2_kinds_read_ids_trimmed():
         return "\n".join([header, *rows])
 
     padded = {name: pad(text) for name, text in _MEMBERS.items()}
-    clean, spaced = (io.BytesIO(_feed_zip(m)) for m in (_MEMBERS, padded))
+    clean, spaced = (_feed_zip(m) for m in (_MEMBERS, padded))
+
+    def read(data, kind):
+        return fingerprint.from_feed(io.BytesIO(data), kind)
+
     for kind in ("route_stops@2", "feed_stops@2"):
-        clean.seek(0), spaced.seek(0)
-        assert fingerprint.from_feed(spaced, kind) == fingerprint.from_feed(clean, kind)
-    clean.seek(0), spaced.seek(0)
+        assert read(spaced, kind) == read(clean, kind)
     # Version 1 reads ids as written, so an index built with it still matches.
-    plain, _ = fingerprint.from_feed(clean, "route_stops")
-    assert fingerprint.from_feed(spaced, "route_stops")[0] != plain
+    assert read(spaced, "route_stops")[0] != read(clean, "route_stops")[0]
     assert fingerprint.compute("feed_stops@2", ROUTES, COORDS) != fingerprint.compute(
         "feed_stops", ROUTES, COORDS
     )
