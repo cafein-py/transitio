@@ -5,14 +5,76 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## 0.25.0 — 2026-10-12
+
+### Added
+
+- `IndexedFeed.no_tier_reason` says why the index gives a feed of unknown
+  tier no tier: known only from a catalogue, no service measured, only air or
+  taxi route types, or routes it could not classify. `IndexedFeed.mark` reads
+  the index's mark on a private or campus service or an unofficial
+  compilation. The feed table gains `cross_border`, `no_tier_reason` and
+  `mark` columns.
+- `Area.unused` lists the places with feeds that meet an area but are not
+  among its parts, with why (`transitio.index.AreaUnused`).
+- `FetchResult.area_note` describes an area fetch: the places standing for
+  the area, the share of its land they cover and the places not used; on the
+  catalogue path, the feeds found and the catalogue feeds without a bounding
+  box, which a search by area cannot find.
+- `transitio.index.refresh(snapshot=...)` installs the published snapshot of
+  that id again.
 
 ### Changed
 
+- `Place.recommend()` and `Area.recommend()` take every feed that adds a
+  departure the feeds taken before it do not run, the most local first: the
+  feed covering the smallest area, then the open one, the newer timetable and
+  the fewer stops. An operator's own feed comes before an aggregate repeating
+  it, and the aggregate is taken for what it adds. `target=` and `max_feeds=`
+  limit the selection only when given. Feeds measured in another build are
+  taken without comparison, and contained feeds are ordinary candidates.
+- By default a recommendation considers the tiers of its kind of place —
+  local and regional feeds, and those of unknown tier, at a city or a metro;
+  every tier at a region or a country, part by part in an area — with
+  cross-border feeds included. Feeds at other tiers, and feeds the index marks
+  as private or campus services or unofficial compilations, are listed as not
+  considered with how to include them.
+- A feed is judged by whether its timetable as indexed runs on the study day:
+  one stale when indexed is a candidate for a day its timetable covers, and a
+  timetable starting after the day is left out, also without a study day
+  (today then), in `recommend()` and `fetch`.
+- `Place.feeds()` and `Area.feeds()` list every feed serving the place by
+  default, of every relevance category and cross-border ones included;
+  `categories="default"` and `international=False` give the former view.
+- `fetch(place=...)` takes the feeds `recommend()` considers, of every
+  category and cross-border ones included, and delivers them whole; every
+  other feed serving the place gets a selection row saying why, and `feeds=`
+  accepts any feed serving the place. On the index paths `fetch` takes the
+  feeds in the order `recommend()` does, the most local first, so a trip an
+  aggregate repeats is kept in the more local feed.
+- `fetch(aoi=...)` keeps an area's cities as parts; a region or a country
+  stands only for the land no city covers, with the feeds whose coverage meets
+  that land.
+- The catalogue search reads every page (`search_feeds` has no cap by
+  default); with a study day it takes feeds of every status, judged by their
+  own windows.
+- With a Mobility Database token and a study day, each dataset covering the
+  day is tried, newest first, then the feed's own source; a feed no dataset
+  covers is no longer skipped. Without a day the feed's own source comes first
+  and the newest dataset is the fallback. `MobilityDatabase.datasets` reads
+  every page before sorting.
+- `refresh()` keeps the ten newest snapshots (`keep=None` keeps every one) and
+  warns with the id and size of each snapshot it removes.
 - The guides give the feed index's new download and disk sizes. They also
   explain that a country's place boundaries and link details are downloaded
   the first time a query needs them, and how to download all of them in
   advance for offline work.
+
+### Fixed
+
+- Network snapping and shape inference work with pyrosm 0.19, which
+  simplifies `to_graph()` by default and no longer fills the reader's
+  caches on a custom-criteria read.
 
 ## 0.24.0 — 2026-10-11
 

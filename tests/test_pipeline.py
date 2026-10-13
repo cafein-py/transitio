@@ -981,7 +981,8 @@ def _partitioned_index(
 ):
     """A schema-10 index serving Q1757 with ``feeds`` (``{feed id: extra
     columns}``) in that order, each a local feed at
-    ``https://feeds.example/<feed id>``; ``edges`` adds edge fields by feed id
+    ``https://feeds.example/<feed id>`` whose stop count follows that order,
+    so fetch takes them in it; ``edges`` adds edge fields by feed id
     and ``more`` further edge records. With ``providers`` (access provider
     records) a schema-11 index."""
     import transitio.index as transitio_index
@@ -998,9 +999,10 @@ def _partitioned_index(
             "home_country": "FI",
             "scope": "domestic",
             "atlas": {"urls": {"static_current": f"https://feeds.example/{feed_id}"}},
+            "stop_count": position + 1,
             **extra,
         }
-        for feed_id, extra in feeds.items()
+        for position, (feed_id, extra) in enumerate(feeds.items())
     ]
     records = [
         edge(
@@ -1747,8 +1749,9 @@ def _network(agency="HSL", start="20260101", stops=None, hours=(8,), **options):
 
 
 # Specs for _network, plus "cut" (the routes a selector keeps), "in" (the
-# containers the index names), "ended" (an index window that ended) and
-# "renewed" (a probe answering 200).
+# containers the index names), "ended" (an index window that ended),
+# "renewed" (a probe answering 200) and "wide" (a coverage wider than the
+# others').
 NEW, OLD, OLDER = ({"start": f"2026{month}01"} for month in ("06", "05", "04"))
 C, F = {"agency": "C"}, {"agency": "F"}
 AB, ABC = {**C, "routes": ("a", "b")}, {**C, "routes": ("a", "b", "c")}
@@ -1943,6 +1946,11 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
             {"A": "+", "M": f"- {MARKED}"},
         ),
         ({"A": C, "M": {**F, "hours": (15,), "mark": "private"}}, NAMED, ALL),
+        (
+            {"W": {**C, "hours": (8, 9), "wide": True}, "A": F},
+            {},
+            {"A": "+", "W": "+ 1 repeated trips of A left out (1)"},
+        ),
     ],
     ids=(
         "identical identical-overlapping-routes container-renewed "
@@ -1957,7 +1965,7 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
         "placeholder-under-stop-threshold placeholders-other-routes "
         "repeats-other-agency repeats-on-the-day repeats-not-every-date "
         "repeats-other-time-zone repeats-kept repeats-exact marked-skipped "
-        "marked-named"
+        "marked-named repeats-kept-in-the-more-local-feed"
     ).split(),
 )
 def test_fetch_delivers_one_copy_per_service(
@@ -1987,8 +1995,10 @@ def test_fetch_delivers_one_copy_per_service(
 
 def _fetch_networks(tmp_path, monkeypatch, specs, **options):
     """``(result, downloaded)``: a fetch of Q1757 into ``tmp_path / "out"``
-    over ``specs``, ``{feed id: spec}`` in record order (the specs above),
-    with ``options``, and the ids of the feeds downloaded."""
+    over ``specs``, ``{feed id: spec}`` in record order but for a wide one
+    (the specs above), with ``options``, and the ids of the feeds
+    downloaded."""
+    from index_fixture import GEOM_HEX
     from transitio.catalog._atlas import TransitlandAtlas
 
     monkeypatch.delenv("MOBILITY_API_REFRESH_TOKEN", raising=False)
@@ -1996,14 +2006,16 @@ def _fetch_networks(tmp_path, monkeypatch, specs, **options):
     marks = {}
     for feed_id, spec in specs.items():
         spec = dict(spec)
-        cut, containers, ended, mark = (
-            spec.pop(key, None) for key in ("cut", "in", "ended", "mark")
+        cut, containers, ended, mark, wide = (
+            spec.pop(key, None) for key in ("cut", "in", "ended", "mark", "wide")
         )
         renewed.update([feed_id] if spec.pop("renewed", False) else [])
         payloads[feed_id] = _network(**spec)
         columns[feed_id] = {"etag": '"v1"'}
         if ended:
             columns[feed_id].update(service_start=ENDED[0], service_end=ENDED[1])
+        if wide:
+            columns[feed_id]["coverage"] = GEOM_HEX
         if mark:
             marks[feed_id] = {"evidence": {"declared_level": "city", "mark": mark}}
         if cut:
