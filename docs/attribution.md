@@ -80,7 +80,8 @@ per-snapshot `NOTICE` records the licence judged for each feed.
 
 `transitio` looks up the time zone at a feed's stops with
 [tzfpy](https://github.com/ringsaturn/tzfpy) (MIT), for instance to leave out
-a feed whose `agency_timezone` differs from the others' in a merge. tzfpy's
+a feed whose `agency_timezone` differs from the others' in a merge with
+`timezones="skip"`. tzfpy's
 boundary data comes from
 [timezone-boundary-builder](https://github.com/evansiroky/timezone-boundary-builder),
 under the [Open Database License (ODbL 1.0)](https://opendatacommons.org/licenses/odbl/1-0/),
