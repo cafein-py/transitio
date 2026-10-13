@@ -20,7 +20,9 @@ cache's records under ``cache``:
   stored as ``<key>.json``;
 - ``repeats``: what ``fetch`` found of the version's trips repeating those of
   the feeds delivered before it, by key: the trips left out, the feeds they
-  repeat, the skip reason, the note and the service window.
+  repeat, the skip reason, the note and the service window, and the near
+  repeats among them with the stop times they took at stops the trips they
+  repeat do not serve.
 
 A delivered copy's sidecar describes the first acquisition. A version is
 published only after its download completed and the file is a readable zip;
@@ -146,8 +148,10 @@ def _output_record(key, record):
 def _repeats_record(key, record):
     """Whether ``record`` holds what ``fetch`` found of a version's repeated
     trips under ``key``: the count left out (None: not compared), the ids
-    of the feeds they repeat, the skip reason and note, and the service
-    window."""
+    of the feeds they repeat, the skip reason and note, the service window,
+    and, when recorded (a release before them did not), the count among
+    them only nearly repeated and ``{stop id: count}`` of the stop times
+    those took at stops the trips they repeat do not serve."""
     fields = ("dropped", "of", "skip", "note", "window")
     if not (_DIGEST.fullmatch(key) and isinstance(record, dict)):
         return False
@@ -157,11 +161,19 @@ def _repeats_record(key, record):
     if window is not None and not (isinstance(window, list) and len(window) == 2):
         return False
     texts = [record["skip"], record["note"], *(window or ())]
+    near, unaligned = record.get("near", 0), record.get("unaligned", {})
     return (
         (dropped is None or type(dropped) is int and dropped >= 0)
         and isinstance(ids, list)
         and all(isinstance(i, str) for i in ids)
         and all(text is None or isinstance(text, str) for text in texts)
+        and type(near) is int
+        and near >= 0
+        and isinstance(unaligned, dict)
+        and all(
+            isinstance(stop, str) and type(n) is int and n > 0
+            for stop, n in unaligned.items()
+        )
     )
 
 

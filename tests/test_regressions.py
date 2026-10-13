@@ -1336,7 +1336,7 @@ def test_merge_leaves_out_the_feed_whose_stops_lie_in_another_time_zone(tmp_path
     output = tmp_path / "merged.zip"
     left = f"left out feed 0 (f1, {feeds[0]}): America/New_York, "
     with pytest.warns(UserWarning, match=re.escape(left + "stops in Pacific/Honolulu")):
-        report = merge_feeds(feeds, output, reference_date="20260601")
+        report = merge_feeds(feeds, output, timezones="skip", reference_date="20260601")
     assert report["skipped_feeds"] == [
         {
             "feed": 0,
@@ -1487,20 +1487,24 @@ _YEAR = ["2026-01-01", "2026-12-31"]
             id="calendars",
         ),
         pytest.param([], None, _YEAR, id="complete"),
+        # A crop keeping no trip was reported as missing both calendar files.
+        pytest.param(None, "no trip stops in the area", None, id="empty-crop"),
     ],
 )
 def test_a_feed_missing_a_required_file_is_skipped(tmp_path, dropped, reason, window):
     # A feed without agency.txt was delivered, its report counting the
     # error, and cafein then refused every delivered feed.
+    from shapely.geometry import box
+
     from transitio.pipeline._fetch import _process_feed, _SkipFeed
 
-    files = {name: text for name, text in FEED.items() if name not in dropped}
+    files = {name: text for name, text in FEED.items() if name not in (dropped or ())}
     source = write_zip(tmp_path / "feed.zip", files)
     options = dict(
-        geometry=None,
+        geometry=None if dropped is not None else box(0, 0, 1, 1),
         tag="t",
         repair=False,
-        crop=False,
+        crop=dropped is None,
         modes=None,
         day=None,
         study=False,
@@ -1516,6 +1520,167 @@ def test_a_feed_missing_a_required_file_is_skipped(tmp_path, dropped, reason, wi
     with pytest.raises(_SkipFeed) as caught:
         _process_feed(source, **options)
     assert (caught.value.reason, caught.value.window) == (reason, window)
+    if dropped is None:
+        # A mode filter reads the emptied routes.txt before the validation.
+        with pytest.raises(_SkipFeed, match=reason):
+            _process_feed(source, **{**options, "modes": {"bus"}})
+
+
+def test_the_area_crop_says_what_it_left_out(tmp_path):
+    # Stops just outside a boundary, served only by trips that never stop
+    # inside, were removed with no word (50 HSL stops at Helsinki).
+    from shapely.geometry import box
+
+    from transitio.pipeline._fetch import _crop_counts_read, _crop_note, _process_feed
+
+    source = write_zip(tmp_path / "feed.zip", FEED)
+    *_, made, _, _ = _process_feed(
+        source,
+        geometry=box(*CITY_BBOX),
+        tag="t",
+        repair=False,
+        crop=True,
+        modes=None,
+        day=None,
+        study=False,
+        hosted=None,
+        budgets={},
+    )
+    assert _crop_note(made) == "crop to the area: kept 1 of 2 trips and 2 of 3 stops"
+    # Stored with the cached output, they are read back only in that shape.
+    assert _crop_counts_read(made["crop_counts"]) and _crop_counts_read(None)
+    for bad in ({}, {"trips.txt": [1, 2]}, {"trips.txt": [1], "stops.txt": [2, 3]}):
+        assert not _crop_counts_read(bad)
+
+
+def test_a_size_limit_is_noted_and_warned(tmp_path):
+    # A crop over 2 GiB was refused with a skip line only, and an uncropped
+    # feed over a budget was delivered with a report that silently skipped
+    # its stop times.
+    from shapely.geometry import box
+
+    from transitio.pipeline._fetch import (
+        _entry,
+        _note,
+        _partial_note,
+        _process_feed,
+        _skip,
+        _warn_budgets,
+    )
+
+    source = write_zip(tmp_path / "feed.zip", FEED)
+    options = dict(geometry=None, tag="t", repair=False, crop=False, modes=None)
+    options.update(day=None, study=False, hosted=None)
+    *_, made, _, _ = _process_feed(source, budgets={"max_entry_bytes": 160}, **options)
+    note = _partial_note(made)
+    assert note == (
+        "validated partly: stop_times.txt declares 178 uncompressed bytes, over "
+        "the 160-byte budget (max_entry_bytes)"
+    )
+    with pytest.raises(OSError) as refused:
+        options.update(crop=True, geometry=box(*CITY_BBOX))
+        _process_feed(source, budgets={"max_total_bytes": 300}, **options)
+    delivered, skipped = _entry("f-a", None), _entry("f-b", None)
+    delivered["decision"] = "delivered"
+    _note(delivered, note)
+    _skip(skipped, f"processing failed: {refused.value}")
+    with pytest.warns(UserWarning) as caught:
+        _warn_budgets([delivered, skipped], stacklevel=2)
+    (said,) = [str(w.message) for w in caught]
+    assert said.startswith(f"size limits reached: f-a delivered ({note}); f-b skipped")
+    assert said.endswith("fetch(max_entry_bytes=..., max_total_bytes=...) raises them")
+
+
+def test_the_repair_writes_a_missing_agency_txt(tmp_path):
+    # A feed without agency.txt was skipped even with repair=True.
+    from transitio.pipeline._fetch import (
+        _agency_note,
+        _agency_written,
+        _process_feed,
+    )
+
+    files = {name: text for name, text in FEED.items() if name != "agency.txt"}
+    source = write_zip(tmp_path / "feed.zip", files)
+    path, _, made, *_ = _process_feed(
+        source,
+        geometry=None,
+        tag="t",
+        repair=True,
+        crop=False,
+        modes=None,
+        day=None,
+        study=False,
+        hosted=None,
+        budgets={},
+        provenance={"source_url": "https://x.example/gtfs.zip"},
+        name="Region",
+    )
+    with zipfile.ZipFile(path) as archive:
+        rows = archive.read("agency.txt").decode().splitlines()[1:]
+    zone = "https://x.example/gtfs.zip,Europe/Helsinki"
+    assert rows == [f"espoo,Region (espoo),{zone}", f"hsl,Region (hsl),{zone}"]
+    added = [fix for fix in made["fixes"] if fix["action"] == "add_entity"]
+    assert added == [
+        {
+            "action": "add_entity",
+            "filename": "agency.txt",
+            "csvRowNumber": row,
+            "field": "agency_name",
+            "new_value": f"Region ({agency_id})",
+            "triggered_by": "missing_required_file",
+        }
+        for row, agency_id in ((2, "espoo"), (3, "hsl"))
+    ]
+    assert _agency_note(made) == (
+        "repair wrote agency.txt: the feed's name and source URL, the time zone "
+        "of its stops"
+    )
+    assert not list(tmp_path.glob("*-agency.zip"))
+    # Without a usable name nothing is written.
+    assert _agency_written(source, tmp_path / "x.zip", (" ", "https://x")) == []
+
+
+@pytest.mark.parametrize(
+    "names, extra, note",
+    [
+        pytest.param({"agency.txt": "Agency.txt"}, {}, "'Agency.txt'", id="case"),
+        pytest.param({"stops.txt": " stops.txt"}, {}, "' stops.txt'", id="padded"),
+        pytest.param({"routes.txt": "routes.csv"}, {}, "'routes.csv'", id="csv"),
+        pytest.param({n: f"gtfs/{n}" for n in FEED}, {}, "'gtfs/", id="folder"),
+        pytest.param({}, {"Agency.txt": "x\n"}, None, id="own-name-present"),
+        pytest.param(
+            {"agency.txt": "Agency.txt"}, {"AGENCY.csv": "x\n"}, None, id="two-claims"
+        ),
+    ],
+)
+def test_files_under_other_names_are_read_under_their_own(tmp_path, names, extra, note):
+    # 13 crawled feeds held a required file as Agency.txt, stops.csv or with a
+    # leading space, and fetch skipped each as missing that file.
+    from transitio.catalog._cache import FeedCache
+    from transitio.pipeline._fetch import (
+        _add_version,
+        _process_feed,
+        _renamed_note,
+        _SkipFeed,
+    )
+
+    cache = FeedCache(tmp_path / "cache")
+    cache.folder("f-a").mkdir(parents=True)
+    files = {names.get(name, name): text for name, text in FEED.items()}
+    staged = write_zip(cache.folder("f-a") / "latest.zip", {**files, **extra})
+    version = _add_version(cache, "f-a", staged, "https://x.example", "producer", None)
+    options = dict(geometry=None, repair=False, crop=False, modes=None, day=None)
+    options.update(study=False, hosted=None, budgets={})
+    if note is None and names:
+        with pytest.raises(_SkipFeed, match="missing required file agency.txt"):
+            _process_feed(version.path, **options)
+        assert _renamed_note(version) is None
+        return
+    _process_feed(version.path, **options)
+    with zipfile.ZipFile(version.path) as archive:
+        assert set(FEED) <= set(archive.namelist())
+    said = _renamed_note(version)
+    assert said is None if note is None else said.startswith(f"read {note}")
 
 
 FK = "foreign_key_violation"
@@ -1913,7 +2078,32 @@ def test_delivered_feeds_do_not_repeat_each_others_trips(tmp_path, monkeypatch):
     result = fetch(place="Q1757", index=index, crop=False, osm=False, expired="keep")
     trips = [read_entry(path, "trips.txt").decode().split() for path in result.feeds]
     assert [rows[1:] for rows in trips] == [["x36,wk,t1"], ["x36,wk,t2"]]
-    assert result.selection[1]["note"] == "1 repeated trips of f-a left out"
+    assert result.selection[1]["note"] == (
+        "1 repeated trips of f-a left out (0 exact, 1 near: within 50 m and 3 minutes)"
+    )
+
+
+def test_near_repeats_name_the_stops_whose_departures_they_take():
+    # Near repeats removed stop events at stops the trips they repeat do not
+    # serve (239 of 80,098 at Augsburg) with no warning.
+    from transitio.pipeline._fetch import _repeats_note, _warn_unaligned
+
+    from transitio.catalog._cache import _repeats_record
+
+    forged = "s\n\x1b[2Jx" + "y" * 60
+    with pytest.warns(UserWarning) as caught:
+        _warn_unaligned({"f-b": {"s9": 2, "s1": 1, forged: 1}, "f-c": {}}, 2)
+    (said,) = [str(w.message) for w in caught]
+    assert "f-b: 4 at 3 stops (s9, s  [2Jx" in said and "f-c" not in said
+    assert "\n" not in said and "\x1b" not in said and "y" * 40 not in said
+    # A repeat record a release before these fields stays well formed.
+    old = {"dropped": 1, "of": ["f-a"], "skip": None, "note": "n", "window": None}
+    assert _repeats_record("0" * 64, old)
+    assert not _repeats_record("0" * 64, {**old, "unaligned": {"s": 0}})
+    outcome = {"note": "3 repeated trips of f-a left out", "dropped": 3, "near": 1}
+    assert _repeats_note(outcome).endswith(
+        "(2 exact, 1 near: within 50 m and 3 minutes)"
+    )
 
 
 def test_a_placeholder_calendar_is_an_older_version_of_the_dated_network(tmp_path):
@@ -3619,7 +3809,7 @@ def test_trips_listed_per_date_are_matched_through_their_days(blocks):
 
     earlier = feed("t", range(1, 13))
     later = feed("u", range(1, 14), extra=[("x1a", 1)])
-    gone, of, _ = repeated_trips([earlier, later])[1]
+    gone, of, *_ = repeated_trips([earlier, later])[1]
     # Each earlier copy covers one later copy on its date. Unblocked trips go
     # first, so with blocks x1a takes t1a's date and block k1 is kept.
     first = 2 if blocks else 1

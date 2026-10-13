@@ -34,16 +34,25 @@ def drop_duplicate_trips(merged, table_sets, positions, near=True):
         rows = pd.concat([merged.get("transfers.txt"), rows], ignore_index=True)
         merged["transfers.txt"] = rows.fillna("")
     _drop_trip_rows(merged, gone, [])
-    # A stop time is unaligned when none of its trip's pairs aligns it.
-    stops = aligned.groupby(["later", "position"])["earlier_stop"].count()
     return {
         "dropped": len(gone),
         "by_feed": {at: len(ids) for at, ids in zip(positions, dropped) if ids},
         "unexpanded_services": unexpanded,
         "stop_links": len(links),
         "near_matches": aligned["later"].nunique(),
-        "unaligned_stops": int((stops == 0).sum()),
+        "unaligned_stops": len(_unaligned(aligned)),
     }
+
+
+def _unaligned(aligned):
+    """The stop times of the later trips in ``aligned`` (the near pairs'
+    stops, :func:`_find_duplicates`) that none of their trip's pairs aligns,
+    as ``later``, ``position`` and ``later_stop`` rows."""
+    counted = aligned.groupby(["later", "position", "later_stop"])["earlier_stop"]
+    counted = counted.count().reset_index()
+    return counted.loc[
+        counted["earlier_stop"] == 0, ["later", "position", "later_stop"]
+    ]
 
 
 def _named_trips(tables, name, *columns):
@@ -53,11 +62,14 @@ def _named_trips(tables, name, *columns):
 
 
 def repeated_trips(table_sets, near=True, day=None):
-    """Per input, ``(trip ids, earlier, in scope)``: the ids of the trips
-    that repeat, or with ``near`` nearly repeat, trips kept from the inputs
-    before it, as :func:`~transitio.gtfs.merge_tables` leaves them out; the
-    positions of the inputs whose trips they repeat, sorted; and the ids of
-    its trips in scope, which a trip that cannot be compared stays among.
+    """Per input, ``(trip ids, earlier, in scope, near, unaligned)``: the
+    ids of the trips that repeat, or with ``near`` nearly repeat, trips kept
+    from the inputs before it, as :func:`~transitio.gtfs.merge_tables`
+    leaves them out; the positions of the inputs whose trips they repeat,
+    sorted; the ids of its trips in scope, which a trip that cannot be
+    compared stays among; the ids among the first of the trips only nearly
+    repeated; and ``{stop_id: count}`` of those trips' stop times at stops
+    the trips they repeat do not serve, whose departures go with them.
 
     ``table_sets`` are the inputs' unprefixed tables; an empty one is not
     compared. With a ``day``, a date, the trips in scope are those running
@@ -79,15 +91,36 @@ def repeated_trips(table_sets, near=True, day=None):
             scope[position] = set(trips["trip_id"])
         prefixed.append(_prefix_feed(tables, f"f{position}", set()))
     if len(prefixed) < 2:
-        return [(set(), [], ids) for ids in scope]
+        return [(set(), [], ids, set(), {}) for ids in scope]
     dropped, exact, aligned, _ = _find_duplicates(prefixed, near, within)
     pairs = set(exact) | set(zip(aligned["later"], aligned["earlier"]))
-    found = [(set(), set()) for _ in table_sets]
+    found = [(set(), set(), set(), {}) for _ in table_sets]
+
+    def split(value):
+        # "f<position>:<id>" as (position, id).
+        head, _, rest = value.partition(":")
+        return int(head[1:]), rest
+
     for position, gone in zip(present, dropped):
-        found[position][0].update(trip.split(":", 1)[1] for trip in gone)
+        found[position][0].update(split(trip)[1] for trip in gone)
     for later, earlier in pairs:
-        found[int(later.split(":", 1)[0][1:])][1].add(int(earlier.split(":", 1)[0][1:]))
-    return [(gone, sorted(of), ids) for (gone, of), ids in zip(found, scope)]
+        found[split(later)[0]][1].add(split(earlier)[0])
+    for later in aligned["later"].unique():
+        position, trip = split(later)
+        if trip in found[position][0]:
+            found[position][2].add(trip)
+    for later, stop in _unaligned(aligned)[["later", "later_stop"]].itertuples(
+        index=False
+    ):
+        position, trip = split(later)
+        if trip in found[position][2]:
+            counts = found[position][3]
+            stop = split(stop)[1]
+            counts[stop] = counts.get(stop, 0) + 1
+    return [
+        (gone, sorted(of), ids, nearly, counts)
+        for (gone, of, nearly, counts), ids in zip(found, scope)
+    ]
 
 
 def _running(tables, within):

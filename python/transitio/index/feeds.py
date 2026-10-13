@@ -210,7 +210,6 @@ _SUMMARY_KEYS = (
     "share_of_place",
     "share_basis",
     "stale_when_indexed",
-    "carried_by",
     "overlap",
     "mark",
 )

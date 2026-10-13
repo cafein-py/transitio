@@ -9,7 +9,12 @@ stop. ``feed_stops`` — a feed that legitimately skipped ``stop_times`` —
 hashes ``(route_id, agency_id, route_type)`` plus the same coordinate set:
 route ids alone would let a feed keep its ids while moving its stops across a
 border or into a second city. Both are derivable from the downloaded feed
-alone; neither includes anything computed against the boundary cache.
+alone; neither includes anything computed against the boundary cache. Each
+has a version 2, ``route_stops@2`` and ``feed_stops@2``, that reads route,
+agency, stop and trip ids trimmed of surrounding whitespace, so a feed padding
+its ids (``trips.txt`` with a space after each comma) joins its trips to its
+stop times; the version-1 kinds read ids as written, so an index built with
+them still matches.
 
 The content identity (:func:`identity`) is a separate, per-table digest of a
 feed's schedule tables, normalized so that two copies of one feed match
@@ -40,13 +45,16 @@ __all__ = [
     "IDENTITY_TABLES",
     "IDENTITY_VERSION",
     "KINDS",
+    "TRIMMED_KINDS",
     "compute",
     "from_feed",
     "identical_groups",
     "identity",
 ]
 
-KINDS = ("route_stops", "feed_stops")
+# Version 2 of each kind: ids trimmed of surrounding whitespace.
+TRIMMED_KINDS = {"route_stops@2": "route_stops", "feed_stops@2": "feed_stops"}
+KINDS = ("route_stops", "feed_stops", *TRIMMED_KINDS)
 # ~1 m: absorbs float formatting churn, never a moved stop.
 COORDINATE_DECIMALS = 5
 
@@ -66,7 +74,7 @@ def compute(kind, routes, coords, served=None):
     """
     if kind not in KINDS:
         raise ValueError(f"unknown fingerprint kind {kind!r}")
-    if kind == "route_stops" and served is None:
+    if TRIMMED_KINDS.get(kind, kind) == "route_stops" and served is None:
         raise ValueError("route_stops needs the served stops per route")
     digest = hashlib.sha256()
     _line(digest, ["kind", kind])
@@ -74,7 +82,7 @@ def compute(kind, routes, coords, served=None):
     for route_id in sorted(routes):
         info = routes[route_id]
         row = [route_id, info.get("agency_id") or "", info.get("route_type")]
-        if kind == "route_stops":
+        if TRIMMED_KINDS.get(kind, kind) == "route_stops":
             row.append(sorted(served.get(route_id, ())))
         _line(digest, row)
     _line(digest, ["stops"])
@@ -106,7 +114,8 @@ def from_feed(path, kind):
     feed that cannot produce the evidence the selector was built from, which
     the caller treats as a mismatch rather than a crash. The extraction mirrors
     the build stage's: root-level members read by name, header names trimmed
-    (of two that trim alike, the first column is read), ids kept as written,
+    (of two that trim alike, the first column is read), ids kept as written
+    (trimmed for a version-2 kind, which ``route_ids`` then are too),
     coordinates range-checked, traversal-only stop-time rows excluded — so an
     unchanged feed recomputes the byte-identical digest.
     """
@@ -123,16 +132,17 @@ def from_feed(path, kind):
             names = collections.Counter(info.filename for info in archive.infolist())
             if any(names[member] > 1 for member in _MEMBERS):
                 return None, set()
-            routes = _member_routes(archive)
+            trim = kind in TRIMMED_KINDS
+            routes = _member_routes(archive, trim)
             if routes is None:
                 return None, set()
             present = set(routes)
-            coords = _member_coords(archive)
+            coords = _member_coords(archive, trim)
             if coords is None:
                 return None, present
             served = None
-            if kind == "route_stops":
-                served = _member_served(archive, routes)
+            if TRIMMED_KINDS.get(kind, kind) == "route_stops":
+                served = _member_served(archive, routes, trim)
                 if served is None:
                     return None, present
             return compute(kind, routes, coords, served), present
@@ -192,28 +202,36 @@ def _header_names(names):
     return trimmed
 
 
-def _member_routes(archive):
+def _id(row, field, trim):
+    """``row``'s ``field``, ``""`` when absent, trimmed with ``trim``."""
+    value = row.get(field) or ""
+    return value.strip() if trim else value
+
+
+def _member_routes(archive, trim=False):
     """``{route_id: {"route_type", "agency_id"}}`` from ``routes.txt``, or
-    None when it is absent; an unparsable type is None, ids stay verbatim."""
+    None when it is absent; an unparsable type is None, ids stay verbatim
+    unless ``trim``."""
     with _member(archive, "routes.txt") as reader:
         if reader is None:
             return None
         routes = {}
         for row in reader:
             value = (row.get("route_type") or "").strip()
-            route_id = row.get("route_id") or ""
+            route_id = _id(row, "route_id", trim)
             if not route_id:
                 continue
             routes[route_id] = {
                 "route_type": int(value) if value.isdigit() else None,
-                "agency_id": row.get("agency_id") or "",
+                "agency_id": _id(row, "agency_id", trim),
             }
         return routes
 
 
-def _member_coords(archive):
+def _member_coords(archive, trim=False):
     """``{stop_id: (lon, lat)}`` from ``stops.txt`` for parseable, in-range
-    rows, or None when it is absent; ids verbatim, last row wins."""
+    rows, or None when it is absent; ids verbatim unless ``trim``, last row
+    wins."""
     with _member(archive, "stops.txt") as reader:
         if reader is None:
             return None
@@ -224,23 +242,24 @@ def _member_coords(archive):
                 y = float(row.get("stop_lat") or "")
             except ValueError:
                 continue
-            stop_id = row.get("stop_id") or ""
+            stop_id = _id(row, "stop_id", trim)
             if stop_id and -180.0 <= x <= 180.0 and -90.0 <= y <= 90.0:
                 coords[stop_id] = (x, y)
         return coords
 
 
-def _member_served(archive, routes):
+def _member_served(archive, routes, trim=False):
     """``{route_id: {stop_id}}`` scheduled by ``trips.txt``/``stop_times.txt``
     for known routes, or None when either member is absent; a stop both
-    no-pickup and no-drop-off is traversal, not service, and is excluded."""
+    no-pickup and no-drop-off is traversal, not service, and is excluded.
+    Ids are trimmed with ``trim``."""
     with _member(archive, "trips.txt") as reader:
         if reader is None:
             return None
         trip_routes = {}
         for row in reader:
-            trip_id = row.get("trip_id") or ""
-            route_id = row.get("route_id") or ""
+            trip_id = _id(row, "trip_id", trim)
+            route_id = _id(row, "route_id", trim)
             if trip_id and route_id in routes:
                 trip_routes[trip_id] = route_id
     with _member(archive, "stop_times.txt") as reader:
@@ -248,8 +267,8 @@ def _member_served(archive, routes):
             return None
         served = {}
         for row in reader:
-            route_id = trip_routes.get(row.get("trip_id") or "")
-            stop_id = row.get("stop_id") or ""
+            route_id = trip_routes.get(_id(row, "trip_id", trim))
+            stop_id = _id(row, "stop_id", trim)
             if route_id is None or not stop_id:
                 continue
             if (row.get("pickup_type") or "").strip() == "1" and (

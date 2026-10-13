@@ -393,12 +393,16 @@ def test_outputs_are_keyed_by_the_exact_area_and_the_budgets():
         [(0, 0), (1, 0), (1, 1), (0.5, 0.5), (0, 1)]
     )
 
-    def key(area, crop=True, **budgets):
-        return _output_key(version, area, None, crop, False, budgets)
+    def key(area, crop=True, agency=None, **budgets):
+        return _output_key(
+            version, area, None, crop, agency is not None, budgets, agency
+        )
 
     assert key(square) != key(notched)  # the same bounds
     assert key(square) != key(square, max_notices_per_file=5)
     assert key(square, crop=False) == key(notched, crop=False)
+    # The agency a repair writes into a missing agency.txt.
+    assert key(square, agency=("A", "u")) != key(square, agency=("B", "u"))
 
 
 def test_an_area_fetch_delivers_the_same_content_once(pipeline_env, monkeypatch):
@@ -944,7 +948,7 @@ def test_fetch_place_selects_downloads_and_processes(tmp_path, monkeypatch):
         ({"exclude": ["national"]}, "exclude="),
         ({"on_unknown": "exclude"}, "on_unknown='exclude'"),
         ({"on_untrusted_selector": "drop"}, "on_untrusted_selector='drop'"),
-        ({"contained": "keep"}, "contained='keep'"),
+        ({"contained": "drop"}, "contained='drop'"),
         ({"feeds": ["f-a"]}, "feeds="),
         ({"credentials": {"p": {"key": "k"}}}, "credentials="),
     ],
@@ -1763,6 +1767,8 @@ MARKED = (
     "private or campus service, not considered: fetch takes it when named in feeds="
 )
 NAMED, ALL = {"feeds": ["A", "M"]}, {"A": "+", "M": "+"}
+# Containers first, contained feeds left out before download.
+DROP = {"contained": "drop"}
 # A trip half a minute after the 09:00 trip, which it nearly repeats.
 NEAR_NINE = {
     "trips.txt": "r1,wk,x\n",
@@ -1788,11 +1794,12 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
                 "Y": "+ cut to 2 of 3 routes; 1 repeated trips of X left out [X] (1)",
             },
         ),
-        ({"F": IN_C, "C": {**C, "renewed": True}}, {}, {"C": "+", "F": KEPT}),
-        ({"F": {**IN_C, "renewed": True}, "C": C}, {}, {"C": "+", "F": KEPT}),
+        ({"F": IN_C, "C": C}, {}, {"C": "+", "F": "+"}),
+        ({"F": IN_C, "C": {**C, "renewed": True}}, DROP, {"C": "+", "F": KEPT}),
+        ({"F": {**IN_C, "renewed": True}, "C": C}, DROP, {"C": "+", "F": KEPT}),
         (
             {"F": IN_C, "C": {**AB, "cut": "a"}},
-            {},
+            DROP,
             {
                 "C": "+ cut to 1 of 2 routes",
                 "F": f"+ {WHOLE}; kept: container C cropped to selected routes",
@@ -1800,12 +1807,12 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
         ),
         (
             {"F": IN_C, "C": {**C, "ended": True}},
-            {},
+            DROP,
             {"C": f"- {R_ENDED}{SAME}", "F": "+ kept: container C skipped"},
         ),
         (
             {"P": {**AB, "cut": "a"}, "C": AB, "F": IN_C},
-            {},
+            DROP,
             {
                 "P": "+ cut to 1 of 2 routes",
                 "C": f"+ {WHOLE}; 1 repeated trips of P left out [P] (1)",
@@ -1814,7 +1821,7 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
         ),
         (
             {"C": AB, "P": {**AB, "cut": "a"}, "F": IN_C},
-            {},
+            DROP,
             {"C": f"+ {WHOLE}", "P": "- same content as C [C]", "F": f"{SKIP_C} -> C"},
         ),
         (
@@ -1869,12 +1876,12 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
         ),
         (
             {"V": {**NEW, "hours": (9,)}, "C": OLD, "F": IN_C},
-            ON_DAY,
+            {**ON_DAY, **DROP},
             {"V": "+", "C": "+", "F": f"{SKIP_C} -> C"},
         ),
         (
             {"V": {**NEW, "hours": (9,)}, "E": OLD, "C": OLD, "F": IN_C},
-            ON_DAY,
+            {**ON_DAY, **DROP},
             {"V": "+", "E": "+", "C": "- same content as E [E]", "F": f"{SKIP_C} -> E"},
         ),
         (
@@ -1919,6 +1926,19 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
             ON_DAY,
             {"A": f"+ {HELD_NOTE}", "B": f"+ {HELD_NOTE}"},
         ),
+        (
+            {"A": NEW, "B": {**HELD, "routes": ("x",), "hours": (2,)}},
+            ON_DAY,
+            {"A": "+", "B": f"+ {HELD_NOTE}; similar to A but adds service on {DAY}"},
+        ),
+        (
+            {
+                "A": {**NEW, "routes": ("r1", "r2", "r3", "r4")},
+                "B": {**HELD, "routes": ("r1", "r2", "r3")},
+            },
+            ON_DAY,
+            {"A": "+", "B": f"- another version of A {HELD_NOTE} [A 0.75 1.0]"},
+        ),
         ({"X": F, "Y": C}, {}, {"X": "+", "Y": "- every trip repeats a trip of X (1)"}),
         (
             {"A": NEW, "B": {**OLD, **F}},
@@ -1953,7 +1973,7 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
         ),
     ],
     ids=(
-        "identical identical-overlapping-routes container-renewed "
+        "identical identical-overlapping-routes contained-kept container-renewed "
         "contained-renewed container-cropped container-expired "
         "partial-copy-first partial-copy-after version-covered "
         "version-legal-form version-unnamed-agency version-extra-trip "
@@ -1963,6 +1983,7 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
         "version-same-content-container version-under-stop-threshold "
         "version-transfers versions-no-study-day placeholder-starting-later "
         "placeholder-under-stop-threshold placeholders-other-routes "
+        "placeholder-other-routes-adds placeholder-other-routes-repeats "
         "repeats-other-agency repeats-on-the-day repeats-not-every-date "
         "repeats-other-time-zone repeats-kept repeats-exact marked-skipped "
         "marked-named repeats-kept-in-the-more-local-feed"
@@ -2411,7 +2432,7 @@ def test_containment_from_the_cache_follows_the_proofs_of_the_snapshot(
 
     monkeypatch.setattr("transitio.catalog.TransitlandAtlas", Served)
     cache_dir = tmp_path / "cache"
-    options = dict(place="Q1757", index=index, crop=False, osm=False)
+    options = dict(place="Q1757", index=index, crop=False, osm=False, **DROP)
 
     def decisions():
         result = fetch(cache_dir=cache_dir, **options)
@@ -2451,7 +2472,7 @@ def test_a_container_read_from_the_hosted_copy_proves_nothing(tmp_path, monkeypa
 
     _serve(monkeypatch, handler)
     cache_dir = tmp_path / "cache"
-    options = dict(place="Q1757", index=index, crop=False, osm=False)
+    options = dict(place="Q1757", index=index, crop=False, osm=False, **DROP)
     first = fetch(cache_dir=cache_dir, **options)
     online[0] = False
     again = fetch(cache_dir=cache_dir, **options)
@@ -3171,53 +3192,6 @@ _REMOTE = (26.0, 61.0, 26.2, 61.2)
 
 
 @pytest.mark.parametrize(
-    "stops, expected, inside",
-    [
-        pytest.param([[(60.169, 24.931)]], "served", [(24.931, 60.169)], id="one-part"),
-        pytest.param(
-            [[(60.169, 24.931)], [(61.1, 26.1), (60.169, 24.931)]],
-            "whole",
-            [(24.931, 60.169), (26.1, 61.1)],
-            id="both-parts",
-        ),
-        pytest.param([[(59.0, 24.0)]], "whole", None, id="no-part"),
-        pytest.param([], "whole", None, id="nothing-delivered"),
-        # A feed whose stops cannot be read could serve the remote part.
-        pytest.param([[(60.169, 24.931)], None], "whole", None, id="unreadable-stops"),
-    ],
-)
-def test_osm_parts_are_those_holding_a_delivered_stop(
-    tmp_path, stops, expected, inside
-):
-    import shapely
-
-    from transitio.osm._fetch import _buffered
-    from transitio.pipeline._fetch import _osm_parts, _osm_stops
-
-    geometry = shapely.union_all([shapely.box(*_SERVED), shapely.box(*_REMOTE)])
-    feeds = []
-    for number, coords in enumerate(stops):
-        path = tmp_path / f"{number}.zip"
-        if coords is None:
-            path.write_bytes(_zip({"agency.txt": GTFS["agency.txt"]}))
-        else:
-            rows = "".join(f"s{i},{y},{x}\n" for i, (y, x) in enumerate(coords))
-            # A row without coordinates is not a located stop.
-            rows += "s-blank,,\n"
-            path.write_bytes(_zip({"stops.txt": "stop_id,stop_lat,stop_lon\n" + rows}))
-        feeds.append(path)
-    parts, located = _osm_parts(geometry, feeds)
-    assert parts.equals(shapely.box(*_SERVED) if expected == "served" else geometry)
-    assert [None if located[p] is None else located[p].tolist() for p in feeds] == [
-        None if coords is None else [[x, y] for y, x in coords] for coords in stops
-    ]
-    # What the extract must cover: the located stops inside the grown parts,
-    # each once.
-    must_cover = _osm_stops(_buffered(parts, 1600), located)
-    assert must_cover == (None if inside is None else shapely.multipoints(inside))
-
-
-@pytest.mark.parametrize(
     ("outside", "total", "warned"),
     [(21, 40, True), (20, 40, False), (0, 0, False)],
 )
@@ -3238,45 +3212,27 @@ def test_most_stops_outside_the_osm_extract_warn(outside, total, warned):
     )
 
 
-_PARTS_NOTE = "OSM area: 1 of 2 parts (247 of 488 km²)"
-
-
 @pytest.mark.parametrize(
-    "served, counts, expected",
+    "counts, expected",
     [
-        pytest.param(True, (0, 2, 0), _PARTS_NOTE, id="parts"),
         pytest.param(
-            False,
-            (12, 40, 0),
-            "OSM area: 12 of 40 located stops outside it",
-            id="stops",
+            (12, 40, 0), "OSM area: 12 of 40 located stops outside it", id="stops"
         ),
         pytest.param(
-            True,
-            (1, 3, 0),
-            f"{_PARTS_NOTE}; 1 of 3 located stops outside it",
-            id="parts-and-stops",
-        ),
-        pytest.param(
-            False,
             (0, 40, 1),
             "OSM area: 0 of 40 located stops outside it (stops.txt of 1 feed not read)",
             id="unread",
         ),
-        pytest.param(False, (0, 40, 0), None, id="neither"),
+        pytest.param((0, 40, 0), None, id="neither"),
     ],
 )
-def test_osm_note_names_the_parts_and_stops_outside_the_area(served, counts, expected):
-    import shapely
-
+def test_osm_note_names_the_stops_outside_the_area(counts, expected):
     from transitio.pipeline._fetch import _osm_note
 
-    geometry = shapely.union_all([shapely.box(*_SERVED), shapely.box(*_REMOTE)])
-    parts = shapely.box(*_SERVED) if served else geometry
-    assert _osm_note(geometry, parts, *counts) == expected
+    assert _osm_note(*counts) == expected
 
 
-def test_fetch_place_fetches_the_osm_extract_last_for_the_served_parts(
+def test_fetch_place_fetches_the_osm_extract_last_for_the_whole_place(
     tmp_path, monkeypatch
 ):
     import shapely
@@ -3296,26 +3252,27 @@ def test_fetch_place_fetches_the_osm_extract_last_for_the_served_parts(
         return download(self, feed, directory=directory)
 
     def recorded_fetch_pbf(aoi, **kwargs):
-        events.append((aoi, kwargs["buffer_m"], kwargs["must_cover"]))
+        events.append((aoi, kwargs["buffer_m"], kwargs.get("must_cover")))
         return fake_pbf
 
     monkeypatch.setattr(
         "transitio.catalog.TransitlandAtlas._fetch_static", recorded_download
     )
     monkeypatch.setattr("transitio.osm.fetch_pbf", recorded_fetch_pbf)
-    served = shapely.box(*_SERVED)
     place_obj = transitio.place("Q1757", index=index)
-    place_obj._record["geometry"] = shapely.union_all([served, shapely.box(*_REMOTE)])
+    # Only the first part holds a stop; the extract covers both.
+    whole = shapely.union_all([shapely.box(*_SERVED), shapely.box(*_REMOTE)])
+    place_obj._record["geometry"] = whole
     result = fetch(place=place_obj, directory=tmp_path / "out", crop=False)
 
     feed, (aoi, buffer_m, must_cover) = events
-    assert feed == "feed" and aoi.equals(served) and buffer_m == 1600
-    assert must_cover == shapely.multipoints([(24.931, 60.169), (24.941, 60.171)])
+    assert feed == "feed" and aoi.equals(whole) and buffer_m == 1600
+    assert must_cover is None  # all of the grown place
     assert result.osm_pbf == fake_pbf
-    assert result.osm_area.equals(_buffered(served, 1600))
+    assert result.osm_area.equals(_buffered(whole, 1600))
     (entry,) = result.selection
     assert entry["decision"] == "delivered"
-    assert result.osm_note.startswith("OSM area: 1 of 2 parts (")
+    assert result.osm_note is None
 
 
 # route -> (agency, stop, trip, route_type); a1 carries local+regional.
@@ -3408,7 +3365,7 @@ def _feed_tables(path):
     return out
 
 
-def _selector_index(tmp_path, edges):
+def _selector_index(tmp_path, edges, **columns):
     import transitio.index as transitio_index
     from index_fixture import HULL, covered_feed, write_index
 
@@ -3416,6 +3373,7 @@ def _selector_index(tmp_path, edges):
         **covered_feed("f-a", coverage_source="crawl"),
         "coverage": HULL,
         "atlas": {"urls": {"static_current": "https://feeds.example/a.zip"}},
+        **columns,
     }
     return transitio_index.read_index(
         write_index(tmp_path / "index", feeds=[feed], edges=edges)
@@ -3661,7 +3619,8 @@ def test_fetch_place_stale_selector_follows_on_untrusted_selector(
     assert sel["trusted"] is False and sel["reason"] == "stale" and sel["kept"] is None
     assert whole.selection[0]["note"] == "delivered whole: selector out of date"
 
-    # auto + exclude: the exclusion is a hard constraint, so the feed is skipped.
+    # auto + exclude: the exclusion is a hard constraint, so the changed feed
+    # is cut to the selected routes it still has; "drop" skips it.
     _stub_pbf_and_atlas(monkeypatch, tmp_path, payload)
     excl = fetch(
         place="Q1757",
@@ -3671,8 +3630,28 @@ def test_fetch_place_stale_selector_follows_on_untrusted_selector(
         tiers=["local"],
         exclude=["national"],
     )
-    assert excl.feeds == []
-    assert any("untrustworthy selector" in reason for _, reason in excl.skipped)
+    assert {r["route_id"] for r in _feed_tables(excl.feeds[0])["routes.txt"]} == {
+        "r-local"
+    }
+    (sel,) = excl.selections
+    assert (sel["trusted"], sel["reason"], sel["kept"]) == (False, "stale", ["r-local"])
+    assert sel["dropped"] == ["r-nat", "r-reg", "r-unknown"]
+    assert excl.selection[0]["note"] == (
+        "cut to 1 of 4 routes; "
+        "changed since indexed: 1 of 1 selected routes still in it"
+    )
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, payload)
+    dropped = fetch(
+        place="Q1757",
+        index=index,
+        directory=tmp_path / "d",
+        crop=False,
+        tiers=["local"],
+        exclude=["national"],
+        on_untrusted_selector="drop",
+    )
+    assert dropped.feeds == []
+    assert any("untrustworthy selector" in reason for _, reason in dropped.skipped)
 
     # error policy: an untrustworthy selector raises rather than guessing.
     _stub_pbf_and_atlas(monkeypatch, tmp_path, payload)
@@ -3694,12 +3673,116 @@ def test_fetch_place_stale_selector_follows_on_untrusted_selector(
     options = dict(place="Q1757", index=index, crop=False, tiers=["local"])
     cached = fetch(**options)
     assert [e["cache"] for e in cached.selection] == ["reused"] and cached.feeds
-    assert fetch(exclude=["national"], **options).feeds == []
+    offline_cut = fetch(exclude=["national"], **options)
+    assert {
+        r["route_id"] for r in _feed_tables(offline_cut.feeds[0])["routes.txt"]
+    } == {"r-local"}
+    (sel,) = offline_cut.selections
+    assert (sel["trusted"], sel["reason"], sel["kept"]) == (False, "stale", ["r-local"])
+    assert "changed since indexed: 1 of 1" in offline_cut.selection[0]["note"]
+    assert (
+        fetch(exclude=["national"], on_untrusted_selector="drop", **options).feeds == []
+    )
     with pytest.raises(StaleSelectorError):
         fetch(on_untrusted_selector="error", **options)
     with pytest.warns(UserWarning, match="f-a: refresh failed"):
         refreshed = fetch(use_cache=False, **options)
     assert [e["cache"] for e in refreshed.selection] == ["fallback"]
+
+
+@pytest.mark.parametrize(
+    "datasets, use_cache, failure, error",
+    [
+        pytest.param(1, True, "download", "producer down", id="download-fails"),
+        # A refresh replaces the first stale version with the second.
+        pytest.param(2, False, "download", "producer down", id="refresh-two-stale"),
+        pytest.param(1, True, "caching", "disk full", id="caching-fails"),
+    ],
+)
+def test_a_changed_dataset_is_cut_when_no_later_source_serves(
+    tmp_path, monkeypatch, datasets, use_cache, failure, error
+):
+    # A covering dataset whose selector is stale gives way to the feed's own
+    # URL; when that source fails, the dataset is cut, not skipped.
+    import io
+    from pathlib import Path as _Path
+
+    from index_fixture import edge as _edge
+    from transitio.catalog._models import Dataset
+    from transitio.pipeline import _fetch
+
+    service = {"stops": 1, "routes": 1, "departures_per_day": 1.0}
+    stale = {
+        **_edge("Q1757", "f-a", tier="local", service=service),
+        "selector_state": "complete",
+        "selector": {"route_id": ["r-local"]},
+        "fingerprint_kind": "route_stops",
+        "classification_fingerprint": "0" * 64,
+        "needs_review": False,
+    }
+    mdb = {"mdb_id": "mdb-9", "urls": {"latest": "u"}}
+    index = _selector_index(tmp_path, [stale], mdb=mdb)
+    payload = _multi_route_gtfs()
+    _stub_pbf_and_atlas(monkeypatch, tmp_path, payload)
+    covering = [
+        Dataset.from_api(
+            {"id": f"mdb-9-{n}", "feed_id": "mdb-9", "hosted_url": f"https://x/{n}"}
+        )
+        for n in range(datasets)
+    ]
+    monkeypatch.setattr(
+        "transitio.catalog.MobilityDatabase.datasets_for",
+        lambda self, feed, when: covering,
+    )
+
+    def dataset_download(self, dataset, directory=None):
+        base = _Path(directory) if directory else tmp_path
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / f"{dataset.id}.zip"
+        # Each dataset its own bytes, so each is its own version.
+        buffer = io.BytesIO(payload)
+        with zipfile.ZipFile(buffer, "a") as archive:
+            archive.writestr("readme.txt", dataset.id)
+        path.write_bytes(buffer.getvalue())
+        return path
+
+    def producer_down(self, feed, directory=None):
+        raise RuntimeError(error)
+
+    monkeypatch.setattr(
+        "transitio.catalog.MobilityDatabase._fetch_dataset", dataset_download
+    )
+    if failure == "download":
+        monkeypatch.setattr(
+            "transitio.catalog.TransitlandAtlas._fetch_static", producer_down
+        )
+    else:
+        add = _fetch._add_version
+
+        def add_version(cache, feed_id, path, url, fetched_from, *args, **options):
+            if fetched_from == "producer":
+                raise OSError(error)
+            return add(cache, feed_id, path, url, fetched_from, *args, **options)
+
+        monkeypatch.setattr(_fetch, "_add_version", add_version)
+    result = fetch(
+        place="Q1757",
+        index=index,
+        directory=tmp_path / "out",
+        crop=False,
+        osm=False,
+        tiers=["local"],
+        exclude=["national"],
+        when="2026-06-01",
+        refresh_token="tok",
+        use_cache=use_cache,
+    )
+    (entry,) = result.selection
+    assert (entry["decision"], entry["fetched_from"]) == ("delivered", "mdb_dataset")
+    assert error in entry["download_errors"]
+    assert {r["route_id"] for r in _feed_tables(result.feeds[0])["routes.txt"]} == {
+        "r-local"
+    }
 
 
 def test_a_cached_version_lacking_a_selected_route_is_passed_over(

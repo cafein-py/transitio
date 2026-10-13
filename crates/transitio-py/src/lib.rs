@@ -262,6 +262,7 @@ fn crop_feed(
         let result = transitio_gtfs::crop(&path, &output, options, &crop_options)?;
         let report = serde_json::json!({
             "row_counts": result.row_counts,
+            "source_counts": result.source_counts,
             "source_routes": result.source_routes,
             "source_notices": result.source_notices,
             "remaining_notices": result.validation.notices,

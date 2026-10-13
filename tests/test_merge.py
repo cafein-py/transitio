@@ -87,19 +87,55 @@ def test_single_agency_backfill_creates_missing_column():
     assert list(tables["fare_attributes.txt"]["agency_id"]) == ["f1:a1"]
 
 
-def test_dropped_files_and_extra_columns():
+@pytest.mark.parametrize("with_info", [True, False])
+def test_dropped_files_and_extra_columns(with_info):
+    def translated(publisher):
+        return frame(
+            table_name=["stops", "stops", "feed_info"],
+            field_name=["stop_name", "stop_name", "feed_publisher_name"],
+            language=["sv", "sv", "sv"],
+            translation=["Kampen", "Kampen", publisher.upper()],
+            record_id=["1", "", ""],
+            field_value=["", "Kamppi", publisher],
+        )
+
+    def info(publisher, start, end, version):
+        return frame(
+            feed_publisher_name=[publisher],
+            feed_publisher_url=["https://pub.example"],
+            feed_lang=["fi"],
+            feed_start_date=[start],
+            feed_end_date=[end],
+            feed_version=[version],
+        )
+
     first = {
         "stops.txt": frame(stop_id=["1"], custom_note=["keep"]),
-        "feed_info.txt": frame(feed_publisher_name=["pub"]),
-        "translations.txt": frame(table_name=["stops"]),
+        "translations.txt": translated("one"),
     }
-    second = {"stops.txt": frame(stop_id=["1"])}
+    second = {"stops.txt": frame(stop_id=["1"]), "translations.txt": translated("two")}
+    if with_info:
+        first["feed_info.txt"] = info("one", "20260101", "20261231", "v1")
+        second["feed_info.txt"] = info("two", "20260201", "20270131", "v2")
     tables, dropped = merge_tables([first, second], extra_entries=[["readme.txt"], []])
-    assert dropped == ["feed_info.txt", "readme.txt", "translations.txt"]
-    assert "feed_info.txt" not in tables
+    assert dropped == ["readme.txt"]
     stops = tables["stops.txt"]
     assert list(stops["stop_id"]) == ["f1:1", "f2:1"]
     assert list(stops["custom_note"]) == ["keep", ""]
+    kept = tables["translations.txt"]
+    # Translations by record id follow the prefixed ids; those by value once.
+    by_stop = kept[kept["table_name"] == "stops"]
+    assert list(by_stop["record_id"]) == ["f1:1", "", "f2:1"]
+    publishers = list(kept.loc[kept["table_name"] == "feed_info", "field_value"])
+    if not with_info:
+        assert "feed_info.txt" not in tables and publishers == []
+        return
+    # One feed_info row, the first input's, its dates widened, its version
+    # blank as they differ, and its translations alone.
+    (row,) = tables["feed_info.txt"].to_dict("records")
+    fields = ("feed_publisher_name", "feed_start_date", "feed_end_date", "feed_version")
+    assert tuple(row[field] for field in fields) == ("one", "20260101", "20270131", "")
+    assert publishers == ["one"]
 
 
 def test_path_and_memory_inputs_equal(tmp_path):
@@ -212,8 +248,8 @@ IN_OSLO = (59.911, 10.750)
 @pytest.mark.parametrize(
     "zones, in_oslo, timezones, error, skipped",
     [
-        ([HEL, UTC, HEL], (), "refuse", "differ", None),
-        ([HEL, UTC, HEL], (), None, None, [(1, UTC, HEL)]),
+        ([HEL, UTC, HEL], (), None, "differ", None),
+        ([HEL, UTC, HEL], (), "skip", None, [(1, UTC, HEL)]),
         ([UTC, UTC, HEL, HEL], (), "skip", None, [(0, UTC, HEL), (1, UTC, HEL)]),
         ([HEL, OSLO], (1,), "skip", None, [(1, OSLO, OSLO)]),
         ([HEL, UTC, OSLO], (), "skip", None, [(1, UTC, HEL), (2, OSLO, HEL)]),
@@ -228,7 +264,7 @@ IN_OSLO = (59.911, 10.750)
         ([UTC, CET, PARIS], (), "skip", None, [(0, UTC, HEL)]),
     ],
     ids=[
-        "refused",
+        "refused-by-default",
         "outlier-left-out",
         "stops-outweigh-count",
         "both-vouch-earliest",
@@ -1057,6 +1093,30 @@ def test_duplicate_trips(tmp_path, inputs, dropped, expected):
         "near_matches": expected.get("near", 0),
         "unaligned_stops": expected.get("unaligned", 0),
     }
+    if mode == "drop" and len(feeds) == 2:
+        # fetch's reading of the same: the near trips and their unaligned stops.
+        from transitio.gtfs._duplicates import repeated_trips
+
+        *_, near, unaligned = repeated_trips([feed.tables for feed in feeds])[1]
+        assert len(near) == expected.get("near", 0)
+        assert sum(unaligned.values()) == expected.get("unaligned", 0)
+
+
+def test_a_dropped_repeat_takes_its_translations():
+    # Translations by record id follow the merge's prefixed ids, so a
+    # translation of a trip left out as a repeat would name no trip.
+    feeds = [_repeats(ONE), _repeats(ONE)]
+    for feed in feeds:
+        feed.tables["translations.txt"] = frame(
+            table_name=["trips"],
+            field_name=["trip_headsign"],
+            language=["sv"],
+            translation=["Centrum"],
+            record_id=["t1"],
+        )
+    tables, _ = merge_tables([feed.tables for feed in feeds])
+    assert list(tables["trips.txt"]["trip_id"]) == ["f1:t1"]
+    assert list(tables["translations.txt"]["record_id"]) == ["f1:t1"]
 
 
 def test_repeated_trips_on_a_day():
@@ -1076,7 +1136,11 @@ def test_repeated_trips_on_a_day():
     second = _repeats(_trips(later, {"times": LATER}), rows=[*moved, undeclared])
     tables = [_repeats(ONE).tables, second.tables]
     found = repeated_trips(tables, day=datetime.date(2026, 1, 14))
-    assert found == [(set(), [], {"t1"}), ({"t1"}, [0], {"t1", "t2", "t9"})]
+    # t1 repeats nearly, every stop aligned.
+    assert found == [
+        (set(), [], {"t1"}, set(), {}),
+        ({"t1"}, [0], {"t1", "t2", "t9"}, {"t1"}, {}),
+    ]
 
 
 def test_rows_of_dropped_trips_go():

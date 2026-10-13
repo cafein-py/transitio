@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- `crop_feed` reports `source_counts`, the rows of trips.txt and stops.txt
+  in the source before the crop.
+- `transitio.index.fingerprint` has version-2 kinds, `route_stops@2` and
+  `feed_stops@2`, that read route, agency, stop and trip ids trimmed of
+  surrounding whitespace; the version-1 kinds are unchanged.
+
+### Changed
+
+- `fetch` stores a download holding its GTFS files under other names (in
+  another case, padded with spaces, ending `.csv`, or all in one folder)
+  with them under their own names, noted on the feed.
+- With `repair=True`, a feed without agency.txt gets one, named after the
+  feed, with its source URL and the time zone of most of its stops,
+  recorded as repair fixes; when the name, the URL or the zone is unknown
+  none is written and the feed is skipped as before.
+- A crop that keeps no trip skips its feed as "no trip stops in the area",
+  "no trip of the selected routes stops in the area" or "no trip runs the
+  selected routes" instead of "missing calendar.txt and
+  calendar_dates.txt".
+- A delivered feed whose validation a byte or row budget cut short is noted
+  "validated partly: …", and one warning per call names every feed a
+  budget skipped or cut short and the `fetch` keywords that raise them.
+- `fetch(place=...)` fetches the OSM extract for the whole place grown by
+  1.6 km, not only for the parts holding a delivered stop; a feed the area
+  crop left trips or stops out of is noted with the counts kept.
+- `fetch(contained=...)` defaults to `"keep"`: a feed the index records as
+  contained in a larger one is downloaded, and only the trips its container
+  also runs are left out; `"drop"` stays as an option.
+- An undated feed (a placeholder calendar) is left out as another version of
+  a later dated one only when their route keys overlap 0.9 or more, or the
+  kept versions run every trip it runs on the day whatever the route names
+  and modes; otherwise it stays, noted.
+- The note on a feed cut of repeated trips counts exact and near repeats
+  apart, and a warning names the stops whose departures near repeats took.
+- Under `on_untrusted_selector="auto"` with `exclude=` or
+  `on_unknown="exclude"`, a feed that changed since indexed is cut to the
+  selected routes it still has instead of skipped, when its selector is
+  complete and some selected route remains; otherwise it is skipped as
+  before.
+- `merge_feeds(timezones=...)` defaults to `"refuse"`, and a merge keeps
+  `translations.txt` (record ids prefixed like the ids they name) and one
+  `feed_info.txt` row.
+
 ## 0.25.0 — 2026-10-12
 
 ### Added
