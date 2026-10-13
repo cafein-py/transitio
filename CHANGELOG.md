@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The index flags it on each edge; an index that does not is read the same
   way from the feed's dates.
 
+### Changed
+
+- A route the index places in two tiers, its own and `international` (one
+  that also crosses a border, such as Strasbourg's tram D), counts its
+  departures once in a feed's overlap evidence (`IndexedFeed.overlap`, the
+  feed table's `covers` and `repeats`, `recommend()`), whichever tiers a query
+  matches: the index files them on the international edge under
+  `overlap_repeats`, which the reader adds only when the route's own tier is
+  not matched.
+
 ## 0.26.0 — 2026-10-13
 
 ### Added

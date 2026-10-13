@@ -217,6 +217,7 @@ _SUMMARY_KEYS = (
     "stale_when_indexed",
     "nominal_window",
     "overlap",
+    "overlap_repeats",
     "mark",
 )
 
@@ -695,12 +696,10 @@ class IndexedFeed:
         matched edges' overlap evidence: ``{"departures": {mode: per day},
         "with": {feed_id: {mode: share}}}``, departures summed over the
         edges and each share weighted by them. None when no matched edge
-        records it."""
+        records it. A route of two tiers counts once (see
+        :func:`_overlap_blocks`)."""
         departures, run, found = {}, {}, False
-        for edge in self.edges.values():
-            block = edge.summary.get("overlap")
-            if not isinstance(block, dict):
-                continue
+        for _, block in _overlap_blocks(self):
             found = True
             counts = {m: float(v) for m, v in (block.get("departures") or {}).items()}
             for mode, value in counts.items():
@@ -973,6 +972,26 @@ def _summed_service(feed):
     return summed
 
 
+def _overlap_blocks(feed):
+    """The overlap blocks of the feed's matched edges, as ``(place_id,
+    block)``: each edge's ``overlap``, and each block of its
+    ``overlap_repeats`` — the evidence of routes whose own tier is the key,
+    repeated on the international edge of a route that also crosses a
+    border — unless the feed's edge of that tier at the place is matched
+    too, so such a route's departures count once whichever tiers match."""
+    matched = {(edge.place_id, edge.tier) for edge in feed.edges.values()}
+    for edge in feed.edges.values():
+        block = edge.summary.get("overlap")
+        if isinstance(block, dict):
+            yield edge.place_id, block
+        repeats = edge.summary.get("overlap_repeats")
+        if not isinstance(repeats, dict):
+            continue
+        for tier, block in sorted(repeats.items()):
+            if (edge.place_id, tier) not in matched and isinstance(block, dict):
+                yield edge.place_id, block
+
+
 def _family_blocks(feeds):
     """Each feed's overlap evidence by mode family, for the feeds that record
     departures: ``{feed_id: (departures, shares)}``, ``departures`` per
@@ -985,11 +1004,8 @@ def _family_blocks(feeds):
     recorded share."""
     by_place = {}
     for feed in feeds:
-        for edge in feed.edges.values():
-            block = edge.summary.get("overlap")
-            if not isinstance(block, dict):
-                continue
-            here = by_place.setdefault(edge.place_id, {})
+        for place_id, block in _overlap_blocks(feed):
+            here = by_place.setdefault(place_id, {})
             departures, run = here.setdefault(feed.feed_id, ({}, {}))
             counts = {m: float(v) for m, v in (block.get("departures") or {}).items()}
             for mode, value in counts.items():
