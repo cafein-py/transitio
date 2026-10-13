@@ -3941,3 +3941,31 @@ def test_recommend_judges_a_timetable_by_the_study_day(tmp_path, monkeypatch):
         "f-old": "stale when indexed: its timetable ended 2026-07-31",
         "f-next": "its timetable as indexed starts 2026-11-01, after 2026-10-13",
     }
+
+
+def test_a_feed_of_placeholder_dates_covers_a_day_only_nominally(tmp_path):
+    """Shuttle feeds ending in 2099 and CORE Calabria starting in 1970 looked as
+    if they covered almost any study day."""
+    pytest.importorskip("geopandas")
+    import transitio.index as transitio_index
+    from test_index_views import MUNICH, munich_index
+
+    shuttle = {"stops": 5, "modes": {"bus": 10}}
+    feeds = {
+        **MUNICH,
+        "f-flagged": {
+            **shuttle,
+            "name": "Flagged",
+            "evidence": {"nominal_window": True},
+        },
+        "f-2099": {**shuttle, "name": "Beach", "end": "2099-12-31"},
+        "f-1970": {**shuttle, "name": "Calabria", "start": "1970-01-01"},
+    }
+    munich = transitio_index.place("muc", index=munich_index(tmp_path, feeds))
+    table = munich.feeds(categories=None).to_dataframe().set_index("feed_id")
+    flagged = set(table.index[table["nominal_window"]])
+    assert flagged == {"f-flagged", "f-2099", "f-1970"}
+    assert table.loc["f-2099", "reason"].endswith(
+        "its timetable's dates (2026-06-01 to 2099-12-31) are placeholders: it "
+        "covers a day only nominally"
+    )
