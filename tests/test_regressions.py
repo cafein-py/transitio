@@ -3969,3 +3969,32 @@ def test_a_feed_of_placeholder_dates_covers_a_day_only_nominally(tmp_path):
         "its timetable's dates (2026-06-01 to 2099-12-31) are placeholders: it "
         "covers a day only nominally"
     )
+
+
+@pytest.mark.parametrize(
+    "tiers",
+    [("local",), ("international",), ("local", "international")],
+    ids=["local", "international", "both"],
+)
+def test_a_route_of_two_tiers_counts_its_departures_once(tmp_path, tiers):
+    """A route that is local and also crosses a border (Strasbourg's tram D)
+    sits in two tier edges; summing both edges' overlap counted its
+    departures twice, and evidence kept only on its own tier's edge left an
+    international-only query without them."""
+    pytest.importorskip("geopandas")
+    import transitio.index as transitio_index
+    from test_index_views import munich_index
+
+    block = {"departures": {"tram": 40.0}, "with": {}}
+    feeds = {
+        "f-tram": {
+            "name": "Tram",
+            "stops": 20,
+            "modes": {"tram": 40},
+            "tiers": ("local", "international"),
+            "evidence": {"overlap_repeats": {"local": block}},
+        }
+    }
+    munich = transitio_index.place("muc", index=munich_index(tmp_path, feeds))
+    (feed,) = munich.feeds(tiers=tiers, categories=None)
+    assert feed.overlap["departures"] == {"tram": 40.0}
