@@ -4115,6 +4115,12 @@ def _fetch_place(
             notes, proven = [], []
             if contained == "drop":
                 proven, notes = _containers(feed, entries, carriers, cropped, current)
+            # An open feed whose provider asks for a registration says where,
+            # delivered or not.
+            signup = None
+            if refusal is None and feed.access == "open" and feed.registration_url:
+                signup = feed.access_instructions()
+                notes.append(signup)
             deferred = None
             if use_cache:
                 done, deferred = reuse(
@@ -4210,7 +4216,11 @@ def _fetch_place(
                         feed, entry, candidates, key, notes, keyless, proven, deferred
                     ):
                         break
-                    _skip(entry, f"download failed: {download_errors}", note=keyless)
+                    _skip(
+                        entry,
+                        f"download failed: {download_errors}",
+                        note=keyless or signup,
+                    )
                     break
                 acquired_as = dataset.id if fetched_from == "mdb_dataset" else None
                 try:

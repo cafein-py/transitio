@@ -445,6 +445,12 @@ SL = (
 ACCESS_CASES = [
     ("f-open", {"access": "open"}, None),
     (
+        "f-signup",
+        {"access": "open", "registration_url": "https://open.example/join"},
+        "f-signup is open, but its provider asks for a free registration at "
+        "https://open.example/join.",
+    ),
+    (
         "f-sl",
         {
             "name": "SL",

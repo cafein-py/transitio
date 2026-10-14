@@ -512,10 +512,17 @@ class IndexedFeed:
     def access_instructions(self):
         """How to get and give the credentials a protected feed needs, as one
         paragraph: who issues them, where to register, and how to hand them
-        to transitio. None for an open feed and before schema 11."""
-        if self.access != "key":
-            return None
+        to transitio. An open feed whose provider asks for a free registration
+        (a ``registration_url``) says where; None for any other open feed and
+        before schema 11."""
         name = self.name or self.feed_id
+        if self.access != "key":
+            if self.access == "open" and self.registration_url:
+                return (
+                    f"{name} is open, but its provider asks for a free "
+                    f"registration at {self.registration_url}."
+                )
+            return None
         provider = self._provider()
         if provider is None:
             lead = "needs credentials; the index has no access details for it yet"
