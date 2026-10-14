@@ -202,6 +202,11 @@ def _relevance(value):
 _FAMILIES = {"tram": "rail", "subway": "rail", "rail": "rail"}
 # A copy of the build's rank.STALE_DAYS.
 _STALE_DAYS = 30
+# Copies of the build's rank.NOMINAL_BEFORE and rank.NOMINAL_YEARS: a service
+# window of placeholder dates starts before the one or ends more than the
+# other after the crawl.
+_NOMINAL_BEFORE = datetime.date(2000, 1, 1)
+_NOMINAL_YEARS = 5
 
 
 # The evidence keys the reader ranks and explains feeds by; a schema-12 edge
@@ -210,6 +215,7 @@ _SUMMARY_KEYS = (
     "share_of_place",
     "share_basis",
     "stale_when_indexed",
+    "nominal_window",
     "overlap",
     "mark",
 )
@@ -665,6 +671,25 @@ class IndexedFeed:
         return end
 
     @property
+    def nominal_window(self):
+        """Whether the feed's service window holds placeholder dates (a
+        start before 2000, or an end more than five years after the index
+        crawled it, such as 2099), so it covers a day only nominally. The
+        index flags it on each edge; an index that does not is read the same
+        way from the feed's own dates."""
+        if any(e.summary.get("nominal_window") for e in self.edges.values()):
+            return True
+        start, end = self.service_start, self.service_end
+        if start is not None and start < _NOMINAL_BEFORE:
+            return True
+        crawled = self.last_crawled
+        crawled = _day(crawled[:10]) if isinstance(crawled, str) else None
+        if end is None or crawled is None:
+            return False
+        limit = (crawled.year + _NOMINAL_YEARS, crawled.month, crawled.day)
+        return (end.year, end.month, end.day) > limit
+
+    @property
     def overlap(self):
         """How much of the feed's service other feeds also run, from the
         matched edges' overlap evidence: ``{"departures": {mode: per day},
@@ -850,12 +875,13 @@ class FeedList(list):
         their shares; both come from the index's overlap evidence and are
         None without it. ``cross_border`` says whether the feed serves the
         place across a border, ``no_tier_reason`` why the index gives a feed
-        of unknown tier no tier, and ``mark`` the index's mark on a private
-        or campus service or an unofficial compilation. ``reason`` gives the
+        of unknown tier no tier, ``mark`` the index's mark on a private or
+        campus service or an unofficial compilation, and ``nominal_window``
+        whether the feed's dates are placeholders. ``reason`` gives the
         category and tiers, the share of the departures summed over the
         place's feeds, the feed repeating the most of it, and where they
-        apply, the border, the mark, the missing tier, staleness, the feeds
-        containing it and the account it needs.
+        apply, the border, the mark, the missing tier, staleness, the
+        placeholder dates, the feeds containing it and the account it needs.
         """
         import pandas
 
@@ -897,6 +923,7 @@ class FeedList(list):
                     "service_start": feed.service_start,
                     "service_end": feed.service_end,
                     "stale_when_indexed": feed.stale_when_indexed,
+                    "nominal_window": feed.nominal_window,
                     "contained_in": feed.contained_in,
                     "access": feed.access,
                     "stop_count": feed.stop_count,
@@ -926,6 +953,7 @@ _TABLE_COLUMNS = (
     "service_start",
     "service_end",
     "stale_when_indexed",
+    "nominal_window",
     "contained_in",
     "access",
     "stop_count",
@@ -1088,6 +1116,11 @@ def _ranking_reason(feed, repeats):
     ended = feed.stale_when_indexed
     if ended is not None:
         notes.append(f"stale when indexed: its timetable ended {ended}")
+    if feed.nominal_window:
+        notes.append(
+            f"its timetable's dates ({feed.service_start} to {feed.service_end}) "
+            "are placeholders: it covers a day only nominally"
+        )
     if feed.contained_in:
         notes.append(f"contained in {', '.join(feed.contained_in)}")
     notes.append(_access_note(feed))

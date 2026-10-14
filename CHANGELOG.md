@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- `IndexedFeed.nominal_window` says whether a feed's timetable dates are
+  placeholders (a start before 2000, or an end more than five years after the
+  index crawled it, such as 2099), so it covers a day only nominally; the
+  feed table gains a `nominal_window` column and the feed's reason says so.
+  The index flags it on each edge; an index that does not is read the same
+  way from the feed's dates.
+
 ## 0.26.0 — 2026-10-13
 
 ### Added

@@ -647,7 +647,8 @@ def test_the_feed_table_ranks_and_explains_each_feed(tmp_path, monkeypatch, over
             "feed_id name catalogue_name tiers relevance_category relevance "
             "cross_border no_tier_reason mark share_of_place departures_per_day "
             "stops routes modes covers repeats "
-            "service_start service_end stale_when_indexed contained_in access "
+            "service_start service_end stale_when_indexed nominal_window "
+            "contained_in access "
             "stop_count reason"
         ).split()
     )
