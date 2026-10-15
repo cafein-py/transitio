@@ -1522,6 +1522,11 @@ DELIVERED = [("GET", API), ("GET", CDN)]
 
 
 FROM_HOSTED = "from the Mobility Database hosted copy"
+ATLAS = "https://feeds.example/f-a"
+ALL_404 = (
+    f"download_url: {CURATED}: HTTP 404 Not Found; mdb_latest: {HOSTED}: "
+    f"HTTP 404 Not Found; atlas: {ATLAS}: HTTP 404 Not Found"
+)
 MISSING = "protected feed: credentials missing for p-key; {instructions}"
 HOSTED_404 = f"mdb_latest: {HOSTED}: HTTP 404 Not Found"
 NONE = (None, None, None)
@@ -1532,6 +1537,28 @@ NONE = (None, None, None)
     "columns, credentials, routes, seen, outcome",
     [
         ({"download_url": CURATED}, None, {}, [("GET", CURATED)], NONE),
+        (
+            {"download_url": CURATED, "registration_url": "https://open.example/join"},
+            None,
+            {},
+            [("GET", CURATED)],
+            (None, None, "{instructions}"),
+        ),
+        (
+            {
+                "download_url": CURATED,
+                "registration_url": "https://open.example/join",
+                "mdb": {"urls": {"latest": HOSTED}},
+            },
+            None,
+            {CURATED: (404, {}), HOSTED: (404, {}), ATLAS: (404, {})},
+            [("GET", CURATED), ("GET", HOSTED), ("GET", ATLAS)],
+            (
+                f"download failed: {ALL_404}",
+                ALL_404,
+                "{instructions}",
+            ),
+        ),
         (
             {"download_url": CURATED},
             None,
@@ -1604,6 +1631,8 @@ NONE = (None, None, None)
     ],
     ids=[
         "open-download-url",
+        "open-with-registration",
+        "open-with-registration-fails",
         "open-hosted-copy-second",
         "query-explicit-over-env",
         "header-env",
