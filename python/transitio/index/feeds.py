@@ -207,6 +207,13 @@ _STALE_DAYS = 30
 # other after the crawl.
 _NOMINAL_BEFORE = datetime.date(2000, 1, 1)
 _NOMINAL_YEARS = 5
+# The crawl statuses an index publishes for a feed it could not read, in words.
+_UNREAD = {
+    "failed": "the index could not download it: its link did not work",
+    "no_url": "its catalogue gives no download link",
+    "unreadable": "its download is not a readable GTFS archive",
+    "no_gtfs_files": "its download holds no GTFS files",
+}
 
 
 # The evidence keys the reader ranks and explains feeds by; a schema-12 edge
@@ -591,6 +598,20 @@ class IndexedFeed:
         return _scalar(self._row.get("crawl_status"))
 
     @property
+    def download_problem(self):
+        """Why the index holds no timetable of the feed, in words, when its
+        crawl status says the read failed (``failed``, ``no_url``,
+        ``unreadable``, ``no_gtfs_files``) and no edge measured its service;
+        None otherwise, and on an index that records no failed reads."""
+        problem = _UNREAD.get(self.crawl_status)
+        edges = self.edges.values()
+        if problem is None or any(
+            edge.service.departures_per_day is not None for edge in edges
+        ):
+            return None
+        return problem
+
+    @property
     def last_crawled(self):
         return _scalar(self._row.get("last_crawled"))
 
@@ -752,13 +773,16 @@ class IndexedFeed:
     def no_tier_reason(self):
         """Why the index gives the feed no tier here, in words, when every
         matched edge is of unknown tier; None otherwise. The index records no
-        reason, so it is read from the edges: a feed known only from a
+        reason, so it is read from the feed and its edges: a feed the index
+        could not read (:attr:`download_problem`), one known only from a
         catalogue, one whose service the index did not measure, one whose
         routes are all of types the index does not classify (air, taxi and
         others), else one whose routes it could not classify."""
         edges = list(self.edges.values())
         if not edges or any(edge.tier != "unknown" for edge in edges):
             return None
+        if self.download_problem is not None:
+            return self.download_problem
         if all(edge.method == "inferred" for edge in edges):
             return "known only from a catalogue: the index has not crawled it"
         if all(edge.service.departures_per_day is None for edge in edges):
@@ -1246,11 +1270,12 @@ def _link_edges(index, place_ids):
 
 
 def _view_key(feed):
-    """Sort key of a place's view: category order, then relevance high to
-    low, then the feed id."""
+    """Sort key of a place's view: the feeds the index could not read last,
+    then category order, relevance high to low, and the feed id."""
     category = feed.relevance_category
     rank = CATEGORY_ORDER.index(category) if category in CATEGORY_ORDER else 99
-    return (rank, -(feed.relevance or 0.0), feed.feed_id)
+    unread = feed.download_problem is not None
+    return (unread, rank, -(feed.relevance or 0.0), feed.feed_id)
 
 
 def feeds_for_place(index, place, **query):

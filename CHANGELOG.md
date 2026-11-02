@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+
+- A feed the index could not read — its link failed, gave no download, or
+  held no readable GTFS — says so in `IndexedFeed.download_problem` and its
+  `no_tier_reason`, `recommend()` never takes it ("not considered: the index
+  could not download it: its link did not work"), and it comes after every
+  other feed in a place's feed list and in a recommendation's left-out
+  feeds. It needs an index that records failed reads in `crawl_status`.
+
 ## 0.28.0 — 2026-10-15
 
 ### Added
