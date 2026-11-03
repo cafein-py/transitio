@@ -411,8 +411,11 @@ def recommend(
 
 
 def _excluded(feed, day, blocks):
-    """Why ``feed`` is no candidate on ``day``, or None: its timetable as
-    indexed must run on the day, whether or not it was stale when indexed."""
+    """Why ``feed`` is no candidate on ``day``, or None: the index must have
+    read it, and its timetable as indexed must run on the day, whether or not
+    it was stale when indexed."""
+    if feed.download_problem is not None:
+        return f"not considered: {feed.download_problem}"
     if feed.mark is not None:
         reason = "not considered: fetch takes it when named in feeds="
         return f"{MARKS[feed.mark]}, {reason}"
@@ -618,11 +621,12 @@ def _feeds_are(count):
 
 def _largest_first(choices):
     """``choices`` by their feeds' departures in the place, the most first,
-    then by id."""
+    then by id; the feeds the index could not read last."""
 
     def key(choice):
         departures = _summed_service(choice.feed)["departures_per_day"]
-        return (-(departures or 0.0), choice.feed.feed_id)
+        unread = choice.feed.download_problem is not None
+        return (unread, -(departures or 0.0), choice.feed.feed_id)
 
     return sorted(choices, key=key)
 

@@ -207,17 +207,32 @@ def test_international_adds_the_cross_border_feeds(index, tmp_path):
 
 
 @pytest.mark.parametrize(
-    "tier, method, departures, kinds, expected",
+    "tier, method, departures, kinds, status, expected",
     [
-        ("local", "crawl", 10.0, ["bus"], None),
-        ("unknown", "inferred", None, [], "known only from a catalogue"),
-        ("unknown", "crawl", None, [], "the index measured no service for it"),
-        ("unknown", "crawl", 10.0, ["1501", "1100"], "of types the index gives no"),
-        ("unknown", "crawl", 10.0, ["bus"], "could not classify its routes"),
+        ("local", "crawl", 10.0, ["bus"], "ok", None),
+        ("unknown", "inferred", None, [], None, "known only from a catalogue"),
+        ("unknown", "inferred", None, [], "failed", "its link did not work"),
+        ("unknown", "inferred", None, [], "unreadable", "not a readable GTFS"),
+        ("unknown", "crawl", None, [], "ok", "the index measured no service for it"),
+        ("unknown", "crawl", 10.0, ["1501", "1100"], "ok", "of types the index"),
+        ("unknown", "crawl", 10.0, ["bus"], "ok", "could not classify its routes"),
+        # Measured service is a read, whatever another build's status says.
+        ("unknown", "crawl", 10.0, ["bus"], "failed", "could not classify"),
     ],
-    ids=["tiered", "catalogued", "no-service", "air-and-taxi", "unclassified"],
+    ids=[
+        "tiered",
+        "catalogued",
+        "link-failed",
+        "unreadable",
+        "no-service",
+        "air-and-taxi",
+        "unclassified",
+        "read-elsewhere",
+    ],
 )
-def test_a_feed_of_unknown_tier_says_why(tier, method, departures, kinds, expected):
+def test_a_feed_of_unknown_tier_says_why(
+    tier, method, departures, kinds, status, expected
+):
     from types import SimpleNamespace
 
     from transitio.index.feeds import IndexedFeed
@@ -228,7 +243,9 @@ def test_a_feed_of_unknown_tier_says_why(tier, method, departures, kinds, expect
         service=SimpleNamespace(departures_per_day=departures),
         summary={"overlap": {"departures": dict.fromkeys(kinds, 1.0)}},
     )
-    reason = IndexedFeed.no_tier_reason.fget(SimpleNamespace(edges={tier: edge}))
+    feed = SimpleNamespace(edges={tier: edge}, crawl_status=status)
+    feed.download_problem = IndexedFeed.download_problem.fget(feed)
+    reason = IndexedFeed.no_tier_reason.fget(feed)
     assert reason is None if expected is None else expected in reason
 
 
@@ -589,6 +606,7 @@ def munich_index(directory, feeds=MUNICH, *, overlap=True, providers=None, kind=
                 "service_start": spec.get("start", "2026-06-01"),
                 "service_end": spec.get("end", "2026-12-31"),
                 "last_crawled": "2026-10-01T03:00:00+00:00",
+                "crawl_status": spec.get("crawl_status"),
                 "access": spec.get("access", "open"),
                 "access_provider": spec.get("provider"),
                 "coverage": (

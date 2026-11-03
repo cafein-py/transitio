@@ -1153,7 +1153,7 @@ def test_a_feed_left_out_names_the_tiers_that_fetch_it(
 def test_contained_keep_leaves_no_feed_out(tmp_path, monkeypatch):
     ids = ("f-a", "f-b", "f-c")
     index = _partitioned_index(
-        tmp_path, monkeypatch, dict.fromkeys(ids, {}), contained={"f-c": ["f-b"]}
+        tmp_path, monkeypatch, {i: {} for i in ids}, contained={"f-c": ["f-b"]}
     )
     later = {"stop_times.txt": GTFS["stop_times.txt"].replace("08:", "10:")}
     other = {**GTFS, "agency.txt": GTFS["agency.txt"].replace("HSL", "VR"), **later}
@@ -1197,7 +1197,7 @@ def test_fetch_takes_only_the_feeds_named(tmp_path, monkeypatch, where, named, u
     index = _partitioned_index(
         tmp_path,
         monkeypatch,
-        dict.fromkeys(("f-a", "f-b", "f-c"), {}),
+        {i: {} for i in ("f-a", "f-b", "f-c")},
         edges={"f-c": tertiary},
     )
     fetched = _serve_by_id(monkeypatch, {"f-a": _zip(GTFS), "f-c": _zip(HKL)})
@@ -1217,7 +1217,7 @@ def test_fetch_takes_the_place_and_day_of_a_recommendation(tmp_path, monkeypatch
     from transitio.index import place as resolve
     from transitio.index.recommend import Choice, Recommendation
 
-    index = _partitioned_index(tmp_path, monkeypatch, dict.fromkeys(("f-a", "f-b"), {}))
+    index = _partitioned_index(tmp_path, monkeypatch, {i: {} for i in ("f-a", "f-b")})
     _serve_by_id(monkeypatch, {"f-a": _zip(GTFS)})
     taken = [Choice(types.SimpleNamespace(feed_id="f-a"), "covers it", 1.0)]
     day = datetime.date(2026, 6, 1)

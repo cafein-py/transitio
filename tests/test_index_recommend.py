@@ -24,8 +24,8 @@ def _reader_reads_schema_11(monkeypatch):
     monkeypatch.setattr(transitio, "__version__", reader.MIN_READER_VERSIONS[11])
 
 
-# A timetable starting in November, a feed without overlap evidence and one
-# the index has no timetable for.
+# A timetable starting in November, a feed without overlap evidence, one the
+# index has no timetable for and one whose link failed when crawled.
 LATER = {
     **MUNICH,
     "f-next": {
@@ -36,6 +36,12 @@ LATER = {
         "evidence": {"overlap": None},
     },
     "f-decl": {"name": "Declared", "stops": 50},
+    "f-dead": {
+        "name": "Dead link",
+        "stops": 50,
+        "tiers": ("unknown",),
+        "crawl_status": "failed",
+    },
 }
 KEYS = {
     "f-mvv": {**MUNICH["f-mvv"], "access": "key", "provider": "mvv-api"},
@@ -86,6 +92,8 @@ TAKEN_UNCOMPARED = (
                 "f-next": "its timetable as indexed starts 2026-11-01, after "
                 "2026-10-13",
                 "f-decl": "not measured: the index has no timetable for it here",
+                "f-dead": "not considered: the index could not download it: "
+                "its link did not work",
             },
             id="munich",
         ),
@@ -157,6 +165,10 @@ def test_a_recommendation_takes_what_each_feed_adds(
     given = {c.feed.feed_id: c.reason for c in found.taken + found.left_out}
     assert sorted(given) == sorted(feeds)
     assert {feed_id: given[feed_id] for feed_id in reasons} == reasons
+    # A feed the index could not read comes after every other one.
+    for listed in (found.left_out, found.place.feeds(categories=None)):
+        unread = [getattr(c, "feed", c).download_problem is not None for c in listed]
+        assert unread == sorted(unread)
     table = found.to_dataframe()
     assert list(table["feed_id"]) == list(given) and table["taken"].sum() == len(taken)
     uncompared = [c for c in found.taken if c.reason == TAKEN_UNCOMPARED]
