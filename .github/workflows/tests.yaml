@@ -47,13 +47,15 @@ jobs:
         with:
           path: tests/data
           key: test-data-${{ hashFiles('scripts/fetch_test_data.py') }}
-      # The reference places read a published index snapshot: one job
-      # downloads it, with the place files it reads on demand.
-      - uses: actions/cache@v4
+      # The reference places read the newest published index snapshot: one
+      # job installs it, with the place files it reads on demand, and keeps
+      # it under the snapshot's id.
+      - id: restore-reference
+        uses: actions/cache/restore@v4
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
         with:
           path: tests/cache/reference-index
-          key: reference-index-${{ hashFiles('tests/data/reference_places.json') }}
+          key: reference-index-
           restore-keys: reference-index-
       - run: python scripts/fetch_test_data.py
       - run: cargo test --workspace
@@ -63,4 +65,14 @@ jobs:
         env:
           TRANSITIO_REQUIRE_TEST_DATA: "1"
           TRANSITIO_REFERENCE_PLACES: ${{ matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12' && '1' || '' }}
+      - id: reference-snapshot
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        run: echo "snapshot=$(ls tests/cache/reference-index/snapshots | grep -E '^[0-9a-f]{16}$' | head -1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/save@v4
+        if: >-
+          steps.reference-snapshot.outputs.snapshot != '' &&
+          steps.restore-reference.outputs.cache-matched-key != format('reference-index-{0}', steps.reference-snapshot.outputs.snapshot)
+        with:
+          path: tests/cache/reference-index
+          key: reference-index-${{ steps.reference-snapshot.outputs.snapshot }}
 
