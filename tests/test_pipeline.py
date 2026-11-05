@@ -1236,6 +1236,16 @@ def test_fetch_takes_the_place_and_day_of_a_recommendation(tmp_path, monkeypatch
     ):
         with pytest.raises(ValueError, match=message):
             fetch(feeds=found, **wrong, **options)
+    # One without a study day is no recommendation for today.
+    undated = Recommendation(found.place, None, taken, [], 1.0, {}, "overlap", None)
+    with pytest.raises(ValueError, match="without a study day"):
+        fetch(feeds=undated, when="2026-06-01", **options)
+    # Its feeds come in the order it took them, not in one fetch works out.
+    _serve_by_id(monkeypatch, {"f-a": _zip(GTFS), "f-b": _zip(GTFS)})
+    both = [Choice(types.SimpleNamespace(feed_id=i), "", None) for i in ("f-b", "f-a")]
+    undated = Recommendation(found.place, None, both, [], 1.0, {}, "overlap", None)
+    result = fetch(feeds=undated, **{**options, "directory": tmp_path / "both"})
+    assert [e["feed_id"] for e in result.selection] == ["f-b", "f-a"]
 
 
 def _calendar(start, end, days="1111111"):
@@ -1836,7 +1846,7 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
         ),
         (
             {"F": IN_C, "C": {**C, "ended": True}},
-            DROP,
+            {**DROP, "expired": "skip"},
             {"C": f"- {R_ENDED}{SAME}", "F": "+ kept: container C skipped"},
         ),
         (
@@ -2000,6 +2010,11 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
             {},
             {"A": "+", "W": "+ 1 repeated trips of A left out (1)"},
         ),
+        (
+            {"W": {**C, "hours": (8, 9), "wide": True}, "A": {**F, "ended": True}},
+            {},
+            {"W": "+", "A": "- every trip repeats a trip of W (1)"},
+        ),
     ],
     ids=(
         "identical identical-overlapping-routes contained-kept container-renewed "
@@ -2015,7 +2030,8 @@ SKIP_C, WHOLE = "- contained in C [C]", "delivered whole: selector unavailable"
         "placeholder-other-routes-adds placeholder-other-routes-repeats "
         "repeats-other-agency repeats-on-the-day repeats-not-every-date "
         "repeats-other-time-zone repeats-kept repeats-exact marked-skipped "
-        "marked-named repeats-kept-in-the-more-local-feed"
+        "marked-named repeats-kept-in-the-more-local-feed "
+        "repeats-kept-in-the-feed-running-today"
     ).split(),
 )
 def test_fetch_delivers_one_copy_per_service(
@@ -2718,26 +2734,44 @@ def test_fetch_place_with_token_selects_the_covering_dataset(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize(
-    "when, datasets, own, expected",
+    "when, datasets, own, expired, expected",
     [
-        pytest.param(DAY, [], "now", ("producer", None), id="no-covering-dataset"),
         pytest.param(
-            DAY, ["old", "now"], "now", ("mdb_dataset", "now"), id="next-dataset"
-        ),
-        pytest.param(None, ["now"], "now", ("producer", None), id="own-url-first"),
-        pytest.param(
-            None, ["now"], None, ("mdb_dataset", "now"), id="newest-when-own-fails"
+            DAY, [], "now", None, ("producer", None), id="no-covering-dataset"
         ),
         pytest.param(
-            None, ["now"], "old", ("mdb_dataset", "now"), id="newest-when-own-ended"
+            DAY, ["old", "now"], "now", None, ("mdb_dataset", "now"), id="next-dataset"
+        ),
+        pytest.param(
+            None, ["now"], "now", None, ("producer", None), id="own-url-first"
+        ),
+        pytest.param(
+            None,
+            ["now"],
+            None,
+            None,
+            ("mdb_dataset", "now"),
+            id="newest-when-own-fails",
+        ),
+        pytest.param(
+            None,
+            ["now"],
+            "old",
+            "skip",
+            ("mdb_dataset", "now"),
+            id="newest-when-own-ended",
+        ),
+        pytest.param(
+            None, ["now"], "old", None, ("producer", None), id="own-ended-kept"
         ),
     ],
 )
 def test_fetch_place_with_token_tries_each_source_in_turn(
-    tmp_path, monkeypatch, when, datasets, own, expected
+    tmp_path, monkeypatch, when, datasets, own, expired, expected
 ):
     # With a day, every dataset covering it, then the feed's own URLs; without
-    # a day the feed's own URLs, then the newest dataset.
+    # a day the feed's own URLs, then the newest dataset, an ended own archive
+    # being kept unless expired="skip".
     from transitio.catalog import MobilityDatabase, TransitlandAtlas
     from transitio.catalog._models import Dataset
 
@@ -2782,6 +2816,7 @@ def test_fetch_place_with_token_tries_each_source_in_turn(
         crop=False,
         when=when,
         refresh_token="tok",
+        expired=expired,
     )
     (entry,) = result.selection
     provenance = result.reports[0]["summary"]["provenance"]
@@ -2791,8 +2826,8 @@ def test_fetch_place_with_token_tries_each_source_in_turn(
 def test_an_ended_unchanged_archive_gives_way_to_the_newest_dataset(
     tmp_path, monkeypatch
 ):
-    # Without a day, the feed's own archive proven ended and unchanged was
-    # skipped before the newest dataset was tried.
+    # Without a day and with expired="skip", the feed's own archive proven
+    # ended and unchanged was skipped before the newest dataset was tried.
     from transitio.catalog import MobilityDatabase
     from transitio.catalog._models import Dataset
 
@@ -2824,6 +2859,7 @@ def test_an_ended_unchanged_archive_gives_way_to_the_newest_dataset(
         crop=False,
         osm=False,
         refresh_token="tok",
+        expired="skip",
     )
     (entry,) = result.selection
     assert (entry["decision"], entry["fetched_from"]) == ("delivered", "mdb_dataset")

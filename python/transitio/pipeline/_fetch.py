@@ -256,9 +256,14 @@ def _from_recommendation(feeds, place, aoi, when):
             "feeds= is a recommendation, which names its place: pass no place= "
             "or aoi="
         )
-    if when is not None and as_date(when) != (feeds.when or _today()):
+    if when is not None and feeds.when is None:
         raise ValueError(
-            f"feeds= is a recommendation for {feeds.when or _today()}, "
+            "feeds= is a recommendation without a study day: pass no when=, or "
+            "recommend for that day"
+        )
+    if when is not None and as_date(when) != feeds.when:
+        raise ValueError(
+            f"feeds= is a recommendation for {feeds.when}, "
             f"not for {as_date(when)}: pass no when="
         )
     return feeds.place, feeds.when if when is None else when
@@ -2423,7 +2428,7 @@ def fetch(
     credentials=None,
     modes=None,
     duplicate_trips="drop",
-    expired="skip",
+    expired=None,
     repair=False,
     crop=True,
     osm=True,
@@ -2681,17 +2686,19 @@ def fetch(
         starts <start>, after <day>"``), or when its validation report for
         the day counts no active trip and carries the
         ``no_service_on_reference_date`` notice (``"no service on
-        <day>"``). Without ``when`` there is no study day, only today: a
-        feed is skipped when its computed window ended before today or
-        starts after it, and one that runs on other weekdays stays. An
-        unknown window passes the window checks, and a report without a
-        ``moment`` for the day passes the day check.
+        <day>"``). Without ``when`` there is no study day, and no feed is
+        skipped for its dates, since older data serves research as well;
+        ``expired="skip"`` tests today instead: a feed is skipped when its
+        computed window ended before today or starts after it, and one that
+        runs on other weekdays stays. An unknown window passes the window
+        checks, and a report without a ``moment`` for the day passes the
+        day check.
     feeds : list of str, Recommendation or object with ``feed_ids``, optional
         Fetch only these feeds of the index: a list of feed ids (or one id),
         a :class:`~transitio.index.Recommendation`, whose place and day the
         call then takes (``fetch(feeds=place.recommend(day))``; another
-        ``place``, any ``aoi`` or a ``when`` on another day raises
-        ``ValueError``),
+        ``place``, any ``aoi``, a ``when`` on another day or any ``when``
+        for a recommendation without a study day raises ``ValueError``),
         or an object whose ``feed_ids`` attribute lists them. They are
         taken from every feed serving the place, or the area's places, of
         any tier and category and cross-border ones included, and ``tiers``,
@@ -2744,7 +2751,8 @@ def fetch(
         or nearly repeat (``"drop"``), a trip of an earlier delivered feed,
         as above: ``"exact"`` leaves out exact repeats only, and ``"keep"``
         compares nothing. Another value raises ``ValueError``.
-    expired : {"skip", "keep"}, default "skip"
+    expired : {"skip", "keep"}, optional
+        ``"skip"`` with ``when``, ``"keep"`` without it, by default.
         With ``"skip"``, on the index paths, an indexed feed whose index
         service window misses the day, the study day or today (ends before
         it or starts after it), is skipped before download when a
@@ -2972,8 +2980,10 @@ def fetch(
         raise ValueError("pass exactly one of aoi= or place=")
     if contained not in ("keep", "drop"):
         raise ValueError("contained= must be 'keep' or 'drop'")
-    if expired not in ("skip", "keep"):
+    if expired not in (None, "skip", "keep"):
         raise ValueError("expired= must be 'skip' or 'keep'")
+    if expired is None:
+        expired = "skip" if when is not None else "keep"
     if place is not None and country_code is not None:
         raise ValueError("country_code= applies only with aoi=")
     if place is not None and index is False:
@@ -2984,7 +2994,12 @@ def fetch(
         )
     if duplicate_trips not in ("drop", "exact", "keep"):
         raise ValueError("duplicate_trips= must be 'drop', 'exact' or 'keep'")
+    ranked = None
     if feeds is not None:
+        from transitio.index.recommend import Recommendation
+
+        # A recommendation's feeds come in the order it took them.
+        ranked = feeds.feed_ids if isinstance(feeds, Recommendation) else None
         feeds = getattr(feeds, "feed_ids", feeds)
         feeds = {feeds} if isinstance(feeds, str) else set(feeds)
         if not feeds:
@@ -3027,6 +3042,7 @@ def fetch(
             on_untrusted_selector=on_untrusted_selector,
             contained=contained,
             wanted=feeds,
+            ranked=ranked,
             index=index,
             credentials=credentials,
             when=when,
@@ -3548,6 +3564,7 @@ def _fetch_place(
     on_untrusted_selector,
     contained,
     wanted,
+    ranked,
     index,
     credentials,
     when,
@@ -3569,7 +3586,8 @@ def _fetch_place(
     """The index paths, ``fetch(place=...)`` and ``fetch(aoi=...)`` given an
     :class:`~transitio.index.Area`: the place geometry, or the area's, is the
     AOI, feeds come from the index at the tiers recommend() considers (or
-    those asked for), each served by a cached version when one serves the
+    those asked for, in the order of a recommendation's ``ranked`` ids when
+    given), each served by a cached version when one serves the
     request, else downloaded MDB-then-Atlas (decision I) and then from the
     MDB hosted copy (:func:`_download_indexed`); with ``tiers``, ``exclude``
     or ``on_unknown="exclude"`` a bundled feed is cropped to the routes its
@@ -3602,8 +3620,8 @@ def _fetch_place(
         _by_place,
         _default_tiers,
         _less,
-        _local_key,
         _not_considered,
+        _taking_order,
         _tier_words,
     )
     from transitio.index.places import _as_shape
@@ -3645,9 +3663,14 @@ def _fetch_place(
         )
         return found if wanted is None else [f for f in found if f.feed_id in wanted]
 
-    # The most local first, as recommend() takes them, so a trip repeated in
-    # an aggregate is kept in the operator's own feed.
-    offered = sorted(candidates(on_unknown), key=_local_key)
+    # In the order recommend() takes them, so a trip repeated in an aggregate
+    # is kept in the operator's own feed, and without a study day in a feed
+    # running today rather than in an older version; a recommendation's
+    # feeds in its own order.
+    offered = _taking_order(candidates(on_unknown), when, day)
+    if ranked:
+        position = {feed_id: n for n, feed_id in enumerate(ranked)}
+        offered.sort(key=lambda f: position.get(f.feed_id, len(position)))
     if wanted is not None:
         missing = wanted.difference(f.feed_id for f in candidates("include"))
         if missing:

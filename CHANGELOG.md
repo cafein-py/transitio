@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Without a study day, `recommend()` and `fetch()` no longer leave out a feed
+  for its dates: older data serves research as well. `recommend()` takes the
+  feeds whose timetable runs today first, so an older version is taken only
+  for what the others lack, and a taken feed that does not run today gives
+  its window in its reason; `Recommendation.to_dataframe()` gains
+  `service_start` and `service_end`. `fetch()`'s `expired` is `"skip"` with
+  `when` and `"keep"` without it by default, its place path takes the feeds
+  in `recommend()`'s order, and `fetch(feeds=...)` refuses a `when` for a
+  recommendation without a study day. With a study day, both still leave
+  out a feed that does not run on it.
 - A feed the index could not read — its link failed, gave no download, or
   held no readable GTFS — says so in `IndexedFeed.download_problem` and its
   `no_tier_reason`, `recommend()` never takes it ("not considered: the index

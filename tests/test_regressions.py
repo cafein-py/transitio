@@ -3902,7 +3902,8 @@ def test_dangling_parents_and_agencies_are_cleared_where_the_rules_allow(tmp_pat
 
 def test_recommend_judges_a_timetable_by_the_study_day(tmp_path, monkeypatch):
     # A feed stale when indexed was left out even for a day its timetable
-    # covers, and without a day a timetable starting later was taken.
+    # covers, and without a day a timetable starting later was taken. Without
+    # a day no feed is left out for its dates now, the one running today first.
     import datetime
 
     import transitio
@@ -3928,18 +3929,28 @@ def test_recommend_judges_a_timetable_by_the_study_day(tmp_path, monkeypatch):
             "stops": 80,
             "start": "2026-11-01",
         },
+        "f-now": {
+            "name": "Now",
+            "modes": {"bus": 100},
+            "stops": 10,
+            "start": "2026-10-01",
+            "end": "2026-12-31",
+        },
     }
     place = transitio_index.place("muc", index=munich_index(tmp_path, feeds))
     july = place.recommend("2026-07-15")
     assert july.feed_ids == ["f-old"]
-    assert [c.reason for c in july.left_out] == [
-        "its timetable as indexed starts 2026-11-01, after 2026-07-15"
-    ]
-    today = place.recommend()
-    assert today.feed_ids == []
-    assert {c.feed.feed_id: c.reason for c in today.left_out} == {
-        "f-old": "stale when indexed: its timetable ended 2026-07-31",
-        "f-next": "its timetable as indexed starts 2026-11-01, after 2026-10-13",
+    assert {c.feed.feed_id: c.reason for c in july.left_out} == {
+        "f-next": "its timetable as indexed starts 2026-11-01, after 2026-07-15",
+        "f-now": "its timetable as indexed starts 2026-10-01, after 2026-07-15",
+    }
+    anyday = place.recommend()
+    assert anyday.feed_ids[0] == "f-now" and sorted(anyday.feed_ids) == sorted(feeds)
+    assert {c.feed.feed_id: c.reason.split("; ")[-1] for c in anyday.taken[1:]} == {
+        "f-old": "its timetable as indexed runs from 2026-06-01 to 2026-07-31, "
+        "not today",
+        "f-next": "its timetable as indexed runs from 2026-11-01 to 2026-12-31, "
+        "not today",
     }
 
 
