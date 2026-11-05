@@ -43,9 +43,13 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Only the files fetch_test_data.py downloads: the tracked ones in
+      # tests/data must stay as checked out.
       - uses: actions/cache@v4
         with:
-          path: tests/data
+          path: |
+            tests/data/helsinki_gtfs.zip
+            tests/data/kantakaupunki.osm.pbf
           key: test-data-${{ hashFiles('scripts/fetch_test_data.py') }}
       # The reference places read the newest published index snapshot: one
       # job installs it, with the place files it reads on demand, and keeps
