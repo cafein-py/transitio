@@ -7,9 +7,11 @@ ones (``DEFAULT_TIERS``) at a city or a metro, every tier at a region or a
 country. A feed serving the place only at other tiers is listed as not
 considered, as is a feed the index marks as a private or campus service or
 an unofficial compilation. A feed is left out when its timetable as indexed
-does not run on the day (the study day, else today), whether or not it was
-stale when indexed, when it needs a paid account, or when the index measured
-no service for it.
+does not run on the study day, whether or not it was stale when indexed,
+when it needs a paid account, or when the index measured no service for it.
+Without a study day no feed is left out for its dates: older data serves
+research as well. The feeds whose timetable runs today are then taken
+first, and a taken one that does not run today gives its window.
 
 The candidates are taken the most local first: the one whose coverage
 covers the smallest area, then the open one, the newer timetable and the
@@ -114,9 +116,12 @@ class Recommendation:
 
     def to_dataframe(self):
         """The taken feeds, then those left out, one row each: ``feed_id``,
-        ``name``, ``taken``, ``adds`` and ``reason``."""
+        ``name``, ``taken``, ``adds``, ``reason`` and the timetable window as
+        indexed, ``service_start`` and ``service_end``."""
         import pandas
 
+        columns = ["feed_id", "name", "taken", "adds", "reason"]
+        columns += ["service_start", "service_end"]
         rows = [
             {
                 "feed_id": choice.feed.feed_id,
@@ -124,13 +129,13 @@ class Recommendation:
                 "taken": taken,
                 "adds": choice.adds,
                 "reason": choice.reason,
+                "service_start": choice.feed.service_start,
+                "service_end": choice.feed.service_end,
             }
             for taken, choices in ((True, self.taken), (False, self.left_out))
             for choice in choices
         ]
-        return pandas.DataFrame(
-            rows, columns=["feed_id", "name", "taken", "adds", "reason"]
-        )
+        return pandas.DataFrame(rows, columns=columns)
 
     def __str__(self):
         head = _label(self.place) + (f", {self.when}" if self.when else "")
@@ -251,7 +256,7 @@ def recommend(
     excluded=(),
 ):
     """The :class:`Recommendation` for ``target``, a place or an area, from
-    its ``feeds`` on ``when`` (today when None): the feeds at the ``tiers``
+    its ``feeds`` on the study day ``when`` (None for none): the feeds at the ``tiers``
     considered (every tier when None), with ``outside`` the feeds serving it
     at other tiers only and ``excluded`` the tiers left out by ``exclude``;
     see :meth:`~transitio.index.Place.recommend`."""
@@ -278,7 +283,7 @@ def recommend(
     blocks = _family_blocks(feeds)
     left_out, candidates = [], []
     for feed in feeds:
-        reason = _excluded(feed, day, blocks)
+        reason = _excluded(feed, when, blocks)
         if reason is None:
             candidates.append(feed)
         else:
@@ -289,9 +294,14 @@ def recommend(
     blocks = {f.feed_id: blocks[f.feed_id] for f in candidates if f.feed_id in blocks}
     apart = _apart(candidates, blocks)
     blocks = {i: block for i, block in blocks.items() if i not in apart}
-    order = sorted(candidates, key=_local_key)
+    order = _taking_order(candidates, when, day)
     if not blocks:
-        taken, rest, note = _without_overlap(order, max_feeds)
+        first = "the most local first"
+        if when is None and any(_off_day(f, day) for f in order):
+            first = "those running today first, then the most local"
+        taken, rest, note = _without_overlap(order, max_feeds, first)
+        if when is None:
+            taken = [_with_window(choice, day) for choice in taken]
         left_out = _largest_first(rest) + _largest_first(left_out)
         return Recommendation(
             target,
@@ -396,6 +406,8 @@ def recommend(
         )
     left_out = _largest_first(rest) + _largest_first(left_out)
     note = "; ".join(notes) or None
+    if when is None:
+        chosen = [_with_window(choice, day) for choice in chosen]
     return Recommendation(
         target,
         when,
@@ -411,14 +423,29 @@ def recommend(
 
 
 def _excluded(feed, day, blocks):
-    """Why ``feed`` is no candidate on ``day``, or None: the index must have
-    read it, and its timetable as indexed must run on the day, whether or not
-    it was stale when indexed."""
+    """Why ``feed`` is no candidate, or None: the index must have read it,
+    and on a study ``day`` (None without one) its timetable as indexed must
+    run then."""
     if feed.download_problem is not None:
         return f"not considered: {feed.download_problem}"
     if feed.mark is not None:
         reason = "not considered: fetch takes it when named in feeds="
         return f"{MARKS[feed.mark]}, {reason}"
+    off_day = None if day is None else _off_day(feed, day)
+    if off_day is not None:
+        return off_day
+    provider = feed._provider()
+    if feed.access == "key" and provider is not None and provider.free is False:
+        return _access_note(feed)
+    departures = _summed_service(feed)["departures_per_day"]
+    if feed.feed_id not in blocks and not departures:
+        return "not measured: the index has no timetable for it here"
+    return None
+
+
+def _off_day(feed, day):
+    """Why the timetable of ``feed`` as indexed does not run on ``day``, or
+    None, whether or not it was stale when indexed."""
     ended = feed.stale_when_indexed
     if ended is not None and ended < day:
         return f"stale when indexed: its timetable ended {ended}"
@@ -430,13 +457,30 @@ def _excluded(feed, day, blocks):
         )
     if start is not None and start > day:
         return f"its timetable as indexed starts {start}, after {day}"
-    provider = feed._provider()
-    if feed.access == "key" and provider is not None and provider.free is False:
-        return _access_note(feed)
-    departures = _summed_service(feed)["departures_per_day"]
-    if feed.feed_id not in blocks and not departures:
-        return "not measured: the index has no timetable for it here"
     return None
+
+
+def _with_window(choice, day):
+    """``choice`` with its timetable window added to the reason when the
+    timetable as indexed does not run on ``day``."""
+    if _off_day(choice.feed, day) is None:
+        return choice
+    start, end = choice.feed.service_start, choice.feed.service_end
+    window = f"from {start} to {end}" if start and end else f"until {end}"
+    window = window if end else f"from {start}"
+    reason = f"{choice.reason}; its timetable as indexed runs {window}, not today"
+    return choice._replace(reason=reason)
+
+
+def _taking_order(feeds, when, day):
+    """``feeds`` in the order they are taken, the most local first; without
+    a study day ``when``, those whose timetable as indexed runs on ``day``
+    (today) before the others, so an older version comes only for what the
+    others lack."""
+    return sorted(
+        feeds,
+        key=lambda f: (when is None and _off_day(f, day) is not None, _local_key(f)),
+    )
 
 
 def _area(feed):
@@ -584,9 +628,10 @@ def _repeats(feed, block, taken, stops):
     return reason
 
 
-def _without_overlap(order, max_feeds):
+def _without_overlap(order, max_feeds, first="the most local first"):
     """``(taken, left_out, note)`` on an index without overlap evidence: every
-    feed in ``order``, at most ``max_feeds`` of them."""
+    feed in ``order``, at most ``max_feeds`` of them, the note saying the
+    order as ``first``."""
     if not order:
         return [], [], "no feed is left to take"
     taken, rest = [], []
@@ -601,10 +646,10 @@ def _without_overlap(order, max_feeds):
         departures = _summed_service(feed)["departures_per_day"] or 0.0
         reason = f"{departures:,.0f} departures a day as indexed"
         taken.append(Choice(feed, _with_access(feed, reason), None))
-    taking = "every feed is taken, the most local first"
+    taking = f"every feed is taken, {first}"
     if rest:
         taking = (
-            f"at most {max_feeds} are taken, the most local first, and "
+            f"at most {max_feeds} are taken, {first}, and "
             f"{_feeds_are(len(rest))} left out"
         )
     note = (

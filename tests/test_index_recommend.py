@@ -213,7 +213,7 @@ def test_an_area_recommendation_sums_its_parts(tmp_path, monkeypatch):
         return {**record, "evidence": {"overlap": overlap}}
 
     # f-a runs the bus of both cities, f-b repeats it in k2, f-c is c1's tram
-    # and f-d's timetable ended in January.
+    # and f-d's timetable ended in January, so without a day it comes last.
     edges = [
         served("c1", "f-a", {"bus": 600}),
         served("k2", "f-a", {"bus": 400}),
@@ -234,24 +234,24 @@ def test_an_area_recommendation_sums_its_parts(tmp_path, monkeypatch):
     )
     area = reader.area((2, 0, 2.8, 0.4), index=reader.read_index(path))
     found = area.recommend()
-    assert found.feed_ids == ["f-a", "f-c"] and found.when is None
+    assert found.feed_ids == ["f-a", "f-c", "f-d"] and found.when is None
     assert found.coverage == pytest.approx(1.0)
     assert str(found).splitlines() == [
-        "The area's 2 places: take 2 feeds, covering about 100 % of the "
+        "The area's 2 places: take 3 feeds, covering about 100 % of the "
         "departures the index records there, each counted once",
         "  considers local and regional feeds only, and those of unknown tier; "
         "tiers=None adds national and international feeds",
-        "  + f-a: covers 95 % of the place's departures (100 % of bus; 0 % of "
+        "  + f-a: covers 94 % of the place's departures (99 % of bus; 0 % of "
         "rail, subway and tram)",
         "  + f-c: adds rail, subway and tram the feeds above lack: 100 % of the "
         "place's rail, subway and tram",
+        "  + f-d: adds bus the feeds above lack: 0.99 % of the place's bus; its "
+        "timetable as indexed runs until 2026-01-31, not today",
         "  - f-b: repeats f-a (100 % of its departures)",
-        "  - f-d: its timetable as indexed ends 2026-01-31, before 2026-10-13 "
-        "(a newer download may run then)",
     ]
     # A cap stops the selection while the tram feed still adds departures.
     assert area.recommend(max_feeds=1).note == (
-        "at most 1 feed is taken; 1 feed is left out for it"
+        "at most 1 feed is taken; 2 feeds are left out for it"
     )
     wrongs = ({"target": 0}, {"target": 1.5}, {"max_feeds": 0}, {"max_feeds": 1.5})
     for wrong in wrongs + ({"when": "soon"},):

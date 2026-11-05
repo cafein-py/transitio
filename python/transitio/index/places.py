@@ -458,8 +458,8 @@ class Place:
         target=None,
         max_feeds=None,
     ):
-        """Which of the place's feeds to use on ``when`` (a date, today when
-        None), and why the others are left out, as a
+        """Which of the place's feeds to use on the study day ``when`` (a
+        date, or None for none), and why the others are left out, as a
         :class:`~transitio.index.Recommendation`; ``print()`` it to read it.
 
         The candidates are the feeds serving the place at ``tiers``, together
@@ -471,10 +471,13 @@ class Place:
         only is listed as not considered, as is a feed the index marks as a
         private or campus service or an unofficial compilation (``fetch``
         takes it when named in ``feeds=``). A candidate is left out when its
-        timetable as indexed does not run on the day (a feed stale when
+        timetable as indexed does not run on the study day (a feed stale when
         indexed is a candidate for a day its timetable covers), when it needs
         a paid account, or when it adds no departure the feeds taken before
-        it do not run. The candidates are taken the most
+        it do not run. Without a study day no feed is left out for its dates,
+        since older data serves research as well: the feeds whose timetable
+        runs today come first, and a taken one that does not run today gives
+        its window. The candidates are taken the most
         local first, the one covering the smallest area, so an operator's own
         feed comes before an aggregate repeating it and the aggregate is taken
         for what it adds; among feeds covering as much, the open one and the
