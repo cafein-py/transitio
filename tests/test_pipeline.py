@@ -981,14 +981,21 @@ def test_fetch_rejects_invalid_options():
 
 
 def _partitioned_index(
-    tmp_path, monkeypatch, feeds, contained=None, edges=None, providers=None, more=()
+    tmp_path,
+    monkeypatch,
+    feeds,
+    contained=None,
+    edges=None,
+    providers=None,
+    more=(),
+    places=None,
 ):
     """A schema-10 index serving Q1757 with ``feeds`` (``{feed id: extra
     columns}``) in that order, each a local feed at
     ``https://feeds.example/<feed id>`` whose stop count follows that order,
     so fetch takes them in it; ``edges`` adds edge fields by feed id
     and ``more`` further edge records. With ``providers`` (access provider
-    records) a schema-11 index."""
+    records) a schema-11 index; ``places`` replaces the fixture's Q1757."""
     import transitio.index as transitio_index
     from index_fixture import HULL, PLACES, covered_feed, edge, write_partitioned_index
 
@@ -1024,7 +1031,7 @@ def _partitioned_index(
     directory = write_partitioned_index(
         tmp_path / "index",
         feeds=rows,
-        places=[PLACES[0]],
+        places=places or [PLACES[0]],
         edges=[*records, *more],
         contained=contained or {},
         access=None if providers is None else {"providers": providers},
@@ -1105,6 +1112,60 @@ def test_fetch_takes_the_tiers_recommend_considers(tmp_path, monkeypatch):
             "not considered: serves the place at the national tier, which exclude= "
             "leaves out"
         )
+
+
+def test_a_metro_answering_for_a_city_lists_the_city_feeds_it_lacks(
+    tmp_path, monkeypatch
+):
+    # Helsinki's own metro runs f-l but not the city's island feed f-i or its
+    # national feed f-n.
+    from index_fixture import GEOM_HEX, edge, place
+
+    import transitio.index as transitio_index
+
+    city = place(
+        "Q1757", "city", name="Helsinki", geometry=GEOM_HEX, metro_ids=["Q-metro"]
+    )
+    metro = place(
+        "Q-metro",
+        "metro",
+        name="Helsinki",
+        geometry=GEOM_HEX,
+        member_ids=["Q1757"],
+        source_subtype="city-region (FAO)",
+    )
+    more = [edge("Q-metro", "f-l", tier="local", relevance_category="primary")]
+    index = _partitioned_index(
+        tmp_path,
+        monkeypatch,
+        {"f-l": {}, "f-i": {}, "f-n": {}},
+        edges={"f-n": {"tier": "national", "relevance_category": "tertiary"}},
+        more=more,
+        places=[city, metro],
+    )
+    reason = (
+        'not considered: serves Helsinki (city) outside the metro; kind="city" '
+        "looks up the city"
+    )
+    helsinki = transitio_index.place("Helsinki", index=index)
+    assert helsinki.id == "Q-metro" and helsinki.promoted_from.id == "Q1757"
+    given = {c.feed.feed_id: c.reason for c in helsinki.recommend().left_out}
+    assert given["f-i"] == given["f-n"] == reason
+    fetched = _serve_by_id(monkeypatch, {"f-l": _zip(GTFS)})
+    result = fetch(
+        place="Helsinki",
+        index=index,
+        directory=tmp_path / "out",
+        crop=False,
+        osm=False,
+    )
+    decisions = [(e["feed_id"], e["decision"], e["reason"]) for e in result.selection]
+    assert decisions == [
+        ("f-l", "delivered", None),
+        ("f-i", "skipped", reason),
+        ("f-n", "skipped", reason),
+    ]
+    assert fetched == ["f-l"]
 
 
 @pytest.mark.parametrize(

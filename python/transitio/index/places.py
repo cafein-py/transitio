@@ -42,7 +42,11 @@ in its country), which keep every definition so that dropping the others
 cannot hand the city's name to one of them; a named definition keeps only
 its metros. Anything else raises
 :class:`AmbiguousPlaceError` with the candidates, or
-:class:`PlaceNotFoundError` with the partial matches, if any.
+:class:`PlaceNotFoundError` with the partial matches, if any. A name
+without ``kind`` that resolves to a city answers with the city's own metro:
+a metro the city belongs to whose name begins with one of the city's own
+names, the earliest definition in the default order first; its
+``promoted_from`` is the city.
 """
 
 import functools
@@ -122,14 +126,15 @@ _EXACT, _PREFIX, _SUBSET = 3, 2, 1
 _KIND_ORDER = {"metro": 0, "city": 1, "region": 2, "country": 3}
 
 # The metro definitions (a metro's ``source_subtype``) in the order a lookup
-# picks among one metro's: the commuting-based ones (Urban Audit FUAs, US
-# MSAs), Eurostat's NUTS-3 metropolitan regions, then the FAO city-regions,
-# global and with uneven boundaries. Any other ranks after these.
+# picks among one metro's: the FAO city-regions, which cover the world and
+# hold the most of their city's feeds, then the commuting-based ones (Urban
+# Audit FUAs, US MSAs) and Eurostat's NUTS-3 metropolitan regions. Any other
+# ranks after these.
 _METRO_DEFINITIONS = (
+    "city-region (FAO)",
     "functional urban area",
     "metropolitan statistical area",
     "metropolitan region",
-    "city-region (FAO)",
 )
 
 
@@ -247,13 +252,20 @@ Delineation = namedtuple("Delineation", ["relation", "kind", "subtype", "place"]
 class Place:
     """A resolved place: its identity, hierarchy, names and boundary."""
 
-    def __init__(self, record, lookup):
+    def __init__(self, record, lookup, *, promoted_from=None):
         self._record = record
         self._lookup = lookup
+        self._promoted_from = promoted_from
 
     @property
     def id(self):
         return self._record["place_id"]
+
+    @property
+    def promoted_from(self):
+        """The city a name resolved to, when this metro answers for it (see
+        :func:`transitio.index.place`); None otherwise."""
+        return self._promoted_from
 
     @property
     def kind(self):
@@ -470,7 +482,9 @@ class Place:
         tiers as in :meth:`feeds`; a feed serving the place at other tiers
         only is listed as not considered, as is a feed the index marks as a
         private or campus service or an unofficial compilation (``fetch``
-        takes it when named in ``feeds=``). A candidate is left out when its
+        takes it when named in ``feeds=``). On a metro that answers for a city
+        (:attr:`promoted_from`), a feed serving the city at any tier but not
+        the metro is listed as not considered too. A candidate is left out when its
         timetable as indexed does not run on the study day (a feed stale when
         indexed is a candidate for a day its timetable covers), when it needs
         a paid account, or when it adds no departure the feeds taken before
@@ -891,6 +905,10 @@ class _PlaceLookup:
         self._children = defaultdict(list)
         self._countries = defaultdict(list)
         self._definitions = set()  # the metro definitions the index holds
+        # Metro membership, listed by the metro (member_ids) or the place
+        # (metro_ids): place id -> its metros, metro id -> its members.
+        self._metros_of = defaultdict(set)
+        self._members = defaultdict(set)
         self._name_index = None  # built on the first suggestion, under the lock
         self._name_lock = threading.Lock()
         self._label_index = None  # built on the first name query, under the lock
@@ -928,6 +946,12 @@ class _PlaceLookup:
                 self._countries[record["country_code"]].append(place_id)
             if record["kind"] == "metro" and record["source_subtype"]:
                 self._definitions.add(record["source_subtype"])
+            pairs = [(place_id, metro) for metro in record["metro_ids"]]
+            if record["kind"] == "metro":
+                pairs += [(member, place_id) for member in record["member_ids"]]
+            for member, metro in pairs:
+                self._metros_of[member].add(metro)
+                self._members[metro].add(member)
             qids = record["concordances"].get("wikidata", [])
             for alias in [*record["former_ids"], *qids]:
                 self._aliases.setdefault(alias, place_id)
@@ -1190,6 +1214,9 @@ class _PlaceLookup:
         return suggestions
 
     def resolve(self, query, kind=None, definition=None):
+        """The place ``query`` names (see :func:`transitio.index.place`); a
+        name without ``kind`` resolving to a city answers with its own metro
+        (``_promoted``)."""
         if definition is not None:
             if kind not in (None, "metro"):
                 raise ValueError(
@@ -1212,10 +1239,45 @@ class _PlaceLookup:
         first = None
         for name, scored in self._readings(query, kind, definition):
             try:
-                return self._answer(query, name, scored)
+                place = self._answer(query, name, scored)
             except AmbiguousPlaceError as error:
                 first = first or error
+                continue
+            return place if kind is not None else self._promoted(place)
         raise first
+
+    def _promoted(self, place):
+        """``place``, or for a city with an own metro (``_own_metro``) that
+        metro, answering for the city."""
+        metro = self._own_metro(place.id) if place.kind == "city" else None
+        if metro is None:
+            return place
+        return Place(self._records[metro], self, promoted_from=place)
+
+    def _own_metro(self, city_id):
+        """The id of the city's own metro, or None: of the metros the city
+        belongs to (``_metros_of``), those whose name begins with one of the
+        city's own names (``_own_names``), the earliest definition in
+        ``_METRO_DEFINITIONS`` first, then the one with the most feeds."""
+        records = self._records
+        own = self._own_names(city_id)
+        named = []
+        for metro in self._metros_of.get(city_id, ()):
+            if metro not in records:
+                continue
+            norm = _normalize(records[metro]["name"])
+            if any(norm == name or norm.startswith(name + " ") for name in own if name):
+                named.append(metro)
+        if not named:
+            return None
+        return min(
+            named,
+            key=lambda m: (
+                _definition_rank(records[m]["source_subtype"]),
+                -self._feed_count(m),
+                m,
+            ),
+        )
 
     def _answer(self, query, name, scored):
         """The place one reading of ``query`` names, or raise."""
@@ -1235,8 +1297,9 @@ class _PlaceLookup:
 
     def _one_definition(self, scored):
         """``scored`` less the exact metro matches another definition of the
-        same metro outranks. Exact matches sharing a member place, directly or
-        along a chain, are one metro under several definitions and keep those
+        same metro outranks. Exact matches sharing a member place
+        (``_members``), directly or along a chain, are one metro under several
+        definitions and keep those
         of the earliest definition in ``_METRO_DEFINITIONS``. Shared members,
         not country codes, group them: a cross-border metro may be filed
         under a neighbour's code (Basel's FAO region under France), while
@@ -1248,7 +1311,7 @@ class _PlaceLookup:
             for tier, pid in scored
             if tier == _EXACT and records[pid]["kind"] == "metro"
         ]
-        members = {pid: set(records[pid]["member_ids"]) for pid in exact}
+        members = {pid: self._members.get(pid, set()) for pid in exact}
         group = {}
         for start in exact:
             if start in group:
