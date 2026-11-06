@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+
+- A city's name gives the city's metro area: when the city a name resolves
+  to belongs to a metro whose name begins with one of the city's own names,
+  `transitio.place()` returns that metro, and `Place.promoted_from` is the
+  city. "Helsinki" is the Helsinki city-region (FAO); "Espoo", in the
+  Helsinki metros, stays the city; `kind="city"`, an id or a `Place` gives
+  the city itself. `recommend()`, and `fetch()` without `feeds=`, on such a
+  metro list the city's feeds the metro lacks as not considered. At the 300
+  most populous cities with a feed in index 686fdcff93792fb4, 189 names now
+  give the city's metro, whose local and regional feeds number 1,489 more
+  than the cities'; at 6 of them, Tokyo and Sheffield among them, the metro
+  lacks 11 of the city's feeds, which are listed.
+- Where one metro has several definitions, the FAO city-region comes first,
+  then the functional urban area, the metropolitan statistical area and the
+  metropolitan region: "Stockholm" with `kind="metro"` is its FAO
+  city-region. `DISCOVERY_SEMANTICS_VERSION` is 6.
+
 ## 0.29.0 — 2026-11-05
 
 ### Changed

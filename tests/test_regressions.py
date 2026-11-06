@@ -788,15 +788,15 @@ def test_a_city_far_larger_than_its_namesakes_wins(name, rows, expected):
 @pytest.mark.parametrize(
     ("name", "options", "expected"),
     [
-        ("Stockholm", {"kind": "metro"}, "m-fua"),
+        ("Stockholm", {"kind": "metro"}, "m-fao"),
         ("Stockholm", {"definition": "metropolitan region"}, "m-mr"),
-        ("Stockholm", {"definition": "city-region (FAO)"}, "m-fao"),
+        ("Stockholm", {"definition": "functional urban area"}, "m-fua"),
         ("Athens", {"kind": "metro"}, None),
         # The definition that answers carries the name only in another language.
-        ("Kansas City", {"kind": "metro"}, "m-kc-msa"),
-        ("Stockholm", {}, "m-fua"),
+        ("Kansas City", {"kind": "metro"}, "m-kc-fao"),
+        ("Stockholm", {}, "m-fao"),
         # A city of the name abroad leaves the British metros one metro.
-        ("Ipswich", {}, "m-ips-mr"),
+        ("Ipswich", {}, "m-ips-fao"),
         # The city's own metros keep both definitions, so neither outruns it.
         ("Firenze", {}, None),
     ],
@@ -817,7 +817,7 @@ def test_one_definition_of_a_metro_answers(name, options, expected):
         ("m-fua", "Stockholm", "SE", "functional urban area", ["c", "d"], 3),
         ("m-ath-us", "Athens", "US", "city-region (FAO)", ["e"], 3),
         ("m-ath-gr", "Athens", "GR", "city-region (FAO)", ["f"], 3),
-        ("m-kc-fao", "Kansas City", "US", "city-region (FAO)", ["j"], 14),
+        ("m-kc-msa", "Kansas City", "US", "metropolitan statistical area", ["j"], 14),
         ("m-ips-mr", "Ipswich", "GB", "metropolitan region", ["g"], 6),
         ("m-ips-fao", "Ipswich", "GB", "city-region (FAO)", ["g", "h"], 6),
         ("m-flr-fua", "Firenze", "IT", "functional urban area", ["i"], 26),
@@ -836,13 +836,13 @@ def test_one_definition_of_a_metro_answers(name, options, expected):
         _place("r-flr", "region", "Florence", "IT", names=florence),
         _place("c-flr", "city", "Florence", "IT", names=florence, parent="r-flr"),
         {
-            **_place("m-kc-msa", "metro", "KC area", "US", names={"da": "Kansas City"}),
-            "source_subtype": "metropolitan statistical area",
+            **_place("m-kc-fao", "metro", "KC area", "US", names={"da": "Kansas City"}),
+            "source_subtype": "city-region (FAO)",
             "member_ids": ["j"],
         },
     ]
     feeds = {row[0]: row[-1] for row in metros}
-    feeds.update({"c-ips": 1, "r-flr": 26, "c-flr": 11, "m-kc-msa": 7})
+    feeds.update({"c-ips": 1, "r-flr": 26, "c-flr": 11, "m-kc-fao": 7})
     lookup = _lookup(places, feeds)
     if expected is None:
         with pytest.raises(AmbiguousPlaceError):
@@ -3320,7 +3320,7 @@ def test_a_row_bar_counts_whole_rows(monkeypatch, capsys):
 
 def test_places_and_suggestions_list_the_resolved_city_first():
     # places("Augsburg") and suggest("augs") listed Augsburg's metros before
-    # the city place("Augsburg") answers.
+    # the city place("Augsburg") picks.
     import transitio.index as transitio_index
     from test_index_resolve import _index, _p
 
@@ -3330,7 +3330,7 @@ def test_places_and_suggestions_list_the_resolved_city_first():
             _p("Q-aug", "city", "Augsburg", metro_ids=["Q-aug-m"], country_code="DE"),
         ]
     )
-    assert transitio_index.place("Augsburg", index=idx).id == "Q-aug"
+    assert transitio_index.place("Augsburg", index=idx).promoted_from.id == "Q-aug"
     assert [p.id for p in transitio_index.places("Augsburg", index=idx)] == [
         "Q-aug",
         "Q-aug-m",

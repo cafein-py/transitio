@@ -3617,6 +3617,7 @@ def _fetch_place(
     )
     from transitio.index.feeds import MARKS, _hosted_url, _names
     from transitio.index.recommend import (
+        _beyond_metro,
         _by_place,
         _default_tiers,
         _less,
@@ -3981,6 +3982,9 @@ def _fetch_place(
                 reason = _not_considered(feed, excluded)
                 hint = f"; {named}" if elsewhere(feed_id) else ""
                 _skip(entry_for(feed), reason + hint)
+    if wanted is None:
+        for feed, reason in _beyond_metro(place_obj):
+            _skip(entry_for(feed), reason)
     hidden = [f for i, f in every.items() if i not in offered_ids and elsewhere(i)]
     view_note = None
     if tiers is None and wanted is None and hidden and not offered:

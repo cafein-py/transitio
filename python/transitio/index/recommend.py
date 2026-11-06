@@ -210,7 +210,8 @@ def recommend_for(target, when, tiers, exclude, goal, max_feeds):
     """The :class:`Recommendation` for ``target``, a place or an area, from
     the feeds serving it at ``tiers`` (every tier when None, the kind of
     place's own when ``"default"``), cross-border ones included, listing
-    those serving it at other tiers only as not considered."""
+    those serving it at other tiers only as not considered, as are those
+    serving the city a metro answers for but not the metro."""
     if isinstance(tiers, str) and tiers == "default":
         tiers = _default_tiers(target)
     else:
@@ -223,6 +224,7 @@ def recommend_for(target, when, tiers, exclude, goal, max_feeds):
         categories=None,
         international=True,
     )
+    beyond = _beyond_metro(target)
     outside = []
     if tiers is not None or excluded:
         considered = {feed.feed_id for feed in feeds}
@@ -241,6 +243,7 @@ def recommend_for(target, when, tiers, exclude, goal, max_feeds):
         tiers=tiers,
         outside=outside,
         excluded=excluded,
+        beyond=beyond,
     )
 
 
@@ -254,11 +257,14 @@ def recommend(
     tiers=None,
     outside=(),
     excluded=(),
+    beyond=(),
 ):
     """The :class:`Recommendation` for ``target``, a place or an area, from
     its ``feeds`` on the study day ``when`` (None for none): the feeds at the ``tiers``
     considered (every tier when None), with ``outside`` the feeds serving it
-    at other tiers only and ``excluded`` the tiers left out by ``exclude``;
+    at other tiers only, ``excluded`` the tiers left out by ``exclude`` and
+    ``beyond`` the ``(feed, reason)`` pairs left out for serving the place
+    only beyond it (``_beyond_metro``);
     see :meth:`~transitio.index.Place.recommend`."""
     if goal is not None and not 0 < goal <= 1:
         raise ValueError(f"target must be above 0 and at most 1, not {goal!r}")
@@ -291,6 +297,7 @@ def recommend(
     left_out += [
         Choice(f, _with_access(f, _not_considered(f, excluded)), None) for f in outside
     ]
+    left_out += [Choice(f, _with_access(f, why), None) for f, why in beyond]
     blocks = {f.feed_id: blocks[f.feed_id] for f in candidates if f.feed_id in blocks}
     apart = _apart(candidates, blocks)
     blocks = {i: block for i, block in blocks.items() if i not in apart}
@@ -735,6 +742,22 @@ def _not_considered(feed, excluded=()):
         f"tier{'' if len(tiers) == 1 else 's'}"
     )
     return reason + (", which exclude= leaves out" if tiers <= set(excluded) else "")
+
+
+def _beyond_metro(target):
+    """The feeds serving the city a metro answers for (its ``promoted_from``),
+    at any tier, but the metro at none, each with why it is left out; none for
+    any other target."""
+    city = getattr(target, "promoted_from", None)
+    if city is None:
+        return []
+    held = {feed.feed_id for feed in target.feeds(categories=None, international=True)}
+    reason = (
+        f"not considered: serves {city.name} (city) outside the metro; "
+        'kind="city" looks up the city'
+    )
+    found = city.feeds(categories=None, international=True)
+    return [(feed, reason) for feed in found if feed.feed_id not in held]
 
 
 def _with_access(feed, reason):

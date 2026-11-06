@@ -344,9 +344,9 @@ def test_requires_refuses_non_string_names(idx):
         metro.feeds(requires=["shapes.txt", 3])
 
 
-def test_a_bare_city_name_finds_the_city_and_its_feed(idx):
+def test_a_bare_city_name_finds_its_metro_and_the_city_feed(idx):
     place = transitio.place("Gotham", index=idx)
-    assert place.id == "Q101"
+    assert place.id == "Q102" and place.promoted_from.id == "Q101"
     assert "f-city" in [f.feed_id for f in place.feeds()]
 
 

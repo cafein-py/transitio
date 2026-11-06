@@ -126,10 +126,66 @@ def idx():
     return _index(RECORDS)
 
 
-@pytest.mark.parametrize("name", ["New York City", "Twinsburg"])
-def test_a_bare_city_name_returns_the_city(idx, name):
-    # with a default metro (New York City) or several metros (Twinsburg)
-    assert transitio_index.place(name, index=idx).kind == "city"
+# Helsinki belongs to two metros of its name (Espoo too), Turku to two only it
+# lists, and Dayton to its metropolitan statistical area, not to a same-named
+# FAO city-region; Antwerp's metro carries its Dutch name.
+OWN_METROS = [
+    _p("c-tku", "city", "Turku", country_code="FI", metro_ids=["m-tf", "m-tu"]),
+    _p("m-tf", "metro", "Turku", country_code="FI", source_subtype="city-region (FAO)"),
+    _p(
+        "m-tu",
+        "metro",
+        "Turku",
+        country_code="FI",
+        source_subtype="functional urban area",
+    ),
+    _p("tp_1", "city", "Helsinki", country_code="FI", metro_ids=["m-fua"]),
+    _p("c-esp", "city", "Espoo", country_code="FI"),
+    *(
+        _p(pid, "metro", "Helsinki", country_code="FI", source_subtype=subtype, **kw)
+        for pid, subtype, kw in (
+            ("m-fua", "functional urban area", {"member_ids": ["c-esp"]}),
+            ("m-fao", "city-region (FAO)", {"member_ids": ["tp_1", "c-esp"]}),
+        )
+    ),
+    _p("c-day", "city", "Dayton"),
+    _p("m-day-fao", "metro", "Dayton", source_subtype="city-region (FAO)"),
+    _p(
+        "m-day",
+        "metro",
+        "Dayton metropolitan area",
+        member_ids=["c-day"],
+        source_subtype="metropolitan statistical area",
+    ),
+    _p("c-ant", "city", "Antwerp", names={"nl": "Antwerpen"}, country_code="BE"),
+    _p("m-ant", "metro", "Antwerpen", country_code="BE", member_ids=["c-ant"]),
+]
+
+
+@pytest.mark.parametrize(
+    ("query", "options", "expected", "promoted_from"),
+    [
+        ("Helsinki", {}, "m-fao", "tp_1"),  # the FAO city-region first
+        ("Helsinki", {"kind": "city"}, "tp_1", None),
+        ("Helsinki", {"kind": "metro"}, "m-fao", None),
+        ("Turku", {}, "m-tf", "c-tku"),
+        ("Turku", {"kind": "metro"}, "m-tf", None),
+        ("tp_1", {}, "tp_1", None),  # an id never promotes
+        ("Espoo", {}, "c-esp", None),  # in metros named after another city
+        ("Dayton", {}, "m-day", "c-day"),  # a metro it is no member of is not taken
+        ("Antwerp", {}, "m-ant", "c-ant"),
+        # Metros not named after it, or named after another city.
+        ("New York City", {}, "Q60", None),
+        ("Twinsburg", {}, "Q-twin", None),
+    ],
+)
+def test_a_city_name_answers_with_the_citys_own_metro(
+    query, options, expected, promoted_from
+):
+    idx = _index([r for r in RECORDS if r["place_id"] != "Q1757"] + OWN_METROS)
+    place = transitio_index.place(query, index=idx, **options)
+    assert place.id == expected
+    assert getattr(place.promoted_from, "id", None) == promoted_from
 
 
 def test_kind_pins_the_scope(idx):
@@ -145,7 +201,7 @@ def test_kind_pins_the_scope(idx):
         ({"kind": "city", "definition": "city-region (FAO)"}, "kind='city'"),
         (
             {"definition": "urban area"},
-            "'metropolitan statistical area', 'city-region (FAO)'",
+            "'city-region (FAO)', 'metropolitan statistical area'",
         ),
     ],
 )
